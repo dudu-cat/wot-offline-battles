@@ -1411,7 +1411,7 @@ def _catalog_motion_result(status, token=None, accepted_now=False,
 
 def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		return_status=False, dt=0.04, kinetic_speed=None,
-		return_detail=False, kinetic_commit=False):
+		return_detail=False, kinetic_commit=False, commit_enabled=True):
 	"""Resolve exact streamed OBB contact before committing local movement."""
 	_diagnostic_flush_1513(now)
 	if _destructible_catalog is None:
@@ -1509,8 +1509,10 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 				continue
 			if contact_candidate:
 				exact_token.add(key)
-			if physical_crushable:
+			if physical_crushable and commit_enabled:
 				commit_candidates.append((candidate, vel, False))
+			elif physical_crushable:
+				blocked = True
 			elif cap_crushable:
 				if kinetic_commit:
 					commit_candidates.append((candidate, kinetic_speed, True))

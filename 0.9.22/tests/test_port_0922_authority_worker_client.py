@@ -83,6 +83,7 @@ class _WorkerRuntime(object):
         self.error = None
         self.draw_ready = True
         self.start_config = None
+        self.fire_intent_results = []
         self.sample = {
             'round_finished': False,
             'frame_callbacks': 1,
@@ -118,6 +119,10 @@ class _WorkerRuntime(object):
     def authority_worker_ready_for_draw_off(self):
         return self.draw_ready
 
+    def on_fire_intent_result(self, message):
+        self.fire_intent_results.append(dict(message))
+        return True
+
 
 def _human(player_id=1):
     return {
@@ -142,6 +147,7 @@ def _human(player_id=1):
         'critical_base_revision': 0,
         'critical_ack_seq': 0,
         'outfits': {},
+        'vehicle_compact_descr': 'dGVzdA==',
     }
 
 
@@ -201,7 +207,8 @@ class AuthorityWorkerClientTests(unittest.TestCase):
     def test_player_hello_wire_shape_advertises_required_capabilities(self):
         client = LANClient(
             '127.0.0.1', 28782, 'Player', 'ussr:R11_MS-1',
-            max_health=90, account_key='account', outfits={})
+            max_health=90, account_key='account', outfits={},
+            vehicle_compact_descr='dGVzdA==')
 
         self.assertEqual({
             'type': 'hello',
@@ -213,6 +220,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'max_health': 90,
             'account_key': 'account',
             'outfits': {},
+            'vehicle_compact_descr': 'dGVzdA==',
         }, client._hello_payload())
         self.assertNotIn('role', client._hello_payload())
 
@@ -351,6 +359,10 @@ class AuthorityWorkerClientTests(unittest.TestCase):
                 SIMULATION_WORKER_CAPABILITY],
             'server_capabilities': [
                 lan_client_module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                lan_client_module.HUMAN_RAM_TIMELINE_CAPABILITY,
+                lan_client_module.LEAN_SNAPSHOT_MANIFEST_CAPABILITY,
+                lan_client_module.RAM_CONTACT_LEDGER_CAPABILITY,
+                lan_client_module.PLAYER_FIRE_INTENT_CAPABILITY,
                 lan_client_module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 lan_client_module.RANDOM_MAP_CAPABILITY],
             'map': '01_karelia', 'map_pool': ['01_karelia'],
@@ -401,7 +413,8 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'authority_epoch': 0, 'projectile_revision': 0,
             'bot_state_revision': 0,
             'bot_authority_id': WORKER_AUTHORITY_ID,
-            'players': [_human()], 'bots': [], 'projectiles': [],
+            'bot_manifest': [], 'players': [_human()], 'bots': [],
+            'projectiles': [],
         }
         client._handle_message(snapshot)
 
@@ -767,6 +780,27 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertIn(
             'native adapter failed',
             str(session._worker_failure.call_args[0][0]))
+
+    def test_worker_routes_terminal_player_launch_result_to_runtime(self):
+        world = _DrawWorld()
+        client = _WorkerClient()
+        runtime = _WorkerRuntime(client, world)
+        message = {
+            'type': 'fire_intent_result', 'round_id': 1,
+            'player_id': 2, 'intent_seq': 3, 'accepted': False,
+            'reason': 'projectile_launch_rejected',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            session = WorkerSession(
+                {}, bigworld=world,
+                status_path=str(Path(directory) / 'status.json'))
+            session.client = client
+            session.runtime = runtime
+            session._active_round_id = 1
+
+            session._on_event('fire_intent_result', message)
+
+        self.assertEqual([message], runtime.fire_intent_results)
 
     def test_worker_forces_compound_factory_and_track_animation_off(self):
         world = _DrawWorld()

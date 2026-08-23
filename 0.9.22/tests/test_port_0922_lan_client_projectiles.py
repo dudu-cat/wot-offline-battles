@@ -11,6 +11,8 @@ sys.path.insert(0, str(
     ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'))
 
 from gui.mods.offline_lan_0922 import lan_client as module
+from gui.mods.offline_lan_0922.authority_worker import (
+    AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.lan_client import LANClient
 
 
@@ -81,11 +83,40 @@ class ProjectileWireTests(unittest.TestCase):
         client.phase = 'battle'
         client.round_id = 3
         client.player_id = 7
-        client.bot_authority_id = 7
+        client.bot_authority_id = module.WORKER_AUTHORITY_ID
         client.authority_epoch = 4
-        client.capabilities = [module.PROJECTILE_LEDGER_CAPABILITY]
+        client.capabilities = list(module.CLIENT_CAPABILITIES)
         client.server_capabilities = [
             module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            module.RAM_CONTACT_LEDGER_CAPABILITY,
+            module.HUMAN_RAM_TIMELINE_CAPABILITY,
+            module.PLAYER_FIRE_INTENT_CAPABILITY,
+            module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+            module.PROJECTILE_WRECK_HIT_CAPABILITY,
+            module.RANDOM_MAP_CAPABILITY,
+        ]
+        with client._outbound_lock:
+            client._outbound_accepting = True
+        return client
+
+    def active_worker_client(self):
+        client = AuthorityWorkerLANClient('127.0.0.1', 28782)
+        client.sock = RecordingSocket()
+        client.running = True
+        client.connected = True
+        client.ready = True
+        client.phase = 'battle'
+        client.round_id = 3
+        client.player_id = module.WORKER_AUTHORITY_ID
+        client.bot_authority_id = module.WORKER_AUTHORITY_ID
+        client.authority_epoch = 4
+        client.capabilities = list(module.CLIENT_CAPABILITIES) + [
+            module.SIMULATION_WORKER_CAPABILITY]
+        client.server_capabilities = [
+            module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            module.RAM_CONTACT_LEDGER_CAPABILITY,
+            module.HUMAN_RAM_TIMELINE_CAPABILITY,
+            module.PLAYER_FIRE_INTENT_CAPABILITY,
             module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
             module.PROJECTILE_WRECK_HIT_CAPABILITY,
             module.RANDOM_MAP_CAPABILITY,
@@ -96,7 +127,8 @@ class ProjectileWireTests(unittest.TestCase):
 
     @staticmethod
     def launch(client, shooter_kind='player', shooter_id=7,
-               shot_seq=None, authority_epoch=None, **overrides):
+               shot_seq=None, authority_epoch=None, fire_intent_seq=None,
+               fire_input_seq=None, **overrides):
         values = {
             'shell_index': 2,
             'origin': [1.0, 2.0, 3.0],
@@ -122,15 +154,31 @@ class ProjectileWireTests(unittest.TestCase):
             values['max_distance'], values['max_time_ms'], values['is_he'],
             values['splash_radius'], authority_epoch=authority_epoch,
             penetration_factor=values['penetration_factor'],
-            source_shot=frozen_shot)
+            source_shot=frozen_shot,
+            fire_intent_seq=fire_intent_seq,
+            fire_input_seq=fire_input_seq)
 
-    def test_player_launch_is_frozen_fifo_wire_and_commits_sequence(self):
-        client = self.active_client()
+    @staticmethod
+    def send_player_input(client, shell_index=2):
+        return client.send_input(
+            0.5, -0.25, aim_yaw=0.3, gun_pitch=-0.1,
+            position=[1.0, 2.0, 3.0], yaw=0.2, speed=4.0,
+            shell_index=shell_index, pose_time_us=1000)
+
+    def test_worker_player_launch_is_frozen_fifo_wire_with_intent_identity(self):
+        client = self.active_worker_client()
         origin = [1.0, 2.0, 3.0]
 
-        self.assertEqual(1, self.launch(client, origin=origin))
+        self.assertIsNone(self.launch(
+            client, shot_seq=1, origin=origin, authority_epoch=4,
+            fire_input_seq=9))
+        self.assertIsNone(self.launch(
+            client, shot_seq=1, origin=origin, authority_epoch=4,
+            fire_intent_seq=6))
+        self.assertEqual(1, self.launch(
+            client, shot_seq=1, origin=origin, authority_epoch=4,
+            fire_intent_seq=6, fire_input_seq=9))
         origin[0] = 999.0
-        self.assertEqual(1, client._fire_seq)
         self.assertEqual(1, len(client._outbound_queue))
         frozen = client._outbound_queue[0][1]
         self.assertEqual((1.0, 2.0, 3.0), frozen['origin'])
@@ -143,39 +191,60 @@ class ProjectileWireTests(unittest.TestCase):
             'type', 'round_id', 'shooter_kind', 'shooter_id', 'shot_seq',
             'shell_index', 'origin', 'velocity', 'gravity', 'max_distance',
             'max_time_ms', 'is_he', 'splash_radius', 'penetration_factor',
-            'source_shot',
+            'source_shot', 'authority_epoch', 'fire_intent_seq',
+            'fire_input_seq',
         }, set(message))
         self.assertEqual('player', message['shooter_kind'])
         self.assertEqual(7, message['shooter_id'])
         self.assertEqual(1, message['shot_seq'])
+        self.assertEqual(6, message['fire_intent_seq'])
+        self.assertEqual(9, message['fire_input_seq'])
         self.assertEqual([1.0, 2.0, 3.0], message['origin'])
 
-    def test_failed_player_enqueue_rolls_back_sequence(self):
+    def test_failed_fire_intent_enqueue_rolls_back_sequence(self):
         client = self.active_client()
+        self.assertTrue(self.send_player_input(client))
         client._send = lambda unused_message: False
 
-        self.assertIsNone(self.launch(client))
-        self.assertEqual(0, client._fire_seq)
+        self.assertIsNone(client.send_fire_intent(2, 0.3, -0.1))
+        self.assertEqual(0, client._fire_intent_seq)
 
         client._send = lambda unused_message: True
-        self.assertEqual(1, self.launch(client))
-        self.assertEqual(1, client._fire_seq)
+        self.assertEqual(1, client.send_fire_intent(2, 0.3, -0.1))
+        self.assertEqual(1, client._fire_intent_seq)
 
-    def test_player_supplied_sequence_must_be_exact_next_value(self):
+    def test_visible_fire_intent_requires_input_and_sequences_monotonically(self):
         client = self.active_client()
 
-        self.assertIsNone(self.launch(client, shot_seq=2))
-        self.assertEqual(0, client._fire_seq)
-        self.assertEqual(1, self.launch(client, shot_seq=1))
+        self.assertIsNone(client.send_fire_intent(2, 0.3, -0.1))
+        self.assertTrue(self.send_player_input(client))
+        self.assertEqual(1, client.send_fire_intent(2, 0.3, -0.1))
+        self.assertTrue(self.send_player_input(client, shell_index=1))
+        self.assertEqual(2, client.send_fire_intent(1, 0.4, -0.2))
+        message = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual({
+            'type', 'round_id', 'intent_seq', 'input_seq', 'shell_index',
+        }, set(message))
+        self.assertEqual('fire_intent', message['type'])
+        self.assertEqual(2, message['intent_seq'])
+        self.assertEqual(2, message['input_seq'])
+
+    def test_visible_client_cannot_publish_player_projectile_launch(self):
+        client = self.active_client()
+
+        self.assertIsNone(self.launch(
+            client, shot_seq=1, authority_epoch=4,
+            fire_intent_seq=1, fire_input_seq=1))
+        self.assertEqual([], client._outbound_queue)
 
     def test_bot_launch_requires_current_authority_and_does_not_use_player_seq(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         client._fire_seq = 9
 
-        client.bot_authority_id = 8
+        client.bot_authority_id = 7
         self.assertIsNone(self.launch(
             client, 'bot', 17, 3, authority_epoch=4))
-        client.bot_authority_id = 7
+        client.bot_authority_id = module.WORKER_AUTHORITY_ID
         self.assertIsNone(self.launch(
             client, 'bot', 17, 3, authority_epoch=3))
         self.assertEqual(3, self.launch(
@@ -186,7 +255,7 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual('bot', message['shooter_kind'])
 
     def test_launch_rejects_non_plain_nonfinite_and_out_of_bounds_physics(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         default_speed = math.sqrt(11300.0)
         valid_source = source_shot(
             default_speed, 9.81, 720.0, True, 4.5)
@@ -212,15 +281,18 @@ class ProjectileWireTests(unittest.TestCase):
         )
         for values in invalid:
             with self.subTest(values=values):
-                self.assertIsNone(self.launch(client, **values))
+                self.assertIsNone(self.launch(
+                    client, shot_seq=1, authority_epoch=4,
+                    fire_intent_seq=1, fire_input_seq=1, **values))
         self.assertEqual([], client._outbound_queue)
-        self.assertEqual(0, client._fire_seq)
 
     def test_stock_b4_gravity_is_within_the_wire_contract(self):
-        client = self.active_client()
+        client = self.active_worker_client()
 
         self.assertEqual(1, self.launch(
-            client, gravity=143.0, velocity=[0.0, 100.0, 425.0]))
+            client, shot_seq=1, authority_epoch=4,
+            fire_intent_seq=1, fire_input_seq=1,
+            gravity=143.0, velocity=[0.0, 100.0, 425.0]))
         message = wire_copy(client._outbound_queue[-1][1])
         self.assertEqual(143.0, message['gravity'])
 
@@ -229,16 +301,20 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertIsNone(client.send_fire(shell_index=1))
         self.assertEqual([], client._outbound_queue)
 
+        self.assertTrue(self.send_player_input(client, shell_index=1))
         self.assertEqual(1, client.send_fire(
             shell_index=1, position=[1.0, 2.0, 3.0],
             velocity=[100.0, 0.0, 0.0], gravity=9.81,
             max_distance=500.0, max_time_ms=5000,
             source_shot=source_shot(100.0, 9.81, 500.0)))
-        self.assertEqual(
-            'projectile_launch', client._outbound_queue[0][1]['type'])
+        message = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual('fire_intent', message['type'])
+        self.assertEqual({
+            'type', 'round_id', 'intent_seq', 'input_seq', 'shell_index',
+        }, set(message))
 
     def test_progress_shape_is_exact_and_duplicate_ids_fail_closed(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         cursor = {
             'projectile_id': 'player:7:1',
             'base_checked_ms': 100,
@@ -282,7 +358,7 @@ class ProjectileWireTests(unittest.TestCase):
         }
 
     def test_resolve_is_atomic_and_rejects_duplicate_targets(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         direct = self.effect('player', 8)
         splash = [self.effect('bot', 17, 12.0)]
 
@@ -310,7 +386,7 @@ class ProjectileWireTests(unittest.TestCase):
             [0.0, 0.0, 0.0], direct, []))
 
     def test_optional_terminal_field_is_omitted_without_server_support(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         client.server_capabilities = [
             module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY]
 
@@ -321,7 +397,7 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertNotIn('hit_vehicle', client._outbound_queue[-1][1])
 
     def test_wreck_impact_is_a_strict_presentation_only_field(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         wreck_hit = {'target_kind': 'bot', 'target_id': 17}
 
         self.assertTrue(client.send_projectile_resolve(
@@ -366,7 +442,7 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertTrue(client.request_start(module.RANDOM_MAP_OPTION))
 
     def test_resolve_critical_contract_and_plain_impact_are_strict(self):
-        client = self.active_client()
+        client = self.active_worker_client()
         incomplete = self.effect('bot', 17)
         incomplete['critical'] = {'fire': True}
         self.assertFalse(client.send_projectile_resolve(
@@ -421,12 +497,15 @@ class ProjectileWireTests(unittest.TestCase):
                              if capabilities is None else capabilities),
             'server_capabilities': ([
                 module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.RAM_CONTACT_LEDGER_CAPABILITY,
+                module.HUMAN_RAM_TIMELINE_CAPABILITY,
+                module.PLAYER_FIRE_INTENT_CAPABILITY,
                 module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 module.RANDOM_MAP_CAPABILITY,
             ] if server_capabilities is None else server_capabilities),
             'player_id': 7,
             'host_player_id': 7,
-            'bot_authority_id': 7,
+            'bot_authority_id': module.WORKER_AUTHORITY_ID,
             'authority_epoch': authority_epoch,
             'name': 'P',
             'vehicle': 'ussr:MS-1',
@@ -448,7 +527,7 @@ class ProjectileWireTests(unittest.TestCase):
         client._handle_message(self.welcome([]))
         self.assertFalse(client.ready)
         self.assertEqual(
-            'projectile ledger capability mismatch', client.last_error)
+            'required LAN capability mismatch', client.last_error)
 
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
@@ -457,14 +536,23 @@ class ProjectileWireTests(unittest.TestCase):
             module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY]))
         self.assertFalse(client.ready)
         self.assertEqual(
-            'projectile ledger capability mismatch', client.last_error)
+            'required LAN capability mismatch', client.last_error)
+
+        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client.running = True
+        client._handle_message(self.welcome([
+            capability for capability in module.CLIENT_CAPABILITIES
+            if capability != module.HUMAN_RAM_TIMELINE_CAPABILITY]))
+        self.assertFalse(client.ready)
+        self.assertEqual(
+            'required LAN capability mismatch', client.last_error)
 
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
         client._handle_message(self.welcome(server_capabilities=[]))
         self.assertFalse(client.ready)
         self.assertEqual(
-            'projectile ledger capability mismatch', client.last_error)
+            'required LAN capability mismatch', client.last_error)
 
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
@@ -472,6 +560,31 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertTrue(client.ready)
         self.assertEqual(2, client.authority_epoch)
         self.assertTrue(client.has_projectile_ledger())
+
+    def test_waiting_room_accepts_idle_without_an_authority_id(self):
+        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client.running = True
+        welcome = self.welcome()
+        welcome['bot_authority_id'] = None
+        welcome['authority_status'] = 'idle'
+
+        client._handle_message(welcome)
+
+        self.assertTrue(client.ready)
+        self.assertIsNone(client.bot_authority_id)
+        self.assertIsNone(client.last_error)
+
+        client._handle_message({
+            'type': 'roster', 'protocol': module.PROTOCOL_VERSION,
+            'round_id': 3, 'state_revision': 2, 'phase': 'waiting',
+            'map': '01_karelia', 'host_player_id': 7,
+            'bot_authority_id': None, 'authority_status': 'idle',
+            'authority_epoch': 2,
+            'players': [{'id': 7, 'outfits': {}}],
+        })
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
 
     @staticmethod
     def active_projectile(epoch=2):
@@ -483,6 +596,8 @@ class ProjectileWireTests(unittest.TestCase):
             'source_shot': source_shot(
                 math.sqrt(10100.0), 9.81, 500.0),
             'shot_seq': 1,
+            'fire_intent_seq': 4,
+            'fire_input_seq': 8,
             'shell_index': 0,
             'team': 1,
             'origin': [0.0, 2.0, 0.0],
@@ -511,10 +626,12 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3,
             'server_tick': 10,
             'bot_state_revision': 0,
+            'bot_authority_id': module.WORKER_AUTHORITY_ID,
             'server_time_ms': 1000,
             'authority_epoch': 2,
             'projectile_revision': 1,
             'projectiles': [self.active_projectile()],
+            'bot_manifest': [],
             'players': [{
                 'critical_revision': 0,
                 'critical_base_revision': 0,
@@ -537,12 +654,43 @@ class ProjectileWireTests(unittest.TestCase):
             'authority_epoch': 3,
             'events': [{
                 'kind': 'authority',
-                'player_id': 7,
+                'player_id': module.WORKER_AUTHORITY_ID,
                 'authority_epoch': 3,
             }],
         })
         self.assertEqual(3, client.authority_epoch)
         self.assertEqual(1010, client.server_time_ms)
+
+    def test_player_shot_event_preserves_fire_intent_identity(self):
+        received = []
+        client = LANClient(
+            '127.0.0.1', 28782, 'P', 'ussr:MS-1',
+            on_event=lambda kind, message: received.append((kind, message)))
+        client.running = True
+        client._handle_message(self.welcome())
+        client.phase = 'battle'
+        client._handle_message({
+            'type': 'events',
+            'protocol': module.PROTOCOL_VERSION,
+            'round_id': 3,
+            'server_tick': 11,
+            'server_time_ms': 1001,
+            'authority_epoch': 2,
+            'events': [{
+                'kind': 'shot',
+                'projectile_id': 'player:7:1',
+                'shooter_kind': 'player',
+                'shooter_id': 7,
+                'shot_seq': 1,
+                'fire_intent_seq': 4,
+                'fire_input_seq': 8,
+            }],
+        })
+
+        self.assertTrue(client.running)
+        event = received[-1][1]['events'][0]
+        self.assertEqual(4, event['fire_intent_seq'])
+        self.assertEqual(8, event['fire_input_seq'])
 
     def test_events_require_monotonic_time_and_epoch_envelope(self):
         def client_at(time_ms=1000, epoch=2):
@@ -602,7 +750,8 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3, 'server_tick': 11,
             'server_time_ms': 1001, 'authority_epoch': 3,
             'events': [{
-                'kind': 'authority', 'player_id': 7,
+                'kind': 'authority',
+                'player_id': module.WORKER_AUTHORITY_ID,
                 'authority_epoch': 4,
             }],
         })
@@ -611,27 +760,42 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual('invalid bot authority event', client.last_error)
 
     def test_invalid_snapshot_ledger_stops_client(self):
-        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
-        client.running = True
-        client._handle_message(self.welcome())
-        client.phase = 'battle'
-        projectile = self.active_projectile()
-        projectile['origin'] = (0.0, 2.0, 0.0)
-        client._handle_message({
-            'type': 'snapshot',
-            'protocol': module.PROTOCOL_VERSION,
-            'round_id': 3,
-            'server_tick': 10,
-            'bot_state_revision': 0,
-            'server_time_ms': 1000,
-            'authority_epoch': 2,
-            'projectile_revision': 1,
-            'projectiles': [projectile],
-            'players': [],
-            'bots': [],
-        })
-        self.assertFalse(client.running)
-        self.assertEqual('invalid snapshot message', client.last_error)
+        invalid_projectiles = []
+        bad_origin = self.active_projectile()
+        bad_origin['origin'] = (0.0, 2.0, 0.0)
+        invalid_projectiles.append(bad_origin)
+        missing_intent = self.active_projectile()
+        del missing_intent['fire_intent_seq']
+        invalid_projectiles.append(missing_intent)
+        missing_input = self.active_projectile()
+        del missing_input['fire_input_seq']
+        invalid_projectiles.append(missing_input)
+
+        for projectile in invalid_projectiles:
+            with self.subTest(fields=set(projectile)):
+                client = LANClient(
+                    '127.0.0.1', 28782, 'P', 'ussr:MS-1')
+                client.running = True
+                client._handle_message(self.welcome())
+                client.phase = 'battle'
+                client._handle_message({
+                    'type': 'snapshot',
+                    'protocol': module.PROTOCOL_VERSION,
+                    'round_id': 3,
+                    'server_tick': 10,
+                    'bot_state_revision': 0,
+                    'bot_authority_id': module.WORKER_AUTHORITY_ID,
+                    'server_time_ms': 1000,
+                    'authority_epoch': 2,
+                    'projectile_revision': 1,
+                    'projectiles': [projectile],
+                    'bot_manifest': [],
+                    'players': [],
+                    'bots': [],
+                })
+                self.assertFalse(client.running)
+                self.assertEqual(
+                    'invalid snapshot message', client.last_error)
 
     def test_regressing_wire_time_is_clamped_without_dropping_events(self):
         received = []

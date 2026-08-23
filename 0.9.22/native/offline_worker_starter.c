@@ -18,6 +18,7 @@
 #define WORKER_MUTEX_NAME L"Local\\offline_lan_0922_worker"
 #define WORKER_MODE_ENV L"OFFLINE_LAN_0922_CLIENT_MODE"
 #define WORKER_MODE_VALUE L"simulation_worker"
+#define PLAYER_MODE_VALUE L"player"
 #define MULTI_CLIENT_ENV L"OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS"
 #define MULTI_CLIENT_VALUE L"1"
 #define HIDDEN_DESKTOP_ENV L"OFFLINE_LAN_0922_HIDDEN_DESKTOP"
@@ -393,8 +394,10 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker)
 		SetEnvironmentVariableW(SERVER_HOST_ENV, 0);
 		SetEnvironmentVariableW(SERVER_PORT_ENV, 0);
 	}
-	/* Deleting an absent variable is harmless even though Win32 reports it. */
-	SetEnvironmentVariableW(WORKER_MODE_ENV, 0);
+	if (!SetEnvironmentVariableW(WORKER_MODE_ENV, PLAYER_MODE_VALUE)) {
+		log_failure("SetEnvironmentVariableW(player_mode)", GetLastError());
+		return 21;
+	}
 	SetEnvironmentVariableW(HIDDEN_DESKTOP_ENV, 0);
 	SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0);
 	if (FAILED(StringCchPrintfW(child_command, 2 * MAX_PATH,

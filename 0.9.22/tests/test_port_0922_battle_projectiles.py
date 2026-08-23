@@ -153,6 +153,7 @@ def _event():
             },
         },
         'shot_seq': 1, 'shell_index': 0,
+        'fire_intent_seq': 1, 'fire_input_seq': 1,
         'origin': [0.0, 1.0, 0.0],
         'velocity': [10.0, 0.0, 0.0],
         'gravity': 0.000001, 'maxDistance': 100.0,

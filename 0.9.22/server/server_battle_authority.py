@@ -44,6 +44,7 @@ ARTILLERY_ARC_RAYS_PER_TICK = 4
 PROJECTILE_CHORDS_PER_TICK = 240
 PROJECTILE_MAX_TIME_MS = 20000
 PROJECTILE_PROGRESS_BATCH = 30
+RAM_BOT_HISTORY_SAMPLES = 512
 
 
 class Vector3(object):
@@ -366,6 +367,9 @@ class ServerBattleAuthority(object):
         self._assignments = {}
         self._required_names = ()
         self._last_now = 0.0
+        self._ram_bot_history = {}
+        self._ram_bot_history_order = []
+        self._ram_bot_history_times = {}
 
     def started(self):
         return self._started
@@ -463,6 +467,9 @@ class ServerBattleAuthority(object):
         self._shot_receipts = {}
         self._projectile_launches = {}
         self._pending_resolutions = {}
+        self._ram_bot_history = {}
+        self._ram_bot_history_order = []
+        self._ram_bot_history_times = {}
         self._bots = BotRuntime(
             SERVER_AUTHORITY_ID,
             descriptor_resolver=self._resolve_descriptor,
@@ -492,6 +499,66 @@ class ServerBattleAuthority(object):
     def set_live(self, live):
         self._live = bool(live)
 
+    def launch_player_intent(self, intent):
+        """Turn one admitted player trigger into a server-owned projectile."""
+        if not self._started or not isinstance(intent, dict):
+            return False
+        try:
+            player_id = int(intent['player_id'])
+            intent_seq = int(intent['intent_seq'])
+            input_seq = int(intent['input_seq'])
+            shot_seq = int(intent['shot_seq'])
+            shell_index = int(intent['shell_index'])
+            aim_yaw = float(intent['aim_yaw'])
+            # BigWorld gun pitch is negative-up. The projectile protocol is
+            # positive-up, matching the hidden native worker's launch vector.
+            shot_pitch = -float(intent['gun_pitch'])
+            player = self.state.players[player_id]
+            descriptor = self.descriptors.get(player.vehicle)
+            shot = _descriptor_shot(descriptor, shell_index)
+            speed = _number(_field(shot, 'speed'), -1.0)
+            gravity = _number(_field(shot, 'gravity'), -1.0)
+            maximum = _number(_field(shot, 'maxDistance'), -1.0)
+            origin = _muzzle_origin(intent, descriptor, aim_yaw)
+            if (descriptor is None or origin is None or speed <= 0.0 or
+                    gravity <= 0.0 or maximum <= 0.0 or
+                    not all(math.isfinite(value) for value in (
+                        aim_yaw, shot_pitch))):
+                return False
+            horizontal = math.cos(shot_pitch)
+            velocity = (
+                math.sin(aim_yaw) * horizontal * speed,
+                math.sin(shot_pitch) * speed,
+                math.cos(aim_yaw) * horizontal * speed,
+            )
+            is_he = combat_rules.is_he(shot)
+            message = {
+                'type': 'projectile_launch',
+                'round_id': int(self._round_id),
+                'shooter_kind': 'player',
+                'shooter_id': player_id,
+                'shot_seq': shot_seq,
+                'shell_index': shell_index,
+                'origin': list(origin),
+                'velocity': list(velocity),
+                'gravity': gravity,
+                'max_distance': maximum,
+                'max_time_ms': PROJECTILE_MAX_TIME_MS,
+                'is_he': bool(is_he),
+                'splash_radius': float(
+                    combat_rules.he_radius(shot) if is_he else 0.0),
+                'penetration_factor': float(
+                    combat_rules.sample_penetration_factor()),
+                'source_shot': _source_shot_from_descriptor(shot),
+                'authority_epoch': int(self.state.authority_epoch),
+                'fire_intent_seq': intent_seq,
+                'fire_input_seq': input_seq,
+            }
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        return bool(self.state.launch_projectile(
+            SERVER_AUTHORITY_ID, message))
+
     def capture_bases(self):
         """Standard-battle base points from the validated navigation graph."""
         bases = self.world.graph.get('objective_bases') or ()
@@ -505,6 +572,7 @@ class ServerBattleAuthority(object):
     def apply_snapshot(self, message):
         if self._bots is not None:
             self._bots.apply_snapshot(message)
+            self._remember_ram_bot_snapshot(message)
         if self._projectiles is None or not isinstance(message, dict):
             return
         rows = message.get('projectiles')
@@ -728,23 +796,155 @@ class ServerBattleAuthority(object):
         for player in self.state.players.values():
             if not player.connected or not player.participating:
                 continue
-            rows.append({
-                'id': int(player.player_id),
-                'name': player.name,
-                'vehicle': player.vehicle,
-                'team': int(player.team),
-                'x': float(player.x), 'y': float(player.y),
-                'z': float(player.z), 'yaw': float(player.yaw),
-                'pitch': float(player.pitch), 'roll': float(player.roll),
-                'speed': float(player.speed),
-                'alive': bool(player.alive),
-                'health': int(player.health),
-                'max_health': int(player.max_health),
-                'aim_yaw': float(player.aim_yaw),
-                'gun_pitch': float(player.gun_pitch),
-                'world_pose': bool(player.client_position),
-            })
+            public = self.state._public_player(
+                player, include_outfits=False)
+            rows.append(self._decorate_ram_contacts(public))
         return rows
+
+    def _remember_ram_bot_snapshot(self, snapshot):
+        """Retain canonical bot bodies referenced by human contact proofs."""
+        if not isinstance(snapshot, dict) or self._bots is None:
+            return False
+        try:
+            revision = int(snapshot.get('bot_state_revision'))
+            sample_time_us = int(snapshot.get('bot_state_time_us'))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if revision < 0 or sample_time_us < 0:
+            return False
+        states = {}
+        current = getattr(self._bots, 'states', {}) or {}
+        for raw in snapshot.get('bots') or ():
+            if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            try:
+                bot_id = int(raw['id'])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            state = {}
+            current_state = current.get(bot_id)
+            if isinstance(current_state, dict):
+                for name in ('mass', 'collision_shape', 'vehicle', 'team'):
+                    if name in current_state:
+                        state[name] = current_state[name]
+            state.update(raw)
+            states[bot_id] = state
+        if revision not in self._ram_bot_history:
+            self._ram_bot_history_order.append(revision)
+        self._ram_bot_history[revision] = states
+        self._ram_bot_history_times[revision] = sample_time_us
+        while len(self._ram_bot_history_order) > RAM_BOT_HISTORY_SAMPLES:
+            expired = self._ram_bot_history_order.pop(0)
+            self._ram_bot_history.pop(expired, None)
+            self._ram_bot_history_times.pop(expired, None)
+        return True
+
+    def _ram_bot_state_at(self, bot_id, revision, sample_time_us):
+        """Interpolate one presented bot pose from canonical wire samples."""
+        try:
+            bot_id = int(bot_id)
+            revision = int(revision)
+            sample_time_us = int(sample_time_us)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        samples = []
+        for candidate_revision in self._ram_bot_history_order:
+            candidate_time = self._ram_bot_history_times.get(
+                candidate_revision)
+            candidate_states = self._ram_bot_history.get(
+                candidate_revision, {})
+            state = candidate_states.get(bot_id)
+            if candidate_time is None or not isinstance(state, dict):
+                continue
+            samples.append((candidate_time, candidate_revision, state))
+        samples.sort(key=lambda value: (value[0], value[1]))
+        if not samples:
+            return None
+        left = right = None
+        for candidate in samples:
+            if (candidate[0] <= sample_time_us and
+                    candidate[1] <= revision):
+                left = candidate
+            if (candidate[0] >= sample_time_us and
+                    candidate[1] >= revision):
+                right = candidate
+                break
+        if left is None or right is None:
+            return None
+        left_time, unused_left_revision, left_state = left
+        right_time, unused_right_revision, right_state = right
+        if left_time == right_time:
+            result = dict(left_state)
+            result['ram_vx'] = 0.0
+            result['ram_vz'] = 0.0
+            index = samples.index(left)
+            if len(samples) >= 2:
+                before, after = ((samples[index - 1], left) if index > 0
+                                 else (left, samples[index + 1]))
+                span = float(after[0] - before[0]) / 1000000.0
+                if span > 0.0:
+                    result['ram_vx'] = (
+                        _number(after[2].get('x')) -
+                        _number(before[2].get('x'))) / span
+                    result['ram_vz'] = (
+                        _number(after[2].get('z')) -
+                        _number(before[2].get('z'))) / span
+            return result
+        span_us = float(right_time - left_time)
+        if span_us <= 0.0:
+            return None
+        progress = max(0.0, min(
+            (sample_time_us - left_time) / span_us, 1.0))
+        result = dict(left_state)
+        for name in ('x', 'y', 'z', 'pitch', 'roll', 'aim_yaw',
+                     'gun_pitch'):
+            if name in left_state and name in right_state:
+                result[name] = (_number(left_state.get(name)) +
+                                (_number(right_state.get(name)) -
+                                 _number(left_state.get(name))) * progress)
+        if 'yaw' in left_state and 'yaw' in right_state:
+            left_yaw = _number(left_state.get('yaw'))
+            right_yaw = _number(right_state.get('yaw'))
+            delta = math.atan2(
+                math.sin(right_yaw - left_yaw),
+                math.cos(right_yaw - left_yaw))
+            result['yaw'] = left_yaw + delta * progress
+        if progress >= 1.0:
+            result['alive'] = bool(right_state.get('alive', True))
+        result['ram_vx'] = (
+            _number(right_state.get('x')) -
+            _number(left_state.get('x'))) * 1000000.0 / span_us
+        result['ram_vz'] = (
+            _number(right_state.get('z')) -
+            _number(left_state.get('z'))) * 1000000.0 / span_us
+        return result
+
+    def _decorate_ram_contacts(self, state):
+        """Attach historical bot bodies to pending human contact proofs."""
+        state = dict(state or {})
+        contacts = state.get('ram_contacts')
+        if not isinstance(contacts, list):
+            legacy = state.get('ram_contact')
+            contacts = [legacy] if isinstance(legacy, dict) else []
+        decorated = []
+        for raw_receipt in contacts:
+            if not isinstance(raw_receipt, dict):
+                continue
+            receipt = dict(raw_receipt)
+            try:
+                revision = int(receipt.get('bot_state_revision'))
+                bot_id = int(receipt.get('bot_id'))
+                presentation_time_us = int(
+                    receipt.get('presentation_time_us'))
+            except (TypeError, ValueError, OverflowError):
+                revision = bot_id = presentation_time_us = None
+            bot_state = self._ram_bot_state_at(
+                bot_id, revision, presentation_time_us)
+            if bot_state is not None:
+                receipt['_ram_contact_bot_state'] = dict(bot_state)
+            decorated.append(receipt)
+        state['ram_contacts'] = decorated
+        return state
 
     # -- outgoing message routing --------------------------------------------
 

@@ -1055,6 +1055,8 @@ class WindowTest(unittest.TestCase):
 
     def test_paired_player_uses_window_aware_exit_monitor(self):
         game = _Process(exit_code=None)
+        worker = _Process(exit_code=None)
+        self.window._worker = worker
         with mock.patch(
                 "wot_launcher.subprocess.Popen", return_value=game), \
                 mock.patch(
@@ -1064,10 +1066,49 @@ class WindowTest(unittest.TestCase):
                 self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
                 core.DEFAULT_SERVER_PORT, paired_worker=True)
 
-        wait.assert_called_once_with(game, self.settings_dir)
+        wait.assert_called_once_with(
+            game, self.settings_dir, required_process=worker)
         self.assertIsNone(self.window._game)
         self.assertNotIn("exit code 1", self._log_text())
         self.assertIn("The game closed.", self._log_text())
+
+    def test_paired_player_logs_worker_failure(self):
+        game = _Process(exit_code=None)
+        worker = _Process(exit_code=9)
+        self.window._worker = worker
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(0, False)), \
+                mock.patch.object(self.window, "_log_worker_failure") as log:
+            self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True)
+
+        log.assert_called_once_with(self.settings_dir)
+        self.assertIn(
+            "worker stopped with exit code 9", self._log_text())
+
+    def test_worker_failure_gives_owned_server_a_bounded_delivery_grace(self):
+        game = _Process(exit_code=None)
+        worker = _Process(exit_code=9)
+        self.window._worker = worker
+        self.window._server = _Process(exit_code=None)
+        self.window._server_persistent = False
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(0, False)), \
+                mock.patch.object(self.window, "_log_worker_failure"), \
+                mock.patch("wot_launcher.time.sleep") as sleep:
+            self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True)
+
+        sleep.assert_called_once_with(
+            core.WORKER_FAILURE_DRAIN_SECONDS_0922)
 
     def test_join_does_not_start_the_game_for_an_unrelated_listener(self):
         session = {
@@ -1098,7 +1139,7 @@ class WindowTest(unittest.TestCase):
         run_game.assert_not_called()
         self.assertIn("not the server for this client", self._log_text())
 
-    def test_host_starts_no_hidden_worker(self):
+    def test_host_starts_hidden_worker_without_hiding_server(self):
         session = {
             "client": core.PORT_0_9_22,
             "host": core.LOCAL_HOST,
@@ -1132,10 +1173,12 @@ class WindowTest(unittest.TestCase):
         start_server.assert_called_once_with(
             self.settings_dir, core.PORT_0_9_22, 7,
             loopback_only=False)
-        worker.assert_not_called()
+        worker.assert_called_once_with(
+            self.settings_dir, core.LOCAL_HOST,
+            core.DEFAULT_SERVER_PORT, 7)
         game.assert_called_once_with(
             self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
-            core.DEFAULT_SERVER_PORT, paired_worker=False)
+            core.DEFAULT_SERVER_PORT, paired_worker=True)
 
     def test_closing_the_window_saves_the_settings(self):
         self.window.player_name.set("Peng")

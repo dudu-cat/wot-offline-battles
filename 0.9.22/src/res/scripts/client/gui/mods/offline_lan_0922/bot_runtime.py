@@ -38,7 +38,6 @@ ARTILLERY_IMPACT_ERROR_METRES = 1.5
 ARTILLERY_RECEIPT_HOLD_SECONDS = 10.0
 COVER_JOBS_PER_OBSERVATION = 3
 HUMAN_TARGET_ID_BASE = 1000000
-RAM_REPORT_CURRENT_DISTANCE = 12.5
 VISIBILITY_MIN_SECONDS = 0.18
 VISIBILITY_JITTER_SECONDS = 0.018
 SHOT_LANE_SECONDS = 0.20
@@ -1243,9 +1242,11 @@ class BotRuntime(object):
         self._visibility_still = {}
         self._turn_speeds = {}
         self._ram_cooldowns = {}
+        self._human_ram_cooldowns = {}
         self._ram_contacts = frozenset()
         self._ram_seq = 0
         self._human_ram_receipt_seq = {}
+        self._human_ram_report_cache = {}
         self.finished = False
         self._visibility_cache = {}
         self._team_visibility_cache = {}
@@ -1668,9 +1669,11 @@ class BotRuntime(object):
             self._visibility_still = {}
             self._turn_speeds = {}
             self._ram_cooldowns = {}
+            self._human_ram_cooldowns = {}
             self._ram_contacts = frozenset()
             self._ram_seq = 0
             self._human_ram_receipt_seq = {}
+            self._human_ram_report_cache = {}
             self.adapter = None
             self.finished = False
             self._visibility_cache = {}
@@ -1721,6 +1724,7 @@ class BotRuntime(object):
             self._prewarm_receipt_cursor = 0
             self._pending_ram_reports = []
             self._ram_cooldowns = {}
+            self._human_ram_cooldowns = {}
             self._ram_contacts = frozenset()
             self._cover_queue = []
             self._cover_results = []
@@ -1857,8 +1861,15 @@ class BotRuntime(object):
             return []
         bots = [self._manifest_entry(state)
                 for state in self._ordered_states()]
+        player_collision_profiles = (
+            self._player_collision_manifest(message.get('players'))
+            if message.get('human_ram_timeline') else None)
         self._manifest_sent = True
-        return [{'type': 'bot_manifest', 'bots': bots}]
+        outgoing = {'type': 'bot_manifest', 'bots': bots}
+        if player_collision_profiles is not None:
+            outgoing['player_collision_profiles'] = (
+                player_collision_profiles)
+        return [outgoing]
 
     def _combat_sync_state(self, state):
         bot_id = int(state['id'])
@@ -2411,6 +2422,40 @@ class BotRuntime(object):
                  'hold': bool(point[2]) if len(point) > 2 else False}
                 for point in waypoints],
         }
+        return result
+
+    def _player_collision_manifest(self, players):
+        """Donate descriptor-derived human hull data to the LAN server."""
+        result = []
+        seen = set()
+        for raw in players or ():
+            if not isinstance(raw, dict):
+                raise ValueError('player collision manifest row is invalid')
+            try:
+                player_id = int(raw['id'])
+                vehicle_name = str(raw['vehicle'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise ValueError('player collision manifest identity is invalid')
+            if player_id <= 0 or player_id in seen or not vehicle_name:
+                raise ValueError('player collision manifest identity is invalid')
+            seen.add(player_id)
+            descriptor = self.descriptor_resolver(vehicle_name)
+            params = vehicle_physics.derive_params(descriptor)
+            mass = float(params['mass'])
+            shape = tuple(float(value) for value in
+                          tank_collision.chassis_shape(descriptor))
+            if (math.isnan(mass) or math.isinf(mass) or mass <= 0.0 or
+                    len(shape) != 4 or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in shape)):
+                raise ValueError('player collision manifest body is invalid')
+            result.append({
+                'id': player_id,
+                'vehicle': vehicle_name,
+                'mass': mass,
+                'shape': list(shape),
+            })
+        result.sort(key=lambda value: value['id'])
         return result
 
     def _ordered_states(self):
@@ -3454,6 +3499,11 @@ class BotRuntime(object):
                            other_id >= HUMAN_TARGET_ID_BASE else 'bot')
             if target_kind == 'human':
                 other_id -= HUMAN_TARGET_ID_BASE
+                if not isinstance(human_ram_receipt, dict):
+                    # Current-frame human contact may separate the bodies,
+                    # but only a player's immutable presented-pose receipt
+                    # owns human HP. This prevents delayed replay double-hit.
+                    continue
             self_velocity = event['velocity_self']
             other_velocity = event['velocity_other']
             self_shape = event['shape_self']
@@ -3504,6 +3554,35 @@ class BotRuntime(object):
             reports.append(report)
         return reports
 
+    def ack_human_ram_receipt(self, player_id, seq):
+        """Apply the server-owned terminal high-water from a snapshot."""
+        try:
+            player_id = int(player_id)
+            seq = int(seq)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if player_id <= 0 or seq <= 0:
+            return False
+        previous = int(self._human_ram_receipt_seq.get(player_id, 0))
+        if seq <= previous:
+            return False
+        self._human_ram_receipt_seq[player_id] = seq
+        for key in list(self._human_ram_report_cache):
+            if key[0] == player_id and key[1] <= seq:
+                self._human_ram_report_cache.pop(key, None)
+        return True
+
+    def _terminal_human_ram_report(self, bot_id, player_id, seq):
+        self._ram_seq += 1
+        return {
+            'type': 'bot_ram', 'bot_id': int(bot_id),
+            'target_kind': 'human', 'target_id': int(player_id),
+            'ram_seq': self._ram_seq, 'damage_to_bot': 0,
+            'damage_to_target': 0,
+            'ram_contact_player_id': int(player_id),
+            'ram_contact_seq': int(seq),
+        }
+
     def _apply_tank_contact_response(self, state, result, step,
                                      advance_push=True,
                                      apply_correction=True):
@@ -3550,100 +3629,150 @@ class BotRuntime(object):
                                     processed_pairs=None):
         """Recompute client-observed contact against its canonical bot body."""
         reports = []
+        receipt_players = {}
         for raw in players or ():
             if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
-            receipt = raw.get('ram_contact')
-            historical = raw.get('_ram_contact_bot_state')
-            if not isinstance(receipt, dict) or not isinstance(
-                    historical, dict):
-                continue
             try:
                 player_id = int(raw['id'])
-                seq = int(receipt['seq'])
-                bot_id = int(receipt['bot_id'])
+                resolved_seq = int(raw.get(
+                    'ram_contact_resolved_seq', 0) or 0)
             except (KeyError, TypeError, ValueError, OverflowError):
                 continue
-            if seq <= int(self._human_ram_receipt_seq.get(player_id, 0)):
+            if resolved_seq > 0:
+                self.ack_human_ram_receipt(player_id, resolved_seq)
+            contacts = raw.get('ram_contacts')
+            if isinstance(contacts, list):
+                for receipt in contacts:
+                    if not isinstance(receipt, dict):
+                        continue
+                    entry = dict(raw)
+                    entry['ram_contact'] = receipt
+                    entry['_ram_contact_bot_state'] = receipt.get(
+                        '_ram_contact_bot_state')
+                    receipt_players.setdefault(player_id, []).append(entry)
                 continue
-            self._human_ram_receipt_seq[player_id] = seq
-            current = self.states.get(bot_id)
-            if (current is None or not current.get('alive', True) or
-                    int(_number(historical.get('id'), -1)) != bot_id):
-                continue
-            try:
-                player_x = float(receipt['x'])
-                player_y = float(receipt['y'])
-                player_z = float(receipt['z'])
-                player_yaw = float(receipt['yaw'])
-                player_vx = float(receipt['vx'])
-                player_vz = float(receipt['vz'])
-            except (KeyError, TypeError, ValueError, OverflowError):
-                continue
-            current_dx = _number(current.get('x')) - _number(raw.get('x'))
-            current_dz = _number(current.get('z')) - _number(raw.get('z'))
-            if (current_dx * current_dx + current_dz * current_dz >
-                    RAM_REPORT_CURRENT_DISTANCE *
-                    RAM_REPORT_CURRENT_DISTANCE):
-                continue
-            profile = self._player_collision_profile(raw)
-            bot_yaw = _number(historical.get('yaw'))
-            bot_speed = (_number(historical.get('speed')) if
-                         historical.get('alive', True) else 0.0)
-            bot = {
-                'id': bot_id,
-                'alive': bool(historical.get('alive', True)),
-                'team': int(_number(historical.get('team'))),
-                'vehicle': str(historical.get('vehicle') or ''),
-                'x': _number(historical.get('x')),
-                'y': _number(historical.get('y')),
-                'z': _number(historical.get('z')),
-                'yaw': bot_yaw,
-                'mass': _number(historical.get('mass'), 25000.0),
-                'shape': historical.get('collision_shape'),
-                'vx': _number(historical.get(
-                    'ram_vx', math.sin(bot_yaw) * bot_speed +
-                    _number(historical.get('push_x')))),
-                'vz': _number(historical.get(
-                    'ram_vz', math.cos(bot_yaw) * bot_speed +
-                    _number(historical.get('push_z')))),
-            }
-            player = {
-                'id': HUMAN_TARGET_ID_BASE + player_id,
-                'alive': bool(raw.get('alive', True)),
-                'team': int(_number(raw.get('team'))),
-                'vehicle': str(raw.get('vehicle') or ''),
-                'x': player_x, 'y': player_y, 'z': player_z,
-                'yaw': player_yaw,
-                'mass': profile['mass'], 'shape': profile['shape'],
-                'vx': player_vx, 'vz': player_vz,
-            }
-            result = tank_collision.resolve_tank(
-                bot, (player,), now=now,
-                ram_cooldowns=self._ram_cooldowns,
-                active_ram_contacts=frozenset())
-            self._ram_cooldowns = result['cooldowns']
-            if result['ram_events'] and step is not None:
-                # The human client already applied its half of the e=0
-                # response at the visually presented contact. Apply the bot's
-                # half here as well; otherwise it remains artificially still
-                # and the slowed player collides with it again one second
-                # later. The current-frame detector skips this exact pair.
-                # Accumulate the historical impulse now, but leave its push
-                # integration/damping to the ordinary once-per-bot pass below.
-                # Do not transplant old penetration correction onto the bot's
-                # newer canonical pose; that correction is not time-invariant.
-                self._apply_tank_contact_response(
-                    current, result, step, advance_push=False,
-                    apply_correction=False)
+            receipt_players.setdefault(player_id, []).append(raw)
+        for player_id in sorted(receipt_players):
+            entries = receipt_players[player_id]
+            def receipt_order(value):
+                try:
+                    return int((value.get('ram_contact') or {}).get('seq'))
+                except (AttributeError, TypeError, ValueError,
+                        OverflowError):
+                    return 2147483647
+            entries.sort(key=receipt_order)
+            for raw in entries:
+                receipt = raw.get('ram_contact')
+                historical = raw.get('_ram_contact_bot_state')
+                if not isinstance(receipt, dict):
+                    continue
+                try:
+                    seq = int(receipt['seq'])
+                    bot_id = int(receipt['bot_id'])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                if seq <= int(self._human_ram_receipt_seq.get(
+                        player_id, 0)):
+                    continue
+                key = (player_id, seq)
+                pair = (
+                    min(bot_id, HUMAN_TARGET_ID_BASE + player_id),
+                    max(bot_id, HUMAN_TARGET_ID_BASE + player_id))
+                cached = self._human_ram_report_cache.get(key)
+                if cached is not None:
+                    if processed_pairs is not None:
+                        processed_pairs.add(pair)
+                    reports.extend(dict(report) for report in cached)
+                    break
+                # Missing history is temporary when replaceable snapshots
+                # coalesce the exact revision. Do not skip this sequence and
+                # let a later receipt overtake it.
+                if not isinstance(historical, dict):
+                    break
+                current = self.states.get(bot_id)
+                if current is None:
+                    # A takeover snapshot can expose the receipt before the
+                    # bot state has materialised. Keep it retryable.
+                    break
+                if (not current.get('alive', True) or
+                        int(_number(historical.get('id'), -1)) != bot_id):
+                    receipt_reports = [self._terminal_human_ram_report(
+                        bot_id, player_id, seq)]
+                else:
+                    try:
+                        player_x = float(receipt['x'])
+                        player_y = float(receipt['y'])
+                        player_z = float(receipt['z'])
+                        player_yaw = float(receipt['yaw'])
+                        player_vx = float(receipt['vx'])
+                        player_vz = float(receipt['vz'])
+                        contact_time = float(
+                            receipt['presentation_time_us']) / 1000000.0
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        receipt_reports = [self._terminal_human_ram_report(
+                            bot_id, player_id, seq)]
+                    else:
+                        profile = self._player_collision_profile(raw)
+                        bot_yaw = _number(historical.get('yaw'))
+                        bot_speed = (_number(historical.get('speed')) if
+                                     historical.get('alive', True) else 0.0)
+                        bot = {
+                            'id': bot_id,
+                            'alive': bool(historical.get('alive', True)),
+                            'team': int(_number(historical.get('team'))),
+                            'vehicle': str(historical.get('vehicle') or ''),
+                            'x': _number(historical.get('x')),
+                            'y': _number(historical.get('y')),
+                            'z': _number(historical.get('z')),
+                            'yaw': bot_yaw,
+                            'mass': _number(
+                                historical.get('mass'), 25000.0),
+                            'shape': historical.get('collision_shape'),
+                            'vx': _number(historical.get(
+                                'ram_vx', math.sin(bot_yaw) * bot_speed +
+                                _number(historical.get('push_x')))),
+                            'vz': _number(historical.get(
+                                'ram_vz', math.cos(bot_yaw) * bot_speed +
+                                _number(historical.get('push_z')))),
+                        }
+                        player = {
+                            'id': HUMAN_TARGET_ID_BASE + player_id,
+                            'alive': bool(raw.get('alive', True)),
+                            'team': int(_number(raw.get('team'))),
+                            'vehicle': str(raw.get('vehicle') or ''),
+                            'x': player_x, 'y': player_y, 'z': player_z,
+                            'yaw': player_yaw,
+                            'mass': profile['mass'],
+                            'shape': profile['shape'],
+                            'vx': player_vx, 'vz': player_vz,
+                        }
+                        result = tank_collision.resolve_tank(
+                            # tank_collision uses zero as its no-prior-contact
+                            # sentinel; preserve deltas behind a positive base.
+                            bot, (player,), now=contact_time + 1.0,
+                            ram_cooldowns=self._human_ram_cooldowns,
+                            active_ram_contacts=frozenset())
+                        self._human_ram_cooldowns = result['cooldowns']
+                        if result['ram_events'] and step is not None:
+                            # Apply the bot half once. Cached retries below
+                            # resend the exact operation without another push.
+                            self._apply_tank_contact_response(
+                                current, result, step, advance_push=False,
+                                apply_correction=False)
+                        receipt_reports = self._ram_reports(
+                            current, result['ram_events'], {
+                                'player_id': player_id, 'seq': seq,
+                            }) or [self._terminal_human_ram_report(
+                                bot_id, player_id, seq)]
                 if processed_pairs is not None:
-                    processed_pairs.add((
-                        min(bot_id, HUMAN_TARGET_ID_BASE + player_id),
-                        max(bot_id, HUMAN_TARGET_ID_BASE + player_id)))
-            reports.extend(self._ram_reports(
-                current, result['ram_events'], {
-                    'player_id': player_id, 'seq': seq,
-                }))
+                    processed_pairs.add(pair)
+                frozen = [dict(report) for report in receipt_reports]
+                self._human_ram_report_cache[key] = frozen
+                reports.extend(dict(report) for report in frozen)
+                # One unresolved transaction per player preserves ledger
+                # order even when transport retries or snapshots coalesce.
+                break
         return reports
 
     def _resolve_tank_contacts(self, players, now, step):
@@ -3729,12 +3858,6 @@ class BotRuntime(object):
                 if pair in receipt_pairs:
                     continue
                 other = by_id[tank_id]
-                if (tank_id >= HUMAN_TARGET_ID_BASE and
-                        bool(other.get('alive', True)) and
-                        int(other.get('team', 0)) ==
-                        int(own.get('team', -1))):
-                    other = dict(other)
-                    other['impulse'] = True
                 others.append(other)
             result = tank_collision.resolve_tank(
                 own, others,

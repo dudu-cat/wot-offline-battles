@@ -73,6 +73,7 @@ SERVER_LOOPBACK_ONLY_ENV_0922 = "WOT_0922_LOOPBACK_ONLY"
 CLIENT_SERVER_HOST_ENV_0922 = "OFFLINE_LAN_0922_SERVER_HOST"
 CLIENT_SERVER_PORT_ENV_0922 = "OFFLINE_LAN_0922_SERVER_PORT"
 CLIENT_MODE_ENV_0922 = "OFFLINE_LAN_0922_CLIENT_MODE"
+PLAYER_MODE_0922 = "player"
 CLIENT_PREFERRED_TEAM_ENV_0922 = "OFFLINE_LAN_0922_PREFERRED_TEAM"
 ALLOW_MULTIPLE_CLIENTS_ENV_0922 = "OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS"
 HIDDEN_DESKTOP_ENV_0922 = "OFFLINE_LAN_0922_HIDDEN_DESKTOP"
@@ -88,6 +89,7 @@ PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
 WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
 PAIRED_PLAYER_ARGUMENT_0922 = "--paired-player"
 WORKER_READY_TIMEOUT_SECONDS_0922 = 60.0
+WORKER_FAILURE_DRAIN_SECONDS_0922 = 0.5
 
 _CLIENT_RUNTIME_FILES_0_9_22 = (
     WORKER_STARTER_FILENAME_0922,
@@ -213,9 +215,9 @@ def visible_client_environment(port_version, host=LOCAL_HOST,
     environment = dict(os.environ if environment is None else environment)
     if port_version != PORT_0_9_22:
         return environment
-    for name in (CLIENT_MODE_ENV_0922, HIDDEN_DESKTOP_ENV_0922,
-                 WORKER_READY_MARKER_ENV_0922):
+    for name in (HIDDEN_DESKTOP_ENV_0922, WORKER_READY_MARKER_ENV_0922):
         environment.pop(name, None)
+    environment[CLIENT_MODE_ENV_0922] = PLAYER_MODE_0922
     environment[CLIENT_SERVER_HOST_ENV_0922] = str(host)
     environment[CLIENT_SERVER_PORT_ENV_0922] = str(int(port))
     environment[CLIENT_PREFERRED_TEAM_ENV_0922] = str(
@@ -1595,14 +1597,16 @@ def game_window_is_visible(game_root, enumerator=None):
 
 
 def wait_for_paired_player_exit(
-        process, game_root, window_visible=None,
+        process, game_root, window_visible=None, required_process=None,
         close_grace=PAIRED_PLAYER_WINDOW_CLOSE_GRACE_SECONDS,
         poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None):
-    """Wait for the paired player, retiring a windowless process residue.
+    """Wait for the paired player and its required simulation process.
 
     The #1513 client can destroy its only visible window without terminating
     its process. Only treat that as closure after a player window has first
-    appeared and then remained absent for the full grace period.
+    appeared and then remained absent for the full grace period. If the
+    required worker exits first, terminate the visible client instead of
+    allowing it to continue without its authority.
     """
     import time as time_module
 
@@ -1615,6 +1619,19 @@ def wait_for_paired_player_exit(
     while True:
         exit_code = process.poll()
         if exit_code is not None:
+            return exit_code, False
+        if (required_process is not None and
+                required_process.poll() is not None):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            try:
+                exit_code = process.wait(
+                    timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                exit_code = process.wait()
             return exit_code, False
         visible = window_visible()
         now = clock()

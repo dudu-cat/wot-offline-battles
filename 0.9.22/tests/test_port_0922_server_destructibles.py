@@ -392,18 +392,23 @@ class DonationInstallTest(unittest.TestCase):
         self.assertEqual('destructible_map_donor_disconnected',
                          state.authority_fallback_reason)
 
-    def test_human_destructible_report_marks_the_world(self):
+    def test_visible_destructible_report_cannot_mark_the_world(self):
         world = _installed_world(fence_at=(24.0, 0.0, 24.0))
         driver, state = _driver(world)
         state.players[2] = __import__(
             'test_port_0922_server_authority')._player(2)
-        accepted = state.report_destructible(2, {
+        event = {
             'type': 'destructible', 'round_id': state.round_id,
             'destructible_kind': 'fragile', 'chunk_id': 7,
             'item_index': 0, 'x': 24.0, 'y': 0.0, 'z': 24.0,
             'fall_yaw': 0.0, 'speed': 5.0, 'is_shot': False,
-        })
-        self.assertTrue(accepted)
+        }
+
+        self.assertFalse(state.report_destructible(2, event))
+        self.assertFalse(world.is_destroyed(
+            _signature(24.0, 0.0, 24.0)))
+        self.assertTrue(state.report_destructible(
+            SERVER_AUTHORITY_ID, event))
         self.assertTrue(world.is_destroyed(_signature(24.0, 0.0, 24.0)))
 
 

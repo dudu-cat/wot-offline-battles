@@ -15,11 +15,13 @@ import time
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_BUILD, CLIENT_CAPABILITIES, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
-    MAX_MOTION_TIME_US,
+    HUMAN_RAM_TIMELINE_CAPABILITY, MAX_MOTION_TIME_US,
     MAX_PROJECTILE_ID, PROTOCOL_VERSION, PROJECTILE_LEDGER_CAPABILITY,
+    PLAYER_FIRE_INTENT_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY, WORKER_AUTHORITY_ID, LANClient,
     _BOT_STATE_WIRE_FIELDS,
-    _canonical_wire_outfits, _exact_int, _projectile_int_range, _safe_text,
+    _canonical_vehicle_compact_descr, _canonical_wire_outfits,
+    _exact_int, _projectile_int_range, _safe_text,
     _strict_capabilities, _strict_mapping_list)
 
 
@@ -89,6 +91,13 @@ class AuthorityWorkerLANClient(LANClient):
         self.spawn = {
             'x': 0.0, 'y': WORKER_DUMMY_Y, 'z': 0.0, 'yaw': 0.0}
         self._worker_avatar = None
+
+    def is_bot_authority(self):
+        """Only the dedicated worker identity may own bot simulation."""
+        return bool(
+            self.ready and self.phase in ('loading', 'battle') and
+            self.player_id == WORKER_AUTHORITY_ID and
+            self.bot_authority_id == WORKER_AUTHORITY_ID)
 
     def _hello_payload(self):
         """Advertise only a worker role; no dummy player data crosses wire."""
@@ -162,12 +171,19 @@ class AuthorityWorkerLANClient(LANClient):
                 server_capabilities or
                 PROJECTILE_LEDGER_CAPABILITY not in capabilities or
                 SIMULATION_WORKER_CAPABILITY not in capabilities or
+                RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
+                HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
+                PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
+                RAM_CONTACT_LEDGER_CAPABILITY not in server_capabilities or
+                HUMAN_RAM_TIMELINE_CAPABILITY not in server_capabilities or
+                PLAYER_FIRE_INTENT_CAPABILITY not in
+                server_capabilities or
                 state_revision is None or state_revision < 0 or
                 round_id is None or round_id < 0 or
                 (host_player_id is not None and host_player_id <= 0) or
                 authority_epoch is None or server_time_ms is None or
                 team_size is None or not 1 <= team_size <= 15 or
-                authority_id is None or
+                authority_id != WORKER_AUTHORITY_ID or
                 phase not in ('waiting', 'loading', 'battle') or
                 not map_name):
             return self._invalid_worker_message('invalid worker welcome')
@@ -205,15 +221,21 @@ class AuthorityWorkerLANClient(LANClient):
         outfits_valid = all(
             _canonical_wire_outfits(value.get('outfits')) is not None
             for value in players or ())
+        compacts_valid = all(
+            _canonical_vehicle_compact_descr(
+                value.get('vehicle_compact_descr')) is not None
+            for value in players or ())
         if (
                 _exact_int(message.get('protocol')) != PROTOCOL_VERSION or
                 round_id is None or round_id < 0 or
                 state_revision is None or state_revision < 0 or
                 phase not in ('waiting', 'loading', 'battle') or
                 not map_name or players is None or not outfits_valid or
+                not compacts_valid or
                 ((players and host_player_id not in player_ids) or
                  (not players and host_player_id is not None)) or
-                authority_id is None or authority_epoch is None or
+                authority_id != WORKER_AUTHORITY_ID or
+                authority_epoch is None or
                 ('server_time_ms' in message and server_time_ms is None)):
             return self._invalid_worker_message('invalid worker roster')
         if self.round_id is not None and round_id < self.round_id:
@@ -283,6 +305,7 @@ class AuthorityWorkerLANClient(LANClient):
             'id': WORKER_AUTHORITY_ID,
             'name': 'SimulationWorker',
             'vehicle': source['vehicle'],
+            'vehicle_compact_descr': source['vehicle_compact_descr'],
             'team': int(source.get('team', 1) or 1),
             'slot': 0,
             'x': 0.0, 'y': WORKER_DUMMY_Y, 'z': 0.0,
@@ -356,6 +379,22 @@ class AuthorityWorkerLANClient(LANClient):
         if kind == 'roster':
             self._handle_worker_roster(message)
             return
+        if (kind in ('battle_start', 'snapshot') and
+                _authority_id(message.get('bot_authority_id')) !=
+                WORKER_AUTHORITY_ID):
+            self._invalid_worker_message(
+                'worker authority identity changed')
+            return
+        if kind in ('battle_start', 'snapshot'):
+            real_players = _strict_mapping_list(
+                message.get('players'), 63)
+            if (real_players is None or any(
+                    _canonical_vehicle_compact_descr(
+                        value.get('vehicle_compact_descr')) is None
+                    for value in real_players)):
+                self._invalid_worker_message(
+                    'worker player descriptor is unavailable')
+                return
         if kind == 'battle_start':
             message = self._refresh_stale_battle_start(message)
             if message is None:
@@ -850,7 +889,8 @@ class WorkerSession(object):
             else:
                 self.state = 'standby'
         elif kind in ('snapshot', 'events', 'battle_live',
-                      'bot_observation'):
+                      'bot_observation', 'fire_intent',
+                      'fire_intent_result'):
             if (self.runtime is not None and
                     not self.client.is_bot_authority()):
                 self._retire_or_fail('authority_lost')
@@ -866,6 +906,10 @@ class WorkerSession(object):
                 self.runtime.on_events(message)
             elif kind == 'battle_live':
                 self.runtime.on_battle_live(message)
+            elif kind == 'fire_intent':
+                self.runtime.on_fire_intent(message)
+            elif kind == 'fire_intent_result':
+                self.runtime.on_fire_intent_result(message)
             else:
                 self.runtime.on_bot_observation(message)
         elif kind == 'battle_failed':

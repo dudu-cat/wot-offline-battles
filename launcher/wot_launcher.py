@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1253,6 +1254,9 @@ class LauncherWindow(object):
         port = session["tcp_port"]
         needs_worker = (
             session["client"] == core.PORT_0_9_22 and
+            session["mode"] in (core.MODE_SINGLE, core.MODE_HOST))
+        server_loopback_only = (
+            session["client"] == core.PORT_0_9_22 and
             session["mode"] == core.MODE_SINGLE)
         report_session = None
         reused_server = self._server_is_running()
@@ -1307,12 +1311,12 @@ class LauncherWindow(object):
                 if team1_size == team2_size:
                     started = self._start_server(
                         game_root, session["client"], team1_size,
-                        loopback_only=needs_worker)
+                        loopback_only=server_loopback_only)
                 else:
                     started = self._start_server(
                         game_root, session["client"],
                         team1_size=team1_size, team2_size=team2_size,
-                        loopback_only=needs_worker)
+                        loopback_only=server_loopback_only)
                 if not started:
                     return
             elif session["mode"] == core.MODE_JOIN:
@@ -1586,7 +1590,8 @@ class LauncherWindow(object):
             window_closed = False
             if paired_worker:
                 exit_code, window_closed = core.wait_for_paired_player_exit(
-                    self._game, game_root)
+                    self._game, game_root,
+                    required_process=self._worker)
             else:
                 exit_code = self._game.wait()
         finally:
@@ -1595,6 +1600,20 @@ class LauncherWindow(object):
                 not window_closed):
             self._log("The game stopped with exit code %s." % exit_code)
         if paired_worker:
+            worker_exit = (self._worker.poll()
+                           if self._worker is not None else None)
+            if worker_exit is not None and not self._stop_requested:
+                self._log(
+                    "The hidden simulation worker stopped with exit code "
+                    "%s; the game was closed." % worker_exit)
+                self._log_worker_failure(game_root)
+                if (self._server is not None and
+                        not self._server_persistent):
+                    # The server has already fenced the worker and queued the
+                    # terminal roster/result. Give its async outboxes a short
+                    # bounded chance to hand those frames to remote peers
+                    # before session cleanup terminates the local server.
+                    time.sleep(core.WORKER_FAILURE_DRAIN_SECONDS_0922)
             self._log("The game closed.")
             return
         self._log("Waiting %d seconds in case the game restarts itself..." %

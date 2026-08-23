@@ -12,6 +12,8 @@ sys.path.insert(0, str(
     ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'))
 
 from gui.mods.offline_lan_0922 import lan_client as lan_client_module
+from gui.mods.offline_lan_0922.authority_worker import (
+    AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.lan_client import LANClient
 
 
@@ -48,14 +50,19 @@ def wait_until(predicate, timeout=1.0):
 
 
 class LanClientQueueTests(unittest.TestCase):
-    def activate(self, sock=None):
-        client = LANClient(
-            '127.0.0.1', 28782, 'P', 'ussr:MS-1',
-            bigworld=QueueBigWorld())
+    def activate(self, sock=None, worker=False):
+        if worker:
+            client = AuthorityWorkerLANClient(
+                '127.0.0.1', 28782, bigworld=QueueBigWorld())
+        else:
+            client = LANClient(
+                '127.0.0.1', 28782, 'P', 'ussr:MS-1',
+                bigworld=QueueBigWorld())
         client.sock = sock or RecordingSocket()
         client.running = True
         client.connected = True
-        client.player_id = 1
+        client.player_id = (lan_client_module.WORKER_AUTHORITY_ID
+                            if worker else 1)
         client._stopping = False
         with client._outbound_lock:
             client._outbound_accepting = True
@@ -79,6 +86,51 @@ class LanClientQueueTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.017, events[0][1]['_client_dispatch_delay'])
         self.assertNotIn('_client_dispatch_delay', message)
+
+    def test_receive_overflow_never_evicts_terminal_protocol_messages(self):
+        client = self.activate()
+        protected = [
+            {'type': 'battle_receipt', 'receipt_id': 'server:7:1'},
+            {'type': 'fire_intent', 'player_id': 1, 'intent_seq': 2},
+            {'type': 'fire_intent_result', 'player_id': 1,
+             'intent_seq': 2},
+        ]
+        original_limit = lan_client_module.MAX_PENDING_MESSAGES
+        lan_client_module.MAX_PENDING_MESSAGES = 4
+        try:
+            client._pending = protected + [{'type': 'pong'}]
+            incoming = {
+                'type': 'fire_intent_result', 'player_id': 2,
+                'intent_seq': 3,
+            }
+
+            client._queue_message(incoming)
+        finally:
+            lan_client_module.MAX_PENDING_MESSAGES = original_limit
+
+        self.assertEqual(protected + [incoming], client._pending)
+
+    def test_receive_overflow_fails_closed_for_each_new_terminal_message(self):
+        client = self.activate()
+        protected = [
+            {'type': 'battle_receipt', 'receipt_id': 'server:7:1'},
+            {'type': 'fire_intent', 'player_id': 1, 'intent_seq': 2},
+            {'type': 'fire_intent_result', 'player_id': 1,
+             'intent_seq': 2},
+        ]
+        original_limit = lan_client_module.MAX_PENDING_MESSAGES
+        lan_client_module.MAX_PENDING_MESSAGES = len(protected)
+        try:
+            for message_type in (
+                    'battle_receipt', 'fire_intent',
+                    'fire_intent_result'):
+                client._pending = list(protected)
+                with self.subTest(message_type=message_type):
+                    with self.assertRaises(RuntimeError):
+                        client._queue_message({'type': message_type})
+                    self.assertEqual(protected, client._pending)
+        finally:
+            lan_client_module.MAX_PENDING_MESSAGES = original_limit
 
     def test_reliable_fifo_freezes_all_state_without_coalescing(self):
         client = self.activate()
@@ -131,11 +183,11 @@ class LanClientQueueTests(unittest.TestCase):
             client._outbound_queue[0][1])
 
     def test_bot_state_queue_projects_full_local_state_to_wire_contract(self):
-        client = self.activate()
+        client = self.activate(worker=True)
         client.ready = True
         client.phase = 'battle'
         client.round_id = 7
-        client.bot_authority_id = 1
+        client.bot_authority_id = lan_client_module.WORKER_AUTHORITY_ID
         states = []
         for index in range(29):
             states.append({
@@ -204,11 +256,11 @@ class LanClientQueueTests(unittest.TestCase):
         self.assertNotIn('shot_proof_key', queued_bots[0])
 
     def test_bot_state_projection_rejects_half_shot_pair(self):
-        client = self.activate()
+        client = self.activate(worker=True)
         client.ready = True
         client.phase = 'battle'
         client.round_id = 7
-        client.bot_authority_id = 1
+        client.bot_authority_id = lan_client_module.WORKER_AUTHORITY_ID
 
         self.assertFalse(client.send_bot_state([{
             'id': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
@@ -218,11 +270,11 @@ class LanClientQueueTests(unittest.TestCase):
         self.assertEqual([], client._outbound_queue)
 
     def test_bot_state_projection_requires_boolean_atomic_reload_state(self):
-        client = self.activate()
+        client = self.activate(worker=True)
         client.ready = True
         client.phase = 'battle'
         client.round_id = 7
-        client.bot_authority_id = 1
+        client.bot_authority_id = lan_client_module.WORKER_AUTHORITY_ID
         state = {
             'id': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
             'health': 100, 'alive': True, 'fire_seq': 1,
@@ -399,8 +451,11 @@ class LanClientQueueTests(unittest.TestCase):
         client.ready = True
         client.phase = 'battle'
         client.round_id = 3
+        self.assertTrue(client.send_input(
+            0.0, 0.0, position=(0.0, 0.0, 0.0), yaw=0.0,
+            shell_index=0))
         original_limit = lan_client_module.MAX_OUTBOUND_MESSAGES
-        lan_client_module.MAX_OUTBOUND_MESSAGES = 0
+        lan_client_module.MAX_OUTBOUND_MESSAGES = 1
         try:
             self.assertIsNone(client.send_fire(
                 position=[0.0, 1.0, 0.0], velocity=[100.0, 0.0, 0.0],
@@ -408,20 +463,24 @@ class LanClientQueueTests(unittest.TestCase):
                 source_shot=source_shot))
         finally:
             lan_client_module.MAX_OUTBOUND_MESSAGES = original_limit
-        self.assertEqual(0, client._fire_seq)
+        self.assertEqual(0, client._fire_intent_seq)
 
         client = self.activate()
         client.ready = True
         client.phase = 'battle'
         client.round_id = 3
+        self.assertTrue(client.send_input(
+            0.0, 0.0, position=(0.0, 0.0, 0.0), yaw=0.0,
+            shell_index=0))
         self.assertEqual(1, client.send_fire(
             position=[0.0, 1.0, 0.0], velocity=[100.0, 0.0, 0.0],
             gravity=9.81, max_distance=500.0, max_time_ms=5000,
             source_shot=source_shot))
-        self.assertEqual(1, client._fire_seq)
+        self.assertEqual(1, client._fire_intent_seq)
         self.assertEqual(
-            'projectile_launch', client._outbound_queue[0][1]['type'])
-        self.assertEqual(1, client._outbound_queue[0][1]['shot_seq'])
+            'fire_intent', client._outbound_queue[1][1]['type'])
+        self.assertEqual(1, client._outbound_queue[1][1]['intent_seq'])
+        self.assertEqual(1, client._outbound_queue[1][1]['input_seq'])
 
     def test_stop_sends_best_effort_leave_and_clears_queue(self):
         client = self.activate()

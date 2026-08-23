@@ -259,6 +259,7 @@ class LANSessionTests(unittest.TestCase):
             picker_opener=lambda: self.opens.append(True) or True,
             battle_runtime=self.battle_runtime,
             vehicle_provider=lambda: ('ussr:R11_MS-1', 90),
+            vehicle_compact_provider=lambda: 'YQ==',
             on_snapshot=self.snapshots.append,
             status_notifier=self.statuses.append,
             queue_screen_factory=queue_screen_factory)

@@ -459,8 +459,10 @@ class ServerPayloadTest(unittest.TestCase):
             "1234", environment[core.CLIENT_SERVER_PORT_ENV_0922])
         self.assertEqual(
             "1", environment[core.ALLOW_MULTIPLE_CLIENTS_ENV_0922])
-        for name in (core.CLIENT_MODE_ENV_0922,
-                     core.HIDDEN_DESKTOP_ENV_0922,
+        self.assertEqual(
+            core.PLAYER_MODE_0922,
+            environment[core.CLIENT_MODE_ENV_0922])
+        for name in (core.HIDDEN_DESKTOP_ENV_0922,
                      core.WORKER_READY_MARKER_ENV_0922):
             self.assertNotIn(name, environment)
 
@@ -1658,6 +1660,19 @@ class GameProcessTest(unittest.TestCase):
                 process, "/game", window_visible=lambda: next(visible),
                 close_grace=2.0, poll=1.0,
                 clock=lambda: next(ticks), sleep=lambda unused: None))
+        self.assertTrue(process.terminated)
+        self.assertFalse(process.killed)
+
+    def test_paired_player_retires_when_required_worker_exits(self):
+        process = self._TerminableProcess()
+        worker = self._Process([None, 7])
+
+        self.assertEqual(
+            (1, False),
+            core.wait_for_paired_player_exit(
+                process, "/game", required_process=worker,
+                window_visible=lambda: True, poll=1.0,
+                clock=lambda: 0.0, sleep=lambda unused: None))
         self.assertTrue(process.terminated)
         self.assertFalse(process.killed)
 

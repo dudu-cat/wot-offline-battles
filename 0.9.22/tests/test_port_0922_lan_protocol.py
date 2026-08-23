@@ -10,7 +10,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'))
 sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 
-from gui.mods.offline_lan_0922.lan_client import LANClient
+from gui.mods.offline_lan_0922.lan_client import (
+    HUMAN_RAM_TIMELINE_CAPABILITY, LANClient,
+    LEAN_SNAPSHOT_MANIFEST_CAPABILITY)
+from gui.mods.offline_lan_0922.authority_worker import (
+    AuthorityWorkerLANClient)
 from lan_battle_server import (
     BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, Player,
     _bot_combat_log_message, _server_event_log_message, _server_log)
@@ -30,12 +34,22 @@ class LanProtocolTests(unittest.TestCase):
         self.client.state_revision = 4
         self.client.player_id = 1
         self.client.host_player_id = 1
-        self.client.bot_authority_id = 1
+        self.client.bot_authority_id = -1
+        self.client.vehicle_compact_descr = 'dGVzdA=='
         self.sent = []
         def send(message):
             self.sent.append(message)
             return True
         self.client._send = send
+
+    def _worker_client(self):
+        worker = AuthorityWorkerLANClient('127.0.0.1', 28782)
+        worker.ready = True
+        worker.phase = 'battle'
+        worker.round_id = self.client.round_id
+        worker.bot_authority_id = worker.player_id
+        worker._send = self.client._send
+        return worker
 
     def test_v5_explicit_control_messages(self):
         self.assertTrue(self.client.leave_battle())
@@ -44,38 +58,37 @@ class LanProtocolTests(unittest.TestCase):
                          'max_hp': 100.0, 'state': 'destroyed'}],
             'destroyed': ['leftTrackHealth'], 'crew_ko': [],
             'fire': False, 'ammo_rack_death': False, 'events': []}
-        self.assertTrue(self.client.send_hit(
+        self.assertFalse(self.client.send_hit(
             2, 4, 500, 2, 1, (1, 2, 3), critical,
             critical_target_base_revision=8,
             critical_target_ack_seq=3, hull_damage=120))
-        self.assertTrue(self.client.send_bot_manifest([{'id': 1}] * 40))
-        self.assertTrue(self.client.send_bot_state([{'id': 1}]))
-        self.assertTrue(self.client.send_bot_observation([{}] * 70, [{}] * 20))
-        self.assertTrue(self.client.send_bot_bot_hit(1, 2, 3, 120, 2))
-        self.assertTrue(self.client.send_bot_ram(
+        worker = self._worker_client()
+        self.assertTrue(worker.send_bot_manifest([{'id': 1}] * 40))
+        self.assertTrue(worker.send_bot_state([{'id': 1}]))
+        self.assertTrue(worker.send_bot_observation([{}] * 70, [{}] * 20))
+        self.assertTrue(worker.send_bot_bot_hit(1, 2, 3, 120, 2))
+        self.assertTrue(worker.send_bot_ram(
             1, 'human', 2, 4, 20, 80))
-        self.assertTrue(self.client.send_rules_state({'1': {'points': 10}}))
-        self.assertTrue(self.client.send_destructible({
+        self.assertTrue(worker.send_rules_state({'1': {'points': 10}}))
+        self.assertFalse(self.client.send_destructible({
             'destructible_kind': 'tree', 'chunk_id': 17,
             'item_index': 4, 'x': 1.0, 'y': 2.0, 'z': 3.0,
             'fall_yaw': 0.5, 'speed': 12.0, 'is_shot': False}))
-        self.assertTrue(self.client.send_battle_result(1, 'elimination'))
+        self.assertTrue(worker.send_destructible({
+            'destructible_kind': 'tree', 'chunk_id': 17,
+            'item_index': 4, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.5, 'speed': 12.0, 'is_shot': False}))
+        self.assertTrue(worker.send_battle_result(1, 'elimination'))
         self.assertEqual('leave_battle', self.sent[0]['type'])
-        self.assertEqual('hit_report', self.sent[1]['type'])
-        self.assertEqual(critical, self.sent[1]['critical'])
-        self.assertEqual(8, self.sent[1][
-            'critical_target_base_revision'])
-        self.assertEqual(3, self.sent[1]['critical_target_ack_seq'])
-        self.assertEqual(120, self.sent[1]['hull_damage'])
-        self.assertEqual(30, len(self.sent[2]['bots']))
-        self.assertEqual(64, len(self.sent[4]['contacts']))
-        self.assertEqual(1, self.sent[5]['attacker_bot'])
-        self.assertEqual('bot_ram_report', self.sent[6]['type'])
-        self.assertEqual(80, self.sent[6]['damage_to_target'])
-        self.assertEqual('rules_state', self.sent[7]['type'])
-        self.assertEqual('destructible', self.sent[8]['type'])
-        self.assertEqual('tree', self.sent[8]['destructible_kind'])
-        self.assertEqual(17, self.sent[8]['chunk_id'])
+        self.assertEqual(30, len(self.sent[1]['bots']))
+        self.assertEqual(64, len(self.sent[3]['contacts']))
+        self.assertEqual(1, self.sent[4]['attacker_bot'])
+        self.assertEqual('bot_ram_report', self.sent[5]['type'])
+        self.assertEqual(80, self.sent[5]['damage_to_target'])
+        self.assertEqual('rules_state', self.sent[6]['type'])
+        self.assertEqual('destructible', self.sent[7]['type'])
+        self.assertEqual('tree', self.sent[7]['destructible_kind'])
+        self.assertEqual(17, self.sent[7]['chunk_id'])
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
 
@@ -96,17 +109,47 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(0.25, message['pitch'])
         self.assertEqual(-0.3, message['roll'])
 
+    def test_timeline_input_has_round_sequence_and_server_pose_time(self):
+        self.client.capabilities = (HUMAN_RAM_TIMELINE_CAPABILITY,)
+        self.client.server_capabilities = (HUMAN_RAM_TIMELINE_CAPABILITY,)
+
+        self.assertTrue(self.client.send_input(
+            0.0, 0.0, position=(1.0, 2.0, 3.0), yaw=0.4,
+            pose_time_us=123456))
+        self.assertTrue(self.client.send_input(
+            0.0, 0.0, position=(1.0, 2.0, 3.5), yaw=0.4,
+            pose_time_us=156789))
+
+        self.assertEqual((1, 123456), (
+            self.sent[-2]['input_seq'], self.sent[-2]['pose_time_us']))
+        self.assertEqual((2, 156789), (
+            self.sent[-1]['input_seq'], self.sent[-1]['pose_time_us']))
+
+    def test_input_carries_bounded_ram_contact_ledger(self):
+        contacts = [{'seq': value} for value in range(1, 20)]
+
+        self.assertTrue(self.client.send_input(
+            0.0, 0.0, ram_contacts=contacts))
+
+        message = self.sent[-1]
+        self.assertEqual(list(range(1, 17)), [
+            value['seq'] for value in message['ram_contacts']])
+        self.assertNotIn('ram_contact', message)
+
     def test_waiting_room_publishes_one_changed_garage_vehicle(self):
         self.client.phase = 'waiting'
         self.client.vehicle = 'ussr:R11_MS-1'
         self.client.max_health = 90
 
         self.assertFalse(self.client.select_vehicle('ussr:R11_MS-1', 90))
-        self.assertTrue(self.client.select_vehicle('germany:G01_PzI', 150))
+        self.assertTrue(self.client.select_vehicle(
+            'germany:G01_PzI', 150,
+            vehicle_compact_descr='cHpp'))
 
         self.assertEqual({'type': 'select_vehicle',
                           'vehicle': 'germany:G01_PzI',
-                          'max_health': 150}, self.sent[-1])
+                          'max_health': 150,
+                          'vehicle_compact_descr': 'cHpp'}, self.sent[-1])
         # Only the server-published roster may retire the pending selection,
         # so a rejected update is resent on the next waiting roster.
         self.assertEqual('ussr:R11_MS-1', self.client.vehicle)
@@ -115,8 +158,10 @@ class LanProtocolTests(unittest.TestCase):
             'type': 'roster', 'protocol': 5, 'round_id': 8,
             'state_revision': 9, 'phase': 'waiting', 'map': '01_karelia',
             'host_player_id': 1, 'authority_epoch': 0,
+            'bot_authority_id': -1,
             'players': [{'id': 1, 'vehicle': 'germany:G01_PzI',
-                         'max_health': 150}]})
+                         'max_health': 150,
+                         'vehicle_compact_descr': 'cHpp'}]})
 
         self.assertEqual('germany:G01_PzI', self.client.vehicle)
         self.assertEqual(150, self.client.max_health)
@@ -133,21 +178,24 @@ class LanProtocolTests(unittest.TestCase):
         state.client_build = CLIENT_BUILD_0922
         state.players[1] = Player(
             1, _Socket(), ('127.0.0.1', 1), vehicle='ussr:R11_MS-1',
-            team=1, slot=0, health=90, max_health=90)
+            team=1, slot=0, health=90, max_health=90,
+            vehicle_compact_descr='dGVzdA==')
         return state
 
     def test_server_applies_a_waiting_room_vehicle_change(self):
         state = self._room_with_one_player()
 
         self.assertTrue(state.select_vehicle(1, {
-            'vehicle': 'germany:G01_PzI', 'max_health': 150}))
+            'vehicle': 'germany:G01_PzI', 'max_health': 150,
+            'vehicle_compact_descr': 'cHpp'}))
 
         player = state.players[1]
         self.assertEqual('germany:G01_PzI', player.vehicle)
         self.assertEqual(150, player.max_health)
         self.assertEqual(150, player.health)
         self.assertFalse(state.select_vehicle(1, {
-            'vehicle': 'germany:G01_PzI', 'max_health': 150}))
+            'vehicle': 'germany:G01_PzI', 'max_health': 150,
+            'vehicle_compact_descr': 'cHpp'}))
 
     def test_server_keeps_the_round_vehicle_once_the_battle_started(self):
         state = self._room_with_one_player()
@@ -280,20 +328,21 @@ class LanProtocolTests(unittest.TestCase):
             'devices': [], 'destroyed': [], 'crew_ko': [],
             'fire': False, 'ammo_rack_death': False, 'events': []}
 
+        self.assertFalse(
+            self.client.send_hit(2, 1, 100, 2, critical=critical))
+        worker = self._worker_client()
         with self.assertRaises(ValueError):
-            self.client.send_hit(2, 1, 100, 2, critical=critical)
-        with self.assertRaises(ValueError):
-            self.client.send_bot_hit(
+            worker.send_bot_hit(
                 2, 1, 100, 2, critical=critical,
                 critical_target_base_revision=True,
                 critical_target_ack_seq=0, hull_damage=100)
         with self.assertRaises(ValueError):
-            self.client.send_bot_human_hit(
+            worker.send_bot_human_hit(
                 1, 2, 1, 100, 2, critical=critical,
                 critical_target_base_revision=0,
                 critical_target_ack_seq=0.5, hull_damage=100)
         with self.assertRaises(ValueError):
-            self.client.send_bot_bot_hit(
+            worker.send_bot_bot_hit(
                 1, 2, 1, 100, 2, critical=critical,
                 critical_target_base_revision=0,
                 critical_target_ack_seq=0, hull_damage=-1)
@@ -366,27 +415,15 @@ class LanProtocolTests(unittest.TestCase):
             'item_index': 2, 'x': 0, 'y': 0, 'z': 0,
             'fall_yaw': 0, 'speed': 0, 'is_shot': 0}))
 
-    def test_input_carries_local_fire_or_drowning_state(self):
-        critical = {
-            'devices': [], 'destroyed': [], 'crew_ko': [],
-            'fire': False, 'ammo_rack_death': False, 'events': []}
-
-        self.assertTrue(self.client.send_input(
-            0, 0, speed=-12.5, reported_health=0,
-            reported_critical=critical,
-            reported_reason=5, reported_display_health=321,
-            reported_attacker_bot=7,
-            reported_critical_base_revision=3,
-            reported_critical_seq=4))
+    def test_input_has_no_client_damage_verdict_fields(self):
+        self.assertTrue(self.client.send_input(0, 0, speed=-12.5))
 
         message = self.sent[-1]
-        self.assertEqual(critical, message['reported_critical'])
-        self.assertEqual(3, message['reported_critical_base_revision'])
-        self.assertEqual(4, message['reported_critical_seq'])
-        self.assertEqual(5, message['reported_reason'])
-        self.assertEqual(321, message['reported_display_health'])
-        self.assertEqual(7, message['reported_attacker_bot'])
+        self.assertFalse(any(
+            key.startswith('reported_') for key in message))
         self.assertEqual(-12.5, message['speed'])
+        with self.assertRaises(TypeError):
+            self.client.send_input(0, 0, reported_health=0)
 
     def test_only_authority_can_send_bot_or_rule_messages(self):
         self.client.bot_authority_id = 2
@@ -399,8 +436,8 @@ class LanProtocolTests(unittest.TestCase):
             1, 'human', 2, 1, 20, 80))
         self.assertFalse(self.client.send_rules_state({}))
         self.assertFalse(self.client.send_battle_result(1, 'elimination'))
-        self.assertTrue(self.client.send_bot_hit(1, 1, 100, 2))
-        self.assertEqual('bot_hit_report', self.sent[0]['type'])
+        self.assertFalse(self.client.send_bot_hit(1, 1, 100, 2))
+        self.assertEqual([], self.sent)
 
     def test_failed_fire_send_does_not_create_sequence_gap(self):
         launch = {
@@ -421,15 +458,24 @@ class LanProtocolTests(unittest.TestCase):
                 },
             },
         }
+        self.assertTrue(self.client.send_input(
+            0.0, 0.0, position=(1.0, 2.0, 3.0), yaw=0.0,
+            shell_index=0, pose_time_us=123456))
         self.client._send = lambda unused_message: False
 
         self.assertIsNone(self.client.send_fire(**launch))
-        self.assertEqual(0, self.client._fire_seq)
+        self.assertEqual(0, self.client._fire_intent_seq)
 
         self.client._send = lambda message: self.sent.append(message) or True
         self.assertEqual(1, self.client.send_fire(**launch))
-        self.assertEqual('projectile_launch', self.sent[-1]['type'])
-        self.assertEqual(1, self.sent[-1]['shot_seq'])
+        self.assertEqual({
+            'type': 'fire_intent', 'round_id': 7,
+            'intent_seq': 1, 'input_seq': 1, 'shell_index': 0,
+        }, self.sent[-1])
+        self.assertFalse(any(
+            field in self.sent[-1]
+            for field in ('position', 'origin', 'velocity', 'gravity',
+                          'source_shot', 'damage')))
 
     def test_worker_sends_hello_before_exposing_connected_socket(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
@@ -544,6 +590,88 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual('disconnected', self.client.phase)
         self.assertIsNone(self.client.last_snapshot)
 
+    def test_lean_snapshot_inherits_the_last_static_bot_manifest(self):
+        self.client.server_capabilities = (
+            LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
+        player = {
+            'id': 1, 'critical_revision': 0,
+            'critical_base_revision': 0, 'critical_ack_seq': 0,
+        }
+        manifest = [{'id': 11, 'vehicle': 'ussr:R11_MS-1'}]
+        first = {
+            'type': 'snapshot', 'protocol': 5, 'round_id': 7,
+            'server_tick': 1, 'bot_state_revision': 0,
+            'players': [player], 'bots': [], 'bot_manifest': manifest,
+            'bot_authority_id': -1,
+        }
+        second = dict(first, server_tick=2)
+        second.pop('bot_manifest')
+
+        self.client._handle_message(first)
+        self.client._handle_message(second)
+
+        self.assertEqual(manifest, self.client.last_snapshot['bot_manifest'])
+        self.assertIsNot(
+            manifest, self.client.last_snapshot['bot_manifest'])
+
+    def test_lean_snapshot_requires_server_capability(self):
+        self.client.running = True
+        player = {
+            'id': 1, 'critical_revision': 0,
+            'critical_base_revision': 0, 'critical_ack_seq': 0,
+        }
+        first = {
+            'type': 'snapshot', 'protocol': 5, 'round_id': 7,
+            'server_tick': 1, 'bot_state_revision': 0,
+            'players': [player], 'bots': [], 'bot_manifest': [],
+            'bot_authority_id': -1, 'authority_epoch': 1,
+        }
+        second = dict(first, server_tick=2)
+        second.pop('bot_manifest')
+
+        self.client._handle_message(first)
+        self.client._handle_message(second)
+
+        self.assertEqual('invalid snapshot message', self.client.last_error)
+        self.assertEqual('disconnected', self.client.phase)
+
+    def test_lean_snapshot_requires_existing_same_lineage_manifest(self):
+        self.client.running = True
+        player = {
+            'id': 1, 'critical_revision': 0,
+            'critical_base_revision': 0, 'critical_ack_seq': 0,
+        }
+        self.client.server_capabilities = (
+            LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
+        first = {
+            'type': 'snapshot', 'protocol': 5, 'round_id': 7,
+            'server_tick': 1, 'bot_state_revision': 0,
+            'players': [player], 'bots': [], 'bot_manifest': [],
+            'bot_authority_id': -1, 'authority_epoch': 1,
+        }
+        changed = dict(
+            first, server_tick=2, bot_authority_id=0,
+            authority_epoch=2)
+        changed.pop('bot_manifest')
+
+        self.client._handle_message(first)
+        self.client._handle_message(changed)
+
+        self.assertEqual('invalid snapshot message', self.client.last_error)
+        self.assertEqual('disconnected', self.client.phase)
+
+        missing = LANClient(
+            '127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        missing.running = True
+        missing.ready = True
+        missing.phase = 'battle'
+        missing.round_id = 7
+        missing.server_capabilities = (
+            LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
+        first.pop('bot_manifest')
+        missing._handle_message(first)
+        self.assertEqual('invalid snapshot message', missing.last_error)
+
     def test_snapshot_rejects_non_exact_bot_combat_revisions(self):
         cases = (
             ('combat_revision', True),
@@ -631,6 +759,7 @@ class LanProtocolTests(unittest.TestCase):
         self.client._handle_message({
             'type': 'battle_live', 'protocol': 5, 'round_id': 7,
             'server_tick': 0,
+            'bot_authority_id': -1,
             'state_revision': 5, 'countdown_seconds': 30.0,
             'battle_duration_seconds': 900.0,
             'timing': {
@@ -669,10 +798,12 @@ class LanProtocolTests(unittest.TestCase):
             'type': 'roster', 'protocol': 5, 'round_id': 7,
             'state_revision': 7, 'phase': 'battle',
             'map': '01_karelia', 'host_player_id': 1,
+            'bot_authority_id': -1,
             'players': [{'id': 1}]})
         live = {
             'type': 'battle_live', 'protocol': 5, 'round_id': 7,
             'server_tick': 0, 'state_revision': 6,
+            'bot_authority_id': -1,
             'countdown_seconds': 15.0,
             'battle_duration_seconds': 900.0,
             '_client_received_time': 100.0,
@@ -689,7 +820,7 @@ class LanProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(115.0, self.client.combat_deadline)
         self.assertEqual(['roster', 'battle_live'], events)
 
-    def test_transition_repair_roster_replaces_failed_authority(self):
+    def test_visible_client_rejects_player_authority(self):
         self.client.player_id = 2
         self.client.phase = 'waiting'
         players = [
@@ -703,18 +834,30 @@ class LanProtocolTests(unittest.TestCase):
             'state_revision': 5, 'phase': 'loading',
             'map': '01_karelia', 'host_player_id': 1,
             'bot_authority_id': 1, 'players': players})
-        self.client._handle_message({
-            'type': 'roster', 'protocol': 5, 'round_id': 7,
-            'state_revision': 6, 'phase': 'loading',
-            'map': '01_karelia', 'host_player_id': 2,
-            'bot_authority_id': 2, 'players': [players[1]]})
+        self.assertEqual('waiting', self.client.phase)
+        self.assertEqual('invalid battle_start message',
+                         self.client.last_error)
+        self.assertFalse(self.client.is_bot_authority())
 
-        self.assertEqual('loading', self.client.phase)
-        self.assertEqual(6, self.client.state_revision)
-        self.assertEqual(2, self.client.host_player_id)
-        self.assertEqual(2, self.client.bot_authority_id)
-        self.assertEqual([2], [player['id'] for player in self.client.roster])
-        self.assertTrue(self.client.is_bot_authority())
+    def test_visible_client_accepts_only_explicit_worker_failure_without_id(self):
+        self.client.authority_epoch = 1
+
+        self.client._handle_message({
+            'type': 'events', 'protocol': 5, 'round_id': 7,
+            'server_tick': 8, 'authority_epoch': 2,
+            'bot_authority_id': None,
+            'worker_status': 'failed',
+            'worker_failure_reason': 'worker_disconnected',
+            'events': [{
+                'kind': 'authority', 'player_id': None,
+                'authority_epoch': 2,
+            }],
+        })
+
+        self.assertIsNone(self.client.last_error)
+        self.assertIsNone(self.client.bot_authority_id)
+        self.assertEqual(2, self.client.authority_epoch)
+        self.assertFalse(self.client.is_bot_authority())
 
     def test_same_round_waiting_roster_cannot_demote_accepted_battle(self):
         players = [{
@@ -725,10 +868,12 @@ class LanProtocolTests(unittest.TestCase):
             'state_revision': 5,
             'phase': 'loading',
             'map': '01_karelia', 'host_player_id': 1,
+            'bot_authority_id': -1,
             'players': players})
         self.client._handle_message({
             'type': 'battle_live', 'protocol': 5, 'round_id': 7,
             'server_tick': 0, 'state_revision': 6,
+            'bot_authority_id': -1,
             'countdown_seconds': 15.0,
             'battle_duration_seconds': 900.0,
             'timing': {
@@ -739,6 +884,7 @@ class LanProtocolTests(unittest.TestCase):
             'type': 'roster', 'protocol': 5, 'round_id': 7,
             'state_revision': 7,
             'phase': 'waiting', 'map': '05_prohorovka',
+            'bot_authority_id': -1,
             'host_player_id': 1, 'players': [{
                 'id': 1, 'team': 1, 'slot': 0, 'name': 'Changed',
                 'vehicle': 'ussr:MS-1', 'x': 1, 'y': 0, 'z': 1}]})

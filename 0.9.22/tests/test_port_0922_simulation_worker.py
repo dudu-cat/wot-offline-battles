@@ -16,7 +16,10 @@ import lan_battle_server as server_module  # noqa: E402
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, ClientHandler,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PROJECTILE_CAPABILITY,
-    Player, PREBATTLE_SECONDS,
+    HUMAN_RAM_TIMELINE_CAPABILITY,
+    LEAN_SNAPSHOT_MANIFEST_CAPABILITY, Player, PREBATTLE_SECONDS,
+    PLAYER_FIRE_INTENT_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+    REPLICA_SNAPSHOT_TICKS,
     SimulationWorker,
     SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
     SIMULATION_WORKER_ROLE, TICK_HZ, ThreadedTCPServer,
@@ -29,6 +32,35 @@ class _Connection(object):
 
     def sendall(self, payload):
         self.messages.append(json.loads(payload.decode('utf-8')))
+
+
+class _BlockingConnection(object):
+    def __init__(self):
+        self.messages = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def sendall(self, payload):
+        message = json.loads(payload.decode('utf-8'))
+        if not self.messages:
+            self.started.set()
+            if not self.release.wait(2.0):
+                raise socket.timeout('synthetic slow peer')
+        self.messages.append(message)
+
+
+class _ShortStallConnection(object):
+    def __init__(self):
+        self.payload = b''
+        self.calls = 0
+
+    def send(self, payload):
+        self.calls += 1
+        if self.calls == 1:
+            raise socket.timeout()
+        count = min(7, len(payload))
+        self.payload += payload[:count]
+        return count
 
 
 class _Peer(object):
@@ -74,7 +106,9 @@ def _worker_hello():
         'client_build': CLIENT_BUILD_0922,
         'capabilities': [
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
-            SIMULATION_WORKER_CAPABILITY],
+            SIMULATION_WORKER_CAPABILITY,
+            HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+            PLAYER_FIRE_INTENT_CAPABILITY],
     }
 
 
@@ -84,8 +118,11 @@ def _player_hello(name='Human'):
         'type': 'hello', 'protocol': 5,
         'client_build': CLIENT_BUILD_0922,
         'capabilities': [
-            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
+            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+            PLAYER_FIRE_INTENT_CAPABILITY],
         'name': name, 'vehicle': 'ussr:R11_MS-1', 'max_health': 90,
+        'vehicle_compact_descr': 'dGVzdA==',
     }
 
 
@@ -105,6 +142,15 @@ def _manifest(roster):
             'route': {'id': 'worker-test', 'waypoints': []},
         })
     return result
+
+
+def _human_profiles(players):
+    return [{
+        'id': int(player['id']),
+        'vehicle': player['vehicle'],
+        'mass': 25000.0,
+        'shape': [1.5, 3.5, -0.8, 1.6],
+    } for player in players]
 
 
 def _bot_publication(manifest, x_offset=0.0):
@@ -128,6 +174,338 @@ def _wait_until(predicate, timeout=2.0):
 
 
 class SimulationWorkerStateTests(unittest.TestCase):
+    def test_lifecycle_broadcasts_do_not_wait_for_a_slow_socket(self):
+        def assert_nonblocking(publish):
+            connection = _BlockingConnection()
+            player = Player(1, connection, ('127.0.0.1', 1000))
+            player._force_async_outbox = True
+            player.participating = True
+            state = BattleState(map_name='01_karelia', team_size=1)
+            state.client_build = CLIENT_BUILD_0922
+            state.phase = 'loading'
+            state.players = {player.player_id: player}
+            state.host_player_id = player.player_id
+            completed = threading.Event()
+            errors = []
+
+            def run():
+                try:
+                    publish(state)
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    completed.set()
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(connection.started.wait(1.0))
+                self.assertTrue(completed.wait(0.25))
+            finally:
+                connection.release.set()
+                thread.join(2.0)
+                player.disconnect()
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], errors)
+
+        publishers = (
+            lambda state: state.broadcast({
+                'type': 'roster', 'round_id': state.round_id}),
+            lambda state: state.broadcast_current_roster(),
+            lambda state: state.broadcast_loading_transition({
+                'type': 'battle_start', 'round_id': state.round_id}),
+        )
+        for publish in publishers:
+            assert_nonblocking(publish)
+
+    def test_outbox_resumes_one_frame_after_short_socket_stall(self):
+        connection = _ShortStallConnection()
+        player = Player(1, connection, ('127.0.0.1', 1000))
+        player._force_async_outbox = True
+
+        self.assertTrue(player.offer_reliable({
+            'type': 'events', 'round_id': 1, 'server_tick': 1,
+            'events': []}))
+        _wait_until(lambda: connection.payload.endswith(b'\n'))
+
+        self.assertTrue(player.connected)
+        self.assertEqual(
+            {'type': 'events', 'round_id': 1, 'server_tick': 1,
+             'events': []},
+            json.loads(connection.payload.decode('utf-8')))
+        player.disconnect()
+
+    def test_outbox_rechecks_disconnect_after_waiting_for_queue_lock(self):
+        for method_name in ('offer_reliable', 'offer_snapshot'):
+            player = Player(1, _Connection(), ('127.0.0.1', 1000))
+            player._force_async_outbox = True
+            producer_entered = threading.Event()
+            producer_release = threading.Event()
+            original_ensure = player._ensure_outbox
+
+            def gated_ensure():
+                if threading.current_thread().name == 'racing-offer':
+                    producer_entered.set()
+                    if not producer_release.wait(1.0):
+                        raise AssertionError('outbox race test timed out')
+                return original_ensure()
+
+            player._ensure_outbox = gated_ensure
+            results = []
+            message = {
+                'type': 'snapshot' if method_name == 'offer_snapshot'
+                else 'events',
+                'round_id': 1,
+                'server_tick': 1,
+            }
+            producer = threading.Thread(
+                target=lambda: results.append(
+                    getattr(player, method_name)(message)),
+                name='racing-offer')
+            producer.start()
+            self.assertTrue(producer_entered.wait(1.0))
+            player._mark_disconnected()
+            producer_release.set()
+            producer.join(1.0)
+
+            self.assertFalse(producer.is_alive())
+            self.assertEqual([False], results)
+            self.assertEqual([], list(player._outbox_reliable))
+            self.assertIsNone(player._outbox_snapshot)
+
+    def test_stale_player_endpoint_cannot_remove_reused_identity(self):
+        state = BattleState(map_name='01_karelia', team_size=1)
+        stale = Player(1, _Connection(), ('127.0.0.1', 1000))
+        current = Player(1, _Connection(), ('127.0.0.1', 1001))
+        state.players = {1: current}
+
+        removed, reset = state._remove_endpoint(stale)
+        self.assertIsNone(removed)
+        self.assertFalse(reset)
+        self.assertIs(current, state.players[1])
+
+        removed, reset = state.remove_player(1, expected=stale)
+        self.assertIsNone(removed)
+        self.assertFalse(reset)
+        self.assertIs(current, state.players[1])
+
+    @staticmethod
+    def _paused_event_publication():
+        entered = threading.Event()
+        release = threading.Event()
+
+        def pause(unused_event, unused_players, unused_bots):
+            entered.set()
+            if not release.wait(2.0):
+                raise RuntimeError('event publication test timed out')
+            return None
+
+        return entered, release, pause
+
+    def test_worker_failure_roster_fences_captured_old_epoch_events(self):
+        state = BattleState(map_name='01_karelia', team_size=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        worker = SimulationWorker(
+            _Connection(), ('127.0.0.1', 1000))
+        state.simulation_worker = worker
+        player_connection = _Connection()
+        player = Player(1, player_connection, ('127.0.0.1', 1001))
+        state.players = {1: player}
+        state.host_player_id = 1
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.bot_roster = []
+        state.pending_events.append({
+            'kind': 'authority',
+            'player_id': SIMULATION_WORKER_AUTHORITY_ID,
+            'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+        })
+        entered, release, pause = self._paused_event_publication()
+        with mock.patch.object(
+                server_module, '_server_event_log_message',
+                side_effect=pause):
+            tick = threading.Thread(
+                target=state.tick_once, args=(1.0 / TICK_HZ,))
+            tick.start()
+            self.assertTrue(entered.wait(1.0))
+            state.remove_simulation_worker(worker)
+            roster = state.broadcast_current_roster()
+            release.set()
+            tick.join(2.0)
+
+        self.assertFalse(tick.is_alive())
+        roster_index = player_connection.messages.index(roster)
+        self.assertFalse(any(
+            message.get('type') == 'events' and
+            message.get('authority_epoch') < roster['authority_epoch']
+            for message in player_connection.messages[roster_index + 1:]))
+
+    def test_membership_roster_fences_captured_old_player_snapshot(self):
+        state = BattleState(map_name='01_karelia', team_size=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        worker = SimulationWorker(
+            _Connection(), ('127.0.0.1', 1000))
+        state.simulation_worker = worker
+        first_connection = _Connection()
+        first = Player(1, first_connection, ('127.0.0.1', 1001))
+        second = Player(2, _Connection(), ('127.0.0.1', 1002), team=2)
+        state.players = {1: first, 2: second}
+        state.host_player_id = 1
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.bot_roster = []
+        state.pending_events.append({
+            'kind': 'authority',
+            'player_id': SIMULATION_WORKER_AUTHORITY_ID,
+            'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+        })
+        entered, release, pause = self._paused_event_publication()
+        with mock.patch.object(
+                server_module, '_server_event_log_message',
+                side_effect=pause):
+            tick = threading.Thread(
+                target=state.tick_once, args=(1.0 / TICK_HZ,))
+            tick.start()
+            self.assertTrue(entered.wait(1.0))
+            state.remove_player(second.player_id)
+            roster = state.broadcast_current_roster()
+            release.set()
+            tick.join(2.0)
+
+        self.assertFalse(tick.is_alive())
+        roster_index = first_connection.messages.index(roster)
+        self.assertFalse(any(
+            message.get('type') == 'snapshot' and
+            second.player_id in [
+                value.get('id') for value in message.get('players', ())]
+            for message in first_connection.messages[roster_index + 1:]))
+
+    def test_outbox_isolates_slow_peer_and_coalesces_unsent_snapshots(self):
+        connection = _BlockingConnection()
+        player = Player(1, connection, ('127.0.0.1', 1000))
+        player._force_async_outbox = True
+
+        self.assertTrue(player.offer_snapshot({
+            'type': 'snapshot', 'round_id': 1, 'server_tick': 1}))
+        self.assertTrue(connection.started.wait(1.0))
+        self.assertTrue(player.offer_snapshot({
+            'type': 'snapshot', 'round_id': 1, 'server_tick': 2}))
+        self.assertTrue(player.offer_snapshot({
+            'type': 'snapshot', 'round_id': 1, 'server_tick': 3}))
+        self.assertTrue(player.offer_reliable({
+            'type': 'events', 'round_id': 1, 'server_tick': 4,
+            'events': []}))
+        self.assertTrue(player.offer_snapshot({
+            'type': 'snapshot', 'round_id': 1, 'server_tick': 4}))
+
+        connection.release.set()
+        _wait_until(lambda: len(connection.messages) == 3)
+
+        self.assertEqual(
+            [('snapshot', 1), ('events', 4), ('snapshot', 4)],
+            [(message['type'], message['server_tick'])
+             for message in connection.messages])
+        player.connected = False
+        with player._outbox_condition:
+            player._outbox_condition.notify_all()
+
+    def test_same_round_roster_fences_an_unsent_snapshot(self):
+        connection = _BlockingConnection()
+        player = Player(1, connection, ('127.0.0.1', 1000))
+        player._force_async_outbox = True
+
+        self.assertTrue(player.offer_snapshot({
+            'type': 'snapshot', 'round_id': 1, 'server_tick': 1}))
+        self.assertTrue(connection.started.wait(1.0))
+        self.assertTrue(player.offer_snapshot({
+            'type': 'snapshot', 'round_id': 1, 'server_tick': 2}))
+        self.assertTrue(player.offer_reliable({
+            'type': 'roster', 'round_id': 1, 'players': []}))
+
+        connection.release.set()
+        _wait_until(lambda: len(connection.messages) == 2)
+        self.assertEqual(
+            ['snapshot', 'roster'],
+            [message['type'] for message in connection.messages])
+        player.disconnect()
+
+    def test_replicas_are_15_hz_and_worker_loss_terminates_round(self):
+        self.assertEqual(2, REPLICA_SNAPSHOT_TICKS)
+        state = BattleState(map_name='01_karelia', team_size=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        worker_connection = _Connection()
+        worker = SimulationWorker(
+            worker_connection, ('127.0.0.1', 1000))
+        state.simulation_worker = worker
+        first_connection = _Connection()
+        second_connection = _Connection()
+        first = Player(
+            1, first_connection, ('127.0.0.1', 1001),
+            capabilities=(LEAN_SNAPSHOT_MANIFEST_CAPABILITY,))
+        second = Player(
+            2, second_connection, ('127.0.0.1', 1002), team=2,
+            capabilities=(LEAN_SNAPSHOT_MANIFEST_CAPABILITY,))
+        state.players = {1: first, 2: second}
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.bot_roster = []
+
+        for _unused in range(5):
+            state.tick_once(1.0 / TICK_HZ)
+
+        self.assertEqual(5, sum(
+            message.get('type') == 'snapshot'
+            for message in worker_connection.messages))
+        self.assertEqual(3, sum(
+            message.get('type') == 'snapshot'
+            for message in first_connection.messages))
+        self.assertEqual(3, sum(
+            message.get('type') == 'snapshot'
+            for message in second_connection.messages))
+        first_snapshots = [
+            message for message in first_connection.messages
+            if message.get('type') == 'snapshot']
+        self.assertIn('bot_manifest', first_snapshots[0])
+        self.assertNotIn('bot_manifest', first_snapshots[1])
+
+        removed, round_failed = state.remove_simulation_worker(worker)
+        self.assertIs(worker, removed)
+        self.assertTrue(round_failed)
+        state.tick_once(1.0 / TICK_HZ)
+
+        self.assertIsNone(state.bot_authority_id)
+        self.assertEqual('worker_disconnected',
+                         state.battle_result['reason'])
+        self.assertFalse(state.result_receipts)
+        self.assertEqual(4, sum(
+            message.get('type') == 'snapshot'
+            for message in first_connection.messages))
+        self.assertEqual(4, sum(
+            message.get('type') == 'snapshot'
+            for message in second_connection.messages))
+
+    def test_legacy_v5_replica_keeps_manifest_in_every_snapshot(self):
+        state = BattleState(map_name='01_karelia', team_size=1)
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        connection = _Connection()
+        legacy = Player(1, connection, ('127.0.0.1', 1000))
+        state.players = {1: legacy}
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.bot_roster = []
+
+        for _unused in range(3):
+            state.tick_once(1.0 / TICK_HZ)
+
+        snapshots = [
+            message for message in connection.messages
+            if message.get('type') == 'snapshot']
+        self.assertEqual(2, len(snapshots))
+        self.assertTrue(all(
+            'bot_manifest' in message for message in snapshots))
+
     def test_endpoint_send_clamps_server_time_within_each_round(self):
         player_connection = _Connection()
         worker_connection = _Connection()
@@ -205,7 +583,9 @@ class SimulationWorkerStateTests(unittest.TestCase):
         manifest = _manifest(start['bots'])
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID,
-            {'round_id': state.round_id, 'bots': manifest}))
+            {'round_id': state.round_id, 'bots': manifest,
+             'player_collision_profiles':
+                 _human_profiles(start['players'])}))
 
         self.assertIsNone(state.mark_battle_ready(
             player.player_id, {'round_id': state.round_id}))
@@ -222,7 +602,7 @@ class SimulationWorkerStateTests(unittest.TestCase):
         self.assertEqual([player.account_key],
                          list(state.round_participants))
 
-    def test_loading_disconnect_rebuilds_manifest_without_deadlock(self):
+    def test_loading_worker_disconnect_terminates_without_player_takeover(self):
         state = BattleState(map_name='01_karelia', team_size=1)
         worker, error = state.add_simulation_worker(
             _Connection(), ('127.0.0.1', 1000), _worker_hello())
@@ -235,24 +615,28 @@ class SimulationWorkerStateTests(unittest.TestCase):
         manifest = _manifest(start['bots'])
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID,
-            {'round_id': state.round_id, 'bots': manifest}))
+            {'round_id': state.round_id, 'bots': manifest,
+             'player_collision_profiles':
+                 _human_profiles(start['players'])}))
         self.assertIsNone(state.mark_battle_ready(
             player.player_id, {'round_id': state.round_id}))
 
         old_epoch = state.authority_epoch
-        removed, failed_over = state.remove_simulation_worker(worker)
+        removed, round_failed = state.remove_simulation_worker(worker)
 
         self.assertIs(worker, removed)
-        self.assertTrue(failed_over)
-        self.assertEqual('loading', state.phase)
-        self.assertEqual(player.player_id, state.bot_authority_id)
+        self.assertTrue(round_failed)
+        self.assertEqual('battle', state.phase)
+        self.assertIsNone(state.bot_authority_id)
         self.assertEqual(old_epoch + 1, state.authority_epoch)
         self.assertIsNone(state.bot_manifest_authority_id)
-        self.assertTrue(state.update_bot_manifest(
+        self.assertFalse(state.update_bot_manifest(
             player.player_id,
             {'round_id': state.round_id, 'bots': manifest}))
-        self.assertIsNotNone(state.activate_battle_if_ready())
-        self.assertEqual('battle', state.phase)
+        self.assertIsNone(state.activate_battle_if_ready())
+        self.assertEqual('worker_disconnected',
+                         state.battle_result['reason'])
+        self.assertFalse(state.result_receipts)
 
     def test_tick_never_delivers_player_receipts_to_worker(self):
         state = BattleState(map_name='01_karelia', team_size=1)
@@ -280,7 +664,7 @@ class SimulationWorkerStateTests(unittest.TestCase):
             message.get('type') for message in worker_connection.messages])
         self.assertIs(worker, state.simulation_worker)
 
-    def test_pending_live_refreshes_authority_after_worker_failover(self):
+    def test_worker_loss_cancels_pending_live_and_publishes_failure(self):
         state = BattleState(map_name='01_karelia', team_size=1)
         worker_connection = _Connection()
         worker, error = state.add_simulation_worker(
@@ -295,7 +679,9 @@ class SimulationWorkerStateTests(unittest.TestCase):
         manifest = _manifest(start['bots'])
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID,
-            {'round_id': state.round_id, 'bots': manifest}))
+            {'round_id': state.round_id, 'bots': manifest,
+             'player_collision_profiles':
+                 _human_profiles(start['players'])}))
         self.assertIsNone(state.mark_battle_ready(
             player.player_id, {'round_id': state.round_id}))
         self.assertIsNotNone(state.mark_battle_ready(
@@ -306,29 +692,28 @@ class SimulationWorkerStateTests(unittest.TestCase):
                              'message']['bot_authority_id'])
         old_epoch = state.authority_epoch
 
-        removed, failed_over = state.remove_simulation_worker(worker)
+        removed, round_failed = state.remove_simulation_worker(worker)
         self.assertIs(worker, removed)
-        self.assertTrue(failed_over)
+        self.assertTrue(round_failed)
         self.assertEqual(old_epoch + 1, state.authority_epoch)
         state.tick_once(1.0 / TICK_HZ)
 
         live_messages = [
             message for message in player_connection.messages
             if message.get('type') == 'battle_live']
-        self.assertEqual(1, len(live_messages))
-        self.assertEqual(player.player_id,
-                         live_messages[0]['bot_authority_id'])
+        self.assertEqual([], live_messages)
+        snapshots = [
+            message for message in player_connection.messages
+            if message.get('type') == 'snapshot']
+        self.assertTrue(snapshots)
+        self.assertIsNone(snapshots[-1]['bot_authority_id'])
         self.assertEqual(state.authority_epoch,
-                         live_messages[0]['authority_epoch'])
-        self.assertEqual(state.state_revision,
-                         live_messages[0]['state_revision'])
-        self.assertEqual(state._server_time_ms(),
-                         live_messages[0]['server_time_ms'])
-        self.assertEqual(state._timing_payload(),
-                         live_messages[0]['timing'])
-        self.assertEqual('fallback', live_messages[0]['worker_status'])
+                         snapshots[-1]['authority_epoch'])
+        self.assertEqual('failed', snapshots[-1]['worker_status'])
         self.assertEqual('worker_disconnected',
-                         live_messages[0]['worker_fallback_reason'])
+                         snapshots[-1]['worker_failure_reason'])
+        self.assertEqual('worker_disconnected',
+                         snapshots[-1]['battle_result']['reason'])
         self.assertFalse(any(
             message.get('type') == 'battle_live'
             for message in worker_connection.messages))
@@ -347,7 +732,9 @@ class SimulationWorkerStateTests(unittest.TestCase):
         manifest = _manifest(start['bots'])
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID,
-            {'round_id': state.round_id, 'bots': manifest}))
+            {'round_id': state.round_id, 'bots': manifest,
+             'player_collision_profiles':
+                 _human_profiles(start['players'])}))
         self.assertIsNone(state.mark_battle_ready(
             player.player_id, {'round_id': state.round_id}))
         self.assertIsNotNone(state.mark_battle_ready(
@@ -415,7 +802,9 @@ class SimulationWorkerStateTests(unittest.TestCase):
         manifest = _manifest(start['bots'])
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID,
-            {'round_id': state.round_id, 'bots': manifest}))
+            {'round_id': state.round_id, 'bots': manifest,
+             'player_collision_profiles':
+                 _human_profiles(start['players'])}))
         self.assertIsNone(state.mark_battle_ready(
             player.player_id, {'round_id': state.round_id}))
         self.assertIsNotNone(state.mark_battle_ready(
@@ -452,7 +841,9 @@ class SimulationWorkerStateTests(unittest.TestCase):
         manifest = _manifest(start['bots'])
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID,
-            {'round_id': state.round_id, 'bots': manifest}))
+            {'round_id': state.round_id, 'bots': manifest,
+             'player_collision_profiles':
+                 _human_profiles(start['players'])}))
         self.assertIsNone(state.mark_battle_ready(
             first.player_id, {'round_id': state.round_id}))
         self.assertIsNone(state.mark_battle_ready(
@@ -558,7 +949,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
         manifest = _manifest(worker_start['bots'])
         worker.send({
             'type': 'bot_manifest', 'round_id': self.state.round_id,
-            'bots': manifest})
+            'bots': manifest,
+            'player_collision_profiles':
+                _human_profiles(worker_start['players'])})
         _wait_until(lambda: self.state.bot_manifest_authority_id ==
                     SIMULATION_WORKER_AUTHORITY_ID)
         player.send({
@@ -570,7 +963,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             self.state.tick, int(round(PREBATTLE_SECONDS * TICK_HZ)))
         return manifest
 
-    def test_handler_worker_authority_and_disconnect_takeover(self):
+    def test_handler_worker_disconnect_never_promotes_visible_client(self):
         worker = self._connect()
         worker.send(_worker_hello())
         welcome = worker.receive_until('welcome')
@@ -627,7 +1020,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
         manifest = _manifest(worker_start['bots'])
         worker.send({
             'type': 'bot_manifest', 'round_id': self.state.round_id,
-            'bots': manifest})
+            'bots': manifest,
+            'player_collision_profiles':
+                _human_profiles(worker_start['players'])})
         _wait_until(lambda: self.state.bot_manifest_authority_id ==
                     SIMULATION_WORKER_AUTHORITY_ID)
         player.receive_until('snapshot')
@@ -645,8 +1040,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             'bots': publication})
         player.send({'type': 'ping', 'seq': 2})
         player.receive_until('pong')
-        self.assertEqual('authority',
-                         self.state.last_bot_state_reject_code)
+        # Modern visible commands are rejected by the dispatcher before
+        # they can reach, or mutate diagnostics inside, the authority path.
+        self.assertEqual('', self.state.last_bot_state_reject_code)
         revision = self.state.bot_state_revision
 
         worker.send({
@@ -664,17 +1060,17 @@ class SimulationWorkerSocketTests(unittest.TestCase):
         worker.send({'type': 'leave'})
         _wait_until(lambda: self.state.simulation_worker is None)
 
-        self.assertEqual(1, self.state.bot_authority_id)
+        self.assertIsNone(self.state.bot_authority_id)
         self.assertEqual(old_epoch + 1, self.state.authority_epoch)
         self.assertIsNone(self.state.bot_manifest_authority_id)
         self.assertEqual('worker_disconnected',
-                         self.state.worker_fallback_reason)
+                         self.state.worker_failure_reason)
         self.assertEqual([1], sorted(self.state.players))
         self.assertFalse(self.state.bot_pending_projectile_launches)
         self.assertFalse(self.state._projectile_authority_matches(
             SIMULATION_WORKER_AUTHORITY_ID,
             {'authority_epoch': old_epoch}))
-        self.assertTrue(self.state._projectile_authority_matches(
+        self.assertFalse(self.state._projectile_authority_matches(
             1, {'authority_epoch': self.state.authority_epoch}))
 
         replacement = self._connect()
@@ -683,30 +1079,34 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             'battle_in_progress',
             replacement.receive_until('error')['code'])
 
-        player.receive_until('roster')
+        roster = player.receive_until('roster')
+        self.assertIsNone(roster['bot_authority_id'])
+        self.assertEqual('failed', roster['worker_status'])
+        self.assertEqual('worker_disconnected',
+                         roster['worker_failure_reason'])
         player.send({
             'type': 'bot_manifest', 'round_id': self.state.round_id,
             'bots': manifest})
         player.send({'type': 'ping', 'seq': 4})
         player.receive_until('pong')
-        self.assertEqual(1, self.state.bot_manifest_authority_id)
+        self.assertIsNone(self.state.bot_manifest_authority_id)
 
-        takeover_publication = _bot_publication(manifest, x_offset=2.0)
+        rejected_publication = _bot_publication(manifest, x_offset=2.0)
         player.send({
             'type': 'bot_state', 'round_id': self.state.round_id,
-            'bots': takeover_publication})
+            'bots': rejected_publication})
         player.send({'type': 'ping', 'seq': 5})
         player.receive_until('pong')
-        self.assertEqual(2.0 + manifest[0]['x'],
-                         self.state.bot_states[manifest[0]['id']]['x'])
+        self.assertNotEqual(2.0 + manifest[0]['x'],
+                            self.state.bot_states[manifest[0]['id']]['x'])
 
-    def test_socket_failover_refreshes_queued_live_barrier(self):
+    def test_socket_worker_loss_cancels_queued_live_barrier(self):
         worker = self._connect()
         worker.send(_worker_hello())
         worker.receive_until('welcome')
         player = self._connect()
         player.send(_player_hello())
-        player_welcome = player.receive_until('welcome')
+        player.receive_until('welcome')
 
         player.send({
             'type': 'start_battle', 'round_id': self.state.round_id})
@@ -715,7 +1115,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
         manifest = _manifest(worker_start['bots'])
         worker.send({
             'type': 'bot_manifest', 'round_id': self.state.round_id,
-            'bots': manifest})
+            'bots': manifest,
+            'player_collision_profiles':
+                _human_profiles(worker_start['players'])})
         _wait_until(lambda: self.state.bot_manifest_authority_id ==
                     SIMULATION_WORKER_AUTHORITY_ID)
         player.send({
@@ -728,21 +1130,20 @@ class SimulationWorkerSocketTests(unittest.TestCase):
         worker.send({'type': 'leave'})
         _wait_until(lambda: self.state.simulation_worker is None)
         roster = player.receive_until('roster')
-        self.assertEqual(player_welcome['player_id'],
-                         roster['bot_authority_id'])
+        self.assertIsNone(roster['bot_authority_id'])
         self.assertEqual(old_epoch + 1, roster['authority_epoch'])
+        self.assertEqual('failed', roster['worker_status'])
 
         self.state.tick_once(1.0 / TICK_HZ)
-        live = player.receive_until('battle_live')
-
-        self.assertEqual(roster['bot_authority_id'],
-                         live['bot_authority_id'])
+        events = player.receive_until('events')
         self.assertEqual(roster['authority_epoch'],
-                         live['authority_epoch'])
-        self.assertGreaterEqual(live['state_revision'],
-                                roster['state_revision'])
+                         events['authority_epoch'])
+        self.assertTrue(any(
+            event.get('kind') == 'battle_result' and
+            event.get('reason') == 'worker_disconnected'
+            for event in events['events']))
 
-    def test_silent_open_worker_times_out_to_player_authority(self):
+    def test_silent_open_worker_timeout_terminates_round(self):
         with mock.patch.object(
                 server_module,
                 'SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS', 0.1):
@@ -774,13 +1175,13 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 timeout=2.0)
 
             roster = player.receive_until('roster')
-            self.assertEqual(player_welcome['player_id'],
-                             roster['bot_authority_id'])
-            self.assertEqual(player_welcome['player_id'],
-                             self.state.bot_authority_id)
+            self.assertIsNone(roster['bot_authority_id'])
+            self.assertIsNone(self.state.bot_authority_id)
             self.assertEqual(old_epoch + 1, self.state.authority_epoch)
             self.assertEqual('worker_disconnected',
-                             self.state.worker_fallback_reason)
+                             self.state.worker_failure_reason)
+            self.assertEqual('worker_disconnected',
+                             self.state.battle_result['reason'])
             self.assertNotEqual(-1, worker.socket.fileno())
 
     def test_loading_worker_ping_refreshes_liveness(self):
@@ -919,8 +1320,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
 
             _wait_until(
                 lambda: self.state.simulation_worker is None, timeout=2.0)
-            self.assertEqual(player_welcome['player_id'],
-                             self.state.bot_authority_id)
+            self.assertIsNone(self.state.bot_authority_id)
+            self.assertEqual('worker_disconnected',
+                             self.state.battle_result['reason'])
 
     def test_duplicate_and_stale_progress_do_not_refresh_liveness(self):
         with mock.patch.object(
@@ -931,7 +1333,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             worker.receive_until('welcome')
             player = self._connect()
             player.send(_player_hello())
-            player_welcome = player.receive_until('welcome')
+            player.receive_until('welcome')
             self._enter_worker_countdown(worker, player)
             epoch = self.state.authority_epoch
             endpoint = self.state.simulation_worker
@@ -973,8 +1375,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             worker.receive_until('pong')
             _wait_until(
                 lambda: self.state.simulation_worker is None, timeout=2.0)
-            self.assertEqual(player_welcome['player_id'],
-                             self.state.bot_authority_id)
+            self.assertIsNone(self.state.bot_authority_id)
+            self.assertEqual('worker_disconnected',
+                             self.state.battle_result['reason'])
 
     def test_player_socket_has_no_worker_liveness_timeout(self):
         with mock.patch.object(
@@ -989,22 +1392,25 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 'map_pool', 'host_player_id', 'phase', 'round_id',
                 'state_revision', 'spawn', 'bot_authority_id', 'team_size',
                 'authority_epoch', 'capabilities', 'server_capabilities',
-                'team_sizes',
+                'team_sizes', 'authority_status',
+                'authority_fallback_reason', 'worker_status',
+                'vehicle_compact_descr',
             }, set(welcome))
             roster = player.receive_until('roster')
-            self.assertNotIn('worker_status', roster)
-            self.assertNotIn('worker_fallback_reason', roster)
+            self.assertEqual('missing', roster['worker_status'])
+            self.assertNotIn('worker_failure_reason', roster)
             player.send({
                 'type': 'start_battle',
                 'round_id': self.state.round_id,
             })
-            player.receive_until('battle_start')
+            denied = player.receive_until('start_denied')
+            self.assertEqual('simulation_worker_required', denied['code'])
 
             time.sleep(0.65)
 
             self.assertIn(welcome['player_id'], self.state.players)
             self.assertTrue(self.state.players[welcome['player_id']].connected)
-            self.assertEqual('loading', self.state.phase)
+            self.assertEqual('waiting', self.state.phase)
 
 
 if __name__ == '__main__':

@@ -18,12 +18,21 @@ PROJECTILE_WRECK_HIT_CAPABILITY = 'projectile_wreck_hit_v1'
 RANDOM_MAP_CAPABILITY = 'random_map_v1'
 TEAM_SELECTION_CAPABILITY = 'team_selection_v1'
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
+LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
+RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v1'
+HUMAN_RAM_TIMELINE_CAPABILITY = 'human_ram_timeline_v1'
+PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v1'
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
     PROJECTILE_LEDGER_CAPABILITY,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    LEAN_SNAPSHOT_MANIFEST_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY,
+    HUMAN_RAM_TIMELINE_CAPABILITY,
+    PLAYER_FIRE_INTENT_CAPABILITY,
 )
 WORKER_AUTHORITY_ID = -1
+SERVER_AUTHORITY_ID = 0
 POLL_INTERVAL = 1.0 / 60.0
 PING_INTERVAL = 1.0
 MAX_MESSAGE_BYTES = 256 * 1024
@@ -53,6 +62,7 @@ PROJECTILE_SHELL_KINDS = frozenset((
     'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
+MAX_VEHICLE_COMPACT_BYTES = 64 * 1024
 RESULT_INTERACTION_LIMITS = {
     'spotted': (0, 1),
     'death_reason': (-1, 10),
@@ -87,6 +97,8 @@ _BOT_STATE_WIRE_FIELDS = (
 STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
     'start_denied', 'team_denied', 'events', 'error'))
+ORDERED_RECEIVE_TYPES = STATE_BARRIER_TYPES | frozenset((
+    'battle_receipt', 'fire_intent', 'fire_intent_result'))
 SERVER_STATE_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live', 'start_denied',
     'team_denied', 'snapshot', 'events', 'bot_observation',
@@ -404,6 +416,34 @@ def _projectile_float_range(value, minimum, maximum):
     return parsed
 
 
+def _valid_visible_authority_id(value):
+    """Accept infrastructure authorities, never a visible player id."""
+    return _exact_int(value) in (WORKER_AUTHORITY_ID, SERVER_AUTHORITY_ID)
+
+
+def _valid_visible_authority_message(message):
+    """Allow no authority while waiting or after an explicit failure."""
+    if not isinstance(message, dict):
+        return False
+    if _valid_visible_authority_id(message.get('bot_authority_id')):
+        return True
+    if message.get('bot_authority_id') is not None:
+        return False
+    if _safe_text(message.get('phase'), '') == 'waiting':
+        # A room may legitimately wait for its worker or server authority.
+        # Visible clients cannot become authority, so this cannot enable a
+        # player-side fallback.
+        return True
+    worker_status = _safe_text(message.get('worker_status'), '')
+    worker_reason = _safe_text(message.get('worker_failure_reason'), '')
+    if worker_status == 'failed' and worker_reason:
+        return True
+    return bool(
+        _safe_text(message.get('phase'), '') == 'waiting' and
+        _safe_text(message.get('authority_status'), '') == 'failed' and
+        _safe_text(message.get('authority_fallback_reason'), ''))
+
+
 def _strict_projectile_source_shot(value):
     """Validate the immutable mounted-gun law carried by one launch."""
     if not isinstance(value, dict) or set(value) != {
@@ -681,11 +721,16 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         'authority_epoch'))
     seen = set()
     for projectile in value:
-        if not isinstance(projectile, dict) or set(projectile) != expected:
+        if not isinstance(projectile, dict):
             return False
         projectile_id = _strict_projectile_id(
             projectile.get('projectile_id'))
         shooter_kind = projectile.get('shooter_kind')
+        projectile_fields = set(projectile)
+        player_intent_fields = {'fire_intent_seq', 'fire_input_seq'}
+        if (projectile_fields != expected and
+                projectile_fields != expected | player_intent_fields):
+            return False
         source_vehicle = projectile.get('source_vehicle')
         source_shot = _strict_projectile_source_shot(
             projectile.get('source_shot'))
@@ -725,6 +770,13 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         is_he = projectile.get('is_he')
         epoch = _projectile_int_range(
             projectile.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+        fire_intent_seq = _projectile_int_range(
+            projectile.get('fire_intent_seq'), 1, MAX_PROJECTILE_ID)
+        fire_input_seq = _projectile_int_range(
+            projectile.get('fire_input_seq'), 1, MAX_PROJECTILE_ID)
+        if ((shooter_kind == 'player') !=
+                player_intent_fields.issubset(projectile_fields)):
+            return False
         if (projectile_id is None or projectile_id in seen or
                 shooter_kind not in ('player', 'bot') or
                 not isinstance(source_vehicle, string_types) or
@@ -741,7 +793,9 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
                 launch_time > server_time_ms or checked_through is None or
                 checked_through > max_time_ms or checked_distance is None or
                 checked_distance > max_distance + 0.1 or
-                piercing_loss is None or epoch != authority_epoch):
+                piercing_loss is None or epoch != authority_epoch or
+                (shooter_kind == 'player' and
+                 (fire_intent_seq is None or fire_input_seq is None))):
             return False
         seen.add(projectile_id)
     return True
@@ -895,6 +949,22 @@ def _canonical_wire_outfits(value):
     return result
 
 
+def _canonical_vehicle_compact_descr(value):
+    """Return one canonical base64 mounted vehicle descriptor."""
+    if not isinstance(value, string_types) or not value:
+        return None
+    try:
+        ascii_value = value.encode('ascii')
+        raw = base64.b64decode(ascii_value)
+        canonical = base64.b64encode(raw).decode('ascii')
+    except Exception:
+        return None
+    if (canonical != value or not raw or
+            len(raw) > MAX_VEHICLE_COMPACT_BYTES):
+        return None
+    return canonical
+
+
 def _load_bigworld():
     import BigWorld
     return BigWorld
@@ -904,7 +974,8 @@ class LANClient(object):
 
     def __init__(self, host, port, name, vehicle, max_health=100,
                  on_event=None, bigworld=None, account_key=None,
-                 outfits=None, requested_team=0):
+                 outfits=None, requested_team=0,
+                 vehicle_compact_descr=None):
         self.host = _safe_text(host, '127.0.0.1', 255)
         self.port = int(port or 28782)
         self.name = _safe_text(name, 'Player')
@@ -913,6 +984,8 @@ class LANClient(object):
         self.account_key = _safe_text(
             account_key, uuid.uuid4().hex, 64)
         self.outfits = _canonical_wire_outfits(outfits or {}) or {}
+        self.vehicle_compact_descr = (
+            _canonical_vehicle_compact_descr(vehicle_compact_descr) or '')
         self.requested_team = _team_choice(requested_team)
         self._published_player_outfits = {}
         self.on_event = on_event
@@ -944,6 +1017,7 @@ class LANClient(object):
         self.last_snapshot = None
         self.last_error = None
         self.rtt_ms = None
+        self.minimum_rtt_ms = None
         self.combat_phase = 'loading'
         self.combat_deadline = None
         self.combat_end_deadline = None
@@ -967,6 +1041,9 @@ class LANClient(object):
         self._last_ping = 0.0
         self._ping_seq = 0
         self._fire_seq = 0
+        self._fire_intent_seq = 0
+        self._input_seq = 0
+        self._input_seq_round = None
         self._projectile_lock = threading.Lock()
 
     def start(self):
@@ -988,6 +1065,10 @@ class LANClient(object):
             self.server_capabilities = []
             self.authority_epoch = None
             self.server_time_ms = None
+            self.rtt_ms = None
+            self.minimum_rtt_ms = None
+            self._input_seq = 0
+            self._input_seq_round = None
         with self._pending_lock:
             self._pending = []
             self._recv_buffer = u''
@@ -1018,6 +1099,7 @@ class LANClient(object):
             'max_health': self.max_health,
             'account_key': self.account_key,
             'outfits': dict(self.outfits),
+            'vehicle_compact_descr': self.vehicle_compact_descr,
         }
         if self.requested_team in (1, 2):
             payload['requested_team'] = self.requested_team
@@ -1118,7 +1200,8 @@ class LANClient(object):
             message['map'] = map_name
         return self._send(message)
 
-    def select_vehicle(self, vehicle, max_health, outfits=None):
+    def select_vehicle(self, vehicle, max_health, outfits=None,
+                       vehicle_compact_descr=None):
         """Publish one waiting-room garage change for the next round."""
         if not self.ready or self.phase != 'waiting':
             return False
@@ -1129,16 +1212,24 @@ class LANClient(object):
         publishes_outfits = outfits is not None
         outfits = (_canonical_wire_outfits(outfits)
                    if publishes_outfits else self.outfits)
-        if outfits is None:
+        compact = _canonical_vehicle_compact_descr(
+            self.vehicle_compact_descr if vehicle_compact_descr is None
+            else vehicle_compact_descr)
+        if outfits is None or compact is None:
             return False
         if (vehicle == self.vehicle and max_health == self.max_health and
-                outfits == self.outfits):
+                outfits == self.outfits and
+                compact == self.vehicle_compact_descr):
             return False
         message = {'type': 'select_vehicle', 'vehicle': vehicle,
-                   'max_health': max_health}
+                   'max_health': max_health,
+                   'vehicle_compact_descr': compact}
         if publishes_outfits:
             message['outfits'] = outfits
-        return self._send(message)
+        if not self._send(message):
+            return False
+        self.vehicle_compact_descr = compact
+        return True
 
     def select_team(self, team):
         """Request a waiting-room team; the server owns the capacity check."""
@@ -1170,6 +1261,10 @@ class LANClient(object):
             outfits = _canonical_wire_outfits(entry.get('outfits'))
             if outfits is not None:
                 self.outfits = outfits
+            compact = _canonical_vehicle_compact_descr(
+                entry.get('vehicle_compact_descr'))
+            if compact is not None:
+                self.vehicle_compact_descr = compact
             return
 
     def _remember_player_outfits(self, players):
@@ -1206,15 +1301,17 @@ class LANClient(object):
     def send_input(self, forward, turn, aim_yaw=0.0, gun_pitch=0.0,
                    position=None, yaw=None, fire_seq=0,
                    speed=None,
-                   ram_contact=None,
-                   reported_health=None, reported_critical=None,
-                   reported_reason=None, reported_display_health=None,
-                   reported_attacker=None, reported_attacker_bot=None,
-                   reported_critical_base_revision=None,
-                   reported_critical_seq=None, siege_enabled=None,
+                   shell_index=None,
+                   pose_time_us=None,
+                   ram_contacts=None,
+                   siege_enabled=None,
                    pitch=None, roll=None):
         if not self.ready or self.phase != 'battle':
             return False
+        if self._input_seq_round != self.round_id:
+            self._input_seq_round = self.round_id
+            self._input_seq = 0
+        next_input_seq = self._input_seq + 1
         message = {
             'type': 'input',
             'round_id': self.round_id,
@@ -1224,6 +1321,11 @@ class LANClient(object):
             'gun_pitch': _finite_float(gun_pitch),
             'fire_seq': max(0, int(fire_seq or 0)),
         }
+        timeline_enabled = bool(
+            HUMAN_RAM_TIMELINE_CAPABILITY in self.capabilities and
+            HUMAN_RAM_TIMELINE_CAPABILITY in self.server_capabilities)
+        if timeline_enabled:
+            message['input_seq'] = next_input_seq
         if position is not None and len(position) >= 3:
             message['x'] = _finite_float(position[0])
             message['y'] = _finite_float(position[1])
@@ -1235,40 +1337,32 @@ class LANClient(object):
             if roll is not None:
                 message['roll'] = max(
                     -0.61, min(0.61, _finite_float(roll)))
+            if timeline_enabled and pose_time_us is not None:
+                parsed_pose_time = _exact_int(pose_time_us)
+                if (parsed_pose_time is None or
+                        not 0 <= parsed_pose_time <= MAX_MOTION_TIME_US):
+                    return False
+                message['pose_time_us'] = parsed_pose_time
         if speed is not None:
             message['speed'] = max(
                 -200.0, min(200.0, _finite_float(speed)))
-        if isinstance(ram_contact, dict):
-            message['ram_contact'] = dict(ram_contact)
-        if reported_health is not None:
-            message['reported_health'] = max(0, int(reported_health))
-        if isinstance(reported_critical, dict):
-            message['reported_critical'] = reported_critical
-            if (reported_critical_base_revision is None or
-                    reported_critical_seq is None):
-                raise ValueError(
-                    '#1513 critical report requires revision and sequence')
-            message['reported_critical_base_revision'] = max(
-                0, int(reported_critical_base_revision))
-            message['reported_critical_seq'] = max(
-                1, int(reported_critical_seq))
-        if reported_reason is not None:
-            message['reported_reason'] = max(
-                0, min(int(reported_reason or 0), 255))
-        if reported_display_health is not None:
-            message['reported_display_health'] = max(
-                0, int(reported_display_health or 0))
-        if reported_attacker is not None:
-            message['reported_attacker'] = max(
-                0, int(reported_attacker or 0))
-        if reported_attacker_bot is not None:
-            message['reported_attacker_bot'] = max(
-                0, int(reported_attacker_bot or 0))
+        if shell_index is not None:
+            parsed_shell = _projectile_int_range(shell_index, 0, 9)
+            if parsed_shell is None:
+                return False
+            message['shell_index'] = parsed_shell
+        if isinstance(ram_contacts, list):
+            message['ram_contacts'] = [
+                dict(value) for value in ram_contacts[:16]
+                if isinstance(value, dict)]
         if siege_enabled is not None:
             if not isinstance(siege_enabled, bool):
                 raise ValueError('siege_enabled must be BOOL')
             message['siege_enabled'] = siege_enabled
-        return self._send(message)
+        if not self._send(message):
+            return False
+        self._input_seq = next_input_seq
+        return True
 
     def send_battle_ready(self, bases=None):
         """Join the server-owned #1513 load barrier exactly once per round."""
@@ -1299,27 +1393,57 @@ class LANClient(object):
                   max_distance=None, max_time_ms=None, is_he=False,
                   splash_radius=0.0, penetration_factor=1.0,
                   source_shot=None):
-        """Compatibility wrapper for a modern player projectile launch.
+        """Compatibility wrapper that submits only a player trigger intent."""
+        return self.send_fire_intent(
+            shell_index, 0.0 if aim_yaw is None else aim_yaw,
+            0.0 if gun_pitch is None else gun_pitch)
 
-        A #1513 client must never fall back to the old instantaneous ``input``
-        fire edge.  Callers therefore have to provide the frozen launch
-        physics; legacy positional aim arguments remain only for call-site
-        compatibility and are not put on the wire.
-        """
-        if (position is None or velocity is None or gravity is None or
-                max_distance is None or max_time_ms is None):
+    def send_fire_intent(self, shell_index, aim_yaw, gun_pitch):
+        """Queue one ordered trigger input without damage or ballistics."""
+        if (not self.ready or self.phase != 'battle' or
+                self.is_bot_authority()):
             return None
-        return self.send_projectile_launch(
-            'player', self.player_id, None, shell_index, position, velocity,
-            gravity, max_distance, max_time_ms, is_he, splash_radius,
-            penetration_factor=penetration_factor,
-            source_shot=source_shot)
+        if (self._input_seq_round != self.round_id or
+                self._input_seq <= 0):
+            return None
+        parsed_shell = _projectile_int_range(shell_index, 0, 9)
+        if parsed_shell is None:
+            return None
+        with self._projectile_lock:
+            sequence = self._fire_intent_seq + 1
+            message = {
+                'type': 'fire_intent', 'round_id': self.round_id,
+                'intent_seq': sequence, 'shell_index': parsed_shell,
+                'input_seq': self._input_seq,
+            }
+            if not self._send(message):
+                return None
+            self._fire_intent_seq = sequence
+            return sequence
+
+    def send_fire_intent_result(self, player_id, intent_seq, reason):
+        """Publish one worker-owned terminal rejection."""
+        parsed_player = _projectile_int_range(
+            player_id, 1, MAX_PROJECTILE_ID)
+        parsed_sequence = _projectile_int_range(
+            intent_seq, 1, MAX_PROJECTILE_ID)
+        if (not self.is_bot_authority() or parsed_player is None or
+                parsed_sequence is None or self.round_id is None or
+                self.authority_epoch is None):
+            return False
+        return self._send({
+            'type': 'fire_intent_result', 'round_id': self.round_id,
+            'authority_epoch': self.authority_epoch,
+            'player_id': parsed_player, 'intent_seq': parsed_sequence,
+            'accepted': False,
+            'reason': _safe_text(reason, 'rejected', 64),
+        })
 
     def send_projectile_launch(
             self, shooter_kind, shooter_id, shot_seq, shell_index, origin,
             velocity, gravity, max_distance, max_time_ms, is_he,
             splash_radius, authority_epoch=None, penetration_factor=1.0,
-            source_shot=None):
+            source_shot=None, fire_intent_seq=None, fire_input_seq=None):
         """Enqueue one immutable projectile launch and return its shot seq."""
         if not self.ready or self.phase != 'battle':
             return None
@@ -1354,8 +1478,20 @@ class LANClient(object):
             return None
 
         parsed_epoch = None
+        parsed_intent_seq = None
+        parsed_input_seq = None
         if shooter_kind == 'player':
-            if parsed_shooter_id != _exact_int(self.player_id):
+            parsed_epoch = _projectile_int_range(
+                authority_epoch, 0, MAX_PROJECTILE_ID)
+            parsed_intent_seq = _projectile_int_range(
+                fire_intent_seq, 1, MAX_PROJECTILE_ID)
+            parsed_input_seq = _projectile_int_range(
+                fire_input_seq, 1, MAX_PROJECTILE_ID)
+            if (not self.is_bot_authority() or
+                    _exact_int(self.player_id) != WORKER_AUTHORITY_ID or
+                    parsed_epoch is None or parsed_intent_seq is None or
+                    parsed_input_seq is None or
+                    parsed_epoch != _exact_int(self.authority_epoch)):
                 return None
         else:
             parsed_epoch = _projectile_int_range(
@@ -1365,15 +1501,11 @@ class LANClient(object):
                 return None
 
         with self._projectile_lock:
-            previous = getattr(self, '_fire_seq', 0)
             if shooter_kind == 'player':
-                expected = previous + 1
-                if shot_seq is not None:
-                    supplied = _projectile_int_range(
-                        shot_seq, 1, MAX_PROJECTILE_ID)
-                    if supplied != expected:
-                        return None
-                parsed_seq = expected
+                parsed_seq = _projectile_int_range(
+                    shot_seq, 1, MAX_PROJECTILE_ID)
+                if parsed_seq is None:
+                    return None
             else:
                 parsed_seq = _projectile_int_range(
                     shot_seq, 1, MAX_PROJECTILE_ID)
@@ -1399,10 +1531,11 @@ class LANClient(object):
             }
             if parsed_epoch is not None:
                 message['authority_epoch'] = parsed_epoch
+            if parsed_intent_seq is not None:
+                message['fire_intent_seq'] = parsed_intent_seq
+                message['fire_input_seq'] = parsed_input_seq
             if not self._send(message):
                 return None
-            if shooter_kind == 'player':
-                self._fire_seq = parsed_seq
             return parsed_seq
 
     def send_projectile_progress(self, authority_epoch, cursors):
@@ -1589,28 +1722,13 @@ class LANClient(object):
                  shell_index=0, impact_position=None, critical=None,
                  splash=False, critical_target_base_revision=None,
                  critical_target_ack_seq=None, hull_damage=None):
-        if not self.ready or self.phase != 'battle':
-            return False
-        message = {'type': 'hit_report', 'round_id': self.round_id,
-                   'target': int(target_id),
-                   'shot_seq': int(shot_seq),
-                   'damage': max(0, int(damage or 0)),
-                   'shot_result': max(0, min(int(shot_result or 0), 2)),
-                   'shell_index': max(0, min(int(shell_index or 0), 9)),
-                   'splash': bool(splash)}
-        if impact_position is not None and len(impact_position) >= 3:
-            message['x'] = _finite_float(impact_position[0])
-            message['y'] = _finite_float(impact_position[1])
-            message['z'] = _finite_float(impact_position[2])
-        _attach_critical_proposal(
-            message, critical, critical_target_base_revision,
-            critical_target_ack_seq, hull_damage)
-        return self._send(message)
+        """Visible #1513 clients never publish hit verdicts."""
+        return False
 
     def send_destructible(self, event):
-        """Report one map-object result resolved by the trusted client."""
+        """Publish one worker-resolved map destruction."""
         if (not self.ready or self.phase != 'battle' or
-                not isinstance(event, dict)):
+                not self.is_bot_authority() or not isinstance(event, dict)):
             return False
         kind = _safe_text(event.get('destructible_kind'), '', 16)
         if kind not in ('tree', 'column', 'fragile', 'module'):
@@ -1640,13 +1758,8 @@ class LANClient(object):
         return self._send(message)
 
     def is_bot_authority(self):
-        """Whether this connection currently owns authoritative bot messages."""
-        if not self.ready or self.phase not in ('loading', 'battle'):
-            return False
-        try:
-            return int(self.player_id) == int(self.bot_authority_id)
-        except (TypeError, ValueError):
-            return False
+        """Visible #1513 clients never own authoritative bot messages."""
+        return False
 
     def has_projectile_ledger(self):
         return PROJECTILE_LEDGER_CAPABILITY in self.capabilities
@@ -1665,12 +1778,16 @@ class LANClient(object):
     def has_team_selection(self):
         return TEAM_SELECTION_CAPABILITY in self.server_capabilities
 
-    def send_bot_manifest(self, bots):
+    def send_bot_manifest(self, bots, player_collision_profiles=None):
         if not self.is_bot_authority():
             return False
-        return self._send({'type': 'bot_manifest',
-                           'round_id': self.round_id,
-                           'bots': list(bots or ())[:30]})
+        message = {'type': 'bot_manifest',
+                   'round_id': self.round_id,
+                   'bots': list(bots or ())[:30]}
+        if player_collision_profiles is not None:
+            message['player_collision_profiles'] = list(
+                player_collision_profiles or ())[:64]
+        return self._send(message)
 
     def send_bot_state(self, bots, sample_time_us=None):
         if not self.is_bot_authority():
@@ -1717,12 +1834,8 @@ class LANClient(object):
                            'affordances': list(affordances or ())[:16]})
 
     def send_spotted_report(self, targets):
-        """Report this player's own spotted set, for assist accounting only."""
-        if not self.ready:
-            return False
-        return self._send({'type': 'spotted_report',
-                           'round_id': self.round_id,
-                           'targets': list(targets or ())[:64]})
+        """Visible spotting is presentation-only until worker validation."""
+        return False
 
     def send_descriptor_catalog(self, vehicles):
         if not self.ready:
@@ -1757,7 +1870,8 @@ class LANClient(object):
                      impact_position=None, critical=None, splash=False,
                      critical_target_base_revision=None,
                      critical_target_ack_seq=None, hull_damage=None):
-        if not self.ready or self.phase != 'battle':
+        if (not self.ready or self.phase != 'battle' or
+                not self.is_bot_authority()):
             return False
         message = {'type': 'bot_hit_report', 'round_id': self.round_id,
                    'target': int(target_id),
@@ -2009,10 +2123,11 @@ class LANClient(object):
                 if removable_index is None:
                     removable_index = next((
                         index for index, value in enumerate(self._pending)
-                        if value.get('type') not in STATE_BARRIER_TYPES), None)
+                        if value.get('type') not in ORDERED_RECEIVE_TYPES),
+                        None)
                 if removable_index is not None:
                     del self._pending[removable_index]
-                elif message.get('type') not in STATE_BARRIER_TYPES:
+                elif message.get('type') not in ORDERED_RECEIVE_TYPES:
                     return
                 else:
                     raise RuntimeError(
@@ -2376,10 +2491,19 @@ class LANClient(object):
                 message.get('server_capabilities', []))
             if (capabilities is None or
                     PROJECTILE_LEDGER_CAPABILITY not in capabilities or
+                    RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
+                    HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
+                    PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                     server_capabilities is None or
                     DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
+                    server_capabilities or
+                    RAM_CONTACT_LEDGER_CAPABILITY not in
+                    server_capabilities or
+                    HUMAN_RAM_TIMELINE_CAPABILITY not in
+                    server_capabilities or
+                    PLAYER_FIRE_INTENT_CAPABILITY not in
                     server_capabilities):
-                self.last_error = 'projectile ledger capability mismatch'
+                self.last_error = 'required LAN capability mismatch'
                 self.stop()
                 return
             player_id = _exact_int(message.get('player_id'))
@@ -2399,6 +2523,8 @@ class LANClient(object):
             map_name = _safe_text(message.get('map'), '')
             spawn = message.get('spawn')
             outfits = _canonical_wire_outfits(message.get('outfits'))
+            vehicle_compact_descr = _canonical_vehicle_compact_descr(
+                message.get('vehicle_compact_descr'))
             team_sizes = _team_sizes(
                 message.get('team_sizes'), message.get('team_size'),
                 self.team_sizes)
@@ -2410,6 +2536,7 @@ class LANClient(object):
                     authority_epoch is None or
                     ('server_time_ms' in message and
                      welcome_server_time is None) or
+                    not _valid_visible_authority_message(message) or
                     phase != 'waiting' or not map_name or outfits is None or
                     team_sizes is None or
                     not isinstance(spawn, dict) or
@@ -2431,6 +2558,8 @@ class LANClient(object):
             self.slot = slot
             self.max_health = max_health
             self.outfits = outfits
+            if vehicle_compact_descr is not None:
+                self.vehicle_compact_descr = vehicle_compact_descr
             self._published_player_outfits[player_id] = dict(outfits)
             self.map_name = map_name
             self.map_pool = self._map_names(message.get('map_pool'))
@@ -2494,6 +2623,7 @@ class LANClient(object):
                     not player_siege_contract or
                     team_sizes is None or
                     host_player_id not in player_ids or
+                    not _valid_visible_authority_message(message) or
                     (ledger_required and authority_epoch is None) or
                     (ledger_required and round_id == self.round_id and
                      self.authority_epoch is not None and
@@ -2515,6 +2645,7 @@ class LANClient(object):
             if round_id != self.round_id:
                 self.last_snapshot = None
                 self._fire_seq = 0
+                self._fire_intent_seq = 0
                 self._battle_start_round_id = None
                 self._battle_live_round_id = None
                 self._combat_timing_round_id = None
@@ -2606,6 +2737,8 @@ class LANClient(object):
                     team_sizes is None or
                     self.player_id not in local_ids or
                     host_player_id not in local_ids or
+                    not _valid_visible_authority_id(
+                        message.get('bot_authority_id')) or
                     (ledger_required and authority_epoch is None) or
                     (ledger_required and round_id == self.round_id and
                      self.authority_epoch is not None and
@@ -2618,6 +2751,7 @@ class LANClient(object):
             if round_id != self.round_id:
                 self.last_snapshot = None
                 self._fire_seq = 0
+                self._fire_intent_seq = 0
                 self._battle_start_round_id = None
                 self._battle_live_round_id = None
                 self._combat_timing_round_id = None
@@ -2653,6 +2787,8 @@ class LANClient(object):
             if (round_id is None or round_id != self.round_id or
                     self.phase not in ('loading', 'battle') or
                     state_revision is None or state_revision < 0 or
+                    not _valid_visible_authority_id(
+                        message.get('bot_authority_id')) or
                     (self.has_projectile_ledger() and
                      authority_epoch is None) or
                     (self.has_projectile_ledger() and
@@ -2805,6 +2941,16 @@ class LANClient(object):
                  authority_epoch >= self.authority_epoch) and
                 _valid_active_projectiles(
                     projectiles, authority_epoch, server_time_ms)))
+            lean_manifest_valid = bool(
+                'bot_manifest' not in message and
+                LEAN_SNAPSHOT_MANIFEST_CAPABILITY in
+                self.server_capabilities and
+                previous_snapshot is not None and
+                isinstance(previous_snapshot.get('bot_manifest'), list) and
+                message.get('bot_authority_id') ==
+                previous_snapshot.get('bot_authority_id') and
+                message.get('authority_epoch') ==
+                previous_snapshot.get('authority_epoch'))
             invalid_reasons = []
             if server_tick is None or server_tick < 0:
                 invalid_reasons.append('server_tick')
@@ -2817,6 +2963,8 @@ class LANClient(object):
                 invalid_reasons.append('motion_timing')
             if not valid_projectiles:
                 invalid_reasons.append('projectiles')
+            if not _valid_visible_authority_message(message):
+                invalid_reasons.append('bot_authority')
             if players is None:
                 invalid_reasons.append('players')
             if not player_outfits_valid:
@@ -2831,6 +2979,9 @@ class LANClient(object):
                 invalid_reasons.append('bot_combat')
             if 'bot_manifest' in message and manifest is None:
                 invalid_reasons.append('bot_manifest')
+            if ('bot_manifest' not in message and
+                    not lean_manifest_valid):
+                invalid_reasons.append('bot_manifest_missing')
             if ('bot_orders' in message and
                     (orders is None or order_revision is None or
                      order_revision < 0)):
@@ -2885,6 +3036,12 @@ class LANClient(object):
             if players != message.get('players'):
                 message = dict(message)
                 message['players'] = players
+            if ('bot_manifest' not in message and
+                    lean_manifest_valid):
+                message = dict(message)
+                message['bot_manifest'] = [
+                    dict(value)
+                    for value in previous_snapshot.get('bot_manifest') or ()]
             self.last_snapshot = message
             if server_time_ms is not None:
                 self.server_time_ms = server_time_ms
@@ -2921,13 +3078,14 @@ class LANClient(object):
                 event_authority_epoch = _projectile_int_range(
                     event.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
                 authority_id = event.get('player_id')
-                if authority_id is not None:
-                    parsed_authority_id = _exact_int(authority_id)
-                    authority_id = (
-                        parsed_authority_id
-                        if parsed_authority_id == WORKER_AUTHORITY_ID else
-                        _projectile_int_range(
-                            authority_id, 1, MAX_PROJECTILE_ID))
+                if not (_valid_visible_authority_id(authority_id) or
+                        (authority_id is None and
+                         _valid_visible_authority_message(message))):
+                    self.last_error = 'invalid bot authority event'
+                    self.stop()
+                    return
+                authority_id = (_exact_int(authority_id)
+                                if authority_id is not None else None)
                 if (event_authority_epoch is None or
                         (self.authority_epoch is not None and
                          event_authority_epoch < self.authority_epoch) or
@@ -2977,6 +3135,9 @@ class LANClient(object):
                     self.rtt_ms = sample
                 else:
                     self.rtt_ms = self.rtt_ms * 0.75 + sample * 0.25
+                if (self.minimum_rtt_ms is None or
+                        sample < self.minimum_rtt_ms):
+                    self.minimum_rtt_ms = sample
         elif kind == 'error':
             error_message = _safe_text(
                 message.get('message'), message.get('code') or 'server error')

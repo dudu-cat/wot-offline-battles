@@ -119,6 +119,21 @@ def _selected_vehicle_outfits():
     return result
 
 
+def _selected_vehicle_compact_descr():
+    """Return the selected mounted vehicle descriptor as canonical base64."""
+    from CurrentVehicle import g_currentVehicle
+
+    item = g_currentVehicle.item
+    descriptor = None if item is None else item.descriptor
+    maker = getattr(descriptor, 'makeCompactDescr', None)
+    compact = maker() if callable(maker) else None
+    if not isinstance(compact, bytes) or not compact:
+        raise ValueError('selected vehicle compact descriptor is unavailable')
+    if len(compact) > 64 * 1024:
+        raise ValueError('selected vehicle compact descriptor is too large')
+    return base64.b64encode(compact).decode('ascii')
+
+
 def _message_value(message, name, default=None):
     if isinstance(message, dict):
         return message.get(name, default)
@@ -145,7 +160,8 @@ class LANSession(object):
                  on_snapshot=None, on_event=None, lobby_ready=None,
                  callback=None, cancel_callback=None, status_notifier=None,
                  vehicle_provider=None, room_factory=None,
-                 queue_screen_factory=None, postbattle_store=None):
+                 queue_screen_factory=None, postbattle_store=None,
+                 vehicle_compact_provider=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
@@ -165,6 +181,8 @@ class LANSession(object):
         self._status_notifier = status_notifier or _show_status
         self._vehicle_provider = vehicle_provider or _selected_vehicle_details
         self._outfit_provider = _selected_vehicle_outfits
+        self._vehicle_compact_provider = (
+            vehicle_compact_provider or _selected_vehicle_compact_descr)
         self._postbattle_store = postbattle_store
         self._published_progress_battles = (
             -1 if postbattle_store is None else
@@ -251,6 +269,10 @@ class LANSession(object):
         if self._postbattle_store is not None:
             client.account_key = self._postbattle_store.account_key
         client.outfits = self._outfit_provider()
+        try:
+            client.vehicle_compact_descr = self._vehicle_compact_provider()
+        except Exception:
+            client.vehicle_compact_descr = ''
         return client
 
     def _publish_postbattle_results(self):
@@ -494,6 +516,7 @@ class LANSession(object):
             vehicle, max_health = self._vehicle_provider()
             max_health = int(max_health)
             outfits = self._outfit_provider()
+            vehicle_compact_descr = self._vehicle_compact_provider()
         except Exception:
             # A lobby transition can hide the garage selection.  Keep the
             # vehicle the server already holds for this player.
@@ -501,7 +524,8 @@ class LANSession(object):
         if not vehicle or max_health < 1:
             return False
         try:
-            return bool(select(vehicle, max_health, outfits))
+            return bool(select(
+                vehicle, max_health, outfits, vehicle_compact_descr))
         except TypeError:
             # Test doubles and the first protocol-v5 client accepted only the
             # original vehicle and max-health arguments.
@@ -1833,6 +1857,12 @@ class LANSession(object):
                 return
             if self._battle_runtime is not None:
                 self._battle_runtime.on_events(message)
+        elif kind == 'fire_intent_result':
+            round_id = _message_value(message, 'round_id')
+            if (self._battle_started and
+                    round_id == self._active_round_id and
+                    self._battle_runtime is not None):
+                self._battle_runtime.on_fire_intent_result(message)
         elif kind in ('disconnected', 'connection_lost', 'error'):
             if (not self._battle_started and
                     bool(getattr(self.client, 'ready', False)) and

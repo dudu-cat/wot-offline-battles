@@ -9,7 +9,9 @@ sys.path.insert(0, str(SERVER_ROOT))
 
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
-    PROJECTILE_CAPABILITY,
+    HUMAN_RAM_TIMELINE_CAPABILITY, PROJECTILE_CAPABILITY,
+    PLAYER_FIRE_INTENT_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+    SIMULATION_WORKER_CAPABILITY,
 )
 
 
@@ -25,14 +27,36 @@ def _hello(index, team=None):
     result = {
         'client_build': CLIENT_BUILD_0922,
         'capabilities': [
-            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY],
+            PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+            HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+            PLAYER_FIRE_INTENT_CAPABILITY],
         'name': 'Player-%d' % index,
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
+        'vehicle_compact_descr': 'dGVzdA==',
     }
     if team is not None:
         result['requested_team'] = team
     return result
+
+
+def _attach_worker(state):
+    worker, error = state.add_simulation_worker(
+        _Connection(), ('127.0.0.1', 2000), {
+            'role': 'simulation_worker',
+            'client_build': CLIENT_BUILD_0922,
+            'capabilities': [
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                SIMULATION_WORKER_CAPABILITY,
+                HUMAN_RAM_TIMELINE_CAPABILITY,
+                RAM_CONTACT_LEDGER_CAPABILITY,
+                PLAYER_FIRE_INTENT_CAPABILITY,
+            ],
+        })
+    if error is not None:
+        raise AssertionError(error)
+    return worker
 
 
 class ServerTeamSizeTests(unittest.TestCase):
@@ -52,6 +76,7 @@ class ServerTeamSizeTests(unittest.TestCase):
 
     def test_humans_occupy_selected_slots_in_both_rounds(self):
         state = BattleState(team_size=4, authority_mode='client')
+        _attach_worker(state)
         players = []
         for index in range(3):
             player, error = state.add_player(
@@ -148,6 +173,7 @@ class ServerTeamSizeTests(unittest.TestCase):
     def test_random_start_chooses_from_the_active_client_map_pool(self):
         state = BattleState(
             map_name='01_karelia', team_size=1, authority_mode='client')
+        _attach_worker(state)
         player, error = state.add_player(
             _Connection(), ('10.0.0.1', 1001), _hello(1))
         self.assertIsNone(error)
@@ -166,6 +192,7 @@ class ServerTeamSizeTests(unittest.TestCase):
     def test_unknown_start_map_remains_fail_closed(self):
         state = BattleState(
             map_name='01_karelia', team_size=1, authority_mode='client')
+        _attach_worker(state)
         player, error = state.add_player(
             _Connection(), ('10.0.0.1', 1001), _hello(1))
         self.assertIsNone(error)

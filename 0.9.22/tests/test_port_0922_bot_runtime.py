@@ -11,7 +11,12 @@ ROOT = Path(__file__).resolve().parents[2]
 PORT_ROOT = ROOT / '0.9.22'
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
-from lan_battle_server import BattleState, CLIENT_BUILD_0922, Player
+from lan_battle_server import (
+    BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    HUMAN_RAM_TIMELINE_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY, Player,
+    PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+    SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
+    SimulationWorker)
 from server_bot_ai import BotPlanner
 
 PACKAGE_ROOT = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' / 'mods' / 'offline_lan_0922'
@@ -210,12 +215,22 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         server.phase = 'battle'
         server.tick = 450
         authority_socket = _CaptureSocket()
+        host_socket = _CaptureSocket()
         guest_socket = _CaptureSocket()
         server.players[1] = Player(
-            1, authority_socket, ('127.0.0.1', 1), team=1, slot=0)
+            1, host_socket, ('127.0.0.1', 1), team=1, slot=0)
         server.players[2] = Player(
             2, guest_socket, ('127.0.0.1', 2), team=2, slot=0)
-        server.bot_authority_id = 1
+        server.simulation_worker = SimulationWorker(
+            authority_socket, ('127.0.0.1', 3), capabilities=(
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                SIMULATION_WORKER_CAPABILITY,
+                RAM_CONTACT_LEDGER_CAPABILITY,
+                HUMAN_RAM_TIMELINE_CAPABILITY,
+                PLAYER_FIRE_INTENT_CAPABILITY,
+            ))
+        server.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
         server.bot_roster = [{
             'id': 11, 'team': 1, 'slot': 1, 'name': 'Revision-11'}]
         manifest_bot = {
@@ -232,8 +247,18 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         }
         if before_manifest is not None:
             before_manifest()
-        assert server.update_bot_manifest(1, {
-            'round_id': server.round_id, 'bots': [manifest_bot]})
+        assert server.update_bot_manifest(SIMULATION_WORKER_AUTHORITY_ID, {
+            'round_id': server.round_id, 'bots': [manifest_bot],
+            'player_collision_profiles': [
+                {
+                    'id': player.player_id,
+                    'vehicle': player.vehicle,
+                    'mass': 5730.0,
+                    'shape': [1.5, 3.5, -0.8, 1.6],
+                }
+                for player in (server.players[1], server.players[2])
+            ],
+        })
         return server, manifest_bot, authority_socket
 
     @staticmethod
@@ -243,18 +268,21 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         bot['combat_seq'] = bot['combat_ack_seq']
         return {'round_id': server.round_id, 'bots': [bot]}
 
-    def test_revision_commits_atomically_survives_handoff_and_resets(self):
+    def test_revision_survives_player_departure_and_resets(self):
         server, manifest_bot, authority_socket = self._server()
         self.assertEqual(0, server.bot_state_revision)
 
         self.assertFalse(server.update_bot_states(
             2, self._publication(server, 1.0)))
         self.assertEqual(0, server.bot_state_revision)
-        self.assertFalse(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': []}))
+        self.assertFalse(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': server.round_id, 'bots': [],
+            }))
         self.assertEqual(0, server.bot_state_revision)
         self.assertTrue(server.update_bot_states(
-            1, self._publication(server, 1.0)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 1.0)))
         self.assertEqual(1, server.bot_state_revision)
 
         server.tick_once(1.0 / 30.0)
@@ -266,13 +294,12 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(1, snapshots[-1]['bot_state_revision'])
 
         server.remove_player(1)
-        self.assertEqual(2, server.bot_authority_id)
-        self.assertEqual(1, server.bot_state_revision)
-        self.assertTrue(server.update_bot_manifest(2, {
-            'round_id': server.round_id, 'bots': [manifest_bot]}))
+        self.assertEqual(
+            SIMULATION_WORKER_AUTHORITY_ID, server.bot_authority_id)
         self.assertEqual(1, server.bot_state_revision)
         self.assertTrue(server.update_bot_states(
-            2, self._publication(server, 2.0)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 2.0)))
         self.assertEqual(2, server.bot_state_revision)
 
         server._reset_round()
@@ -290,7 +317,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         now[0] = 100.065
         self.assertTrue(server.update_bot_states(
-            1, self._publication(server, 1.0)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 1.0)))
         self.assertEqual(65000, server.bot_state_time_us)
         self.assertIsNone(server.bot_source_time_us)
 
@@ -313,7 +341,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.065
         first = self._publication(server, 0.4)
         first['sample_time_us'] = 40000
-        self.assertTrue(server.update_bot_states(1, first))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, first))
         first_mapped_time = server.bot_state_time_us
         self.assertEqual(65000, first_mapped_time)
 
@@ -322,7 +351,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.200
         delayed = self._publication(server, 0.8)
         delayed['sample_time_us'] = 80000
-        self.assertTrue(server.update_bot_states(1, delayed))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, delayed))
         self.assertEqual(first_mapped_time + 40000,
                          server.bot_state_time_us)
 
@@ -331,7 +361,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.210
         fast = self._publication(server, 1.2)
         fast['sample_time_us'] = 120000
-        self.assertTrue(server.update_bot_states(1, fast))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, fast))
         self.assertEqual(first_mapped_time + 80000,
                          server.bot_state_time_us)
 
@@ -346,19 +377,22 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         repeated = self._publication(server, 1.2)
         repeated['sample_time_us'] = 120000
-        self.assertFalse(server.update_bot_states(1, repeated))
+        self.assertFalse(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, repeated))
         self.assertEqual('sample_time_order',
                          server.last_bot_state_reject_code)
 
         self.assertFalse(server.update_bot_states(
-            1, self._publication(server, 1.6)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 1.6)))
         self.assertEqual('sample_time_missing',
                          server.last_bot_state_reject_code)
 
         server.remove_player(1)
-        self.assertEqual(2, server.bot_authority_id)
-        self.assertIsNone(server.bot_source_time_us)
-        self.assertIsNone(server.bot_source_receipt_time_us)
+        self.assertEqual(
+            SIMULATION_WORKER_AUTHORITY_ID, server.bot_authority_id)
+        self.assertEqual(120000, server.bot_source_time_us)
+        self.assertEqual(210000, server.bot_source_receipt_time_us)
 
     def test_source_lead_keeps_snapshot_motion_clock_advancing_uniformly(self):
         now = [100.0]
@@ -370,7 +404,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.200
         slow = self._publication(server, 0.4)
         slow['sample_time_us'] = 40000
-        self.assertTrue(server.update_bot_states(1, slow))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, slow))
         self.assertEqual(200000, server.bot_state_time_us)
         self.assertEqual(0, server.motion_time_offset_us)
 
@@ -379,7 +414,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.210
         fast = self._publication(server, 1.4)
         fast['sample_time_us'] = 140000
-        self.assertTrue(server.update_bot_states(1, fast))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, fast))
         self.assertEqual(300000, server.bot_state_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
@@ -396,7 +432,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.250
         steady = self._publication(server, 1.8)
         steady['sample_time_us'] = 180000
-        self.assertTrue(server.update_bot_states(1, steady))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, steady))
         self.assertEqual(340000, server.bot_state_time_us)
         server.tick_once(1.0 / 30.0)
         snapshots = [
@@ -422,7 +459,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.490
         skipped = self._publication(server, 2.2)
         skipped['sample_time_us'] = 420000
-        self.assertTrue(server.update_bot_states(1, skipped))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, skipped))
         self.assertEqual(580000, server.bot_state_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
@@ -432,7 +470,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.500
         oversized = self._publication(server, 9.0)
         oversized['sample_time_us'] = 1000000
-        self.assertFalse(server.update_bot_states(1, oversized))
+        self.assertFalse(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, oversized))
         self.assertEqual('sample_time_rate',
                          server.last_bot_state_reject_code)
         self.assertEqual(580000, server.bot_state_time_us)
@@ -443,18 +482,20 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.530
         recovered = self._publication(server, 2.6)
         recovered['sample_time_us'] = 460000
-        self.assertTrue(server.update_bot_states(1, recovered))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, recovered))
         self.assertEqual(620000, server.bot_state_time_us)
         self.assertEqual(460000, server.bot_source_time_us)
         self.assertEqual(530000, server.bot_source_receipt_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
-        # A failover resets only the new producer's source origin. The public
-        # logical timeline is still this round's timeline and cannot fall back.
+        # A visible player departure cannot perturb the dedicated worker's
+        # source clock or promote another player to authority.
         server.remove_player(1)
-        self.assertEqual(2, server.bot_authority_id)
-        self.assertIsNone(server.bot_source_time_us)
-        self.assertIsNone(server.bot_source_receipt_time_us)
+        self.assertEqual(
+            SIMULATION_WORKER_AUTHORITY_ID, server.bot_authority_id)
+        self.assertEqual(460000, server.bot_source_time_us)
+        self.assertEqual(530000, server.bot_source_receipt_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
         server._reset_round()
@@ -468,10 +509,12 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             before_manifest=lambda: now.__setitem__(0, 100.025))
 
         self.assertTrue(server.update_bot_states(
-            1, self._publication(server, 1.0)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 1.0)))
         first_time_us = server.bot_state_time_us
         self.assertTrue(server.update_bot_states(
-            1, self._publication(server, 2.0)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 2.0)))
 
         self.assertEqual(2, server.bot_state_revision)
         self.assertGreater(server.bot_state_time_us, first_time_us)
@@ -529,10 +572,11 @@ class ServerReportedHealthTests(unittest.TestCase):
             'critical_ack_seq': 0,
         }, lineage)
 
-    def test_nonfatal_client_simulation_drops_stale_attacker_from_wire(self):
-        server, player, connection = self._server_with_bot()
+    def test_modern_nonfatal_client_health_report_is_rejected(self):
+        server, player, unused_connection = self._server_with_bot()
+        critical_before = dict(player.critical)
 
-        self.assertTrue(server._apply_reported_health(player, {
+        self.assertFalse(server._apply_reported_health(player, {
             'reported_health': 1000,
             'reported_critical': _critical_payload({
                 'name': 'engineHealth', 'hp': 25.0, 'max_hp': 100.0,
@@ -541,50 +585,39 @@ class ServerReportedHealthTests(unittest.TestCase):
             'reported_critical_seq': 1,
             'reported_attacker': 2,
         }))
-        event = server.pending_events[-1]
-        self.assertEqual(0, event['damage'])
-        self.assertNotIn('attacker', event)
-        self.assertNotIn('attacker_bot', event)
-        self.assertTrue(server._validate_combat_event_for_wire(event))
+        self.assertEqual([], server.pending_events)
+        self.assertEqual(critical_before, player.critical)
+        self.assertEqual((0, 0), (
+            player.critical_revision, player.critical_ack_seq))
         self.assertEqual(('', 0),
                          (player.death_attacker_kind,
                           player.death_attacker_id))
         self.assertEqual(0, server.players[2].frags)
         self.assertEqual(0, server.bot_states[28]['frags'])
 
-        server.battle_result = {
-            'winner': 0, 'reason': 'test fence', 'base_team': 0}
-        server.tick_once(1.0 / 30.0)
-
-        wire_event = self._broadcast_health_event(connection)
-        self.assertNotIn('attacker', wire_event)
-        self.assertNotIn('attacker_bot', wire_event)
-
-    def test_fatal_client_simulation_keeps_death_ledger_only_once(self):
-        server, player, connection = self._server_with_bot()
+    def test_modern_fatal_client_health_report_cannot_create_death(self):
+        server, player, unused_connection = self._server_with_bot()
         player.health = 100
-
-        self.assertTrue(server._apply_reported_health(player, {
-            'reported_health': 0,
-            'reported_reason': 1,
-            'reported_attacker_bot': 28,
-        }))
-        self.assertEqual(('bot', 28),
-                         (player.death_attacker_kind,
-                          player.death_attacker_id))
-        self.assertEqual(1, server.bot_states[28]['frags'])
-        health_event = next(event for event in server.pending_events
-                            if event.get('kind') == 'health')
-        self.assertNotIn('attacker', health_event)
-        self.assertNotIn('attacker_bot', health_event)
-        self.assertTrue(server._validate_combat_event_for_wire(health_event))
 
         self.assertFalse(server._apply_reported_health(player, {
             'reported_health': 0,
             'reported_reason': 1,
             'reported_attacker_bot': 28,
         }))
-        self.assertEqual(1, server.bot_states[28]['frags'])
+        self.assertEqual(('', 0),
+                         (player.death_attacker_kind,
+                          player.death_attacker_id))
+        self.assertEqual(100, player.health)
+        self.assertTrue(player.alive)
+        self.assertEqual(0, server.bot_states[28]['frags'])
+        self.assertEqual([], server.pending_events)
+
+        self.assertFalse(server._apply_reported_health(player, {
+            'reported_health': 0,
+            'reported_reason': 1,
+            'reported_attacker_bot': 28,
+        }))
+        self.assertEqual(0, server.bot_states[28]['frags'])
 
         pending_count = len(server.pending_events)
         critical_before = player.critical
@@ -611,14 +644,6 @@ class ServerReportedHealthTests(unittest.TestCase):
         })
         self.assertEqual([], calls)
 
-        server.battle_result = {
-            'winner': 0, 'reason': 'test fence', 'base_team': 0}
-        server.tick_once(1.0 / 30.0)
-
-        wire_event = self._broadcast_health_event(connection)
-        self.assertNotIn('attacker', wire_event)
-        self.assertNotIn('attacker_bot', wire_event)
-
 
 class ServerBotObservationRelayTests(unittest.TestCase):
     @staticmethod
@@ -633,8 +658,8 @@ class ServerBotObservationRelayTests(unittest.TestCase):
             1, authority_socket, ('127.0.0.1', 1), team=1, slot=0)
         server.players[2] = Player(
             2, guest_socket, ('127.0.0.1', 2), team=1, slot=1)
-        server.bot_authority_id = 1
-        server.bot_manifest_authority_id = 1
+        server.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        server.bot_manifest_authority_id = SIMULATION_WORKER_AUTHORITY_ID
         return server, authority_socket, guest_socket
 
     @staticmethod
@@ -656,7 +681,8 @@ class ServerBotObservationRelayTests(unittest.TestCase):
         server, authority_socket, guest_socket = self._server()
 
         relay = server.update_bot_observation(
-            1, self._message(server.round_id))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id))
 
         self.assertIsInstance(relay, dict)
         self.assertEqual({
@@ -673,14 +699,16 @@ class ServerBotObservationRelayTests(unittest.TestCase):
         server, authority_socket, guest_socket = self._server()
 
         self.assertTrue(server.update_bot_observation(
-            1, self._message(server.round_id, visible=False)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id, visible=False)))
         self.assertFalse(server.update_bot_observation(
-            1, self._message(server.round_id - 1, visible=True)))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id - 1, visible=True)))
 
         self.assertEqual([], authority_socket.payloads)
         self.assertEqual([], guest_socket.payloads)
 
-    def test_human_direct_spot_is_merged_before_planning_and_relay(self):
+    def test_modern_human_direct_spot_does_not_override_worker_observation(self):
         server, unused_authority_socket, unused_guest_socket = self._server()
         reporter_socket = _CaptureSocket()
         server.players[3] = Player(
@@ -688,13 +716,10 @@ class ServerBotObservationRelayTests(unittest.TestCase):
         server.player_spotted[3] = frozenset((('player', 2),))
 
         relay = server.update_bot_observation(
-            1, self._message(server.round_id, visible=False, target_id=2))
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id, visible=False, target_id=2))
 
-        self.assertIsInstance(relay, dict)
-        self.assertEqual([{
-            'observing_team': 2, 'target_kind': 'human',
-            'target_id': 2, 'target_team': 1, 'visible': True,
-        }], relay['contacts'])
+        self.assertIs(True, relay)
 
 
 class BotRuntimeTests(unittest.TestCase):
@@ -882,8 +907,10 @@ class BotRuntimeTests(unittest.TestCase):
         for name in ('shell_index', 'next_shell_index', 'ammo_remaining',
                      'ammo_reload_pending'):
             server.bot_states[11][name] = projected[name]
-        self.assertTrue(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': [projected]}),
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': server.round_id, 'bots': [projected],
+            }),
             server.last_bot_state_reject)
         self.assertEqual((0, False, 640, 5), (
             server.bot_states[11]['health'],
@@ -2494,6 +2521,29 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual('bot_manifest', first[0]['type'])
         self.assertEqual(11, first[0]['bots'][0]['id'])
         self.assertEqual([], self.runtime.battle_start(self.start))
+
+    def test_worker_donates_sorted_descriptor_human_collision_profiles(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 25000.0
+        self.runtime.descriptor_resolver = lambda unused: descriptor
+        start = dict(self.start, human_ram_timeline=True, players=[
+            {'id': 2, 'vehicle': 'ussr:R11_MS-1'},
+            {'id': 1, 'vehicle': 'ussr:R11_MS-1'},
+        ])
+
+        outgoing = self.runtime.battle_start(start)
+
+        profiles = outgoing[0]['player_collision_profiles']
+        self.assertEqual([1, 2], [profile['id'] for profile in profiles])
+        self.assertEqual(
+            ['ussr:R11_MS-1', 'ussr:R11_MS-1'],
+            [profile['vehicle'] for profile in profiles])
+        self.assertEqual([25000.0, 25000.0],
+                         [profile['mass'] for profile in profiles])
+        self.assertEqual(
+            [[1.5, 3.5, -0.8, 2.0], [1.5, 3.5, -0.8, 2.0]],
+            [profile['shape'] for profile in profiles])
+        self.assertEqual([], self.runtime.battle_start(start))
 
     def test_injected_baked_graph_replaces_runtime_grid_and_passes_routes(self):
         graph = _graph()
@@ -6334,7 +6384,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(results[20][1], results[30][1], places=12)
         self.assertAlmostEqual(results[30][1], results[60][1], places=12)
 
-    def test_friendly_human_impulse_is_owned_by_bot_but_enemy_is_unchanged(self):
+    def test_current_human_contact_waits_for_receipt_impulse(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
         runtime = self.module.BotRuntime(
@@ -6366,11 +6416,11 @@ class BotRuntimeTests(unittest.TestCase):
         player['team'] = 2
         runtime._resolve_tank_contacts([player], None, .04)
 
-        self.assertLess(friendly_speed, 10.0)
+        self.assertEqual(10.0, friendly_speed)
         self.assertEqual(10.0, state['speed'])
 
         # A wreck has one established immovable-body response regardless of
-        # team.  Friendly impulse ownership only protects a live player.
+        # team. Live human velocity and HP wait for a historical receipt.
         player['alive'] = False
         for team in (1, 2):
             state.update(x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
@@ -6408,7 +6458,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0), (
             runtime.states[11]['push_x'], runtime.states[12]['push_x']))
 
-    def test_ram_report_follows_pose_and_is_cooldown_gated(self):
+    def test_current_human_contact_never_reports_damage_without_receipt(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
         descriptor.hull.hitTester = _HitTester1513(
@@ -6437,13 +6487,8 @@ class BotRuntimeTests(unittest.TestCase):
 
         outgoing = runtime.update(.04, 10.0, players=[player])
 
-        self.assertEqual(['bot_state', 'bot_ram', 'bot_observation'],
+        self.assertEqual(['bot_state', 'bot_observation'],
                          [message['type'] for message in outgoing])
-        report = outgoing[1]
-        self.assertEqual((11, 'human', 2), (
-            report['bot_id'], report['target_kind'], report['target_id']))
-        self.assertGreater(report['damage_to_bot'], 0)
-        self.assertGreater(report['damage_to_target'], 0)
 
         state.update(x=0.0, z=0.0, yaw=math.pi / 2.0, speed=10.0,
                      push_x=0.0, push_z=0.0)
@@ -6470,7 +6515,7 @@ class BotRuntimeTests(unittest.TestCase):
         state.update(x=0.0, z=0.0, yaw=math.pi / 2.0, speed=10.0,
                      push_x=0.0, push_z=0.0)
         new_contact = runtime.update(.04, 11.0, players=[player])
-        self.assertIn(
+        self.assertNotIn(
             'bot_ram', [message['type'] for message in new_contact])
 
     def test_human_ram_receipt_replays_pre_correction_pose_once(self):
@@ -6508,13 +6553,26 @@ class BotRuntimeTests(unittest.TestCase):
             '_ram_contact_bot_state': historical,
         }
 
-        first = runtime._resolve_human_ram_receipts([player], 10.0)
-        repeated = runtime._resolve_human_ram_receipts([player], 10.1)
+        first = runtime._resolve_human_ram_receipts(
+            [player], 10.0, step=.04)
+        push_after_first = (current['push_x'], current['push_z'])
+        repeated = runtime._resolve_human_ram_receipts(
+            [player], 10.1, step=.04)
+        push_after_retry = (current['push_x'], current['push_z'])
+        acknowledged = dict(player, ram_contact_resolved_seq=7)
+        after_ack = runtime._resolve_human_ram_receipts(
+            [acknowledged], 10.2)
         current['x'] = 50.0
         distant = dict(player)
-        distant['ram_contact'] = dict(player['ram_contact'], seq=8)
-        rejected_distant = runtime._resolve_human_ram_receipts(
+        distant['ram_contact_resolved_seq'] = 7
+        distant['ram_contact'] = dict(
+            player['ram_contact'], seq=8,
+            presentation_time_us=1000000)
+        replayed_distant = runtime._resolve_human_ram_receipts(
             [distant], 11.0)
+        distant['ram_contact_resolved_seq'] = 8
+        after_second_ack = runtime._resolve_human_ram_receipts(
+            [distant], 11.1)
 
         self.assertEqual(1, len(first))
         self.assertEqual((11, 'human', 2), (
@@ -6525,9 +6583,14 @@ class BotRuntimeTests(unittest.TestCase):
             first[0]['ram_contact_seq']))
         self.assertGreater(first[0]['damage_to_bot'], 0)
         self.assertGreater(first[0]['damage_to_target'], 0)
-        self.assertEqual([], repeated)
-        self.assertEqual([], rejected_distant)
+        self.assertEqual(first, repeated)
+        self.assertEqual(push_after_first, push_after_retry)
+        self.assertEqual([], after_ack)
+        self.assertEqual(1, len(replayed_distant))
+        self.assertGreater(replayed_distant[0]['damage_to_target'], 0)
+        self.assertEqual([], after_second_ack)
         self.assertEqual({2: 8}, runtime._human_ram_receipt_seq)
+        self.assertEqual({}, runtime._human_ram_report_cache)
 
     def test_human_ram_receipt_and_current_detector_do_not_double_report(self):
         descriptor = _combat_descriptor()
@@ -6571,6 +6634,96 @@ class BotRuntimeTests(unittest.TestCase):
         expected_push = 8.0 * (0.90 ** (0.04 * 60.0))
         self.assertAlmostEqual(expected_push, current['push_z'], places=5)
 
+    def test_human_ram_ledger_resolves_every_contact_and_terminal_noop(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 25000.0
+        descriptor.hull.hitTester = _HitTester1513(
+            (-1.5, -1.0, -3.5), (1.5, 1.0, 3.5))
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        historical = dict(runtime.states[11])
+        historical.update(x=0.0, y=0.0, z=6.5, yaw=math.pi,
+                          ram_vx=0.0, ram_vz=0.0)
+
+        def receipt(seq, presentation_time_us, player_z=0.0):
+            return {
+                'seq': seq, 'bot_id': 11, 'bot_state_revision': 40,
+                'presentation_time_us': presentation_time_us,
+                'x': 0.0, 'y': 0.0, 'z': player_z, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 16.0,
+                '_ram_contact_bot_state': historical,
+            }
+
+        player = {
+            'id': 2, 'team': 1, 'vehicle': 'ussr:R11_MS-1',
+            'x': 0.0, 'y': 0.0, 'z': -30.0, 'yaw': 0.0,
+            'speed': 0.0, 'alive': True,
+            'ram_contacts': [
+                receipt(1, 1000000), receipt(2, 2000000),
+                receipt(3, 3000000, player_z=-30.0)],
+        }
+
+        first = runtime._resolve_human_ram_receipts([player], 20.0)
+        player['ram_contact_resolved_seq'] = 1
+        second = runtime._resolve_human_ram_receipts([player], 20.1)
+        player['ram_contact_resolved_seq'] = 2
+        third = runtime._resolve_human_ram_receipts([player], 20.2)
+        reports = first + second + third
+
+        self.assertEqual([1, 2, 3], [
+            report['ram_contact_seq'] for report in reports])
+        self.assertTrue(all(
+            report['damage_to_target'] > 0 for report in reports[:2]))
+        self.assertEqual((0, 0), (
+            reports[2]['damage_to_bot'], reports[2]['damage_to_target']))
+
+    def test_human_ram_ledger_does_not_overtake_missing_history(self):
+        descriptor = _combat_descriptor()
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        historical = dict(runtime.states[11])
+        historical.update(id=11, ram_vx=0.0, ram_vz=0.0)
+
+        def receipt(seq, include_history):
+            result = {
+                'seq': seq, 'bot_id': 11, 'bot_state_revision': 40,
+                'presentation_time_us': seq * 1000000,
+                'x': 30.0, 'y': 0.0, 'z': 30.0, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 0.0,
+            }
+            if include_history:
+                result['_ram_contact_bot_state'] = historical
+            return result
+
+        player = {
+            'id': 2, 'team': 1, 'vehicle': 'ussr:R11_MS-1',
+            'alive': True,
+            'ram_contacts': [receipt(1, False), receipt(2, True)],
+        }
+
+        self.assertEqual([], runtime._resolve_human_ram_receipts(
+            [player], 20.0))
+        player['ram_contacts'][0]['_ram_contact_bot_state'] = historical
+        first = runtime._resolve_human_ram_receipts([player], 20.1)
+
+        self.assertEqual([1], [
+            report['ram_contact_seq'] for report in first])
+        self.assertNotIn((2, 2), runtime._human_ram_report_cache)
+
     def test_ram_diagnostic_logs_once_per_admitted_event(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
@@ -6596,22 +6749,38 @@ class BotRuntimeTests(unittest.TestCase):
         }
         state.update(x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
                      speed=10.0, push_x=0.0, push_z=0.0)
+        historical = dict(state)
+        historical.update(ram_vx=10.0, ram_vz=0.0)
+        player.update({
+            'ram_contact': {
+                'seq': 1, 'bot_id': 11, 'bot_state_revision': 1,
+                'presentation_time_us': 10000000,
+                'x': 6.5, 'y': 0.0, 'z': 0.0,
+                'yaw': math.pi / 2.0, 'vx': 0.0, 'vz': 0.0,
+            },
+            '_ram_contact_bot_state': historical,
+        })
         capture = io.StringIO()
         previous_stdout = sys.stdout
         try:
             sys.stdout = capture
             first = runtime._resolve_tank_contacts([player], 10.0, .04)
+            first_push = state['push_x']
             state.update(x=0.0, z=0.0, yaw=math.pi / 2.0,
-                         speed=10.0, push_x=0.0, push_z=0.0)
+                         speed=10.0, push_x=first_push, push_z=0.0)
             repeated = runtime._resolve_tank_contacts(
                 [player], 10.2, .04)
+            player['ram_contact_resolved_seq'] = 1
+            acknowledged = runtime._resolve_tank_contacts(
+                [player], 10.3, .04)
         finally:
             sys.stdout = previous_stdout
 
         lines = [line for line in capture.getvalue().splitlines()
                  if 'RAM diagnostic' in line]
         self.assertEqual(1, len(first))
-        self.assertEqual([], repeated)
+        self.assertEqual(first, repeated)
+        self.assertEqual([], acknowledged)
         self.assertEqual(1, len(lines))
         self.assertIn('self_id=11 self_vehicle=ussr:T-34', lines[0])
         self.assertIn(

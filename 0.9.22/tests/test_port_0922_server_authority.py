@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import sys
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -10,8 +11,13 @@ PORT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import (  # noqa: E402
-    BattleState, CLIENT_BUILD_0922, Player, PREBATTLE_SECONDS,
-    PROJECTILE_CAPABILITY, TICK_HZ, _critical_payload,
+    BattleState, CLIENT_BUILD_0922, ClientHandler,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    HUMAN_RAM_TIMELINE_CAPABILITY, Player, PREBATTLE_SECONDS,
+    PLAYER_FIRE_INTENT_CAPABILITY, PROJECTILE_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY,
+    SIMULATION_WORKER_CAPABILITY, TICK_HZ,
+    SIMULATION_WORKER_AUTHORITY_ID, SimulationWorker, _critical_payload,
 )
 import server_battle_authority  # noqa: E402
 from server_battle_authority import (  # noqa: E402
@@ -34,7 +40,9 @@ def _player(player_id, team=1, x=398.0, z=402.0):
         player_id, _Socket(), ('127.0.0.1', player_id),
         team=team, slot=max(0, player_id - 1), x=x, z=z,
         client_position=True, health=1000, max_health=1000,
-        capabilities=(PROJECTILE_CAPABILITY,),
+        capabilities=(
+            PROJECTILE_CAPABILITY, HUMAN_RAM_TIMELINE_CAPABILITY,
+            RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY),
     )
 
 
@@ -109,6 +117,28 @@ def _mounted_source_shot(state, shooter_id, velocity, gravity, maximum):
                 shell, 'explosionRadius', 0.0) or 0.0),
         },
     }
+
+
+def _launch_player_as_authority(state, authority_id, message):
+    """Prepare the trusted half of one already-admitted player trigger."""
+    player = state.players[int(message['shooter_id'])]
+    input_seq = player.input_seq + 1
+    intent_seq = player.fire_intent_seq + 1
+    player.input_seq = input_seq
+    player.fire_intent_seq = intent_seq
+    player.pending_fire_intents[intent_seq] = {
+        'shot_seq': int(message['shot_seq']),
+        'input_seq': input_seq,
+        'shell_index': int(message['shell_index']),
+        'x': float(player.x), 'y': float(player.y), 'z': float(player.z),
+        'deadline_server_time_ms': state._server_time_ms() + 5000,
+    }
+    message.update({
+        'authority_epoch': state.authority_epoch,
+        'fire_intent_seq': intent_seq,
+        'fire_input_seq': input_seq,
+    })
+    return state.launch_projectile(authority_id, message)
 
 
 def _prime_destructible_map(state):
@@ -223,22 +253,36 @@ class ServerCriticalProposalStateTest(unittest.TestCase):
 
 
 class ServerAuthorityElectionTest(unittest.TestCase):
-    def test_client_mode_elects_the_lowest_connected_player(self):
+    @staticmethod
+    def _install_worker(state):
+        worker = SimulationWorker(
+            _Socket(), ('127.0.0.1', 1000), capabilities=(
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                SIMULATION_WORKER_CAPABILITY,
+                HUMAN_RAM_TIMELINE_CAPABILITY,
+                RAM_CONTACT_LEDGER_CAPABILITY,
+                PLAYER_FIRE_INTENT_CAPABILITY))
+        state.simulation_worker = worker
+        state._elect_bot_authority()
+        return worker
+
+    def test_client_mode_requires_worker_and_never_elects_player(self):
         state = _state_with_authority()
         state.authority_mode = 'client'
 
         message, error = state.request_start(1, '01_karelia')
 
-        self.assertIsNone(error)
-        self.assertEqual('battle_start', message['type'])
+        self.assertIsNone(message)
+        self.assertEqual('simulation_worker_required', error)
         self.assertIsNone(state.server_authority)
-        self.assertEqual(1, state.bot_authority_id)
-        self.assertEqual(1, message['bot_authority_id'])
-        self.assertEqual('loading', state.phase)
+        self.assertIsNone(state.bot_authority_id)
+        self.assertEqual('waiting', state.phase)
 
     def test_client_mode_round_goes_live_on_manifest_and_readiness(self):
         state = _state_with_authority()
         state.authority_mode = 'client'
+        self._install_worker(state)
         message, error = state.request_start(1, '01_karelia')
         self.assertIsNone(error)
 
@@ -246,14 +290,26 @@ class ServerAuthorityElectionTest(unittest.TestCase):
                          max_health=350, x=float(index), y=0.0,
                          z=0.0, yaw=0.0)
                     for index, entry in enumerate(state.bot_roster)]
-        self.assertTrue(state.update_bot_manifest(1, {
-            'round_id': state.round_id, 'bots': manifest}))
-        live = state.mark_battle_ready(1, {'round_id': state.round_id})
+        self.assertTrue(state.update_bot_manifest(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+            'round_id': state.round_id, 'bots': manifest,
+            'player_collision_profiles': [{
+                'id': participant.player_id,
+                'vehicle': participant.vehicle,
+                'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+            } for participant in state.players.values()
+             if participant.connected and participant.participating]}))
+        self.assertIsNone(state.mark_battle_ready(
+            1, {'round_id': state.round_id}))
+        live = state.mark_battle_ready(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            {'round_id': state.round_id})
 
         self.assertIsNotNone(live)
         self.assertEqual('battle_live', live['type'])
         self.assertEqual('battle', state.phase)
-        self.assertEqual(1, state.bot_authority_id)
+        self.assertEqual(SIMULATION_WORKER_AUTHORITY_ID,
+                         state.bot_authority_id)
 
     def test_server_owns_bot_authority_after_start(self):
         state = _state_with_authority()
@@ -270,6 +326,63 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         self.assertEqual(len(state.bot_roster), len(state.bot_manifest))
         for entry in state.bot_manifest:
             self.assertEqual('ussr:R11_MS-1', entry['vehicle'])
+
+    def test_server_mode_player_projectiles_require_internal_authority(self):
+        state = _state_with_authority()
+        unused_message, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        state.mark_battle_ready(1, {'round_id': state.round_id})
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        state.pending_live_message = None
+        launch = {
+            'type': 'projectile_launch',
+            'round_id': state.round_id,
+            'shooter_kind': 'player',
+            'shooter_id': 1,
+            'shot_seq': 1,
+            'shell_index': 0,
+            'origin': [state.players[1].x, state.players[1].y + 1.0,
+                       state.players[1].z],
+            'velocity': [0.0, 0.0, 100.0],
+            'gravity': 9.81,
+            'max_distance': 200.0,
+            'max_time_ms': 2000,
+            'is_he': False,
+            'splash_radius': 0.0,
+            'penetration_factor': 1.0,
+            'source_shot': _mounted_source_shot(
+                state, 1, (0.0, 0.0, 100.0), 9.81, 200.0),
+        }
+
+        self.assertFalse(_launch_player_as_authority(
+            state, state.players[1].player_id, dict(launch)))
+        state.players[1].pending_fire_intents.clear()
+        state.players[1].fire_intent_seq = 0
+        self.assertTrue(_launch_player_as_authority(
+            state, SERVER_AUTHORITY_ID, dict(launch)))
+
+    def test_server_mode_fire_intent_becomes_internal_projectile(self):
+        state = _state_with_authority()
+        unused_message, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        state.mark_battle_ready(1, {'round_id': state.round_id})
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        state.pending_live_message = None
+        player = state.players[1]
+        player.input_seq = 1
+        player.pose_time_us = 1
+
+        self.assertTrue(state.submit_fire_intent(1, {
+            'type': 'fire_intent', 'round_id': state.round_id,
+            'intent_seq': 1, 'input_seq': 1, 'shell_index': 0,
+        }))
+
+        projectile_id = '%d:p:1:1' % state.round_id
+        self.assertIn(projectile_id, state.projectiles)
+        launch = state.projectiles[projectile_id]
+        self.assertEqual(1, launch['fire_intent_seq'])
+        self.assertEqual(1, launch['fire_input_seq'])
+        self.assertEqual(SERVER_AUTHORITY_ID, state.bot_authority_id)
 
     def test_loading_snapshot_returns_the_canonical_lineup(self):
         state = _state_with_authority()
@@ -315,6 +428,300 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         self.assertIsNone(state.server_authority)
 
 
+class HumanRamTimelineTest(unittest.TestCase):
+    def _state(self, health=1000):
+        clock = [0.0]
+        state = BattleState(
+            map_name='01_karelia', authority_mode='client',
+            team1_size=1, team2_size=1, clock=lambda: clock[0])
+        state.client_build = CLIENT_BUILD_0922
+        capabilities = (
+            PROJECTILE_CAPABILITY, HUMAN_RAM_TIMELINE_CAPABILITY,
+            RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY)
+        first = _player(1, team=1, x=0.0, z=-1.6)
+        second = _player(2, team=2, x=0.0, z=6.5)
+        first.capabilities = capabilities
+        second.capabilities = capabilities
+        first.health = first.max_health = health
+        second.health = second.max_health = health
+        state.players = {1: first, 2: second}
+        worker = SimulationWorker(
+            _Socket(), ('127.0.0.1', 1000), capabilities=(
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                SIMULATION_WORKER_CAPABILITY,
+                HUMAN_RAM_TIMELINE_CAPABILITY,
+                RAM_CONTACT_LEDGER_CAPABILITY,
+                PLAYER_FIRE_INTENT_CAPABILITY))
+        state.simulation_worker = worker
+        state._elect_room_host()
+        state._elect_bot_authority()
+        state.bot_roster = []
+        state.roster_finalized = True
+        state.phase = 'loading'
+        profiles = [{
+            'id': player.player_id, 'vehicle': player.vehicle,
+            'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+        } for player in (first, second)]
+        self.assertTrue(state.update_bot_manifest(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': state.round_id, 'bots': [],
+                'player_collision_profiles': profiles,
+            }))
+        state.phase = 'battle'
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        return state, clock
+
+    @staticmethod
+    def _input(state, clock, player_id, sequence, sample_time_us,
+               z, speed, yaw, arrival_delay_us=100000):
+        clock[0] = max(
+            clock[0],
+            float(sample_time_us + arrival_delay_us) / 1000000.0)
+        return state.update_input(player_id, {
+            'round_id': state.round_id, 'input_seq': sequence,
+            'pose_time_us': sample_time_us,
+            'x': 0.0, 'y': 0.0, 'z': z, 'yaw': yaw,
+            'speed': speed,
+        })
+
+    def test_profiles_must_match_the_exact_player_roster(self):
+        state, unused_clock = self._state()
+        state.phase = 'loading'
+        state.human_collision_profiles = {}
+        state.human_collision_profile_authority_id = None
+        state.human_collision_manifest_fingerprint = None
+
+        self.assertFalse(state.update_bot_manifest(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': state.round_id, 'bots': [],
+                'player_collision_profiles': [{
+                    'id': 1, 'vehicle': state.players[1].vehicle,
+                    'mass': 8000.0,
+                    'shape': [1.5, 3.5, -0.8, 2.0],
+                }],
+            }))
+        self.assertEqual(
+            'human_collision_profiles',
+            state.last_bot_manifest_reject_code)
+        self.assertIsNone(state.human_collision_profile_authority_id)
+
+    def test_profile_manifest_exact_retry_folds_and_conflict_fails(self):
+        state, unused_clock = self._state()
+        manifest = {
+            'round_id': state.round_id, 'bots': [],
+            'player_collision_profiles': [{
+                'id': player.player_id, 'vehicle': player.vehicle,
+                'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+            } for player in (state.players[1], state.players[2])],
+        }
+        previous = copy.deepcopy(state.human_collision_profiles)
+
+        self.assertTrue(state.update_bot_manifest(
+            SIMULATION_WORKER_AUTHORITY_ID, copy.deepcopy(manifest)))
+        self.assertEqual(previous, state.human_collision_profiles)
+        conflict = copy.deepcopy(manifest)
+        conflict['player_collision_profiles'][0]['mass'] = 9000.0
+        self.assertFalse(state.update_bot_manifest(
+            SIMULATION_WORKER_AUTHORITY_ID, conflict))
+        self.assertEqual(
+            'human_collision_manifest_conflict',
+            state.last_bot_manifest_reject_code)
+        self.assertEqual(previous, state.human_collision_profiles)
+
+    def test_common_frontier_commits_one_atomic_two_sided_ram(self):
+        state, clock = self._state()
+        self._input(state, clock, 1, 1, 100000, -1.6, 16.0, 0.0)
+        self._input(state, clock, 2, 1, 100000, 6.5, 0.0, math.pi)
+        self._input(state, clock, 1, 2, 200000, 0.0, 16.0, 0.0)
+
+        self.assertEqual(0, state._resolve_human_rams())
+        self._input(state, clock, 2, 2, 200000, 6.5, 0.0, math.pi)
+        self.assertEqual(1, state._resolve_human_rams())
+
+        self.assertLess(state.players[1].health, 1000)
+        self.assertEqual(state.players[1].health, state.players[2].health)
+        hits = [event for event in state.pending_events
+                if event.get('kind') == 'hit']
+        self.assertEqual(2, len(hits))
+        self.assertEqual({'ram'}, set(event['source'] for event in hits))
+        self.assertEqual(1, len(set(
+            event['ram_operation_id'] for event in hits)))
+        for event in hits:
+            state._validate_combat_event_for_wire(event)
+
+    def test_input_retry_is_idempotent_and_identity_conflict_is_rejected(self):
+        state, clock = self._state()
+        message = {
+            'round_id': state.round_id, 'input_seq': 1,
+            'pose_time_us': 100000,
+            'x': 0.0, 'y': 0.0, 'z': -1.6, 'yaw': 0.0,
+            'speed': 16.0,
+        }
+        clock[0] = 0.2
+
+        self.assertTrue(state.update_input(1, dict(message)))
+        self.assertTrue(state.update_input(1, dict(message)))
+        self.assertEqual(1, len(state.players[1].pose_history))
+        self.assertFalse(state.update_input(
+            1, dict(message, z=20.0)))
+        self.assertEqual(-1.6, state.players[1].z)
+        self.assertFalse(state.update_input(
+            1, dict(message, input_seq=0)))
+        self.assertFalse(state.update_input(
+            1, dict(message, input_seq=3, pose_time_us=200000)))
+        self.assertEqual(1, state.players[1].input_seq)
+
+    def test_visible_input_cannot_submit_health_or_critical_verdicts(self):
+        state, unused_clock = self._state()
+        player = state.players[1]
+        before = (
+            player.health, player.alive, copy.deepcopy(player.critical),
+            len(state.pending_events), player.input_seq)
+
+        self.assertFalse(state.update_input(1, {
+            'round_id': state.round_id,
+            'input_seq': 1, 'reported_health': 0,
+            'reported_reason': 2, 'reported_critical': {'events': []},
+        }))
+
+        self.assertEqual(before, (
+            player.health, player.alive, player.critical,
+            len(state.pending_events), player.input_seq))
+        self.assertFalse(state.report_bot_ram(1, {
+            'round_id': state.round_id,
+            'bot_id': 1, 'target_kind': 'human', 'target_id': 2,
+            'ram_seq': 1, 'damage_to_bot': 100,
+            'damage_to_target': 100,
+        }))
+
+    def test_missing_timeline_capability_refuses_start_before_mutation(self):
+        state = BattleState(
+            map_name='01_karelia', authority_mode='client', team_size=1)
+        state.client_build = CLIENT_BUILD_0922
+        player = _player(1)
+        player.capabilities = (PROJECTILE_CAPABILITY,)
+        state.players = {1: player}
+        state.simulation_worker = SimulationWorker(
+            _Socket(), ('127.0.0.1', 1000), capabilities=(
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                SIMULATION_WORKER_CAPABILITY))
+        state._elect_room_host()
+        state._elect_bot_authority()
+
+        message, error = state.request_start(1)
+
+        self.assertIsNone(message)
+        self.assertEqual('missing_human_ram_timeline_capability', error)
+        self.assertEqual('waiting', state.phase)
+        self.assertFalse(state.roster_finalized)
+        self.assertEqual({}, state.round_participants)
+
+    def test_manifest_identity_conflict_fences_the_worker(self):
+        state, unused_clock = self._state()
+        worker = state.simulation_worker
+        profiles = [dict(state.human_collision_profiles[player_id])
+                    for player_id in sorted(state.human_collision_profiles)]
+        for profile in profiles:
+            profile['shape'] = list(profile['shape'])
+        profiles[0]['mass'] = 9000.0
+        handler = object.__new__(ClientHandler)
+
+        result = handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, {
+                'type': 'bot_manifest', 'round_id': state.round_id,
+                'bots': [], 'player_collision_profiles': profiles,
+            })
+
+        self.assertEqual('close', result)
+        self.assertFalse(worker.connected)
+        self.assertIsNone(state.simulation_worker)
+        self.assertIsNone(state.bot_authority_id)
+        self.assertEqual(
+            'human_collision_manifest_conflict',
+            state.worker_failure_reason)
+        self.assertEqual(
+            'human_collision_manifest', state.battle_result['reason'])
+
+    def test_sustained_overlap_rearms_only_after_observed_separation(self):
+        state, clock = self._state()
+        sequence = {1: 0, 2: 0}
+
+        def pair(sample_time_us, first_z, first_speed):
+            for player_id, z, speed, yaw in (
+                    (1, first_z, first_speed, 0.0),
+                    (2, 6.5, 0.0, math.pi)):
+                sequence[player_id] += 1
+                self._input(
+                    state, clock, player_id, sequence[player_id],
+                    sample_time_us, z, speed, yaw)
+            return state._resolve_human_rams()
+
+        self.assertEqual(0, pair(100000, -1.6, 16.0))
+        self.assertEqual(1, pair(200000, 0.0, 16.0))
+        first_health = state.players[1].health
+        for sample_time in (400000, 600000, 800000, 1000000):
+            self.assertEqual(0, pair(sample_time, 0.0, 16.0))
+        self.assertEqual(first_health, state.players[1].health)
+
+        self.assertEqual(0, pair(1200000, -5.0, 0.0))
+        self.assertNotIn((1, 2), state.human_ram_contacts)
+        self.assertEqual(1, pair(1400000, 0.0, 16.0))
+        self.assertLess(state.players[1].health, first_health)
+
+    def test_history_gap_cannot_replay_an_unresolved_overlap(self):
+        state, clock = self._state()
+        sequence = {1: 0, 2: 0}
+
+        def pair(sample_time_us, first_z, first_speed):
+            for player_id, z, speed, yaw in (
+                    (1, first_z, first_speed, 0.0),
+                    (2, 6.5, 0.0, math.pi)):
+                sequence[player_id] += 1
+                self._input(
+                    state, clock, player_id, sequence[player_id],
+                    sample_time_us, z, speed, yaw)
+            return state._resolve_human_rams()
+
+        self.assertEqual(0, pair(100000, -1.6, 16.0))
+        self.assertEqual(1, pair(200000, 0.0, 16.0))
+        first_health = state.players[1].health
+        self.assertIn((1, 2), state.human_ram_contacts)
+
+        # A 400 ms source-time hole clears both histories. The pair remains
+        # armed until a later common frontier proves separation.
+        self.assertEqual(0, pair(600000, 0.0, 16.0))
+        self.assertEqual(0, pair(800000, 0.0, 16.0))
+        self.assertEqual(first_health, state.players[1].health)
+        self.assertIn((1, 2), state.human_ram_contacts)
+        self.assertEqual(0, pair(1000000, -5.0, 0.0))
+        self.assertNotIn((1, 2), state.human_ram_contacts)
+
+    def test_simultaneous_fatal_ram_is_committed_before_battle_result(self):
+        state, clock = self._state(health=100)
+        for player_id, z, speed, yaw in (
+                (1, -1.6, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 1, 100000,
+                        z, speed, yaw)
+        for player_id, z, speed, yaw in (
+                (1, 0.0, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 2, 200000,
+                        z, speed, yaw)
+
+        self.assertEqual(1, state._resolve_human_rams())
+
+        self.assertEqual((0, 0), (
+            state.players[1].health, state.players[2].health))
+        self.assertEqual((False, False), (
+            state.players[1].alive, state.players[2].alive))
+        self.assertEqual(0, state.battle_result['winner'])
+        self.assertEqual(2, state.players[1].death_attacker_id)
+        self.assertEqual(1, state.players[2].death_attacker_id)
+
+
 class ServerAuthorityBattleTest(unittest.TestCase):
     def _live_state(self):
         state = _state_with_authority()
@@ -324,6 +731,12 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         self.assertEqual('battle', state.phase)
         state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
         state.pending_live_message = None
+        # This class exercises the server-authority ram receipt seam rather
+        # than the separately covered source-timed human timeline protocol.
+        for player in state.players.values():
+            player.capabilities = tuple(
+                capability for capability in player.capabilities
+                if capability != HUMAN_RAM_TIMELINE_CAPABILITY)
         return state
 
     def test_human_hull_pitch_and_roll_reach_server_narrow_phase(self):
@@ -347,6 +760,108 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         self.assertEqual(-0.3, published['roll'])
         self.assertEqual(0.25, target['pitch'])
         self.assertEqual(-0.3, target['roll'])
+
+    def test_ram_history_brackets_a_coalesced_player_revision(self):
+        state = self._live_state()
+        authority = state.server_authority
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+
+        def remember(server_tick, revision, sample_time_us, z):
+            bot = dict(state.bot_states[bot_id])
+            bot.update(id=bot_id, x=0.0, y=0.0, z=z, yaw=math.pi,
+                       health=1000, alive=True, fire_seq=0)
+            authority.apply_snapshot({
+                'server_tick': server_tick,
+                'bot_state_revision': revision,
+                'bot_state_time_us': sample_time_us,
+                'server_time_ms': sample_time_us // 1000,
+                'bots': [bot], 'projectiles': [],
+            })
+
+        remember(10, 10, 100000, 7.0)
+        remember(12, 12, 120000, 6.0)
+        state.bot_state_revision = 12
+        state.bot_state_time_us = 120000
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'speed': 16.0,
+            'ram_contacts': [{
+                'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 11,
+                'presentation_time_us': 110000,
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 16.0,
+            }],
+        })
+
+        published = authority._players_payload()[0]
+        receipt = published['ram_contacts'][0]
+        historical = receipt['_ram_contact_bot_state']
+
+        self.assertEqual(1, published['ram_contact_admitted_seq'])
+        self.assertAlmostEqual(6.5, historical['z'])
+        self.assertAlmostEqual(-50.0, historical['ram_vz'])
+        self.assertIn('mass', historical)
+        self.assertIn('collision_shape', historical)
+
+    def test_server_authority_resolves_human_ram_receipt_end_to_end(self):
+        state = self._live_state()
+        authority = state.server_authority
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        runtime_bot = authority._bots.states[bot_id]
+        runtime_bot.update(
+            x=0.0, y=0.0, z=6.5, yaw=math.pi, speed=0.0,
+            push_x=0.0, push_z=0.0, health=1000, alive=True)
+        state.bot_states[bot_id].update(
+            x=0.0, y=0.0, z=6.5, yaw=math.pi,
+            health=1000, alive=True)
+
+        for server_tick, revision, sample_time_us in (
+                (20, 20, 200000), (22, 22, 220000)):
+            bot = dict(state.bot_states[bot_id])
+            authority.apply_snapshot({
+                'server_tick': server_tick,
+                'bot_state_revision': revision,
+                'bot_state_time_us': sample_time_us,
+                'server_time_ms': sample_time_us // 1000,
+                'bots': [bot], 'projectiles': [],
+            })
+        state.bot_state_revision = 22
+        state.bot_state_time_us = 220000
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'speed': 16.0,
+            'ram_contacts': [{
+                'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 21,
+                'presentation_time_us': 210000,
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 16.0,
+            }],
+        })
+
+        reports = authority._bots._resolve_human_ram_receipts(
+            authority._players_payload(), 1.0,
+            step=1.0 / TICK_HZ, processed_pairs=set())
+        before = (player.health, state.bot_states[bot_id]['health'])
+        for report in reports:
+            authority._route(report, 1.0)
+
+        self.assertEqual(1, len(reports))
+        self.assertEqual((1, 1), (
+            reports[0]['ram_contact_player_id'],
+            reports[0]['ram_contact_seq']))
+        self.assertGreater(reports[0]['damage_to_target'], 0)
+        self.assertGreater(reports[0]['damage_to_bot'], 0)
+        self.assertLess(player.health, before[0])
+        self.assertLess(state.bot_states[bot_id]['health'], before[1])
+        self.assertEqual([], list(player.ram_contacts))
 
     def test_bots_publish_states_and_move_on_server_ticks(self):
         state = self._live_state()
@@ -378,10 +893,23 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         }
 
         state.update_input(1, {
-            'round_id': state.round_id, 'ram_contact': valid})
+            'round_id': state.round_id,
+            'x': 1.25, 'y': 0.0, 'z': -2.5, 'yaw': 0.25,
+            'speed': 16.5, 'ram_contacts': [valid]})
 
-        self.assertEqual(valid, state._public_player(
-            state.players[1])['ram_contact'])
+        accepted = state._public_player(
+            state.players[1])['ram_contacts'][0]
+        self.assertEqual(
+            {key: valid[key] for key in (
+                'seq', 'bot_id', 'bot_state_revision',
+                'presentation_time_us')},
+            {key: accepted[key] for key in (
+                'seq', 'bot_id', 'bot_state_revision',
+                'presentation_time_us')})
+        self.assertEqual((1.25, 0.0, -2.5, 0.25), tuple(
+            accepted[key] for key in ('x', 'y', 'z', 'yaw')))
+        self.assertAlmostEqual(math.sin(0.25) * 16.5, accepted['vx'], 4)
+        self.assertAlmostEqual(math.cos(0.25) * 16.5, accepted['vz'], 4)
         for rejected in (
                 dict(valid, seq=2, bot_state_revision=301),
                 dict(valid, seq=3, bot_state_revision=44),
@@ -391,12 +919,12 @@ class ServerAuthorityBattleTest(unittest.TestCase):
                 dict(valid, seq=7, presentation_time_us=1.5),
                 dict(valid, seq=0)):
             state.update_input(1, {
-                'round_id': state.round_id, 'ram_contact': rejected})
-            self.assertEqual(valid, state.players[1].ram_contact)
+                'round_id': state.round_id, 'ram_contacts': [rejected]})
+            self.assertEqual([1], list(state.players[1].ram_contacts))
         state.update_input(1, {
             'round_id': state.round_id + 1,
-            'ram_contact': dict(valid, seq=8)})
-        self.assertEqual(valid, state.players[1].ram_contact)
+            'ram_contacts': [dict(valid, seq=8)]})
+        self.assertEqual([1], list(state.players[1].ram_contacts))
 
     def test_accepted_ram_receipt_cannot_reappear_after_authority_change(self):
         state = self._live_state()
@@ -412,8 +940,11 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             'x': player.x, 'y': player.y, 'z': player.z,
             'yaw': 0.0, 'vx': 0.0, 'vz': 16.0,
         }
+        player.ram_contact_seq = 8
         state.update_input(1, {
-            'round_id': state.round_id, 'ram_contact': receipt})
+            'round_id': state.round_id,
+            'input_seq': 1, 'pose_time_us': 2900000,
+            'speed': 16.0, 'ram_contacts': [receipt]})
 
         self.assertTrue(state.report_bot_ram(SERVER_AUTHORITY_ID, {
             'round_id': state.round_id,
@@ -423,15 +954,180 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             'ram_contact_player_id': 1, 'ram_contact_seq': 9,
         }))
 
-        self.assertEqual({}, player.ram_contact)
+        self.assertEqual([], list(player.ram_contacts))
         self.assertEqual(9, player.ram_contact_seq)
-        self.assertNotIn('ram_contact', state._public_player(player))
+        self.assertEqual(
+            [], state._public_player(player).get('ram_contacts', []))
         # The input sender repeats its latest receipt until a newer contact.
         # Keeping the monotonic sequence after clearing prevents that old
         # payload from becoming visible to a takeover authority again.
         state.update_input(1, {
-            'round_id': state.round_id, 'ram_contact': receipt})
-        self.assertEqual({}, player.ram_contact)
+            'round_id': state.round_id,
+            'input_seq': 2, 'pose_time_us': 2900000,
+            'ram_contacts': [receipt]})
+        self.assertEqual([], list(player.ram_contacts))
+
+    def test_ram_contact_ledger_preserves_batch_and_is_idempotent(self):
+        state = self._live_state()
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        bot = state.bot_states[bot_id]
+        bot.update(x=30.0, z=30.0, health=1000, alive=True)
+        state.bot_state_revision = 300
+        state.bot_state_time_us = 3000000
+
+        def receipt(seq, presentation_time_us):
+            return {
+                'seq': seq, 'bot_id': bot_id,
+                'bot_state_revision': 300,
+                'presentation_time_us': presentation_time_us,
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 16.0,
+            }
+
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'ram_contacts': [receipt(1, 1000000),
+                             receipt(2, 2000000)],
+        })
+        self.assertEqual([1, 2], list(player.ram_contacts))
+        self.assertEqual(2, player.ram_contact_seq)
+        self.assertEqual(
+            [1, 2], [value['seq'] for value in
+                     state._public_player(player)['ram_contacts']])
+
+        first = {
+            'round_id': state.round_id,
+            'bot_id': bot_id, 'target_kind': 'human', 'target_id': 1,
+            'ram_seq': 11, 'damage_to_bot': 10,
+            'damage_to_target': 20,
+            'ram_contact_player_id': 1, 'ram_contact_seq': 1,
+        }
+        second = dict(
+            first, ram_seq=12, damage_to_bot=11,
+            damage_to_target=21, ram_contact_seq=2)
+        self.assertFalse(state.report_bot_ram(
+            SERVER_AUTHORITY_ID, second))
+        self.assertEqual([1, 2], list(player.ram_contacts))
+        self.assertTrue(state.report_bot_ram(SERVER_AUTHORITY_ID, first))
+        self.assertEqual(1, player.ram_contact_resolved_seq)
+        self.assertTrue(state.report_bot_ram(SERVER_AUTHORITY_ID, second))
+        self.assertEqual([], list(player.ram_contacts))
+        self.assertEqual(2, player.ram_contact_resolved_seq)
+        self.assertEqual(
+            2, state._public_player(player)['ram_contact_resolved_seq'])
+        self.assertEqual(959, player.health)
+        self.assertEqual(979, bot['health'])
+
+        # Exact retransmission is success without a second HP mutation;
+        # reusing the stable contact identity for other damage conflicts.
+        self.assertTrue(state.report_bot_ram(SERVER_AUTHORITY_ID, second))
+        self.assertFalse(state.report_bot_ram(
+            SERVER_AUTHORITY_ID, dict(second, damage_to_target=22)))
+        self.assertEqual((959, 979), (player.health, bot['health']))
+
+    def test_receipt_terminal_noop_and_direct_human_report_policy(self):
+        state = self._live_state()
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        state.bot_states[bot_id].update(health=1000, alive=True)
+        state.bot_state_revision = 50
+        state.bot_state_time_us = 500000
+        receipt = {
+            'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 50,
+            'presentation_time_us': 400000,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'vx': 0.0, 'vz': 0.0,
+        }
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contacts': [receipt]})
+        terminal = {
+            'round_id': state.round_id,
+            'bot_id': bot_id, 'target_kind': 'human', 'target_id': 1,
+            'ram_seq': 7, 'damage_to_bot': 0, 'damage_to_target': 0,
+            'ram_contact_player_id': 1, 'ram_contact_seq': 1,
+        }
+
+        self.assertTrue(state.report_bot_ram(
+            SERVER_AUTHORITY_ID, terminal))
+        self.assertEqual([], list(player.ram_contacts))
+        self.assertEqual(1, player.ram_contact_resolved_seq)
+        self.assertTrue(state.report_bot_ram(
+            SERVER_AUTHORITY_ID, terminal))
+        self.assertFalse(state.report_bot_ram(SERVER_AUTHORITY_ID, {
+            'round_id': state.round_id,
+            'bot_id': bot_id, 'target_kind': 'human', 'target_id': 1,
+            'ram_seq': 8, 'damage_to_bot': 10, 'damage_to_target': 10,
+        }))
+
+    def test_invalid_or_conflicting_receipt_head_gets_input_decision(self):
+        state = self._live_state()
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 10
+        state.bot_state_time_us = 100000
+
+        def receipt(seq, **values):
+            result = {
+                'seq': seq, 'bot_id': bot_id,
+                'bot_state_revision': 10,
+                'presentation_time_us': 100000,
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 0.0,
+            }
+            result.update(values)
+            return result
+
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'ram_contacts': [
+                receipt(1, bot_state_revision=11), receipt(2)],
+        })
+
+        self.assertEqual(2, player.ram_contact_seq)
+        self.assertEqual([2], list(player.ram_contacts))
+
+        first_three = receipt(3, x=1.0)
+        other_three = receipt(3, x=2.0)
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'ram_contacts': [first_three, other_three, receipt(4)],
+        })
+
+        self.assertEqual(4, player.ram_contact_seq)
+        self.assertEqual([2, 4], list(player.ram_contacts))
+
+    def test_full_ram_ledger_does_not_advance_admission(self):
+        state = self._live_state()
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 10
+        state.bot_state_time_us = 100000
+        for seq in range(100, 132):
+            player.ram_contacts[seq] = {'seq': seq, 'bot_id': bot_id}
+        receipt = {
+            'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 10,
+            'presentation_time_us': 100000,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'vx': 0.0, 'vz': 0.0,
+        }
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contacts': [receipt]})
+        self.assertEqual(0, player.ram_contact_seq)
+        player.ram_contacts.pop(100)
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contacts': [receipt]})
+        self.assertEqual(1, player.ram_contact_seq)
+        self.assertIn(1, player.ram_contacts)
 
     def test_bot_states_stay_inside_the_baked_grid(self):
         state = self._live_state()
@@ -536,7 +1232,8 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
             'shooter_id': 1,
             'shot_seq': shot_seq,
             'shell_index': 0,
-            'origin': [0.0, 1.0, 0.0],
+            'origin': [state.players[1].x, state.players[1].y + 1.0,
+                       state.players[1].z],
             'velocity': list(velocity),
             'gravity': 9.81,
             'max_distance': 200.0,
@@ -547,7 +1244,8 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
             'source_shot': (source_shot or _mounted_source_shot(
                 state, 1, velocity, 9.81, 200.0)),
         }
-        self.assertTrue(state.launch_projectile(1, message))
+        self.assertTrue(_launch_player_as_authority(
+            state, SERVER_AUTHORITY_ID, message))
         return '%d:p:1:%d' % (state.round_id, shot_seq)
 
     def _tick_until_terminal(self, state, projectile_id, limit=30):
@@ -910,7 +1608,9 @@ class VehicleStatisticsTest(unittest.TestCase):
             'shooter_id': shooter_id,
             'shot_seq': shot_seq,
             'shell_index': 0,
-            'origin': [0.0, 1.0, 0.0],
+            'origin': [state.players[shooter_id].x,
+                       state.players[shooter_id].y + 1.0,
+                       state.players[shooter_id].z],
             'velocity': [0.0, 0.0, 100.0],
             'gravity': 9.81,
             'max_distance': 200.0,
@@ -921,7 +1621,8 @@ class VehicleStatisticsTest(unittest.TestCase):
             'source_shot': _mounted_source_shot(
                 state, shooter_id, (0.0, 0.0, 100.0), 9.81, 200.0),
         }
-        self.assertTrue(state.launch_projectile(shooter_id, launch))
+        self.assertTrue(_launch_player_as_authority(
+            state, SERVER_AUTHORITY_ID, launch))
         return '%d:p:%d:%d' % (state.round_id, shooter_id, shot_seq)
 
     def _shoot(self, state, shooter_id, target_id, damage, shot_seq=1,
@@ -1023,11 +1724,14 @@ class VehicleStatisticsTest(unittest.TestCase):
             0, state.vehicle_statistics[('player', 1)][
                 'damage_assisted_track'])
 
-    def test_owner_repair_opens_a_second_server_accepted_track_break(self):
+    def test_visible_owner_repair_verdict_is_rejected(self):
         state = self._live_state()
         target = state.players[2]
         self._shoot(state, 1, 2, 0, critical=_TRACK_CRITICAL)
         first_base = target.critical_report_base_revision
+        before = (
+            copy.deepcopy(target.critical), target.critical_ack_seq,
+            target.critical_report_base_revision)
 
         repaired = {
             'devices': [{'name': 'leftTrackHealth', 'hp': 50.0,
@@ -1038,29 +1742,15 @@ class VehicleStatisticsTest(unittest.TestCase):
                         'old_state': 'destroyed', 'state': 'critical',
                         'cause': 'repair'}],
         }
-        self.assertTrue(state._apply_reported_health(target, {
+        self.assertFalse(state._apply_reported_health(target, {
             'reported_health': target.health,
             'reported_critical': repaired,
             'reported_critical_base_revision': first_base,
             'reported_critical_seq': 1,
         }))
-        self.assertEqual(1, target.critical_ack_seq)
-
-        second_break = dict(_TRACK_CRITICAL)
-        second_break['events'] = [{
-            'kind': 'device', 'name': 'leftTrackHealth',
-            'old_state': 'critical', 'state': 'destroyed', 'cause': 'shot'}]
-        self._shoot(
-            state, 1, 2, 0, shot_seq=2, critical=second_break)
-
-        self.assertIn('leftTrackHealth', target.critical['destroyed'])
-        self.assertGreater(
-            target.critical_report_base_revision, first_base)
-        self.assertEqual(0, target.critical_ack_seq)
-        hits = [event for event in state.pending_events
-                if event.get('kind') == 'hit']
-        self.assertEqual(2, len(hits))
-        self.assertTrue(hits[-1]['critical_accepted'])
+        self.assertEqual(before, (
+            target.critical, target.critical_ack_seq,
+            target.critical_report_base_revision))
 
     def test_ammo_rack_death_clamps_health_and_terminal_retry_is_idempotent(self):
         state = self._live_state()
@@ -1166,30 +1856,20 @@ class VehicleStatisticsTest(unittest.TestCase):
                         for kind, target_id in targets],
         })
 
-    def test_radio_assist_goes_to_the_reporter_not_the_shooter(self):
+    def test_visible_spotted_report_cannot_mint_radio_assist(self):
         state = self._live_state()
-        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 3, [('player', 2)]))
         self._shoot(state, 1, 2, 180)
 
-        assists = self._assists(state)
-        self.assertEqual(1, len(assists))
-        self.assertEqual({
-            'kind': 'assist', 'category': 'radio',
-            'assister_kind': 'player', 'assister_id': 3,
-            'attacker_kind': 'player', 'attacker_id': 1,
-            'target_kind': 'player', 'target_id': 2,
-            'damage': 180,
-        }, assists[0])
-        self.assertEqual(
-            180, state.vehicle_statistics[('player', 3)][
-                'damage_assisted_radio'])
+        self.assertEqual([], self._assists(state))
+        self.assertNotIn(('player', 3), state.vehicle_statistics)
         self.assertEqual(
             0, state.vehicle_statistics[('player', 1)][
                 'damage_assisted_radio'])
 
     def test_a_reporter_earns_no_radio_assist_from_its_own_damage(self):
         state = self._live_state()
-        self.assertTrue(self._report_spotted(state, 1, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 1, [('player', 2)]))
         self._shoot(state, 1, 2, 180)
 
         self.assertEqual([], self._assists(state))
@@ -1199,34 +1879,28 @@ class VehicleStatisticsTest(unittest.TestCase):
 
     def test_an_empty_report_clears_the_previous_spotted_set(self):
         state = self._live_state()
-        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
-        self.assertTrue(self._report_spotted(state, 3, []))
+        self.assertFalse(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 3, []))
         self._shoot(state, 1, 2, 180)
 
         self.assertEqual([], self._assists(state))
 
-    def test_spotted_total_counts_each_enemy_only_once(self):
+    def test_visible_spotted_reports_do_not_create_statistics(self):
         state = self._live_state()
         enemy_bot_id = min(
             bot_id for bot_id, bot in state.bot_states.items()
             if int(bot['team']) == 2)
 
-        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
-        self.assertTrue(self._report_spotted(state, 3, []))
-        self.assertTrue(self._report_spotted(
+        self.assertFalse(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 3, []))
+        self.assertFalse(self._report_spotted(
             state, 3, [('player', 2), ('bot', enemy_bot_id)]))
 
-        self.assertEqual(
-            2, state.vehicle_statistics[('player', 3)]['spotted'])
-        self.assertEqual(
-            2, state._receipt_statistics(
-                state.vehicle_statistics[('player', 3)])['spotted'])
-        interactions = state.vehicle_interactions[('player', 3)]
-        self.assertEqual(1, interactions['player:2']['spotted'])
-        self.assertEqual(1, interactions[
-            'bot:%d' % enemy_bot_id]['spotted'])
+        self.assertNotIn(('player', 3), state.vehicle_statistics)
+        self.assertNotIn(('player', 3), state.vehicle_interactions)
+        self.assertNotIn(3, state.player_spotted)
 
-    def test_first_spotted_report_is_accepted_during_shared_countdown(self):
+    def test_visible_spotted_report_is_rejected_in_every_phase(self):
         state = _state_with_authority()
         self.assertFalse(self._report_spotted(state, 1, []))
         unused_message, error = state.request_start(1, '01_karelia')
@@ -1239,22 +1913,22 @@ class VehicleStatisticsTest(unittest.TestCase):
         self.assertIsNotNone(live)
         self.assertEqual('battle', state.phase)
         self.assertEqual(0, state.tick)
-        self.assertTrue(self._report_spotted(state, 1, []))
-        self.assertEqual(frozenset(), state.player_spotted[1])
+        self.assertFalse(self._report_spotted(state, 1, []))
+        self.assertNotIn(1, state.player_spotted)
 
     def test_a_dead_reporter_stops_earning_radio_assist(self):
         state = self._live_state()
-        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 3, [('player', 2)]))
         state.players[3].alive = False
         self._shoot(state, 1, 2, 180)
 
         self.assertEqual([], self._assists(state))
 
-    def test_spotted_report_refuses_an_invalid_claim_entirely(self):
+    def test_visible_spotted_report_refuses_every_claim_entirely(self):
         state = self._live_state()
         enemy_bot_id = min(bot_id for bot_id, bot in state.bot_states.items()
                            if int(bot['team']) == 2)
-        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 3, [('player', 2)]))
 
         self.assertFalse(self._report_spotted(state, 3, [('player', 99)]))
         self.assertFalse(self._report_spotted(state, 3, [('player', 1)]))
@@ -1266,27 +1940,25 @@ class VehicleStatisticsTest(unittest.TestCase):
         self.assertFalse(state.update_spotted_targets(3, {
             'type': 'spotted_report', 'round_id': state.round_id + 5,
             'targets': []}))
-        self.assertEqual(frozenset([('player', 2)]), state.player_spotted[3])
-        self.assertTrue(self._report_spotted(
+        self.assertNotIn(3, state.player_spotted)
+        self.assertFalse(self._report_spotted(
             state, 3, [('player', 2), ('bot', enemy_bot_id)]))
 
-    def test_track_and_radio_assist_are_both_credited(self):
+    def test_visible_spot_cannot_join_canonical_track_assist(self):
         state = self._live_state()
         self._shoot(state, 1, 2, 50, critical=_TRACK_CRITICAL)
-        self.assertTrue(self._report_spotted(state, 3, [('player', 2)]))
+        self.assertFalse(self._report_spotted(state, 3, [('player', 2)]))
         state.pending_events = []
         self._shoot(state, 4, 2, 200)
 
         self.assertEqual(
-            [('track', 1), ('radio', 3)],
+            [('track', 1)],
             [(event['category'], event['assister_id'])
              for event in self._assists(state)])
         self.assertEqual(
             200, state.vehicle_statistics[('player', 1)][
                 'damage_assisted_track'])
-        self.assertEqual(
-            200, state.vehicle_statistics[('player', 3)][
-                'damage_assisted_radio'])
+        self.assertNotIn(('player', 3), state.vehicle_statistics)
         self.assertEqual(
             200, state.vehicle_statistics[('player', 4)]['damage_dealt'])
 

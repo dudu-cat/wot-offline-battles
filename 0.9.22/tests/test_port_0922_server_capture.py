@@ -43,6 +43,26 @@ class ServerCaptureTests(unittest.TestCase):
                       int(offset) * int(round(TICK_HZ)))
         return state._update_capture()
 
+    @staticmethod
+    def _apply_canonical_critical(state, player, critical):
+        record = {
+            'projectile_id': '%d:b:11:1' % state.round_id,
+            'shooter_kind': 'bot', 'shooter_id': 11,
+            'shot_seq': 1, 'shell_index': 0, 'team': 1,
+        }
+        raw = {
+            'target_kind': 'player', 'target_id': player.player_id,
+            'damage': 0, 'hull_damage': 0, 'shot_result': 2,
+            'x': player.x, 'y': player.y, 'z': player.z,
+            'critical': critical,
+            'critical_target_base_revision':
+                player.critical_report_base_revision,
+            'critical_target_ack_seq': player.critical_ack_seq,
+        }
+        proposal = state._normalize_projectile_effect(
+            raw, record, (player.x, player.y, player.z), False)
+        state._apply_projectile_effect(record, proposal)
+
     def test_modern_capture_requires_exact_ready_bases(self):
         state = self._state()
         state.capture_bases = {}
@@ -302,11 +322,7 @@ class ServerCaptureTests(unittest.TestCase):
                 'old_state': 'normal', 'state': 'critical', 'cause': 'shot',
             }],
         }
-        self.assertTrue(state._apply_reported_health(player, {
-            'reported_health': 1000, 'reported_critical': critical,
-            'reported_critical_base_revision': 0,
-            'reported_critical_seq': 1,
-        }))
+        self._apply_canonical_critical(state, player, critical)
         self.assertEqual(0, state.rules_state['bases']['1']['points'])
         self.assertEqual({}, state.capture_contributors[1])
         event = state.pending_events[-1]
@@ -339,11 +355,7 @@ class ServerCaptureTests(unittest.TestCase):
                 'old_state': 'critical', 'state': 'normal', 'cause': 'repair',
             }],
         }
-        self.assertTrue(state._apply_reported_health(player, {
-            'reported_health': 1000, 'reported_critical': repaired,
-            'reported_critical_base_revision': 0,
-            'reported_critical_seq': 1,
-        }))
+        self._apply_canonical_critical(state, player, repaired)
         self.assertEqual(3, state.rules_state['bases']['1']['points'])
         self.assertEqual({'human:2': 3}, state.capture_contributors[1])
 

@@ -50,6 +50,9 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn(
             '--config engine_config.offline-player.xml', source)
         self.assertIn('--logFilePrefix offline-player-', source)
+        self.assertIn(
+            'SetEnvironmentVariableW(WORKER_MODE_ENV, PLAYER_MODE_VALUE)',
+            source)
         self.assertIn('lstrcmpiW(command_line, PLAYER_MODE)', source)
         self.assertIn(
             'lstrcmpiW(command_line, PAIRED_PLAYER_MODE)', source)
@@ -232,6 +235,7 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn(
             'WoT-0.9.22-LAN-Server.exe'.encode('utf-16le'), payload)
         self.assertIn('WOT_0922_LOOPBACK_ONLY'.encode('utf-16le'), payload)
+        self.assertIn(b'player_mode', payload)
 
 
 if __name__ == '__main__':

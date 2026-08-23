@@ -13,7 +13,9 @@ sys.path.insert(0, str(CLIENT_ROOT))
 from lan_battle_server import (  # noqa: E402
     AUTHORITY_DESCRIPTOR_TIMEOUT_SECONDS,
     AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS,
-    BattleState, CLIENT_BUILD_0922, Player, PROJECTILE_CAPABILITY,
+    BattleState, CLIENT_BUILD_0922, HUMAN_RAM_TIMELINE_CAPABILITY,
+    PLAYER_FIRE_INTENT_CAPABILITY, Player, PROJECTILE_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY,
 )
 from server_battle_authority import SERVER_AUTHORITY_ID  # noqa: E402
 from gui.mods.offline_lan_0922 import descriptor_donation  # noqa: E402
@@ -39,7 +41,13 @@ def _player(player_id, team=1, vehicle='ussr:R11_MS-1'):
         player_id, _Socket(), ('127.0.0.1', player_id),
         team=team, slot=max(0, player_id - 1), x=398.0, z=402.0,
         vehicle=vehicle, client_position=True, health=1000,
-        max_health=1000, capabilities=(PROJECTILE_CAPABILITY,),
+        max_health=1000,
+        capabilities=(
+            PROJECTILE_CAPABILITY,
+            HUMAN_RAM_TIMELINE_CAPABILITY,
+            RAM_CONTACT_LEDGER_CAPABILITY,
+            PLAYER_FIRE_INTENT_CAPABILITY,
+        ),
     )
 
 
