@@ -13,3 +13,6 @@
 # The 0.8.2 client sources keep the CRLF endings the legacy client shipped, so
 # a carriage return at the end of a line is not trailing whitespace there.
 0.8.2/scripts/**/*.py whitespace=cr-at-eol
+
+# Preserve the upstream Sysinternals license text byte-for-byte.
+launcher/vendor/procdump/Eula.txt -text whitespace=cr-at-eol

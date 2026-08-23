@@ -208,6 +208,326 @@ class ErrorReportTest(unittest.TestCase):
                 core.LauncherError, "not a regular directory"):
             error_reports.attach_server(session, dedicated=True)
 
+    def test_only_a_confirmed_crash_role_dump_is_added_to_the_zip(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="start")
+        paths = error_reports.session_dump_paths(session)
+        self.assertEqual(
+            os.path.join(
+                error_reports.session_dumps_directory(), self.SESSION_1),
+            session["dumpDirectory"])
+        self.assertEqual(paths, session["dumpPaths"])
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        self._write(paths[error_reports.ROLE_VISIBLE_CLIENT], b"normal exit")
+        self._write(paths[error_reports.ROLE_HIDDEN_WORKER], b"worker crash")
+
+        self.assertTrue(error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_HIDDEN_WORKER]))
+        error_reports.finalize_session(session, ended_at="end")
+        report = error_reports.create_report()
+        payloads = self._archive(report)
+
+        self.assertEqual({
+            "visible-client.log": b"visible\n",
+            "hidden-worker.dmp": b"worker crash",
+        }, payloads)
+        self.assertNotIn("visible-client.dmp", report["included"])
+        with zipfile.ZipFile(report["path"], "r") as archive:
+            self.assertEqual(
+                zipfile.ZIP_DEFLATED,
+                archive.getinfo("hidden-worker.dmp").compress_type)
+
+    def test_windows_reparse_points_are_rejected_from_dump_boundaries(self):
+        value = mock.Mock(
+            st_mode=0,
+            st_file_attributes=error_reports.stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+        self.assertTrue(error_reports._is_reparse_point(value))
+
+    def test_dump_file_reparse_point_is_not_added_to_the_zip(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        dump_path = error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT)
+        self._write(dump_path, b"redirected memory")
+        error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+        error_reports.finalize_session(session, ended_at="end")
+        real_lstat = os.lstat
+
+        def lstat(path):
+            if path == dump_path:
+                return mock.Mock(
+                    st_mode=error_reports.stat.S_IFREG,
+                    st_file_attributes=(
+                        error_reports.stat.FILE_ATTRIBUTE_REPARSE_POINT))
+            return real_lstat(path)
+
+        with mock.patch.object(error_reports.os, "lstat", side_effect=lstat):
+            report = error_reports.create_report()
+
+        self.assertEqual(
+            {"visible-client.log": b"visible\n"}, self._archive(report))
+
+    def test_report_directory_reparse_point_is_refused(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        error_reports.finalize_session(session, ended_at="end")
+        report_root = error_reports.reports_directory()
+        os.makedirs(report_root)
+        real_lstat = os.lstat
+
+        def lstat(path):
+            if path == report_root:
+                return mock.Mock(
+                    st_mode=error_reports.stat.S_IFDIR,
+                    st_file_attributes=(
+                        error_reports.stat.FILE_ATTRIBUTE_REPARSE_POINT))
+            return real_lstat(path)
+
+        with mock.patch.object(error_reports.os, "lstat", side_effect=lstat):
+            with self.assertRaisesRegex(
+                    core.LauncherError, "not a regular directory"):
+                error_reports.create_report()
+
+    def test_a_confirmed_crash_dump_can_be_reported_before_any_log(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        dump_path = error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT)
+        self._write(dump_path, b"early crash")
+        error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+        error_reports.finalize_session(session, ended_at="end")
+
+        report = error_reports.create_report()
+
+        self.assertEqual(
+            {"visible-client.dmp": b"early crash"},
+            self._archive(report))
+        self.assertEqual(("visible-client.log",), report["missing"])
+
+    def test_dump_files_are_ignored_until_a_crash_role_is_confirmed(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), b"normal exit")
+        error_reports.finalize_session(session, ended_at="end")
+
+        self.assertEqual(
+            {"visible-client.log": b"visible\n"},
+            self._archive(error_reports.create_report()))
+
+    def test_dump_is_not_collected_before_the_session_is_finalized(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), b"still writing")
+        error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+
+        self.assertEqual(
+            {"visible-client.log": b"visible\n"},
+            self._archive(error_reports.create_report()))
+
+    def test_dump_cleanup_is_role_scoped_and_rejects_unknown_roles(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="start")
+        paths = error_reports.session_dump_paths(session)
+        self._write(paths[error_reports.ROLE_VISIBLE_CLIENT], b"visible")
+        self._write(paths[error_reports.ROLE_HIDDEN_WORKER], b"worker")
+
+        removed = error_reports.cleanup_session_dumps(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+
+        self.assertEqual(
+            (paths[error_reports.ROLE_VISIBLE_CLIENT],), removed)
+        self.assertFalse(os.path.lexists(
+            paths[error_reports.ROLE_VISIBLE_CLIENT]))
+        self.assertTrue(os.path.isfile(
+            paths[error_reports.ROLE_HIDDEN_WORKER]))
+        with self.assertRaisesRegex(core.LauncherError, "role is invalid"):
+            error_reports.cleanup_session_dumps(session, ["server"])
+        with self.assertRaisesRegex(core.LauncherError, "role is invalid"):
+            error_reports.set_session_crash_roles(session, ["server"])
+        error_reports.cleanup_session_dumps(session)
+        self.assertFalse(os.path.lexists(session["dumpDirectory"]))
+
+    def test_next_session_removes_only_fixed_stale_monitor_slots(self):
+        first = error_reports.begin_session(
+            self.game, needs_worker=True, session_id=self.SESSION_1,
+            started_at="first")
+        monitor_paths = error_reports._session_dump_monitor_paths(
+            first["dumpPaths"], error_reports.DUMP_ROLES)
+        self._write(monitor_paths[0], b"partial visible memory")
+        self._write(monitor_paths[-1], b"partial worker memory")
+        unrelated = os.path.join(first["dumpDirectory"], "keep.txt")
+        self._write(unrelated, b"not a monitor slot")
+
+        error_reports.begin_session(
+            self.game, session_id=self.SESSION_2, started_at="second")
+
+        self.assertFalse(os.path.lexists(monitor_paths[0]))
+        self.assertFalse(os.path.lexists(monitor_paths[-1]))
+        self.assertTrue(os.path.isfile(unrelated))
+
+    def test_begin_session_removes_only_the_previous_fixed_dump_files(self):
+        first = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="first")
+        first_dump = error_reports.session_dump_path(
+            first, error_reports.ROLE_VISIBLE_CLIENT)
+        unrelated = os.path.join(first["dumpDirectory"], "keep.txt")
+        self._write(first_dump, b"old dump")
+        self._write(unrelated, b"not a dump")
+
+        second = error_reports.begin_session(
+            self.game, session_id=self.SESSION_2, started_at="second")
+
+        self.assertFalse(os.path.lexists(first_dump))
+        self.assertTrue(os.path.isfile(unrelated))
+        self.assertTrue(os.path.isdir(second["dumpDirectory"]))
+
+    def test_begin_session_never_cleans_a_redirected_previous_boundary(self):
+        first = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="first")
+        private_directory = os.path.join(self.root, "private")
+        private_dump = os.path.join(private_directory, "visible-client.dmp")
+        self._write(private_dump, b"private memory")
+        first["dumpDirectory"] = private_directory
+        first["dumpPaths"] = {
+            error_reports.ROLE_VISIBLE_CLIENT: private_dump,
+            error_reports.ROLE_HIDDEN_WORKER: os.path.join(
+                private_directory, "hidden-worker.dmp"),
+        }
+        error_reports._write_state(first)
+
+        error_reports.begin_session(
+            self.game, session_id=self.SESSION_2, started_at="second")
+
+        with open(private_dump, "rb") as stream:
+            self.assertEqual(b"private memory", stream.read())
+
+    def test_redirected_dump_directory_is_never_collected(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        os.rmdir(session["dumpDirectory"])
+        redirected = os.path.join(self.root, "redirected")
+        os.makedirs(redirected)
+        try:
+            os.symlink(redirected, session["dumpDirectory"])
+        except (AttributeError, NotImplementedError, OSError):
+            self.skipTest("symlinks are unavailable")
+        private_dump = os.path.join(redirected, "visible-client.dmp")
+        self._write(private_dump, b"private memory")
+        error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+        error_reports.finalize_session(session, ended_at="end")
+
+        self.assertEqual(
+            {"visible-client.log": b"visible\n"},
+            self._archive(error_reports.create_report()))
+        with self.assertRaisesRegex(
+                core.LauncherError, "not a regular directory"):
+            error_reports.cleanup_session_dumps(session)
+        with open(private_dump, "rb") as stream:
+            self.assertEqual(b"private memory", stream.read())
+
+    def test_dump_symlink_is_never_read_and_cleanup_does_not_follow_it(self):
+        private = os.path.join(self.root, "private.dmp")
+        self._write(private, b"private memory")
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        dump_path = error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT)
+        try:
+            os.symlink(private, dump_path)
+        except (AttributeError, NotImplementedError, OSError):
+            self.skipTest("symlinks are unavailable")
+        error_reports.set_session_crash_roles(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+        error_reports.finalize_session(session, ended_at="end")
+
+        self.assertEqual(
+            {"visible-client.log": b"visible\n"},
+            self._archive(error_reports.create_report()))
+        error_reports.cleanup_session_dumps(
+            session, [error_reports.ROLE_VISIBLE_CLIENT])
+        with open(private, "rb") as stream:
+            self.assertEqual(b"private memory", stream.read())
+        self.assertFalse(os.path.lexists(dump_path))
+
+    def test_tampered_dump_paths_cannot_redirect_report_collection(self):
+        private = os.path.join(self.root, "private.dmp")
+        self._write(private, b"private memory")
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        session["dumpPaths"][error_reports.ROLE_VISIBLE_CLIENT] = private
+        session["crashRoles"] = [error_reports.ROLE_VISIBLE_CLIENT]
+        error_reports._write_state(session)
+
+        with self.assertRaisesRegex(
+                core.LauncherError, "dump boundary is unreadable"):
+            error_reports.create_report()
+        with open(private, "rb") as stream:
+            self.assertEqual(b"private memory", stream.read())
+
+    def test_creating_the_same_report_twice_never_overwrites_the_first(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        error_reports.finalize_session(session, ended_at="end")
+        now = datetime.datetime(2026, 8, 23, 12, 30, 0)
+        first = error_reports.create_report(now=now)
+        with open(first["path"], "rb") as stream:
+            original = stream.read()
+
+        with self.assertRaisesRegex(core.LauncherError, "already exists"):
+            error_reports.create_report(now=now)
+
+        with open(first["path"], "rb") as stream:
+            self.assertEqual(original, stream.read())
+
+    def test_declined_automatic_report_can_delete_only_the_exact_zip(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT), b"visible\n")
+        error_reports.finalize_session(session, ended_at="end")
+        report = error_reports.create_report()
+
+        self.assertTrue(error_reports.delete_report(report["path"]))
+        self.assertFalse(os.path.lexists(report["path"]))
+        self.assertFalse(error_reports.delete_report(report["path"]))
+        self.assertFalse(any(
+            ".tmp-" in name
+            for name in os.listdir(error_reports.reports_directory())))
+
+    def test_report_delete_refuses_a_path_outside_the_report_directory(self):
+        outside = os.path.join(self.root, "private.zip")
+        self._write(outside, b"private")
+
+        with self.assertRaisesRegex(core.LauncherError, "path is unsafe"):
+            error_reports.delete_report(outside)
+
+        with open(outside, "rb") as stream:
+            self.assertEqual(b"private", stream.read())
+
     def test_missing_session_has_a_clear_refusal(self):
         with self.assertRaisesRegex(
                 core.LauncherError, "No launcher game session"):

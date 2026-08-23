@@ -27,6 +27,7 @@ SESSION_SCHEMA = 1
 SESSION_STATE_FILENAME = "latest-error-report-session.json"
 REPORTS_DIRECTORY_NAME = "reports"
 SESSION_LOGS_DIRECTORY_NAME = "session-logs"
+SESSION_DUMPS_DIRECTORY_NAME = "session-dumps"
 SERVER_SESSION_ENV = "WOT_OFFLINE_REPORT_SESSION"
 
 ROLE_SERVER = "server"
@@ -36,6 +37,10 @@ ROLE_HIDDEN_WORKER_STARTER = "hidden-worker-starter"
 
 PRIMARY_ROLES = (
     ROLE_SERVER,
+    ROLE_VISIBLE_CLIENT,
+    ROLE_HIDDEN_WORKER,
+)
+DUMP_ROLES = (
     ROLE_VISIBLE_CLIENT,
     ROLE_HIDDEN_WORKER,
 )
@@ -56,8 +61,13 @@ _ARCHIVE_FILENAMES = {
     ROLE_HIDDEN_WORKER: "hidden-worker.log",
     ROLE_HIDDEN_WORKER_STARTER: "hidden-worker-starter.log",
 }
+_DUMP_FILENAMES = {
+    ROLE_VISIBLE_CLIENT: "visible-client.dmp",
+    ROLE_HIDDEN_WORKER: "hidden-worker.dmp",
+}
 _SESSION_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 _CHUNK_BYTES = 64 * 1024
+_DUMP_MONITOR_SLOTS = 32
 
 
 def _application_directory():
@@ -77,6 +87,11 @@ def session_logs_directory():
         _application_directory(), SESSION_LOGS_DIRECTORY_NAME)
 
 
+def session_dumps_directory():
+    return os.path.join(
+        _application_directory(), SESSION_DUMPS_DIRECTORY_NAME)
+
+
 def _valid_session_id(session_id):
     value = str(session_id or "")
     if _SESSION_ID.fullmatch(value) is None:
@@ -88,6 +103,168 @@ def session_server_log_path(session_id):
     session_id = _valid_session_id(session_id)
     return os.path.join(
         session_logs_directory(), session_id, core.SERVER_LOG_FILENAME)
+
+
+def _expected_dump_layout(session_id):
+    session_id = _valid_session_id(session_id)
+    directory = os.path.join(session_dumps_directory(), session_id)
+    paths = dict((role, os.path.join(directory, _DUMP_FILENAMES[role]))
+                 for role in DUMP_ROLES)
+    return directory, paths
+
+
+def _is_reparse_point(value):
+    attributes = getattr(value, "st_file_attributes", 0)
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and attributes & flag)
+
+
+def _recorded_dump_layout(session, required=True):
+    if not isinstance(session, dict):
+        raise core.LauncherError(
+            "The diagnostic session boundary is unreadable.")
+    directory, paths = _expected_dump_layout(session.get("id"))
+    recorded_directory = session.get("dumpDirectory")
+    recorded_paths = session.get("dumpPaths")
+    if recorded_directory is None and recorded_paths is None and not required:
+        return None
+    if recorded_directory != directory or recorded_paths != paths:
+        raise core.LauncherError(
+            "The diagnostic dump boundary is unreadable.")
+    return directory, paths
+
+
+def _safe_dump_directory(directory, create=False):
+    base = session_dumps_directory()
+    for candidate in (base, directory):
+        if not os.path.lexists(candidate):
+            if not create:
+                return False
+            try:
+                os.makedirs(candidate)
+            except (IOError, OSError):
+                pass
+        try:
+            value = os.lstat(candidate)
+        except (IOError, OSError):
+            raise core.LauncherError(
+                "The diagnostic dump folder could not be created.")
+        if (_is_reparse_point(value) or stat.S_ISLNK(value.st_mode) or
+                not stat.S_ISDIR(value.st_mode)):
+            raise core.LauncherError(
+                "The diagnostic dump folder is not a regular directory.")
+    try:
+        contained = os.path.commonpath(
+            (os.path.realpath(base), os.path.realpath(directory))) == (
+                os.path.realpath(base))
+    except ValueError:
+        contained = False
+    if not contained:
+        raise core.LauncherError("The diagnostic dump folder is unsafe.")
+    return True
+
+
+def _prepare_session_dump_directory(session_id):
+    directory, _paths = _expected_dump_layout(session_id)
+    _safe_dump_directory(directory, create=True)
+    return directory
+
+
+def _normalize_dump_roles(roles, default_all=False):
+    if roles is None:
+        values = DUMP_ROLES if default_all else ()
+    elif isinstance(roles, str):
+        values = (roles,)
+    else:
+        try:
+            values = tuple(roles)
+        except TypeError:
+            raise core.LauncherError(
+                "The diagnostic dump role list is invalid.")
+    if any(role not in DUMP_ROLES for role in values):
+        raise core.LauncherError("The diagnostic dump role is invalid.")
+    selected = set(values)
+    return tuple(role for role in DUMP_ROLES if role in selected)
+
+
+def session_dump_paths(session):
+    """Return the two fixed launcher-owned dump destinations."""
+    directory, paths = _recorded_dump_layout(session)
+    _safe_dump_directory(directory, create=True)
+    return dict(paths)
+
+
+def session_dump_path(session, role):
+    roles = _normalize_dump_roles((role,))
+    return session_dump_paths(session)[roles[0]]
+
+
+def _session_dump_monitor_paths(paths, roles):
+    temporary = []
+    for role in roles:
+        stem, extension = os.path.splitext(paths[role])
+        for slot in range(_DUMP_MONITOR_SLOTS):
+            temporary.append(
+                "%s.monitor-%02d.tmp%s" % (stem, slot, extension))
+    return tuple(temporary)
+
+
+def _remove_dump_entries(directory, candidates):
+    removed = []
+    for path in candidates:
+        try:
+            value = os.lstat(path)
+        except (IOError, OSError):
+            continue
+        if (stat.S_ISDIR(value.st_mode) and
+                not stat.S_ISLNK(value.st_mode)):
+            raise core.LauncherError(
+                "The diagnostic dump path is not a regular file.")
+        try:
+            os.unlink(path)
+        except (IOError, OSError) as error:
+            raise core.LauncherError(
+                "The diagnostic dump could not be removed: %s" % error)
+        removed.append(path)
+    try:
+        os.rmdir(directory)
+    except (IOError, OSError):
+        pass
+    return tuple(removed)
+
+
+def cleanup_session_dump_monitors(session, roles=None):
+    """Delete only the fixed native-monitor slots for this session."""
+    directory, paths = _recorded_dump_layout(session)
+    selected = _normalize_dump_roles(roles, default_all=True)
+    if not selected or not _safe_dump_directory(directory, create=False):
+        return ()
+    return _remove_dump_entries(
+        directory, _session_dump_monitor_paths(paths, selected))
+
+
+def cleanup_session_dumps(session, roles=None):
+    """Delete fixed final and monitor dump entries for this session."""
+    directory, paths = _recorded_dump_layout(session)
+    selected = _normalize_dump_roles(roles, default_all=True)
+    if not selected:
+        return ()
+    if not _safe_dump_directory(directory, create=False):
+        return ()
+    candidates = tuple(paths[role] for role in selected)
+    candidates += _session_dump_monitor_paths(paths, selected)
+    return _remove_dump_entries(directory, candidates)
+
+
+def set_session_crash_roles(session, roles):
+    """Allow only confirmed crashing process roles into the report ZIP."""
+    _recorded_dump_layout(session)
+    selected = _normalize_dump_roles(roles)
+    if not _is_latest(session):
+        return False
+    session["crashRoles"] = list(selected)
+    _write_state(session)
+    return True
 
 
 def _prepare_session_server_directory(session_id):
@@ -177,10 +354,27 @@ def _new_session_id(now=None):
 def begin_session(game_root, needs_worker=False, local_server=False,
                   session_id=None, started_at=None):
     """Replace the report boundary before any process for a game starts."""
+    previous = _read_state()
+    if isinstance(previous, dict):
+        try:
+            if _recorded_dump_layout(previous, required=False) is not None:
+                cleanup_session_dumps(previous)
+        except core.LauncherError:
+            # Never follow a stale or redirected boundary just to clean it up.
+            pass
     game_root = os.path.realpath(os.path.abspath(game_root))
     session_id = _valid_session_id(session_id or _new_session_id())
     started_at = started_at or datetime.datetime.now(
         datetime.timezone.utc).isoformat()
+    dump_directory, dump_paths = _expected_dump_layout(session_id)
+    _prepare_session_dump_directory(session_id)
+    dump_boundary = {
+        "id": session_id,
+        "dumpDirectory": dump_directory,
+        "dumpPaths": dump_paths,
+    }
+    cleanup_session_dumps(dump_boundary)
+    _prepare_session_dump_directory(session_id)
     expected = [ROLE_VISIBLE_CLIENT]
     if local_server:
         expected.append(ROLE_SERVER)
@@ -203,6 +397,9 @@ def begin_session(game_root, needs_worker=False, local_server=False,
         "endedAt": None,
         "expectedRoles": sorted(expected),
         "sources": sources,
+        "dumpDirectory": dump_directory,
+        "dumpPaths": dump_paths,
+        "crashRoles": [],
     }
     _write_state(session)
     return session
@@ -329,6 +526,14 @@ def _validated_session():
            for role, source in session["sources"].items()):
         raise core.LauncherError(
             "The latest diagnostic session boundary is unreadable.")
+    dump_layout = _recorded_dump_layout(session, required=False)
+    crash_roles = session.get("crashRoles", [])
+    if (not isinstance(crash_roles, list) or
+            any(role not in DUMP_ROLES for role in crash_roles) or
+            len(set(crash_roles)) != len(crash_roles) or
+            (dump_layout is None and crash_roles)):
+        raise core.LauncherError(
+            "The latest diagnostic session boundary is unreadable.")
     return session
 
 
@@ -340,7 +545,8 @@ def _open_valid_source(session, role, source):
         return None
     try:
         path_stat = os.lstat(path)
-        if (stat.S_ISLNK(path_stat.st_mode) or
+        if (_is_reparse_point(path_stat) or
+                stat.S_ISLNK(path_stat.st_mode) or
                 not stat.S_ISREG(path_stat.st_mode)):
             return None
         stream = open(path, "rb")
@@ -375,6 +581,40 @@ def _open_valid_source(session, role, source):
         return None
 
 
+def _open_valid_dump(session, role):
+    layout = _recorded_dump_layout(session, required=False)
+    if (layout is None or not session.get("endedAt") or
+            role not in session.get("crashRoles", ())):
+        return None
+    directory, paths = layout
+    try:
+        if not _safe_dump_directory(directory, create=False):
+            return None
+    except core.LauncherError:
+        return None
+    path = paths[role]
+    try:
+        path_stat = os.lstat(path)
+        if (_is_reparse_point(path_stat) or
+                stat.S_ISLNK(path_stat.st_mode) or
+                not stat.S_ISREG(path_stat.st_mode)):
+            return None
+        stream = open(path, "rb")
+    except (IOError, OSError):
+        return None
+    try:
+        value = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(value.st_mode) or
+                not _same_identity(
+                    _file_identity(path_stat), _file_identity(value))):
+            stream.close()
+            return None
+        return stream, int(value.st_size)
+    except Exception:
+        stream.close()
+        return None
+
+
 def _write_slice(archive, archive_name, stream, length):
     remaining = int(length)
     with archive.open(archive_name, "w") as target:
@@ -388,17 +628,43 @@ def _write_slice(archive, archive_name, stream, length):
 
 def _prepare_reports_directory():
     directory = reports_directory()
-    if os.path.lexists(directory):
-        if os.path.islink(directory) or not os.path.isdir(directory):
-            raise core.LauncherError(
-                "The error report folder is not a regular directory.")
-    else:
+    if not os.path.lexists(directory):
         os.makedirs(directory)
+    try:
+        value = os.lstat(directory)
+    except (IOError, OSError):
+        raise core.LauncherError(
+            "The error report folder is not a regular directory.")
+    if (_is_reparse_point(value) or stat.S_ISLNK(value.st_mode) or
+            not stat.S_ISDIR(value.st_mode)):
+        raise core.LauncherError(
+            "The error report folder is not a regular directory.")
     return directory
 
 
+def _publish_report(temporary, report_path):
+    try:
+        descriptor = os.open(
+            report_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise core.LauncherError(
+            "An error report with this name already exists.")
+    try:
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, report_path)
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(report_path)
+        except (IOError, OSError):
+            pass
+        raise
+
+
 def create_report(now=None):
-    """Zip only new log bytes belonging to the latest explicit session."""
+    """Zip only this session's logs and confirmed-crash process dumps."""
     session = _validated_session()
     directory = _prepare_reports_directory()
     now = now or datetime.datetime.now()
@@ -428,11 +694,22 @@ def create_report(now=None):
                     stream.close()
                 included_roles.append(role)
                 included_files.append(archive_name)
+            for role in DUMP_ROLES:
+                opened = _open_valid_dump(session, role)
+                if opened is None:
+                    continue
+                stream, length = opened
+                try:
+                    archive_name = _DUMP_FILENAMES[role]
+                    _write_slice(archive, archive_name, stream, length)
+                finally:
+                    stream.close()
+                included_files.append(archive_name)
         if not included_files:
             raise core.LauncherError(
                 "The latest game session has not produced any diagnostic "
                 "logs yet. No earlier session was included.")
-        os.replace(temporary, report_path)
+        _publish_report(temporary, report_path)
     except Exception:
         try:
             os.unlink(temporary)
@@ -451,6 +728,29 @@ def create_report(now=None):
             _ARCHIVE_FILENAMES[role] for role in PRIMARY_ROLES
             if role not in expected),
     }
+
+
+def delete_report(report_path):
+    """Delete one exact regular ZIP from the launcher report directory."""
+    directory = _prepare_reports_directory()
+    report_path = os.path.abspath(report_path)
+    if (os.path.normcase(os.path.dirname(report_path)) !=
+            os.path.normcase(os.path.abspath(directory))):
+        raise core.LauncherError("The error report ZIP path is unsafe.")
+    try:
+        value = os.lstat(report_path)
+    except (IOError, OSError):
+        return False
+    if (_is_reparse_point(value) or stat.S_ISLNK(value.st_mode) or
+            not stat.S_ISREG(value.st_mode)):
+        raise core.LauncherError(
+            "The error report ZIP is not a regular file.")
+    try:
+        os.unlink(report_path)
+    except (IOError, OSError) as error:
+        raise core.LauncherError(
+            "The error report ZIP could not be removed: %s" % error)
+    return True
 
 
 def select_in_explorer(report_path, runner=None):

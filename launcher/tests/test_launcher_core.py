@@ -338,6 +338,32 @@ class SettingsFileTest(unittest.TestCase):
 
 
 class ServerPayloadTest(unittest.TestCase):
+    def test_source_procdump_resolves_to_the_vendored_executable(self):
+        with mock.patch.object(core.sys, "_MEIPASS", None, create=True):
+            path = core.procdump_executable()
+
+        self.assertEqual(
+            os.path.join(os.path.dirname(core.__file__), "vendor", "procdump",
+                         "procdump.exe"),
+            path)
+
+    def test_frozen_procdump_resolves_inside_the_onedir_bundle(self):
+        bundle = os.path.join(tempfile.gettempdir(), "launcher", "_internal")
+        with mock.patch.object(core.sys, "_MEIPASS", bundle, create=True):
+            path = core.procdump_executable()
+
+        self.assertEqual(
+            os.path.join(bundle, "tools", "procdump.exe"), path)
+
+    def test_explicit_procdump_base_takes_priority_over_bundle_state(self):
+        base = os.path.join(tempfile.gettempdir(), "staged-launcher")
+        with mock.patch.object(
+                core.sys, "_MEIPASS", "/ignored", create=True):
+            path = core.procdump_executable(base)
+
+        self.assertEqual(
+            os.path.join(base, "tools", "procdump.exe"), path)
+
     def test_server_log_lives_beside_the_frozen_launcher(self):
         executable = os.path.join(
             tempfile.gettempdir(), "portable-launcher", "Launcher.exe")
@@ -430,6 +456,13 @@ class ServerPayloadTest(unittest.TestCase):
             [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
              core.WORKER_ONLY_ARGUMENT_0922],
             core.worker_child_command("/game"))
+        self.assertEqual(
+            [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
+             core.STOP_STARTER_ARGUMENT_0922, "42"],
+            core.starter_stop_command("/game", 42))
+        with self.assertRaisesRegex(
+                core.LauncherError, "process identifier is invalid"):
+            core.starter_stop_command("/game", 0)
 
     def test_hidden_worker_inherits_independent_team_sizes(self):
         environment = core.worker_environment(
@@ -439,8 +472,10 @@ class ServerPayloadTest(unittest.TestCase):
 
     def test_visible_0_9_22_client_uses_isolated_config_and_endpoint(self):
         command = core.visible_client_command("/game", core.PORT_0_9_22)
-        self.assertEqual(os.path.join("/game", core.GAME_EXECUTABLE), command[0])
-        self.assertIn(core.PLAYER_ENGINE_CONFIG_0922, command)
+        self.assertEqual(
+            [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
+             core.PLAYER_ARGUMENT_0922],
+            command)
         self.assertEqual(
             [os.path.join("/game", core.WORKER_STARTER_FILENAME_0922),
              core.PAIRED_PLAYER_ARGUMENT_0922],
@@ -1162,6 +1197,25 @@ class PayloadStagingTest(unittest.TestCase):
             "0.8.2 and Map Studio must remain outside the launcher "
             "distribution", script)
 
+    def test_windows_distribution_bundles_procdump_and_its_eula(self):
+        launcher_root = os.path.dirname(os.path.dirname(__file__))
+        vendor_root = os.path.join(launcher_root, "vendor", "procdump")
+        self.assertTrue(os.path.isfile(os.path.join(
+            vendor_root, "procdump.exe")))
+        eula_path = os.path.join(vendor_root, "Eula.txt")
+        self.assertTrue(os.path.isfile(eula_path))
+        with open(eula_path, "r", encoding="utf-8-sig") as stream:
+            self.assertIn(
+                "sysinternals software license terms", stream.read().lower())
+
+        script_path = os.path.join(launcher_root, "build_launcher.ps1")
+        with open(script_path, "r", encoding="utf-8") as stream:
+            script = stream.read()
+        self.assertIn('--add-binary "$ProcDumpExecutable;tools"', script)
+        self.assertIn('--add-data "$ProcDumpEula;tools"', script)
+        self.assertIn('"_internal\\tools\\procdump.exe"', script)
+        self.assertIn('"_internal\\tools\\Eula.txt"', script)
+
     def test_the_0_9_22_server_finds_its_client_modules(self):
         self.assertTrue(os.path.isfile(os.path.join(
             self.target, "0.9.22", "src", "res", "scripts", "client", "gui",
@@ -1636,30 +1690,28 @@ class GameProcessTest(unittest.TestCase):
             "/selected-game",
             enumerator=lambda: [core.game_executable("/other-game")]))
 
-    def test_hidden_worker_does_not_latch_paired_player_as_closed(self):
+    def test_missing_window_does_not_latch_paired_player_as_closed(self):
         process = self._Process([None, None, 0])
-        ticks = iter([0.0, 10.0])
 
         self.assertEqual(
             (0, False),
             core.wait_for_paired_player_exit(
                 process, "/game", window_visible=lambda: False,
                 close_grace=1.0, poll=1.0,
-                clock=lambda: next(ticks), sleep=lambda unused: None))
+                sleep=lambda unused: None))
 
-    def test_paired_player_retires_after_continuous_window_loss(self):
-        process = self._TerminableProcess()
-        visible = iter([False, False, True, False, None, False, False, False])
-        ticks = iter(float(index) for index in range(8))
+    def test_paired_player_never_stops_on_window_loss(self):
+        process = self._Process([None, None, 0])
+        stop = mock.Mock()
 
         self.assertEqual(
-            (1, True),
+            (0, False),
             core.wait_for_paired_player_exit(
-                process, "/game", window_visible=lambda: next(visible),
-                close_grace=2.0, poll=1.0,
-                clock=lambda: next(ticks), sleep=lambda unused: None))
-        self.assertTrue(process.terminated)
-        self.assertFalse(process.killed)
+                process, "/game", window_visible=lambda: False,
+                close_grace=0.0, poll=1.0, stop_process=stop,
+                shutdown_timeout=45.0,
+                sleep=lambda unused: None))
+        stop.assert_not_called()
 
     def test_the_wait_ends_after_a_quiet_grace_period(self):
         ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])

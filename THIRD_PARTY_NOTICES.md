@@ -54,6 +54,19 @@ available under the MIT license. The complete version-pinned licensing terms
 are retained upstream in
 [`PyInstaller v6.21.0 COPYING.txt`](https://github.com/pyinstaller/pyinstaller/blob/v6.21.0/COPYING.txt).
 
+## Microsoft Sysinternals ProcDump
+
+The research launcher bundle includes Microsoft Sysinternals ProcDump for
+process crash collection. ProcDump remains Microsoft's software and is governed
+by the original `Eula.txt` retained beside the bundled executable under
+`_internal/tools`. Microsoft's standard Sysinternals terms do not grant
+third-party redistribution rights; remove ProcDump or obtain separate
+permission before redistributing the launcher bundle. The bundled ProcDump
+v12.01 build is officially supported on Windows 11 and later; Windows 10 use
+has not been validated. Official information is available from the
+[ProcDump documentation](https://learn.microsoft.com/en-us/sysinternals/downloads/procdump)
+and [Sysinternals licensing FAQ](https://learn.microsoft.com/en-us/sysinternals/license-faq).
+
 ## Wargaming intellectual property
 
 This project is an unofficial compatibility modification. It does not include
