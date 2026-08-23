@@ -340,7 +340,6 @@ class WindowTest(unittest.TestCase):
             "host": "10.0.0.5",
             "tcp_port": 1234,
             "needs_server": False,
-            "team_size": core.DEFAULT_TEAM_SIZE,
             "vehicle_profile": None,
         }
         with mock.patch("core.plan_session", return_value=session) as plan, \
@@ -360,18 +359,12 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(self.window.join_entry.cget("state"), "disabled")
         self.assertEqual(self.window.test_button.cget("state"), "disabled")
 
-    def test_each_tab_has_its_own_0_9_22_team_size_control(self):
-        self._game("0.9.22.0.1", "1513")
-        self.assertEqual(
-            "readonly", self.window.single_team_size_box.cget("state"))
-        self.assertEqual(
-            "disabled", self.window.network_team_size_box.cget("state"))
-        self.window.mode.set(core.MODE_JOIN)
-        self.window._refresh_mode()
-        self.assertEqual(
-            "disabled", self.window.single_team_size_box.cget("state"))
-        self.assertEqual(
-            "readonly", self.window.network_team_size_box.cget("state"))
+    def test_team_sizes_are_configured_only_in_the_waiting_room(self):
+        self.assertFalse(hasattr(self.window, "team_size"))
+        self.assertFalse(hasattr(self.window, "team1_size"))
+        self.assertFalse(hasattr(self.window, "team2_size"))
+        self.assertFalse(hasattr(self.window, "single_team_size_box"))
+        self.assertFalse(hasattr(self.window, "network_team_size_box"))
 
     def test_server_button_is_an_explicit_online_action(self):
         self._game("0.9.22.0.1", "1513")
@@ -388,7 +381,6 @@ class WindowTest(unittest.TestCase):
     def test_lan_server_button_installs_data_and_starts_persistent_server(self):
         game_root = self._game("0.9.22.0.1", "1513")
         self.window.mode.set(core.MODE_JOIN)
-        self.window.team_size.set("7")
         self.window._refresh_mode()
         with mock.patch(
                 "core.install_client_mod", return_value=["installed"]) \
@@ -403,7 +395,7 @@ class WindowTest(unittest.TestCase):
 
         install.assert_called_once_with(game_root, core.PORT_0_9_22)
         start_server.assert_called_once_with(
-            game_root, core.PORT_0_9_22, 7, persistent=True)
+            game_root, core.PORT_0_9_22, persistent=True)
         self.assertEqual(
             "%s:%d" % (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT),
             self.window.join_address.get())
@@ -459,21 +451,43 @@ class WindowTest(unittest.TestCase):
         self.window.game_root.set(self.settings_dir)
         self.window.mode.set(core.MODE_JOIN)
         self.window.player_name.set("Peng")
-        self.window.team_size.set("7")
         self.window._save_settings()
         reopened = wot_launcher.LauncherWindow(_FakeTk, _FakeTtk, self.dialog)
         self.assertEqual(reopened.mode.get(), core.MODE_JOIN)
         self.assertEqual(reopened.player_name.get(), "Peng")
-        self.assertEqual(reopened.team_size.get(), "7")
 
-    def test_invalid_team_size_stops_before_starting_a_game(self):
-        self._game("0.9.22.0.1", "1513")
-        self.window.team_size.set("16")
+    def test_legacy_team_size_settings_are_ignored_and_removed(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        core.save_settings({
+            "game_root": game_root,
+            "team_size": "invalid",
+            "team1_size": 0,
+            "team2_size": 99,
+        })
+        reopened = wot_launcher.LauncherWindow(
+            _FakeTk, _FakeTtk, self.dialog)
+        session = {
+            "client": core.PORT_0_9_22,
+            "mode": core.MODE_SINGLE,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": True,
+            "vehicle_profile": None,
+        }
+        with mock.patch("core.plan_session", return_value=session) as plan, \
+                mock.patch("wot_launcher.threading.Thread") as thread:
+            reopened._start()
 
-        self.window._start()
+        self.assertNotIn("team_size", plan.call_args.kwargs)
+        self.assertNotIn("team1_size", plan.call_args.kwargs)
+        self.assertNotIn("team2_size", plan.call_args.kwargs)
+        thread.return_value.start.assert_called_once_with()
+        reopened._save_settings()
+        saved = core.load_settings()
+        self.assertNotIn("team_size", saved)
+        self.assertNotIn("team1_size", saved)
+        self.assertNotIn("team2_size", saved)
 
-        self.assertIn("Tanks per team must be 1-15", self._log_text())
-        self.assertFalse(self.window._busy)
 
     def test_a_selected_game_folder_joins_the_known_list(self):
         game = os.path.join(self.settings_dir, "game")
@@ -588,7 +602,6 @@ class WindowTest(unittest.TestCase):
             "tcp_port": core.DEFAULT_SERVER_PORT,
             "needs_server": False,
             "mode": core.MODE_SINGLE,
-            "team_size": core.DEFAULT_TEAM_SIZE,
             "vehicle_profile": "Fast MS-1",
         }
         prepared = {
@@ -626,7 +639,6 @@ class WindowTest(unittest.TestCase):
             "tcp_port": core.DEFAULT_SERVER_PORT,
             "needs_server": False,
             "mode": core.MODE_JOIN,
-            "team_size": core.DEFAULT_TEAM_SIZE,
             "vehicle_profile": None,
         }
         boundary = {"id": "20260823T120000Z-111111111111"}
@@ -674,7 +686,6 @@ class WindowTest(unittest.TestCase):
             "tcp_port": core.DEFAULT_SERVER_PORT,
             "needs_server": True,
             "mode": core.MODE_SINGLE,
-            "team_size": 7,
             "vehicle_profile": "Fast MS-1",
         }
         order = []
@@ -721,10 +732,9 @@ class WindowTest(unittest.TestCase):
             self.window._run_session(self.settings_dir, session, "Peng")
 
         start_server.assert_called_once_with(
-            self.settings_dir, core.PORT_0_9_22, 7, loopback_only=True)
+            self.settings_dir, core.PORT_0_9_22, loopback_only=True)
         start_worker.assert_called_once_with(
-            self.settings_dir, core.LOCAL_HOST,
-            core.DEFAULT_SERVER_PORT, 7)
+            self.settings_dir, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
         run_game.assert_called_once_with(
             self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
             core.DEFAULT_SERVER_PORT, paired_worker=True)
@@ -851,7 +861,7 @@ class WindowTest(unittest.TestCase):
         popen.assert_not_called()
         self.assertIn("fresh launcher-owned server", self._log_text())
 
-    def test_launcher_owned_server_reuse_requires_the_exact_context(self):
+    def test_launcher_owned_server_reuse_requires_game_and_visibility_context(self):
         server = _Process()
         self.window._server = server
         game_root = os.path.realpath(self.settings_dir)
@@ -859,21 +869,17 @@ class WindowTest(unittest.TestCase):
             "game_root": os.path.normcase(game_root),
             "port_version": core.PORT_0_9_22,
             "loopback_only": False,
-            "team_size": 7,
         }
         with mock.patch("core.listener_status") as listener:
             self.assertTrue(self.window._start_server(
-                self.settings_dir, core.PORT_0_9_22, team_size=7))
+                self.settings_dir, core.PORT_0_9_22))
             self.assertFalse(self.window._start_server(
-                self.settings_dir, core.PORT_0_9_22, team_size=8))
-            self.assertFalse(self.window._start_server(
-                self.settings_dir, core.PORT_0_9_22, team_size=7,
-                loopback_only=True))
+                self.settings_dir, core.PORT_0_9_22, loopback_only=True))
             self.assertFalse(self.window._start_server(
                 os.path.join(self.settings_dir, "other"),
-                core.PORT_0_9_22, team_size=7))
+                core.PORT_0_9_22))
         listener.assert_not_called()
-        self.assertIn("different game, visibility, or team", self._log_text())
+        self.assertIn("different game or visibility", self._log_text())
 
     def test_persistent_server_survives_session_cleanup_until_stopped(self):
         server = _Process()
@@ -884,8 +890,7 @@ class WindowTest(unittest.TestCase):
                 mock.patch("wot_launcher.subprocess.Popen",
                            return_value=server) as popen:
             self.assertTrue(self.window._start_server(
-                self.settings_dir, core.PORT_0_9_22, team_size=7,
-                persistent=True))
+                self.settings_dir, core.PORT_0_9_22, persistent=True))
 
         self.assertEqual(
             wot_launcher._no_console_flags(),
@@ -913,7 +918,7 @@ class WindowTest(unittest.TestCase):
                 mock.patch("wot_launcher.subprocess.Popen",
                            return_value=server) as popen:
             self.assertTrue(self.window._start_server(
-                self.settings_dir, core.PORT_0_9_22, team_size=7))
+                self.settings_dir, core.PORT_0_9_22))
 
         attach.assert_called_once_with(boundary, dedicated=True)
         environment = popen.call_args.kwargs["env"]
@@ -1036,7 +1041,7 @@ class WindowTest(unittest.TestCase):
                 mock.patch("wot_launcher.subprocess.Popen",
                            return_value=worker) as popen:
             self.assertFalse(self.window._start_worker(
-                self.settings_dir, "10.0.0.5", 1234, 7))
+                self.settings_dir, "10.0.0.5", 1234))
 
         self.assertEqual(self.settings_dir, popen.call_args.kwargs["cwd"])
         self.assertEqual(
@@ -1053,20 +1058,20 @@ class WindowTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(marker))
         self.assertIn("worker_exited_before_ready", self._log_text())
 
-    def test_paired_player_uses_window_aware_exit_monitor(self):
+    def test_paired_player_waits_for_the_native_player_job(self):
         game = _Process(exit_code=None)
         with mock.patch(
                 "wot_launcher.subprocess.Popen", return_value=game), \
                 mock.patch(
                     "core.wait_for_paired_player_exit",
-                    return_value=(1, True)) as wait:
+                    return_value=(0, False)) as wait:
             self.window._run_game(
                 self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
                 core.DEFAULT_SERVER_PORT, paired_worker=True)
 
         wait.assert_called_once_with(game, self.settings_dir)
         self.assertIsNone(self.window._game)
-        self.assertNotIn("exit code 1", self._log_text())
+        self.assertNotIn("exit code", self._log_text())
         self.assertIn("The game closed.", self._log_text())
 
     def test_join_does_not_start_the_game_for_an_unrelated_listener(self):
@@ -1105,7 +1110,6 @@ class WindowTest(unittest.TestCase):
             "tcp_port": core.DEFAULT_SERVER_PORT,
             "needs_server": True,
             "mode": core.MODE_HOST,
-            "team_size": 7,
             "vehicle_profile": None,
         }
         with mock.patch("core.install_client_mod", return_value=[]), \
@@ -1130,8 +1134,7 @@ class WindowTest(unittest.TestCase):
             self.window._run_session(self.settings_dir, session, "Peng")
 
         start_server.assert_called_once_with(
-            self.settings_dir, core.PORT_0_9_22, 7,
-            loopback_only=False)
+            self.settings_dir, core.PORT_0_9_22, loopback_only=False)
         worker.assert_not_called()
         game.assert_called_once_with(
             self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,

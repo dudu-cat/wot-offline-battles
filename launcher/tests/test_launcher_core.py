@@ -1594,26 +1594,6 @@ class GameProcessTest(unittest.TestCase):
                 return self.states.pop(0)
             return self.states[0]
 
-    class _TerminableProcess(object):
-        def __init__(self):
-            self.exit_code = None
-            self.terminated = False
-            self.killed = False
-
-        def poll(self):
-            return self.exit_code
-
-        def terminate(self):
-            self.terminated = True
-            self.exit_code = 1
-
-        def kill(self):
-            self.killed = True
-            self.exit_code = -9
-
-        def wait(self, timeout=None):
-            return self.exit_code
-
     def test_native_process_enumerator_matches_the_image_name(self):
         names = ["explorer.exe", "WorldOfTanks.exe"]
 
@@ -1647,19 +1627,18 @@ class GameProcessTest(unittest.TestCase):
                 close_grace=1.0, poll=1.0,
                 clock=lambda: next(ticks), sleep=lambda unused: None))
 
-    def test_paired_player_retires_after_continuous_window_loss(self):
-        process = self._TerminableProcess()
-        visible = iter([False, False, True, False, None, False, False, False])
-        ticks = iter(float(index) for index in range(8))
+    def test_paired_player_ignores_window_loss_until_the_job_exits(self):
+        process = self._Process([None, None, None, None, 0])
+        visibility_checks = []
 
         self.assertEqual(
-            (1, True),
+            (0, False),
             core.wait_for_paired_player_exit(
-                process, "/game", window_visible=lambda: next(visible),
+                process, "/game",
+                window_visible=lambda: visibility_checks.append(True),
                 close_grace=2.0, poll=1.0,
-                clock=lambda: next(ticks), sleep=lambda unused: None))
-        self.assertTrue(process.terminated)
-        self.assertFalse(process.killed)
+                clock=lambda: 999.0, sleep=lambda unused: None))
+        self.assertEqual([], visibility_checks)
 
     def test_the_wait_ends_after_a_quiet_grace_period(self):
         ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])

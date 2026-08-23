@@ -31,6 +31,8 @@ the 0.9.22 client.
 - Only one launcher instance can run at a time.
 - Client, server and hidden-worker lifecycle detection is more reliable,
   including a game closed from its taskbar or after a failed launch.
+- Entering a map no longer looks like a game exit to the launcher when the
+  0.9.22 client temporarily recreates its top-level window.
 - Periodic game-process checks use the Windows process API instead of launching
   `tasklist`, so they no longer flash a console over a full-screen battle.
 - Server logs are written beside the launcher and kept to a bounded size. Noisy
@@ -54,7 +56,10 @@ the 0.9.22 client.
 
 ## Battle behavior
 
-- Team size is configurable from one to fifteen tanks per side.
+- The room host can change each team's size independently from one to fifteen
+  tanks in the waiting room without restarting the game or server. The room
+  stays inside a safe screen margin from 800x600 through ultrawide and 4K
+  layouts, and the launcher no longer duplicates these controls.
 - Each projectile freezes the fitted gun and shell values at launch. Damage,
   module damage, penetration and range falloff, caliber, shell kind and HE
   radius no longer fall back to a vehicle's stock gun on an authority peer.

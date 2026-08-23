@@ -35,16 +35,12 @@ _CHINESE = {
     "Single player": "单人游戏",
     "Online": "联网游戏",
     "Player name": "玩家名",
-    "Team 1 tanks (including players)": "队伍1坦克数（包含玩家）",
-    "Team 2 tanks (including players)": "队伍2坦克数（包含玩家）",
     "Preferred team": "选择队伍",
     "The launcher starts the private server and hidden simulation client "
     "automatically.": "启动游戏时会自动运行隐藏服务器和模拟客户端。",
     "Start single-player battle": "开始单人战斗",
     "Server address": "服务器地址",
     "Test connection": "测试连接",
-    "Team 1 tanks on this server": "本机服务器队伍1坦克数",
-    "Team 2 tanks on this server": "本机服务器队伍2坦克数",
     "Start server": "启动服务器",
     "Stop server": "关闭服务器",
     "To host: start the server, then join the game. Other players use a LAN "
@@ -104,23 +100,6 @@ _CHINESE = {
 
 
 _PREFERRED_TEAM_CHOICES = ("Auto", "1", "2")
-
-
-class _LegacyTeamSizeVariable(object):
-    """Keep integrations that set team_size applying to both new controls."""
-
-    def __init__(self, team1, team2):
-        self._team1 = team1
-        self._team2 = team2
-
-    def get(self):
-        return self._team1.get()
-
-    def set(self, value):
-        self._team1.set(value)
-        self._team2.set(value)
-
-
 def _no_console_flags():
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -320,14 +299,6 @@ class LauncherWindow(object):
                       else core.MODE_JOIN)
         self.mode = tk.StringVar(value=saved_mode)
         self.player_name = tk.StringVar(value=settings.get("name", ""))
-        legacy_team_size = settings.get(
-            "team_size", core.DEFAULT_TEAM_SIZE)
-        self.team1_size = tk.StringVar(value=str(
-            settings.get("team1_size", legacy_team_size)))
-        self.team2_size = tk.StringVar(value=str(
-            settings.get("team2_size", legacy_team_size)))
-        self.team_size = _LegacyTeamSizeVariable(
-            self.team1_size, self.team2_size)
         preferred_team = settings.get(
             "preferred_team", core.DEFAULT_PREFERRED_TEAM)
         try:
@@ -355,44 +326,24 @@ class LauncherWindow(object):
             self.single_panel, textvariable=self.player_name, width=52)
         self.single_player_name_entry.grid(
             row=0, column=1, columnspan=2, sticky="we", padx=(6, 0))
-        self.single_team_size_label = tk.Label(self.single_panel, text="")
-        self.single_team_size_label.grid(
-            row=1, column=0, sticky="w", pady=(6, 0))
-        self.single_team_size_box = self._ttk.Combobox(
-            self.single_panel, textvariable=self.team1_size,
-            values=tuple(str(value) for value in range(
-                core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
-        self.single_team_size_box.grid(
-            row=1, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
-        self.team_size_box = self.single_team_size_box
-        self.single_team2_size_label = tk.Label(
-            self.single_panel, text="")
-        self.single_team2_size_label.grid(
-            row=2, column=0, sticky="w", pady=(6, 0))
-        self.single_team2_size_box = self._ttk.Combobox(
-            self.single_panel, textvariable=self.team2_size,
-            values=tuple(str(value) for value in range(
-                core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
-        self.single_team2_size_box.grid(
-            row=2, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
         self.single_preferred_team_label = tk.Label(
             self.single_panel, text="")
         self.single_preferred_team_label.grid(
-            row=3, column=0, sticky="w", pady=(6, 0))
+            row=1, column=0, sticky="w", pady=(6, 0))
         self.single_preferred_team_box = self._ttk.Combobox(
             self.single_panel, textvariable=self.preferred_team,
             values=_PREFERRED_TEAM_CHOICES, width=10)
         self.single_preferred_team_box.grid(
-            row=3, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
+            row=1, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
         self.single_help_label = tk.Label(
             self.single_panel, text="", anchor="w", justify="left")
         self.single_help_label.grid(
-            row=4, column=0, columnspan=3, sticky="we", pady=(8, 6))
+            row=2, column=0, columnspan=3, sticky="we", pady=(8, 6))
         self.single_start_button = tk.Button(
             self.single_panel, text="", command=self._start_single,
             height=2, font=("TkDefaultFont", 10, "bold"))
         self.single_start_button.grid(
-            row=5, column=0, columnspan=3, sticky="we")
+            row=3, column=0, columnspan=3, sticky="we")
         self.single_panel.grid_columnconfigure(1, weight=1)
 
         self.server_address_label = tk.Label(self.network_panel, text="")
@@ -411,48 +362,29 @@ class LauncherWindow(object):
         self.network_player_name_entry.grid(
             row=1, column=1, columnspan=2, sticky="we", padx=(6, 0),
             pady=(6, 0))
-        self.network_team_size_label = tk.Label(self.network_panel, text="")
-        self.network_team_size_label.grid(
-            row=2, column=0, sticky="w", pady=(6, 0))
-        self.network_team_size_box = self._ttk.Combobox(
-            self.network_panel, textvariable=self.team1_size,
-            values=tuple(str(value) for value in range(
-                core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
-        self.network_team_size_box.grid(
-            row=2, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
-        self.network_team2_size_label = tk.Label(
-            self.network_panel, text="")
-        self.network_team2_size_label.grid(
-            row=3, column=0, sticky="w", pady=(6, 0))
-        self.network_team2_size_box = self._ttk.Combobox(
-            self.network_panel, textvariable=self.team2_size,
-            values=tuple(str(value) for value in range(
-                core.MIN_TEAM_SIZE, core.MAX_TEAM_SIZE + 1)), width=10)
-        self.network_team2_size_box.grid(
-            row=3, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
         self.network_preferred_team_label = tk.Label(
             self.network_panel, text="")
         self.network_preferred_team_label.grid(
-            row=4, column=0, sticky="w", pady=(6, 0))
+            row=2, column=0, sticky="w", pady=(6, 0))
         self.network_preferred_team_box = self._ttk.Combobox(
             self.network_panel, textvariable=self.preferred_team,
             values=_PREFERRED_TEAM_CHOICES, width=10)
         self.network_preferred_team_box.grid(
-            row=4, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
+            row=2, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
         self.server_button = tk.Button(
             self.network_panel, text="", command=self._toggle_lan_server)
         self.server_button.grid(
-            row=5, column=0, columnspan=3, sticky="we", pady=(8, 0))
+            row=3, column=0, columnspan=3, sticky="we", pady=(8, 0))
         self.network_help_label = tk.Label(
             self.network_panel, text="", anchor="w", justify="left",
             wraplength=620)
         self.network_help_label.grid(
-            row=6, column=0, columnspan=3, sticky="we", pady=(8, 6))
+            row=4, column=0, columnspan=3, sticky="we", pady=(8, 6))
         self.network_start_button = tk.Button(
             self.network_panel, text="", command=self._start_network,
             height=2, font=("TkDefaultFont", 10, "bold"))
         self.network_start_button.grid(
-            row=7, column=0, columnspan=3, sticky="we")
+            row=5, column=0, columnspan=3, sticky="we")
         self.network_panel.grid_columnconfigure(1, weight=1)
 
         self.tools_tabs = self._ttk.Notebook(frame)
@@ -566,16 +498,8 @@ class LauncherWindow(object):
         self.battle_tabs.tab(self.network_panel, text=self._t("Online"))
         self.single_player_name_label.config(text=self._t("Player name"))
         self.network_player_name_label.config(text=self._t("Player name"))
-        self.single_team_size_label.config(
-            text=self._t("Team 1 tanks (including players)"))
-        self.single_team2_size_label.config(
-            text=self._t("Team 2 tanks (including players)"))
         self.single_preferred_team_label.config(
             text=self._t("Preferred team"))
-        self.network_team_size_label.config(
-            text=self._t("Team 1 tanks on this server"))
-        self.network_team2_size_label.config(
-            text=self._t("Team 2 tanks on this server"))
         self.network_preferred_team_label.config(
             text=self._t("Preferred team"))
         self.single_help_label.config(text=self._t(
@@ -679,7 +603,7 @@ class LauncherWindow(object):
         self._selected_client = status["client"]
         self._refresh_profiles(status)
         self._update_action_controls()
-        if hasattr(self, "team_size_box"):
+        if hasattr(self, "single_preferred_team_box"):
             self._refresh_mode()
         return status
 
@@ -821,21 +745,6 @@ class LauncherWindow(object):
             not self._maintenance_busy else "disabled")
         self.join_entry.config(state=network_state)
         self.test_button.config(state=network_state)
-        controls_available = (
-            self._selected_client == core.PORT_0_9_22 and not self._busy and
-            not self._maintenance_busy and not self._server_is_running())
-        self.single_team_size_box.config(
-            state="readonly" if controls_available and not network
-            else "disabled")
-        self.single_team2_size_box.config(
-            state="readonly" if controls_available and not network
-            else "disabled")
-        self.network_team_size_box.config(
-            state="readonly" if controls_available and network
-            else "disabled")
-        self.network_team2_size_box.config(
-            state="readonly" if controls_available and network
-            else "disabled")
         selection_available = (
             self._selected_client == core.PORT_0_9_22 and not self._busy and
             not self._maintenance_busy)
@@ -949,14 +858,6 @@ class LauncherWindow(object):
 
     def _save_settings(self):
         try:
-            team1_size = core.parse_team_size(self.team1_size.get())
-        except core.LauncherError:
-            team1_size = core.DEFAULT_TEAM_SIZE
-        try:
-            team2_size = core.parse_team_size(self.team2_size.get())
-        except core.LauncherError:
-            team2_size = core.DEFAULT_TEAM_SIZE
-        try:
             preferred_team = core.parse_preferred_team(
                 self.preferred_team.get())
         except core.LauncherError:
@@ -969,11 +870,6 @@ class LauncherWindow(object):
                      else core.MODE_JOIN),
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
-            # Keep the legacy shared field so older launcher builds reopen a
-            # sensible symmetric room instead of losing the setting entirely.
-            "team_size": max(team1_size, team2_size),
-            "team1_size": team1_size,
-            "team2_size": team2_size,
             "preferred_team": preferred_team,
             "vehicle_profile": self.vehicle_profile.get().strip(),
             "language": self.language_preference,
@@ -1170,12 +1066,6 @@ class LauncherWindow(object):
             self._log(
                 "Select Online and a supported game folder first.")
             return False
-        try:
-            team1_size = core.parse_team_size(self.team1_size.get())
-            team2_size = core.parse_team_size(self.team2_size.get())
-        except core.LauncherError as error:
-            self._log(str(error))
-            return False
         self._remember_folder()
         self._save_settings()
         self._set_maintenance_busy(True)
@@ -1187,15 +1077,8 @@ class LauncherWindow(object):
                 for action in core.install_client_mod(
                         status["path"], status["client"]):
                     self._log(action)
-                if team1_size == team2_size:
-                    started = self._start_server(
-                        status["path"], status["client"], team1_size,
-                        persistent=True)
-                else:
-                    started = self._start_server(
-                        status["path"], status["client"],
-                        team1_size=team1_size, team2_size=team2_size,
-                        persistent=True)
+                started = self._start_server(
+                    status["path"], status["client"], persistent=True)
                 if started:
                     self.root.after(0, self._use_local_server_address)
             except core.LauncherError as error:
@@ -1232,8 +1115,6 @@ class LauncherWindow(object):
             session = core.plan_session(
                 status, self.mode.get(), self.join_address.get(),
                 vehicle_profile=profile_name,
-                team1_size=self.team1_size.get(),
-                team2_size=self.team2_size.get(),
                 preferred_team=self.preferred_team.get())
         except core.LauncherError as error:
             self._log(str(error))
@@ -1300,19 +1181,9 @@ class LauncherWindow(object):
                                             session["mode"], host, port, name):
                 self._log("Wrote %s" % path)
             if session["needs_server"]:
-                team1_size = session.get(
-                    "team1_size") or session["team_size"]
-                team2_size = session.get(
-                    "team2_size") or session["team_size"]
-                if team1_size == team2_size:
-                    started = self._start_server(
-                        game_root, session["client"], team1_size,
-                        loopback_only=needs_worker)
-                else:
-                    started = self._start_server(
-                        game_root, session["client"],
-                        team1_size=team1_size, team2_size=team2_size,
-                        loopback_only=needs_worker)
+                started = self._start_server(
+                    game_root, session["client"],
+                    loopback_only=needs_worker)
                 if not started:
                     return
             elif session["mode"] == core.MODE_JOIN:
@@ -1333,16 +1204,7 @@ class LauncherWindow(object):
             if self._stop_requested:
                 return
             if needs_worker:
-                team1_size = session.get(
-                    "team1_size") or session["team_size"]
-                team2_size = session.get(
-                    "team2_size") or session["team_size"]
-                if team1_size == team2_size:
-                    worker_started = self._start_worker(
-                        game_root, host, port, team1_size)
-                else:
-                    worker_started = self._start_worker(
-                        game_root, host, port, team1_size, team2_size)
+                worker_started = self._start_worker(game_root, host, port)
                 if not worker_started:
                     return
             if self._stop_requested:
@@ -1397,31 +1259,19 @@ class LauncherWindow(object):
                 self.root.after(0, self._finish_close)
 
     def _start_server(self, game_root, port_version,
-                      team_size=core.DEFAULT_TEAM_SIZE,
-                      loopback_only=False, persistent=False,
-                      team1_size=None, team2_size=None):
-        team1_size = core.parse_team_size(
-            team_size if team1_size is None else team1_size)
-        team2_size = core.parse_team_size(
-            team_size if team2_size is None else team2_size)
+                      loopback_only=False, persistent=False):
         requested_context = {
             "game_root": os.path.normcase(os.path.realpath(
                 os.path.abspath(game_root))),
             "port_version": port_version,
             "loopback_only": bool(loopback_only),
-            "team_size": max(team1_size, team2_size),
-            "team1_size": team1_size,
-            "team2_size": team2_size,
         }
         if self._server_is_running():
             current_context = dict(self._server_context or {})
-            legacy_size = current_context.get("team_size")
-            current_context.setdefault("team1_size", legacy_size)
-            current_context.setdefault("team2_size", legacy_size)
             if current_context != requested_context:
                 self._log(
-                    "The launcher-owned LAN server uses different game, "
-                    "visibility, or team settings. Stop it before starting "
+                    "The launcher-owned LAN server uses a different game "
+                    "or visibility setting. Stop it before starting "
                     "this session.")
                 return False
             self._log("Reusing the launcher-owned %s LAN server." %
@@ -1448,9 +1298,7 @@ class LauncherWindow(object):
             return False
         command = core.server_child_command(port_version)
         environment = core.server_environment(
-            port_version, game_root, team_size=max(team1_size, team2_size),
-            team1_size=team1_size, team2_size=team2_size,
-            loopback_only=loopback_only)
+            port_version, game_root, loopback_only=loopback_only)
         server_log_path = core.server_log_path()
         report_session = self._active_report_session
         if report_session is not None:
@@ -1506,10 +1354,7 @@ class LauncherWindow(object):
                       server.poll())
         self.root.after(0, self._update_action_controls)
 
-    def _start_worker(self, game_root, host, port,
-                      team1_size, team2_size=None):
-        if team2_size is None:
-            team2_size = team1_size
+    def _start_worker(self, game_root, host, port):
         starter = core.worker_starter_executable(game_root)
         if not os.path.isfile(starter):
             raise core.LauncherError(
@@ -1527,10 +1372,7 @@ class LauncherWindow(object):
                     "%s" % error)
         self._worker = subprocess.Popen(
             core.worker_child_command(game_root), cwd=game_root,
-            env=core.worker_environment(
-                game_root, host, port,
-                team_size=max(team1_size, team2_size),
-                team1_size=team1_size, team2_size=team2_size),
+            env=core.worker_environment(game_root, host, port),
             creationflags=_no_console_flags())
         if core.wait_for_worker_ready(
                 self._worker, game_root,

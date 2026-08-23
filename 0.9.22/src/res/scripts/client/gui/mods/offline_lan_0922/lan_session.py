@@ -872,6 +872,10 @@ class LANSession(object):
         supported = getattr(self.client, 'has_team_selection', None)
         return bool(callable(supported) and supported())
 
+    def _server_supports_team_size_selection(self):
+        supported = getattr(self.client, 'has_team_size_selection', None)
+        return bool(callable(supported) and supported())
+
     def _team_status(self):
         sizes = dict(getattr(self.client, 'team_sizes', {}) or {})
         counts = {1: 0, 2: 0}
@@ -886,6 +890,7 @@ class LANSession(object):
             'sizes': sizes,
             'counts': counts,
             'supported': self._server_supports_team_selection(),
+            'size_supported': self._server_supports_team_size_selection(),
         }
 
     def select_team(self, team):
@@ -898,6 +903,20 @@ class LANSession(object):
                 'The LAN server did not accept that team selection.')
             return False
         self._status_notifier('Requesting Team %d...' % int(team))
+        return True
+
+    def set_team_size(self, team, size):
+        """Ask the server to change one capacity without restarting."""
+        if (self._stopped or self.client is None or self.state != 'waiting' or
+                not self._is_local_host()):
+            return False
+        setter = getattr(self.client, 'set_team_size', None)
+        if not callable(setter) or not setter(team, size):
+            self._status_notifier(
+                'The LAN server did not accept that team size.')
+            return False
+        self._status_notifier(
+            'Requesting Team %d size %d...' % (int(team), int(size)))
         return True
 
     def _ensure_queue(self):
@@ -956,6 +975,7 @@ class LANSession(object):
                 options.update({
                     'request_team': self.select_team,
                     'team_status': self._team_status,
+                    'request_team_size': self.set_team_size,
                 })
             room = self._room_factory(
                 self.request_start, self._map_pool_value, **options)
@@ -1775,6 +1795,23 @@ class LANSession(object):
                     'The LAN server refused the team selection (%s).' %
                     (code or 'unknown'))
             self._refresh_surface()
+        elif kind == 'team_size_denied':
+            code = _message_value(message, 'code')
+            team = _message_value(message, 'team')
+            if code == 'host_only':
+                notice = 'Only the LAN room host can change team sizes.'
+            elif code == 'team_occupied':
+                notice = ('Team %s already has too many players for that '
+                          'size.' % team)
+            else:
+                notice = ('The LAN server refused the team size (%s).' %
+                          (code or 'unknown'))
+            self._status_notifier(notice)
+            reject = getattr(self._queue, 'reject_team_size', None)
+            if callable(reject):
+                reject(team, notice)
+            else:
+                self._refresh_surface()
         elif kind == 'battle_start':
             self._start_battle(message)
         elif kind == 'battle_live':

@@ -76,6 +76,7 @@ class _Client(object):
         self.requests = []
         self.selections = []
         self.team_selections = []
+        self.team_size_selections = []
         self.descriptor_bundles = []
         self.receipt_acks = []
 
@@ -111,6 +112,16 @@ class _Client(object):
         if not self.ready or self.phase != 'waiting':
             return False
         self.team_selections.append(team)
+        return True
+
+    def has_team_size_selection(self):
+        return True
+
+    def set_team_size(self, team, size):
+        if (not self.ready or self.phase != 'waiting' or
+                self.player_id != self.host_player_id):
+            return False
+        self.team_size_selections.append((team, size))
         return True
 
     def send_descriptor_bundle(self, projections, requested=None,
@@ -288,6 +299,28 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual([2], self.client.team_selections)
         self.assertEqual(
             {1: 0, 2: 0}, self.session._team_status()['counts'])
+
+    def test_host_changes_team_sizes_without_restarting_the_session(self):
+        self.client.ready = True
+        self.client.phase = 'waiting'
+        self.session.state = 'waiting'
+
+        self.assertTrue(self.session.set_team_size(1, 4))
+        self.assertTrue(self.session.set_team_size(2, 9))
+
+        self.assertEqual([(1, 4), (2, 9)],
+                         self.client.team_size_selections)
+        self.assertEqual(1, self.client.start_calls)
+        self.assertTrue(self.session._team_status()['size_supported'])
+
+    def test_guest_cannot_change_team_sizes(self):
+        self.client.ready = True
+        self.client.phase = 'waiting'
+        self.client.host_player_id = 'someone-else'
+        self.session.state = 'waiting'
+
+        self.assertFalse(self.session.set_team_size(1, 4))
+        self.assertEqual([], self.client.team_size_selections)
 
     def test_postbattle_request_retries_after_failure_then_completes_once(self):
         class Store(object):

@@ -171,12 +171,14 @@ PROJECTILE_HIT_VEHICLE_CAPABILITY = "projectile_hit_vehicle_v1"
 PROJECTILE_WRECK_HIT_CAPABILITY = "projectile_wreck_hit_v1"
 RANDOM_MAP_CAPABILITY = "random_map_v1"
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = "destructible_catalog_v5"
+TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
 SERVER_CAPABILITIES = (
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     PROJECTILE_HIT_VEHICLE_CAPABILITY,
     PROJECTILE_WRECK_HIT_CAPABILITY,
     RANDOM_MAP_CAPABILITY,
     "team_selection_v1",
+    TEAM_SIZE_SELECTION_CAPABILITY,
 )
 SIEGE_DISABLED = 0
 SIEGE_SWITCHING_ON = 1
@@ -1615,6 +1617,56 @@ class BattleState:
                 player.slot, player.team)
             player.y = 0.0
             player.aim_yaw = player.yaw
+            self.state_revision += 1
+            return True, None
+
+    def set_team_size(self, player_id, requested_team, requested_size):
+        """Let the waiting-room host change one next-round team capacity."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (player is None or not player.connected or
+                    self.phase != "waiting"):
+                return False, "not_waiting"
+            if player_id != self.host_player_id:
+                return False, "host_only"
+            try:
+                team = _exact_int(requested_team, 1, 2)
+            except ValueError:
+                return False, "invalid_team"
+            try:
+                size = _exact_int(requested_size, 1, 15)
+            except ValueError:
+                return False, "invalid_size"
+
+            participants = sorted(
+                (participant for participant in self.players.values()
+                 if participant.connected and participant.team == team),
+                key=lambda participant: (
+                    participant.slot, participant.player_id))
+            if len(participants) > size:
+                return False, "team_occupied"
+            if self.team_sizes[team] == size:
+                return True, None
+
+            # Leaving players may create slot gaps. Compact only the affected
+            # waiting team before shrinking so every retained player remains
+            # inside the new capacity and receives the matching spawn.
+            for slot, participant in enumerate(participants):
+                if participant.slot == slot:
+                    continue
+                participant.slot = slot
+                participant.x, participant.z, participant.yaw = (
+                    self._spawn_for(slot, team))
+                participant.y = 0.0
+                participant.aim_yaw = participant.yaw
+            self.team_sizes[team] = size
+            self.team_size = max(self.team_sizes.values())
+            occupied_slots = {
+                (participant.team, participant.slot)
+                for participant in self.players.values()
+                if participant.connected
+            }
+            self.bot_roster = self._new_bot_roster(occupied_slots)
             self.state_revision += 1
             return True, None
 
@@ -7382,6 +7434,27 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 "state_revision": server.state.state_revision,
                                 "code": team_error,
                                 "team": message.get("team"),
+                                "team_sizes": server.state._team_sizes_wire(),
+                            })
+                    elif message_type == "set_team_size":
+                        accepted, size_error = server.state.set_team_size(
+                            player.player_id, message.get("team"),
+                            message.get("size"))
+                        if accepted:
+                            _server_log(
+                                "TEAM SIZE id=%d team=%s size=%s" % (
+                                    player.player_id, message.get("team"),
+                                    message.get("size")))
+                            server.state.broadcast_current_roster()
+                        else:
+                            player.send({
+                                "type": "team_size_denied",
+                                "protocol": PROTOCOL_VERSION,
+                                "round_id": server.state.round_id,
+                                "state_revision": server.state.state_revision,
+                                "code": size_error,
+                                "team": message.get("team"),
+                                "size": message.get("size"),
                                 "team_sizes": server.state._team_sizes_wire(),
                             })
                     elif message_type == "ping":

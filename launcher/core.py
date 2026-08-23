@@ -1598,47 +1598,24 @@ def wait_for_paired_player_exit(
         process, game_root, window_visible=None,
         close_grace=PAIRED_PLAYER_WINDOW_CLOSE_GRACE_SECONDS,
         poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None):
-    """Wait for the paired player, retiring a windowless process residue.
+    """Wait for the paired player's native starter process to exit.
 
-    The #1513 client can destroy its only visible window without terminating
-    its process. Only treat that as closure after a player window has first
-    appeared and then remained absent for the full grace period.
+    The starter owns the complete visible-client job and follows process
+    handoffs. Its process handle is therefore the lifecycle authority. The
+    #1513 client destroys and recreates its top-level window while loading a
+    map, so window visibility must never terminate a still-live player job.
+
+    ``game_root``, ``window_visible``, ``close_grace`` and ``clock`` remain in
+    the signature for compatibility with older launcher integrations; they no
+    longer participate in the shutdown decision.
     """
     import time as time_module
 
     sleep = sleep or time_module.sleep
-    clock = clock or time_module.monotonic
-    window_visible = window_visible or (
-        lambda: game_window_is_visible(game_root))
-    window_seen = False
-    missing_since = None
     while True:
         exit_code = process.poll()
         if exit_code is not None:
             return exit_code, False
-        visible = window_visible()
-        now = clock()
-        if visible is True:
-            window_seen = True
-            missing_since = None
-        elif visible is False and window_seen:
-            if missing_since is None:
-                missing_since = now
-            elif now - missing_since >= max(0.0, float(close_grace)):
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-                try:
-                    exit_code = process.wait(
-                        timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    exit_code = process.wait()
-                return exit_code, True
-        else:
-            # An unavailable lookup does not count toward a confirmed absence.
-            missing_since = None
         sleep(max(0.001, float(poll)))
 
 

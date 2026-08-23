@@ -21,9 +21,7 @@ Tanks, and stops that server when the game closes.
      example 192.168.1.20 or 192.168.1.20:28782.
 4. Type a player name. Other players see it in the LAN room. Test connection
    checks the address you typed, or reports whether port 28782 on this PC is
-   already taken when you host. A 0.9.22 single-player or host session also
-   lets you choose the total tanks per team, including human players, from 1
-   through 15.
+   already taken when you host.
 5. Click Start game. The launcher removes older mod files, installs the mod
    for that client, and starts the game. This takes a few seconds. It validates
    and stages the complete package before replacing the old mod, and restores
@@ -31,7 +29,10 @@ Tanks, and stops that server when the game closes.
 
 In the game, fit a tank and click Battle!. Everyone lands in the LAN waiting
 room, drawn over the stock battle queue screen. The room host selects the map
-and clicks START BATTLE. LEAVE closes the room and returns you to the garage.
+and the total tanks for each team, including human players, from 1 through 15,
+then clicks START BATTLE. The room settings can be changed there without
+restarting the game or LAN server. LEAVE closes the room and returns you to
+the garage.
 
 On the 0.9.22 client the garage works offline. Every vehicle is owned and every
 module in its own tech tree is unlocked, each vehicle arrives with its top
