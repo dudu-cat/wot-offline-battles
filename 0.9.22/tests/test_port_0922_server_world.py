@@ -251,17 +251,44 @@ class LoaderTest(unittest.TestCase):
         self.assertIsNone(server_world.load_world(
             'no_such_map', base_dir=str(PORT_ROOT)))
 
-    def test_any_missing_authority_dataset_rejects_the_world(self):
+    def test_missing_optional_dataset_disables_only_that_feature(self):
         loaders = (
-            (server_world.prebaked_destructibles, 'load_catalog'),
-            (server_world.prebaked_foliage, 'load_foliage'),
-            (server_world, 'load_occluders'),
+            (server_world.prebaked_destructibles, 'load_catalog',
+             'destructible catalog'),
+            (server_world.prebaked_foliage, 'load_foliage', 'foliage data'),
         )
-        for owner, name in loaders:
+        for owner, name, warning in loaders:
             with self.subTest(dataset=name):
                 with mock.patch.object(owner, name, return_value=None):
-                    self.assertIsNone(server_world.load_world(
-                        '01_karelia', base_dir=str(PORT_ROOT)))
+                    world = server_world.load_world(
+                        '01_karelia', base_dir=str(PORT_ROOT))
+                    self.assertIsNotNone(world)
+                    self.assertTrue(any(
+                        line.startswith(warning)
+                        for line in world.optional_warnings))
+                    if warning == 'destructible catalog':
+                        self.assertEqual(
+                            'destructible_catalog_unavailable',
+                            world.destructibles_disabled_reason())
+
+    def test_optional_loader_exception_is_a_bounded_single_line_warning(self):
+        with mock.patch.object(
+                server_world.prebaked_destructibles, 'load_catalog',
+                side_effect=RuntimeError('catalog failed\n' + 'x' * 300)):
+            world = server_world.load_world(
+                '01_karelia', base_dir=str(PORT_ROOT))
+
+        self.assertIsNotNone(world)
+        warning = next(line for line in world.optional_warnings
+                       if line.startswith('destructible catalog'))
+        self.assertNotIn('\n', warning)
+        self.assertLessEqual(len(warning), 240)
+
+    def test_missing_static_occluders_rejects_the_world(self):
+        with mock.patch.object(
+                server_world, 'load_occluders', return_value=None):
+            self.assertIsNone(server_world.load_world(
+                '01_karelia', base_dir=str(PORT_ROOT)))
 
 
 class SegmentUnknownTerrainTest(unittest.TestCase):
@@ -336,6 +363,21 @@ class DestructibleIdentityReadinessTest(unittest.TestCase):
 
         self.assertEqual(installed, 2)
         self.assertTrue(world.destructible_identities_ready())
+
+    def test_disabled_destructibles_are_ready_but_never_emit_native_wires(self):
+        catalog = self._catalog()
+        world = server_world.BakedWorld(_graph(), catalog=catalog)
+        world.install_destructible_map(
+            self._donation_rows(catalog)[:1], {}, 8000.0)
+
+        self.assertTrue(world.disable_destructibles('test_mismatch'))
+        self.assertFalse(world.disable_destructibles('duplicate'))
+        self.assertTrue(world.destructible_identities_ready())
+        self.assertFalse(world.requires_destructible_identities())
+        self.assertFalse(world.has_destructible_identities())
+        self.assertFalse(world.mark_destroyed_wire(7, 0))
+        self.assertEqual('test_mismatch',
+                         world.destructibles_disabled_reason())
 
 
 if __name__ == '__main__':

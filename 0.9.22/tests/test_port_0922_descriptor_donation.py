@@ -130,6 +130,33 @@ class DonationFlowTest(unittest.TestCase):
         for entry in state.bot_manifest:
             self.assertIn(entry['vehicle'], names)
 
+    def test_unavailable_destructibles_wait_for_descriptor_start(self):
+        state = _state_with_catalog()
+        state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
+        start, error = state.request_start(1, '01_karelia')
+        self.assertIsNone(error)
+        self.assertTrue(start['need_destructible_map'])
+        self.assertFalse(state.server_authority.started())
+
+        accepted = state.store_destructible_map(1, {
+            'type': 'destructible_map', 'round_id': state.round_id,
+            'map': state.map_name, 'unavailable': True,
+        })
+
+        self.assertIs(True, accepted)
+        self.assertEqual('server_pending', state.authority_status)
+        self.assertEqual(
+            'client_destructible_map_unavailable',
+            state.server_authority.world.destructibles_disabled_reason())
+        result = state.donate_descriptors(1, _bundle(
+            state, projections={'ussr:R11_MS-1': _projection()}))
+        self.assertEqual('started', result)
+        self.assertTrue(state.server_authority.started())
+        self.assertEqual('server', state.authority_status)
+        self.assertTrue(
+            state.server_authority.world.destructible_identities_ready())
+        self.assertIsNone(state.authority_prerequisite_deadline)
+
     def test_partial_bundles_accumulate_before_start(self):
         state = _state_with_catalog()
         state.request_start(1, '01_karelia')
@@ -273,7 +300,7 @@ class DonationFlowTest(unittest.TestCase):
         self.assertEqual('server', live['authority_status'])
         self.assertEqual('battle', state.phase)
 
-    def test_native_identity_timeout_fails_the_round(self):
+    def test_native_identity_timeout_disables_destructibles_and_goes_live(self):
         now = [10.0]
         state = _state_with_catalog(clock=lambda: now[0])
         state.vehicle_catalogs[1] = tuple(_catalog_rows()[:1])
@@ -282,18 +309,44 @@ class DonationFlowTest(unittest.TestCase):
             state, projections={'ussr:R11_MS-1': _projection()}))
         self.assertIsNone(state.mark_battle_ready(
             1, {'type': 'battle_ready', 'round_id': state.round_id}))
+        state.players[1].conn.lines[:] = []
         now[0] += AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS + 0.01
 
         state.tick_once(1.0 / 30.0)
 
-        self.assertEqual('failed', state.authority_status)
-        self.assertEqual('waiting', state.phase)
+        self.assertEqual('server', state.authority_status)
+        self.assertEqual('battle', state.phase)
+        self.assertEqual(
+            'destructible_map_timeout',
+            state.server_authority.world.destructibles_disabled_reason())
         rosters = [line for line in state.players[1].conn.lines
                    if line.get('type') == 'roster']
         self.assertTrue(rosters)
-        self.assertEqual('waiting', rosters[-1]['phase'])
-        self.assertEqual('destructible_map_timeout',
-                         rosters[-1]['authority_fallback_reason'])
+        self.assertEqual('battle', rosters[-1]['phase'])
+        self.assertEqual('server', rosters[-1]['authority_status'])
+        self.assertEqual(True, rosters[-1]['destructibles_disabled'])
+        self.assertEqual(
+            'destructible_map_timeout',
+            rosters[-1]['destructibles_disabled_reason'])
+        self.assertEqual(0, state.tick)
+        self.assertIsNotNone(state.pending_live_message)
+        self.assertEqual(['roster'], state.players[1].conn.sent_kinds())
+
+        state.tick_once(1.0 / 30.0)
+
+        self.assertEqual(0, state.tick)
+        self.assertIsNone(state.pending_live_message)
+        self.assertEqual(
+            ['roster', 'battle_live'],
+            state.players[1].conn.sent_kinds())
+        self.assertEqual(0, state.players[1].conn.lines[-1]['server_tick'])
+        self.assertEqual(
+            True,
+            state.players[1].conn.lines[-1]['destructibles_disabled'])
+
+        state.tick_once(1.0 / 30.0)
+
+        self.assertEqual(1, state.tick)
 
 
 class CatalogValidationTest(unittest.TestCase):

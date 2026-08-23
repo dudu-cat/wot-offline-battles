@@ -182,6 +182,10 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                      'g_offh_destr_contact_bins',
                      'g_offh_destr_pending',
                      'g_offh_destr_falling_active',
+                     'g_offh_destr_isolated_chunks',
+                     'g_offh_destr_isolated_slots',
+                     'g_offh_destr_isolation_logs',
+                     'g_offh_destr_isolation_log_capped',
                      'g_offh_destr_diagnostics',
                      'g_offh_destr_diag_last_static',
                      'g_offh_destr_runtime_space'):
@@ -1693,6 +1697,47 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertNotIn((22, 0), getattr(
             destructibles_sensor, 'g_offh_destr_instances', {}))
 
+    def test_baked_slot_beyond_native_count_is_isolated_before_queries(self):
+        filename = 'content/MilitaryEnvironment/mle008_Canisters.model'
+        matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-1.0, -1.0, -1.0,
+                           1.0, 2.0, 1.0, None]],
+            },
+        }, [list(signature) + [filename, 0, 22, 1, 1.0]]))
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getChunkDestrFilenames = mock.Mock(
+            side_effect=AssertionError('queried past native count'))
+        writes = []
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': bigworld, 'Math': math_module}), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            self.assertIsNone(
+                destructibles_sensor._stream_baked_shot_instance_1513(
+                    1, (22, 1)))
+
+        self.assertEqual({(22, 1)},
+                         destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual({'native_count_range'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
+        bigworld.wg_getChunkDestrFilenames.assert_not_called()
+
     def test_far_baked_fragile_effect_mismatch_fails_closed(self):
         filename = 'content/MilitaryEnvironment/mle011_GroupBoxes.model'
         matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
@@ -1731,18 +1776,25 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused: False)
 
+        writes = []
         with mock.patch.dict(
                 sys.modules, {'BigWorld': bigworld,
                               'AreaDestructibles': area,
                               'Math': math_module}), \
                 mock.patch.object(
                     destructibles_sensor, '_get_destr_authority',
-                    return_value=authority):
+                    return_value=authority), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
             result = destructibles_sensor._catalog_shot_intersection(
                 1, _Vector(), _Vector(0, 0, 20))
 
-        self.assertTrue(result['ambiguous'])
-        self.assertIsNone(result['candidate'])
+        self.assertIsNone(result)
+        self.assertEqual({(22, 0)},
+                         destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual({'effect_category'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
         self.assertNotIn((22, 0), getattr(
             destructibles_sensor, 'g_offh_destr_instances', {}))
 
@@ -2213,7 +2265,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                       diagnostic_lines[0])
         self.assertIn('boxes=2', diagnostic_lines[0])
 
-    def test_native_count_smaller_than_filename_prefix_fails_closed(self):
+    def test_native_count_smaller_than_filename_prefix_isolates_chunk(self):
         manager = _Manager()
         manager.space_id = 1
         manager._DestructiblesManager__loadedChunkIDs = {22: 1}
@@ -2234,14 +2286,94 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
         destructibles_sensor.xrange = range
 
+        writes = []
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
                               'BigWorld': bigworld,
-                              'Math': math_module}):
-            with self.assertRaisesRegex(
-                    RuntimeError, 'filename prefix exceeds native count'):
-                destructibles_sensor._fell_trees_near(
-                    1, _Vector(), 0.0, 0.25, type_descriptor)
+                              'Math': math_module}), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 0.25, type_descriptor)
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 0.25, type_descriptor)
+
+        self.assertEqual({22}, destructibles_sensor.g_offh_destr_isolated_chunks)
+        self.assertEqual({'filename_prefix'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
+        self.assertIn('type=filename_prefix scope=chunk chunk=22', writes[0])
+        self.assertIn('repeats=suppressed_for_battle', writes[0])
+        self.assertEqual([], manager.orders)
+
+    def test_missing_native_count_abi_isolates_multiple_chunks_with_one_log(self):
+        manager = _Manager()
+        manager.space_id = 1
+        del manager._DestructiblesManager__loadedChunkIDs
+        writes = []
+
+        with mock.patch.object(
+                sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            self.assertIsNone(
+                destructibles_sensor._native_chunk_destructible_count_1513(
+                    manager, 22))
+            self.assertIsNone(
+                destructibles_sensor._native_chunk_destructible_count_1513(
+                    manager, 23))
+
+        self.assertEqual({22, 23},
+                         destructibles_sensor.g_offh_destr_isolated_chunks)
+        self.assertEqual({'native_count_abi'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
+        self.assertIn('type=native_count_abi', writes[0])
+        self.assertIn('repeats=suppressed_for_battle', writes[0])
+
+    def test_soft_isolation_logs_have_a_strict_per_battle_cap(self):
+        writes = []
+        with mock.patch.object(
+                sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            for index in range(20):
+                destructibles_sensor._isolate_destructible_1513(
+                    'failure_%s' % index, 22, index)
+
+        self.assertEqual(20, len(
+            destructibles_sensor.g_offh_destr_isolated_slots))
+        self.assertEqual(11, len(
+            destructibles_sensor.g_offh_destr_isolation_logs))
+        self.assertEqual(12, len(writes))
+        self.assertIn('limit=12 additional_types=suppressed_for_battle',
+                      writes[-1])
+
+    def test_isolated_wire_never_reaches_native_destroy(self):
+        with mock.patch.object(
+                sys, 'stdout', types.SimpleNamespace(write=lambda unused: None)):
+            destructibles_sensor._isolate_destructible_1513(
+                'wire_identity_mismatch', 22, 7)
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority') as get_authority:
+            self.assertFalse(destructibles_sensor._try_destroy_destructible(
+                1, _mat_info_1513(
+                    True, mat_kind=73, filename='unsafe.model',
+                    chunk_id=22, item_index=7), 0.0, 10.0))
+
+        get_authority.assert_not_called()
+
+    def test_unregistered_isolation_does_not_scan_the_contact_index(self):
+        class _NoScanDict(dict):
+            def __iter__(self):
+                raise AssertionError('unregistered isolation scanned bins')
+
+        members = {(99, 1)}
+        destructibles_sensor.g_offh_destr_contact_bins = _NoScanDict({
+            (0, 0): members,
+        })
+        with mock.patch.object(
+                sys, 'stdout', types.SimpleNamespace(write=lambda unused: None)):
+            destructibles_sensor._isolate_destructible_1513(
+                'wire_identity_mismatch', 22, 7)
+
+        self.assertEqual({(99, 1)}, members)
 
     def test_normal_motion_updates_drain_one_time_chunk_diagnostics(self):
         lines = []
@@ -2449,16 +2581,24 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
         destructibles_sensor.xrange = range
 
+        writes = []
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
-                              'BigWorld': bigworld, 'Math': math_module}):
+                              'BigWorld': bigworld, 'Math': math_module}), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
             destructibles_sensor._fell_trees_near(
                 1, _Vector(), 0.0, 6.0, type_descriptor)
 
         instance = destructibles_sensor.g_offh_destr_instances[(22, 0)]
         self.assertEqual(expected, instance['filename'])
+        self.assertEqual(1, len(writes))
+        self.assertIn(
+            'DESTR accepted_catalog_identity type=filename_mismatch',
+            writes[0])
+        self.assertIn('repeats=suppressed_for_battle', writes[0])
 
-    def test_v3_native_slot_and_effect_category_abi_fail_explicitly(self):
+    def test_v3_native_slot_and_effect_query_isolate_the_slot(self):
         filename = 'content/test/normal/lod0/fence.model'
         matrix = _ItemMatrix()
         math_module = types.ModuleType('Math')
@@ -2496,26 +2636,44 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         destructibles_sensor.set_catalog(catalog)
         bigworld.wg_getChunkDestrFilenames = lambda *unused: (None,)
+        writes = []
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
-                              'BigWorld': bigworld, 'Math': math_module}):
-            with self.assertRaisesRegex(
-                    RuntimeError, 'filename slot is invalid: chunk=22 item=0'):
-                destructibles_sensor._fell_trees_near(
-                    1, _Vector(), 0.0, 6.0, type_descriptor)
+                              'BigWorld': bigworld, 'Math': math_module}), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 6.0, type_descriptor)
+
+        self.assertEqual({(22, 0)},
+                         destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual({'filename_slot'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
+        self.assertIn('type=filename_slot scope=slot chunk=22 item=0',
+                      writes[0])
 
         destructibles_sensor.set_catalog(catalog)
         bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
         bigworld.wg_getDestructibleEffectCategory = (
             lambda *unused: (_ for _ in ()).throw(ValueError('bad ABI')))
+        writes = []
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
-                              'BigWorld': bigworld, 'Math': math_module}):
-            with self.assertRaisesRegex(
-                    RuntimeError,
-                    'effect category query failed: chunk=22 item=0 module=-1'):
-                destructibles_sensor._fell_trees_near(
-                    1, _Vector(), 0.0, 6.0, type_descriptor)
+                              'BigWorld': bigworld, 'Math': math_module}), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 6.0, type_descriptor)
+
+        self.assertEqual({(22, 0)},
+                         destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual({'effect_query'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
+        self.assertIn('type=effect_query scope=slot chunk=22 item=0',
+                      writes[0])
+        self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
 
     def test_blank_v3_structure_keeps_all_module_boxes(self):
         filename = 'content/Buildings/test/normal/lod0/house.model'
@@ -3973,48 +4131,37 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             self.assertNotIn(
                 (22, 37, None),
                 getattr(destructibles_sensor, 'g_offh_destr_pending', {}))
-            old_boxes = instance['boxes']
-            old_bins = dict((key, set(value)) for key, value in
-                            destructibles_sensor.g_offh_destr_contact_bins.items())
             current[0] = _ItemMatrix(
                 _Vector(20.0, 0.0, 4.0), scale=1.2)
-            with self.assertRaises(RuntimeError):
-                destructibles_sensor._catalog_motion_blocked(
-                    1, _Vector(), 0.0, 11.5, descriptor, 10.02)
-            self.assertEqual(old_boxes, instance['boxes'])
-            self.assertEqual(
-                old_bins, destructibles_sensor.g_offh_destr_contact_bins)
-            current[0] = initial_matrix
-            self.assertEqual('crushed',
-                destructibles_sensor._catalog_motion_blocked(
-                    1, _Vector(), 0.0, 11.5, descriptor, 10.04,
-                    return_status=True))
-            current[0] = _ItemMatrix(_Vector(20.0, 0.0, 4.0))
-            self.assertEqual('clear',
-                destructibles_sensor._catalog_motion_blocked(
-                    1, _Vector(), 0.0, 11.5, descriptor, 10.06,
-                    return_status=True))
-            del area.g_destructiblesAnimator._DestructiblesAnimator__bodies[0][
-                'touchdownCallback']
-            current[0] = _ItemMatrix(_Vector(0.0, 0.0, 4.0))
-            # The resting OBB stays indexed so the ray seam can still name the
-            # felled column; a broken column never blocks either way.
-            self.assertEqual('crushed',
-                destructibles_sensor._catalog_motion_blocked(
-                    1, _Vector(), 0.0, 11.5, descriptor, 10.08,
-                    return_status=True))
-            self.assertTrue(any(
+            writes = []
+            with mock.patch.object(
+                    sys, 'stdout',
+                    types.SimpleNamespace(write=writes.append)):
+                self.assertEqual('clear',
+                    destructibles_sensor._catalog_motion_blocked(
+                        1, _Vector(), 0.0, 11.5, descriptor, 10.02,
+                        return_status=True))
+            self.assertEqual({(22, 37)},
+                             destructibles_sensor.g_offh_destr_isolated_slots)
+            self.assertNotIn(
+                (22, 37), destructibles_sensor.g_offh_destr_instances)
+            self.assertFalse(any(
                 (22, 37) in members for members in
                 destructibles_sensor.g_offh_destr_contact_bins.values()))
-            self.assertEqual('crushed',
+            self.assertNotIn(
+                (22, 37), destructibles_sensor.g_offh_destr_falling_active)
+            self.assertEqual(1, len(writes))
+            self.assertIn('type=falling_scale_change', writes[0])
+            current[0] = initial_matrix
+            self.assertEqual('clear',
                 destructibles_sensor._catalog_motion_blocked(
-                    1, _Vector(), 0.0, 11.5, descriptor, 11.0,
+                    1, _Vector(), 0.0, 11.5, descriptor, 10.04,
                     return_status=True))
 
         self.assertEqual(1, len(calls))
         self.assertNotIn(
             (22, 37), destructibles_sensor.g_offh_destr_falling_active)
-        self.assertEqual(4, len(matrix_queries))
+        self.assertEqual(1, len(matrix_queries))
 
     def _donation_catalog(self):
         fence = 'content/GatesAndFences/gaf022/normal/lod0/fence.model'
@@ -4095,6 +4242,16 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual('structure',
                          resources[house.lower()]['destr_type'])
 
+    def test_donation_is_unavailable_after_any_wire_is_isolated(self):
+        unused_fence, unused_house, catalog = self._donation_catalog()
+        destructibles_sensor.set_catalog(catalog)
+        with mock.patch.object(
+                sys, 'stdout', types.SimpleNamespace(write=lambda unused: None)):
+            destructibles_sensor._isolate_destructible_1513(
+                'wire_identity_mismatch', 31, 4)
+
+        self.assertIsNone(destructibles_sensor.donation_rows_1513())
+
     def test_one_bad_descriptor_fails_the_whole_donation(self):
         fence, house, catalog = self._donation_catalog()
         descriptors = {
@@ -4115,7 +4272,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'kind disagrees'):
                 destructibles_sensor.donation_rows_1513()
 
-    def test_streamed_identity_must_match_the_baked_wire(self):
+    def test_streamed_identity_mismatch_isolates_both_wires_once(self):
         fence = 'content/GatesAndFences/gaf022/normal/lod0/fence.model'
         chunk_translation = _Vector(100.0, 5.0, 200.0)
         matrix = _ItemMatrix(_Vector(2.0, 0.0, 4.0))
@@ -4147,20 +4304,32 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=chunk_translation)
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
+        bigworld.wg_getDestructibleEffectCategory = mock.Mock(
+            side_effect=AssertionError('effect queried for mismatched wire'))
         type_descriptor = _Strict1513Component(
             hull=_Strict1513Component(
                 hitTester=types.SimpleNamespace(bbox=(
                     (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
         destructibles_sensor.xrange = range
 
+        writes = []
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
-                              'BigWorld': bigworld, 'Math': math_module}):
-            with self.assertRaisesRegex(
-                    RuntimeError, 'disagrees with the baked wire'):
-                destructibles_sensor._fell_trees_near(
-                    1, _Vector(102.0, 5.0, 204.0), 0.0, 0.25,
-                    type_descriptor)
+                              'BigWorld': bigworld, 'Math': math_module}), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(102.0, 5.0, 204.0), 0.0, 0.25,
+                type_descriptor)
+
+        self.assertEqual({(22, 0), (23, 5)},
+                         destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual({'wire_identity_mismatch'},
+                         destructibles_sensor.g_offh_destr_isolation_logs)
+        self.assertEqual(1, len(writes))
+        self.assertIn('live=(22, 0) baked=(23, 5)', writes[0])
+        bigworld.wg_getDestructibleEffectCategory.assert_not_called()
+        self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
 
     def test_late_blank_column_registration_uses_native_initial_matrix(self):
         pole = 'content/Environment/env414/normal/lod0/pole.model'

@@ -61,29 +61,31 @@ def _manifest_entry(directory, map_name):
 			locator_quantization != 1000 or
 			str(manifest.get('game_version', '')) != GAME_VERSION):
 		raise ValueError('destructible catalog manifest is incompatible')
-	records = manifest.get('maps') or ()
-	if len(records) != len(SUPPORTED_MAPS):
-		raise ValueError('destructible catalog manifest is incomplete')
-	expected = set(SUPPORTED_MAPS)
-	seen = set()
+	records = manifest.get('maps')
+	if not isinstance(records, list):
+		raise ValueError(
+			'destructible catalog manifest record list is invalid')
 	selected = None
 	for record in records:
-		if not isinstance(record, dict):
-			raise ValueError('destructible catalog manifest record is invalid')
-		name = short_map_name(record.get('map'))
-		filename = str(record.get('file') or '')
-		digest = str(record.get('sha256') or '')
-		if (name not in expected or name in seen or
-				filename != name + '.json' or len(digest) != 64):
+		if (not isinstance(record, dict) or
+				short_map_name(record.get('map')) != map_name):
+			continue
+		if selected is not None:
 			raise ValueError(
-				'destructible catalog manifest record is invalid')
-		seen.add(name)
-		if not os.path.isfile(os.path.join(directory, filename)):
-			raise ValueError('destructible catalog batch is incomplete')
-		if name == map_name:
-			selected = record
-	if seen != expected:
-		raise ValueError('destructible catalog manifest is incomplete')
+				'destructible catalog manifest record is duplicated')
+		selected = record
+	if selected is None:
+		raise ValueError(
+			'destructible catalog manifest has no record for this map')
+	name = short_map_name(selected.get('map'))
+	filename = str(selected.get('file') or '')
+	digest = str(selected.get('sha256') or '')
+	if (name not in SUPPORTED_MAPS or filename != name + '.json' or
+			len(digest) != 64):
+		raise ValueError(
+			'destructible catalog manifest record is invalid')
+	if not os.path.isfile(os.path.join(directory, filename)):
+		raise ValueError('destructible catalog is unavailable')
 	return selected
 
 
@@ -111,10 +113,6 @@ def _instance_candidate(record, resources):
 		if box_index < 0 or box_index >= len(resource.get('boxes') or ()):
 			raise ValueError('destructible instance box index is invalid')
 	return filename, box_index
-
-
-def _candidate_sort_key(candidate):
-	return candidate[0], -1 if candidate[1] is None else int(candidate[1])
 
 
 def _validate(data, map_name):
@@ -207,20 +205,14 @@ def _validate(data, map_name):
 		raise ValueError('ambiguous destructible instance index is invalid')
 	seen_signatures = set()
 	seen_wires = set()
-	instance_kinds = dict((kind, 0)
-		for kind in ('falling', 'fragile', 'structure'))
-	previous_signature = None
 	for row in instances:
 		if (not isinstance(row, list) or len(row) != 17 or
 				any(type(value) not in _INTEGER_TYPES for value in row[:12])):
 			raise ValueError('destructible instance row is invalid')
 		signature = tuple(row[:12])
-		if (signature in seen_signatures or
-				(previous_signature is not None and
-				 signature <= previous_signature)):
+		if signature in seen_signatures:
 			raise ValueError('destructible instance signature is invalid')
-		filename, unused_box_index = _instance_candidate(
-			row[12:14], resources)
+		_instance_candidate(row[12:14], resources)
 		chunk_id, item_index, item_scale = row[14:]
 		if (type(chunk_id) not in _INTEGER_TYPES or
 				type(item_index) not in _INTEGER_TYPES or
@@ -232,47 +224,18 @@ def _validate(data, map_name):
 		if not _finite_number(item_scale) or float(item_scale) <= 0.0:
 			raise ValueError('destructible instance scale is invalid')
 		seen_signatures.add(signature)
-		previous_signature = signature
-		instance_kinds[resources[filename]['kind']] += 1
-	previous_signature = None
-	ambiguous_candidate_count = 0
 	for row in ambiguous_instances:
 		if (not isinstance(row, list) or len(row) != 13 or
 				any(type(value) not in _INTEGER_TYPES for value in row[:12]) or
 				not isinstance(row[12], list) or len(row[12]) < 2):
 			raise ValueError('ambiguous destructible instance row is invalid')
 		signature = tuple(row[:12])
-		if (signature in seen_signatures or
-				(previous_signature is not None and
-				 signature <= previous_signature)):
+		if signature in seen_signatures:
 			raise ValueError(
 				'ambiguous destructible instance signature is invalid')
-		candidates = [_instance_candidate(candidate, resources)
-			for candidate in row[12]]
-		if candidates != sorted(candidates, key=_candidate_sort_key):
-			raise ValueError('ambiguous destructible candidates are invalid')
+		for candidate in row[12]:
+			_instance_candidate(candidate, resources)
 		seen_signatures.add(signature)
-		previous_signature = signature
-		ambiguous_candidate_count += len(candidates)
-	census = data.get('census')
-	try:
-		valid_census = (
-			isinstance(census, dict) and
-			int(census.get('instance_signatures')) == len(instances) and
-			int(census.get('falling_instance_signatures')) ==
-				instance_kinds['falling'] and
-			int(census.get('fragile_instance_signatures')) ==
-				instance_kinds['fragile'] and
-			int(census.get('structure_instance_signatures')) ==
-				instance_kinds['structure'] and
-			int(census.get('ambiguous_instance_signatures')) ==
-				len(ambiguous_instances) and
-			int(census.get('ambiguous_instance_candidates')) ==
-				ambiguous_candidate_count)
-	except (AttributeError, TypeError, ValueError):
-		valid_census = False
-	if not valid_census:
-		raise ValueError('destructible instance census is invalid')
 	return data
 
 

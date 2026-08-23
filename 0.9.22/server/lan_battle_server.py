@@ -1744,13 +1744,15 @@ class BattleState:
             if (self.server_authority is not None and
                     self.authority_status == "server_pending" and
                     player_id == self.host_player_id):
-                # The sole native-data donor left while either projection or
-                # destructible identities were pending. End the round rather
-                # than wait for an impossible retry.
-                reason = ("descriptor_donor_disconnected"
-                          if not self.server_authority.started()
-                          else "destructible_map_donor_disconnected")
-                self._fail_server_authority_round(reason)
+                if self.server_authority.started():
+                    # Destructibles are optional. The remaining players can
+                    # keep the server-hosted battle even when the sole native
+                    # identity donor leaves during loading.
+                    self._disable_server_destructibles(
+                        "destructible_map_donor_disconnected")
+                else:
+                    self._fail_server_authority_round(
+                        "descriptor_donor_disconnected")
             if player_id == self.host_player_id:
                 self._elect_room_host()
             if player_id == self.bot_authority_id:
@@ -1944,9 +1946,22 @@ class BattleState:
         self.state_revision += 1
 
     def _authority_fields(self):
+        destructibles_disabled_reason = ""
+        authority = self.server_authority
+        world = None if authority is None else authority.world
+        disabled_reason = getattr(
+            world, "destructibles_disabled_reason", None)
+        if callable(disabled_reason):
+            reason = disabled_reason()
+            if isinstance(reason, str):
+                destructibles_disabled_reason = reason
         fields = {
             "authority_status": self.authority_status,
             "authority_fallback_reason": self.authority_fallback_reason,
+            "destructibles_disabled": bool(
+                destructibles_disabled_reason),
+            "destructibles_disabled_reason":
+                destructibles_disabled_reason,
         }
         worker = self.simulation_worker
         if worker is not None and worker.connected:
@@ -1982,6 +1997,26 @@ class BattleState:
         self.authority_status = "server"
         self.authority_fallback_reason = ""
         self.authority_prerequisite_deadline = None
+        return True
+
+    def _disable_server_destructibles(self, reason):
+        """Keep the round alive without untrusted native object identities."""
+        authority = self.server_authority
+        if authority is None:
+            return False
+        reason = str(reason or "destructible_data_unavailable")
+        changed = authority.world.disable_destructibles(reason)
+        self.destructible_maps.pop(self.map_name, None)
+        previous_status = self.authority_status
+        if (authority.started() and
+                not self._mark_server_authority_ready()):
+            return False
+        if changed:
+            _server_log(
+                "SERVER AUTHORITY destructibles disabled reason=%s round=%s; "
+                "continuing battle" % (reason, self.round_id))
+        if changed or previous_status != self.authority_status:
+            self.state_revision += 1
         return True
 
     def _fail_server_authority_round(self, reason):
@@ -2030,6 +2065,11 @@ class BattleState:
         reason = ("descriptor_timeout"
                   if authority is None or not authority.started()
                   else "destructible_map_timeout")
+        if reason == "destructible_map_timeout":
+            disabled = self._disable_server_destructibles(reason)
+            if disabled:
+                self._activate_battle_if_ready()
+            return disabled
         return self._fail_server_authority_round(reason)
 
     def lobby_message(self):
@@ -2233,6 +2273,10 @@ class BattleState:
             _server_log(
                 "server authority has no baked world for %s" % self.map_name)
             return "world_data_unavailable"
+        for warning in getattr(world, "optional_warnings", ()):
+            _server_log(
+                "SERVER AUTHORITY optional world feature disabled map=%s: %s" %
+                (self.map_name, warning))
         self.server_authority = ServerBattleAuthority(
             self, world, self.descriptor_store)
         self._wait_for_authority_prerequisite(restart=True)
@@ -2292,6 +2336,16 @@ class BattleState:
             map_name = str(message.get("map") or "")
             if not map_name:
                 return False
+            if message.get("unavailable") is True:
+                if (map_name != self.map_name or self.phase != "loading" or
+                        self.authority_status != "server_pending"):
+                    return False
+                if self._disable_server_destructibles(
+                        "client_destructible_map_unavailable"):
+                    if self._server_authority_prerequisites_ready():
+                        return "ready"
+                    return True
+                return False
             try:
                 part = int(message.get("part"))
                 parts = int(message.get("parts"))
@@ -2339,9 +2393,10 @@ class BattleState:
             if (map_name == self.map_name and
                     self.server_authority is not None and
                     not self.server_authority.world.destructible_identities_ready()):
-                self._fail_server_authority_round(
-                    "destructible_map_incomplete")
-                return "failed"
+                if self._disable_server_destructibles(
+                        "destructible_map_incomplete"):
+                    return "ready"
+                return False
             return True
 
     def _install_destructible_map(self, map_name):
@@ -2703,6 +2758,10 @@ class BattleState:
                 if (player is None or not player.connected or
                         not player.participating or not player.alive):
                     return False
+            if (self.server_authority is not None and
+                    self.server_authority.world.
+                    destructibles_disabled_reason() is not None):
+                return True
             event = self._sanitize_destructible(message)
             if event is None:
                 return False
@@ -6433,6 +6492,10 @@ class BattleState:
             authority_fallback = self._expire_authority_prerequisite()
         if authority_fallback:
             self.broadcast_current_roster()
+            # A disabled optional feature may have made the loading round ready
+            # and queued its tick-zero live barrier. Publish that barrier on the
+            # next tick before advancing simulation.
+            return
         with self.lock:
             if self.phase != "battle":
                 return

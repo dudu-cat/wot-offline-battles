@@ -4764,27 +4764,60 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(('catalog', None), calls[-1])
 
-    def test_supported_map_rejects_missing_destructible_catalog_preflight(self):
-        runtime = _runtime()
-        runtime.area_destructibles = object()
-        runtime.destructibles_cache = object()
-        runtime.destructible_catalog_loader = mock.Mock(return_value=None)
-        battle = BattleRuntime(runtime)
+    def test_destructible_catalog_failure_disables_only_that_feature(self):
         module = sys.modules[BattleRuntime.__module__]
         from gui.mods.offline_lan_0922 import destructibles_sensor
 
-        with mock.patch.object(
-                module.destructibles_compat, 'install', return_value=True), \
-                mock.patch.object(destructibles_sensor, 'set_catalog'), \
-                mock.patch.object(destructibles_sensor, 'reset'), \
-                mock.patch.object(destructibles_sensor, 'set_event_sink'):
-            self.assertFalse(battle.start({
+        for loader_effect in (None, RuntimeError('catalog read failed')):
+            with self.subTest(loader_effect=loader_effect):
+                runtime = _runtime()
+                runtime.area_destructibles = object()
+                runtime.destructibles_cache = object()
+                if isinstance(loader_effect, Exception):
+                    runtime.destructible_catalog_loader = mock.Mock(
+                        side_effect=loader_effect)
+                else:
+                    runtime.destructible_catalog_loader = mock.Mock(
+                        return_value=loader_effect)
+                battle = BattleRuntime(runtime)
+
+                with mock.patch.object(
+                        module.destructibles_compat, 'install',
+                        return_value=True), mock.patch.object(
+                            destructibles_sensor, 'set_catalog'), \
+                        mock.patch.object(destructibles_sensor, 'reset'), \
+                        mock.patch.object(
+                            destructibles_sensor, 'set_event_sink'), \
+                        contextlib.redirect_stdout(io.StringIO()) as log:
+                    self.assertTrue(battle.start({
+                        'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+                        'name': 'Player'}, {}, _Client()))
+                    self.assertIsNone(battle._destructibles)
+                    battle.stop(show_login=False)
+
+                self.assertIn(
+                    'optional destructible interactions disabled for this '
+                    'round', log.getvalue())
+                self.assertIn(
+                    ('map_create', '01_karelia'),
+                    runtime.bigworld.operations)
+
+    def test_foliage_loader_failure_does_not_abort_map_start(self):
+        runtime = _runtime()
+        runtime.foliage_loader = mock.Mock(
+            side_effect=RuntimeError('foliage file is incomplete'))
+        battle = BattleRuntime(runtime)
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertTrue(battle.start({
                 'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
                 'name': 'Player'}, {}, _Client()))
+            self.assertIsNone(battle._foliage)
+            battle.stop(show_login=False)
 
-        self.assertIn('destructible catalog is unavailable', battle.error)
-        self.assertNotIn(('map_create', '01_karelia'),
-                         runtime.bigworld.operations)
+        self.assertEqual(
+            1, log.getvalue().count(
+                'optional foliage camouflage disabled for this round'))
 
     def test_baked_formation_slot_is_reused_without_runtime_nudging(self):
         runtime = _runtime()
@@ -6079,9 +6112,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
             {'team1': ()})
         self.assertTrue(battle._ready_sent)
 
-    def test_required_destructible_donation_data_errors_are_fatal(self):
+    def test_required_destructible_donation_reports_unavailable(self):
         for donation_effect, expected in (
-                (RuntimeError('projection failed'), 'projection failed'),
+                (RuntimeError('projection failed\n' + 'x' * 300),
+                 'projection failed'),
                 (None, 'baked catalog')):
             with self.subTest(expected=expected):
                 battle = BattleRuntime(_runtime())
@@ -6102,14 +6136,44 @@ class BattleRuntimeContractTests(unittest.TestCase):
                     project = mock.Mock(return_value=donation_effect)
                 battle._destructibles = types.SimpleNamespace(
                     donation_rows_1513=project)
+                send_map = mock.Mock(return_value=True)
                 battle.client = types.SimpleNamespace(
-                    send_destructible_map=mock.Mock(return_value=True),
+                    send_destructible_map=send_map,
                     send_battle_ready=mock.Mock(return_value=True))
 
-                with self.assertRaisesRegex(RuntimeError, expected):
-                    battle._maybe_send_battle_ready()
-                battle.client.send_battle_ready.assert_not_called()
-                self.assertFalse(battle._ready_sent)
+                with contextlib.redirect_stdout(io.StringIO()) as log:
+                    self.assertTrue(battle._maybe_send_battle_ready())
+
+                payload = send_map.call_args.args[1]
+                self.assertEqual(True, payload['unavailable'])
+                self.assertIn(expected, payload['reason'])
+                self.assertLessEqual(len(payload['reason']), 160)
+                self.assertNotIn('\n', payload['reason'])
+                self.assertEqual('01_karelia', send_map.call_args.args[0])
+                battle.client.send_battle_ready.assert_called_once_with(
+                    {'team1': ()})
+                self.assertTrue(battle._ready_sent)
+                self.assertEqual(
+                    1, log.getvalue().count(
+                        'optional destructible map donation degraded for '
+                        'this round'))
+
+    def test_disabled_destructibles_report_unavailable_for_donation(self):
+        battle = BattleRuntime(_runtime())
+        battle._start_message = {
+            'map': '01_karelia', 'need_destructible_map': True}
+        battle._destructibles = None
+        send_map = mock.Mock(return_value=True)
+        battle.client = types.SimpleNamespace(
+            send_destructible_map=send_map)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(battle._maybe_donate_destructible_map())
+
+        send_map.assert_called_once_with('01_karelia', {
+            'unavailable': True,
+            'reason': 'destructible catalog is unavailable',
+        })
 
     def test_direction_probe_copies_dual_distance_three_lane_corridor(self):
         runtime = _runtime()
@@ -8894,6 +8958,69 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_battle_frame_requests_the_next_render_frame(self):
         self.assertEqual(0.0, FRAME_SECONDS)
 
+    def test_optional_frame_failures_disable_features_not_the_round(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle.client = types.SimpleNamespace()
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._last_frame_time = 0.98
+        battle._avatar = runtime.bigworld.avatar
+        battle._frame_diagnostics = None
+        battle._maintain_standard_space_visibility = mock.Mock(
+            side_effect=RuntimeError('visibility write failed'))
+        battle._tick_expert_target = mock.Mock(
+            side_effect=RuntimeError('Expert callback failed'))
+        battle._update_target_outline = mock.Mock(
+            side_effect=RuntimeError('edge callback failed'))
+        battle._clear_target_outline = mock.Mock(return_value=True)
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._tick_drowning = mock.Mock()
+        battle._tick_overturn = mock.Mock()
+        battle._drive_local = mock.Mock()
+        battle._report_local_compound = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._schedule = mock.Mock()
+        battle._fail = mock.Mock()
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            battle._frame()
+            battle._frame()
+
+        self.assertEqual('running', battle.state)
+        battle._fail.assert_not_called()
+        self.assertEqual(2, battle._schedule.call_count)
+        battle._maintain_standard_space_visibility.assert_called_once_with(
+            1.0)
+        battle._tick_expert_target.assert_called_once_with(1.0)
+        battle._update_target_outline.assert_called_once_with(1.0)
+        rendered = log.getvalue()
+        for feature in (
+                'map visibility filtering',
+                'Expert damaged-device presentation',
+                'target outline'):
+            self.assertEqual(
+                1, rendered.count(
+                    'optional %s disabled for this round' % feature))
+
+    def test_optional_warning_is_single_line_bounded_and_deduplicated(self):
+        battle = BattleRuntime(_runtime())
+        error = RuntimeError('first line\n' + 'x' * 600)
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            battle._warn_optional_failure('target outline', error)
+            battle._warn_optional_failure('target outline', error)
+
+        lines = log.getvalue().splitlines()
+        self.assertEqual(1, len(lines))
+        self.assertLessEqual(len(lines[0]), 320)
+        self.assertIn('first line', lines[0])
+
     def test_frame_diagnostics_keep_raw_delta_while_motion_uses_cap(self):
         runtime = _runtime()
         runtime.bigworld.now = 1.0
@@ -11505,6 +11632,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._destructibles = mock.Mock()
+        battle._destructibles.is_isolated_1513.return_value = False
         event = {
             'destructible_kind': 'fragile',
             'chunk_id': 3, 'item_index': 9,
@@ -11540,6 +11668,91 @@ class BattleRuntimeContractTests(unittest.TestCase):
                     create=True), self.assertRaisesRegex(
                     RuntimeError, 'shot flag is invalid'):
             battle._apply_destructible_event(invalid)
+
+    def test_canonical_event_never_reenters_an_isolated_native_wire(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = mock.Mock()
+        battle._destructibles.is_isolated_1513.return_value = True
+        event = {
+            'destructible_kind': 'fragile',
+            'chunk_id': 3, 'item_index': 9,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.0, 'speed': 0.0,
+            'is_shot': True}
+        authority = types.ModuleType(
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority.is_destroyed = mock.Mock(return_value=False)
+        authority.destroy_fragile = mock.Mock(return_value=True)
+        package = sys.modules['gui.mods.offline_lan_0922']
+
+        with mock.patch.dict(sys.modules, {
+                'gui.mods.offline_lan_0922.destructibles_authority':
+                authority}), mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
+            self.assertFalse(battle._apply_destructible_event(event))
+
+        authority.is_destroyed.assert_not_called()
+        authority.destroy_fragile.assert_not_called()
+        battle._destructibles.note_destroyed.assert_not_called()
+
+    def test_server_disabled_destructibles_stop_the_sensor_once(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._start_message = {'round_id': 4}
+        sensor = mock.Mock()
+        battle._destructibles = sensor
+        battle._bots = None
+        message = {
+            'round_id': 4, 'bot_authority_id': 0,
+            'destructibles_disabled': True,
+            'destructibles_disabled_reason': 'destructible_map_timeout',
+        }
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertTrue(battle.on_roster(message))
+            self.assertTrue(battle.on_roster(message))
+
+        self.assertIsNone(battle._destructibles)
+        sensor.set_event_sink.assert_called_once_with(None)
+        sensor.reset.assert_called_once_with()
+        sensor.set_catalog.assert_called_once_with(None)
+        self.assertEqual(
+            1, log.getvalue().count(
+                'optional destructible interactions disabled for this round'))
+
+    def test_disabled_snapshot_skips_canonical_destructible_replay(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._start_message = {'round_id': 4}
+        sensor = mock.Mock()
+        battle._destructibles = sensor
+        battle._bots = None
+        battle._sync = None
+        battle._observe_projectile_message = mock.Mock()
+        battle._reconcile_projectile_snapshot = mock.Mock()
+        event = {
+            'destructible_kind': 'fragile',
+            'chunk_id': 3, 'item_index': 9,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.0, 'speed': 0.0,
+            'is_shot': True}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            battle.on_snapshot({
+                'destructibles_disabled': True,
+                'destructibles_disabled_reason':
+                    'client_destructible_map_unavailable',
+                'destructibles': [event],
+            })
+
+        self.assertEqual('running', battle.state)
+        self.assertIsNone(battle._destructibles)
+        sensor.set_event_sink.assert_called_once_with(None)
 
     def test_authority_updates_hidden_remote_through_private_registry(self):
         runtime = _runtime()
@@ -11971,6 +12184,46 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertNotIn('spot_feedback_sent', record)
         self.assertEqual([], battle._avatar.battle_events)
 
+    def test_direct_spot_feedback_failure_keeps_spotting_report_alive(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_descriptor = _Descriptor()
+        battle._local_position = (0.0, 0.0, 0.0)
+        local = _Vehicle(
+            10, battle._local_descriptor, _Vector(), (0, 0, 0),
+            {'health': 500})
+        enemy = _Vehicle(
+            12, _Descriptor(), _Vector(100.0, 0.0, 0.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities.update({10: local, 12: enemy})
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._spotting_observers = lambda: (
+            ((0.0, 0.0, 0.0), local.typeDescriptor, local),)
+        battle._spot_line_of_sight = mock.Mock(return_value=True)
+        battle._set_record_spot_visibility = lambda record, visible: \
+            record.update(spot_visible=bool(visible)) or bool(visible)
+        battle._present_direct_spot = mock.Mock(
+            side_effect=RuntimeError('battle ribbon callback failed'))
+        battle._publish_spotted_targets = mock.Mock()
+        record = {
+            'engine_id': 12, 'network_id': 17, 'kind': 'bot',
+            'ready': True, 'local': False, 'presentation': True,
+            'tombstone': False, 'spot_visible': False,
+            'spot_until': 0.0, 'spot_next': 10.0,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:17': record}
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertTrue(battle._update_spotting(10.0))
+
+        self.assertTrue(record['spot_visible'])
+        battle._publish_spotted_targets.assert_called_once_with([record])
+        self.assertEqual(
+            1, log.getvalue().count(
+                'optional spotting feedback disabled for this round'))
+
     def test_direct_spotting_observer_is_only_the_local_human(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -12339,6 +12592,26 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle._spot_line_of_sight(
             sight, target_position, target, False, True))
         self.assertEqual([False, True], calls)
+
+    def test_runtime_foliage_failure_falls_back_to_zero_bonus_once(self):
+        battle = BattleRuntime(_runtime())
+        camouflage_bonus = mock.Mock(
+            side_effect=RuntimeError('foliage query failed'))
+        battle._foliage = types.SimpleNamespace(
+            camouflage_bonus=camouflage_bonus)
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertEqual(0.0, battle._foliage_camouflage_bonus(
+                (0.0, 0.0, 0.0), (10.0, 0.0, 0.0), False))
+            self.assertEqual(0.0, battle._foliage_camouflage_bonus(
+                (0.0, 0.0, 0.0), (10.0, 0.0, 0.0), False))
+
+        camouflage_bonus.assert_called_once_with(
+            (0.0, 0.0, 0.0), (10.0, 0.0, 0.0), False)
+        self.assertIsNone(battle._foliage)
+        self.assertEqual(
+            1, log.getvalue().count(
+                'optional foliage camouflage disabled for this round'))
 
     def test_dead_local_vehicle_cannot_move_or_fire(self):
         runtime = _runtime()
@@ -15087,6 +15360,39 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([(0, 0)], entity.engine_modes)
         self.assertEqual([], entity.track_scrolls)
 
+    def test_local_track_failure_keeps_live_pose_presentation_running(self):
+        runtime = _runtime()
+        runtime.compatibility.set_vehicle_pose_overlay = mock.Mock()
+        battle = BattleRuntime(runtime)
+        battle._local_matrix = _Matrix()
+        battle._local_model = object()
+        battle._local_camera_velocity = _Vector()
+        battle._local_position = (3.0, 4.0, 5.0)
+        battle._local_yaw = 0.25
+        battle._local_pitch = 0.0
+        battle._local_roll = 0.0
+        battle._local_speed = 2.0
+        battle._local_turn_speed = 0.1
+        battle._reset_full_turret_sniper_aim = mock.Mock()
+        battle._update_local_tracks = mock.Mock(
+            side_effect=RuntimeError('track boundary failed'))
+        entity = types.SimpleNamespace()
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            first = battle._update_local_presentation(entity, 0.1)
+            second = battle._update_local_presentation(entity, 0.1)
+
+        self.assertEqual((3.0, 4.0, 5.0),
+                         (first.x, first.y, first.z))
+        self.assertEqual((3.0, 4.0, 5.0),
+                         (second.x, second.y, second.z))
+        self.assertEqual(
+            2, runtime.compatibility.set_vehicle_pose_overlay.call_count)
+        battle._update_local_tracks.assert_called_once_with(entity)
+        self.assertEqual(
+            1, log.getvalue().count(
+                'optional local track animation disabled for this round'))
+
 
     def test_damage_info_is_skipped_when_the_battle_gui_is_gone(self):
         runtime = _runtime()
@@ -15125,6 +15431,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
             with mock.patch.object(
                     battle, '_critical_extra_index', return_value=7):
                 self.assertFalse(battle._present_critical(record, events, 99))
+
+    def test_damage_info_range_failure_is_never_fatal_or_repeated(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertFalse(battle._show_damage_info(10, 999, 0, 11))
+            self.assertFalse(battle._show_damage_info(10, 999, 0, 11))
+
+        self.assertEqual([], battle._avatar.damage_info)
+        self.assertEqual(
+            1, log.getvalue().count(
+                'optional damage-info presentation disabled for this '
+                'round'))
 
     def test_far_bots_sample_the_suspension_less_than_near_bots(self):
         near = {'id': 1, 'x': 10.0, 'y': 2.0, 'z': 0.0, 'yaw': 0.0,

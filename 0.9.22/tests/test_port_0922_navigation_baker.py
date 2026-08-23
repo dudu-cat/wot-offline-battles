@@ -230,7 +230,7 @@ class CompiledSpace0922Test(unittest.TestCase):
         self.assertFalse(baker.spawn_obbs_overlap(
             first, (14.0, 0.0, 0.0, 0.0), 2.24, 5.46))
 
-    def test_real_ensk_graph_loads_with_0922_loader(self):
+    def test_runtime_loader_only_validates_selected_navigation_record(self):
         graph = ROOT / '0.9.22' / 'navgraphs' / '06_ensk.json'
         self.assertTrue(graph.is_file(), 'baked Ensk graph is missing')
         loader_path = (ROOT / '0.9.22' / 'src' / 'res' / 'scripts' /
@@ -243,6 +243,10 @@ class CompiledSpace0922Test(unittest.TestCase):
             directory = Path(temporary) / 'navgraphs'
             directory.mkdir()
             shutil.copy2(graph, directory / graph.name)
+            manifest_path = directory / 'manifest.json'
+            shutil.copy2(
+                ROOT / '0.9.22' / 'navgraphs' / 'manifest.json',
+                manifest_path)
             package_names = ('gui', 'gui.mods',
                              'gui.mods.offline_lan_0922')
             config_name = 'gui.mods.offline_lan_0922.config'
@@ -261,6 +265,16 @@ class CompiledSpace0922Test(unittest.TestCase):
                 sys.modules[config_name] = config
                 spec.loader.exec_module(loader)
                 loaded = loader.load_graph('06_ensk')
+
+                manifest = json.loads(manifest_path.read_text())
+                selected = next(
+                    record for record in manifest['maps']
+                    if record['map'] == '06_ensk')
+                selected['file'] = 'missing.json'
+                manifest_path.write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(
+                        ValueError, 'manifest record is invalid'):
+                    loader.load_graph('06_ensk')
             finally:
                 for name, previous in saved.items():
                     if previous is None:
