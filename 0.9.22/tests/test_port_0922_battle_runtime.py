@@ -1785,9 +1785,21 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertAlmostEqual(-0.1, vehicle._gun_pitch)
         self.assertTrue(vehicle.update_tracks(
             2.0, 3.0, (ENGINE_MODE_RUNNING, 1)))
+        self.assertTrue(vehicle.update_tracks(
+            2.0, 3.0, (ENGINE_MODE_RUNNING, 1)))
         vehicle.filter.setTracksSpeed.assert_called_once_with(
             2.0, False, 3.0, True)
         self.assertEqual([(2.0, 3.0)], vehicle.track_scrolls)
+
+        pending.appearance.flyingInfoProvider.isLeftSideFlying = False
+        self.assertTrue(vehicle.update_tracks(
+            2.0, 3.0, (ENGINE_MODE_RUNNING, 1)))
+        self.assertEqual([
+            mock.call(2.0, False, 3.0, True),
+            mock.call(2.0, True, 3.0, True),
+        ], vehicle.filter.setTracksSpeed.call_args_list)
+        self.assertEqual([(2.0, 3.0), (2.0, 3.0)],
+                         vehicle.track_scrolls)
 
         # Never call the fatal native WGVehicleFilter method after the engine
         # table stops owning this exact PyEntity, including fallback methods
@@ -1795,13 +1807,29 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         runtime.bigworld.entities.pop(vehicle_id)
         self.assertFalse(vehicle.update_tracks(
             4.0, 5.0, (ENGINE_MODE_RUNNING, 1)))
-        vehicle.filter.setTracksSpeed.assert_called_once_with(
-            2.0, False, 3.0, True)
-        self.assertEqual([(2.0, 3.0)], vehicle.track_scrolls)
+        self.assertEqual(2, vehicle.filter.setTracksSpeed.call_count)
+        self.assertEqual([(2.0, 3.0), (2.0, 3.0)],
+                         vehicle.track_scrolls)
         self.assertFalse(
             vehicle._offlinePresentationCapabilities[
                 'engine_owned_track_motion'])
         runtime.bigworld.entities[vehicle_id] = vehicle
+
+        class _RejectingAnimation(object):
+            def __setattr__(self, name, value):
+                if name in ('keyframes', 'time'):
+                    raise RuntimeError('animation rejected rekey')
+                object.__setattr__(self, name, value)
+
+        state = factory._states[vehicle_id]
+        rejected = _RejectingAnimation()
+        state.animation = rejected
+        state.provider = rejected
+        vehicle.model.matrix = rejected
+        swinging.worldMatrix = rejected
+        self.assertFalse(state._rekey(0.1))
+        self.assertIs(state.matrix, vehicle.model.matrix)
+        self.assertIs(state.matrix, swinging.worldMatrix)
 
         self.assertTrue(factory.destroy(vehicle_id))
         self.assertIsNone(runtime.bigworld.entity(vehicle_id))
@@ -1840,6 +1868,85 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
             vehicle._offlinePresentationCapabilities[
                 'engine_owned_track_motion'])
         self.assertTrue(factory.destroy(vehicle_id))
+
+    def test_guest_native_vehicle_uses_one_stable_pose_matrix(self):
+        runtime = _runtime()
+        holder = {}
+        binding = BigWorldVehicleBinding(
+            runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
+            _VehicleDescr, runtime.encode_gun_angles,
+            outfit_provider=lambda unused_descriptor: '',
+            authority_entity_resolver=lambda entity_id:
+            holder['factory'].get(entity_id))
+        factory = NativeRemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            binding=binding, compatibility=runtime.compatibility,
+            interpolate_motion=False)
+        holder['factory'] = factory
+        properties = binding.properties_from_compact_descr(
+            'ussr:R11_MS-1', 2, 'Native guest')
+
+        vehicle_id = factory.create(
+            _Descriptor(), properties, _Vector(), (0.0, 0.0, 0.0))
+        runtime.bigworld.enter_pending_vehicle(vehicle_id)
+        self.assertTrue(factory.is_ready(vehicle_id))
+        vehicle = factory.get(vehicle_id)
+        state = factory._states[vehicle_id]
+        provider = vehicle.model.matrix
+
+        self.assertIsNone(state.animation)
+        self.assertIs(state.matrix, provider)
+        binding.set_vehicle_pose(
+            vehicle_id, _Vector(1.0, 0.0, 2.0), (0.0, 0.0, 0.2),
+            now=10.0)
+        binding.set_vehicle_pose(
+            vehicle_id, _Vector(2.0, 0.0, 4.0), (0.0, 0.0, 0.4),
+            now=10.1)
+        self.assertIs(provider, vehicle.model.matrix)
+
+        vehicle._offlineNativeDrawVisible = False
+        vehicle._spot_visible = False
+        vehicle.model = _Model()
+        vehicle.appearance.compoundModel = vehicle.model
+        for handler in tuple(vehicle.appearance.onModelChanged.handlers):
+            handler()
+        self.assertIs(provider, vehicle.model.matrix)
+        self.assertFalse(vehicle.model.visible)
+        self.assertEqual([], vehicle.targetCaps)
+
+        self.assertTrue(factory.set_entity_interpolate_motion(
+            vehicle_id, True))
+        self.assertIsNotNone(state.animation)
+        self.assertIs(state.animation, vehicle.model.matrix)
+        self.assertTrue(factory.set_entity_interpolate_motion(
+            vehicle_id, False))
+        self.assertIsNone(state.animation)
+        self.assertIs(state.matrix, vehicle.model.matrix)
+        self.assertTrue(factory.destroy(vehicle_id))
+
+    def test_minimap_refresh_replays_only_the_native_added_signal(self):
+        runtime = _runtime()
+        entity = _Vehicle(
+            77, _Descriptor(), _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500, 'publicInfo': {'team': 1}})
+        entity.proxy = types.SimpleNamespace(id=77)
+        runtime.bigworld.entities[77] = entity
+        arena_dp = runtime.bigworld.avatar.guiSessionProvider.getArenaDP()
+        gui_props = object()
+        arena_dp.getPlayerGuiProps = mock.Mock(return_value=gui_props)
+        feedback = runtime.bigworld.avatar.guiSessionProvider.shared.feedback
+        feedback.onMinimapVehicleAdded = mock.Mock()
+        binding = BigWorldVehicleBinding(
+            runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
+            _VehicleDescr, runtime.encode_gun_angles,
+            outfit_provider=lambda unused_descriptor: '')
+
+        self.assertTrue(binding.refresh_vehicle_minimap(77))
+
+        vehicle_info = arena_dp.getVehicleInfo(77)
+        arena_dp.getPlayerGuiProps.assert_called_once_with(77, 1)
+        feedback.onMinimapVehicleAdded.assert_called_once_with(
+            entity.proxy, vehicle_info, gui_props)
 
 
 class RemoteVehicleFactoryTests(unittest.TestCase):
@@ -3926,6 +4033,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.arena_period.assert_called_once_with(
             'prebattle', 10.0)
         self.assertEqual(60.0, battle._prebattle_deadline)
+        self.assertFalse(battle.on_battle_live({
+            'countdown_seconds': 15.0,
+            'battle_duration_seconds': 900.0}))
+        battle._binding.arena_period.assert_called_once_with(
+            'prebattle', 10.0)
 
         battle._next_spotting_time = 50.1
         with mock.patch.object(
@@ -11005,6 +11117,118 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(17, args[0])
         self.assertEqual(_engine_rotation(0.6, -0.14, 0.08), args[2])
 
+    def test_guest_snapshot_drives_tracks_from_interpolated_hull_turn(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._binding = mock.Mock()
+        battle._clock = mock.Mock(side_effect=(10.0, 10.1))
+        battle._update_bot_tracks = mock.Mock(return_value=True)
+        record = {
+            'engine_id': 17, 'kind': 'bot', 'network_id': 3,
+            'local': False,
+            'state': {'id': 3, 'speed': 0.0,
+                      'health': 500, 'alive': True}}
+
+        battle._apply_record_pose(record, {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0})
+        battle._apply_record_pose(record, {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.1})
+
+        first = battle._update_bot_tracks.call_args_list[0].args
+        second = battle._update_bot_tracks.call_args_list[1].args
+        self.assertEqual(0.0, first[3])
+        self.assertAlmostEqual(1.0, second[3])
+
+        battle._clock = mock.Mock(side_effect=(20.0, 20.1))
+        battle._update_bot_tracks.reset_mock()
+        record = {
+            'engine_id': 18, 'kind': 'player', 'network_id': 4,
+            'local': False,
+            'state': {'id': 4, 'speed': 5.0,
+                      'health': 500, 'alive': True}}
+        battle._apply_record_pose(record, {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.2})
+        battle._apply_record_pose(record, {
+            'x': 0.5, 'y': 0.0, 'z': 0.0, 'yaw': 0.1})
+        self.assertEqual(2, battle._update_bot_tracks.call_count)
+        self.assertAlmostEqual(
+            -1.0, battle._update_bot_tracks.call_args.args[3])
+
+    def test_bot_authority_handoff_switches_only_bot_interpolation(self):
+        battle = BattleRuntime(_runtime())
+        battle.client = types.SimpleNamespace(player_id=1)
+        battle._binding = mock.Mock()
+        battle._remote_factory = types.SimpleNamespace(
+            set_entity_interpolate_motion=mock.Mock(return_value=True))
+        battle._records = {
+            'bot:3': {
+                'engine_id': 17, 'kind': 'bot', 'native_remote': True,
+                'tombstone': False, 'ready': True,
+                'visual_started': True,
+                'track_pose_sample': (4.0, 0.2)},
+            'player:2': {
+                'engine_id': 18, 'kind': 'player', 'native_remote': True,
+                'tombstone': False},
+        }
+
+        self.assertTrue(battle._set_bot_presentation_interpolation(-1))
+        battle._remote_factory.set_entity_interpolate_motion.\
+            assert_called_once_with(17, False)
+        battle._binding.refresh_vehicle_minimap.assert_called_once_with(17)
+        self.assertNotIn('track_pose_sample', battle._records['bot:3'])
+
+        battle._remote_factory.set_entity_interpolate_motion.reset_mock()
+        battle._binding.refresh_vehicle_minimap.reset_mock()
+        self.assertTrue(battle._set_bot_presentation_interpolation(1))
+        battle._remote_factory.set_entity_interpolate_motion.\
+            assert_called_once_with(17, True)
+        battle._binding.refresh_vehicle_minimap.assert_called_once_with(17)
+
+    def test_countdown_hides_native_enemies_and_rebinds_friendly_minimap(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = types.SimpleNamespace(team=1)
+        battle._binding = mock.Mock()
+        friendly = _Vehicle(
+            10, _Descriptor(), _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500, 'publicInfo': {'team': 1}})
+        enemy = _Vehicle(
+            11, _Descriptor(), _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500, 'publicInfo': {'team': 2}})
+        enemy._spot_visible = True
+        enemy._offlineNativeDrawVisible = True
+        enemy.targetCaps = [1]
+        vehicles = {10: friendly, 11: enemy}
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: vehicles.get(entity_id))
+        battle._records = {
+            'bot:1': {
+                'engine_id': 10, 'local': False, 'native_remote': True,
+                'ready': True, 'tombstone': False,
+                'state': {'team': 1}},
+            'bot:2': {
+                'engine_id': 11, 'local': False, 'native_remote': True,
+                'ready': True, 'tombstone': False,
+                # Deliberately stale: stock may have re-added the marker
+                # after runtime state already recorded it as stopped.
+                'visual_started': False, 'spot_visible': True,
+                'state': {'team': 2}},
+        }
+
+        self.assertTrue(battle._reset_prebattle_native_visuals())
+
+        battle._binding.refresh_vehicle_minimap.assert_called_once_with(10)
+        battle._binding.stop_vehicle_visual.assert_called_once_with(11, False)
+        self.assertFalse(enemy.model.visible)
+        self.assertEqual([], enemy.targetCaps)
+        self.assertFalse(enemy._spot_visible)
+        self.assertFalse(enemy._offlineNativeDrawVisible)
+        self.assertFalse(battle._records['bot:2']['visual_started'])
+        self.assertTrue(battle._records['bot:1']['native_minimap_rebound'])
+
+        battle._reset_prebattle_native_visuals()
+        battle._binding.refresh_vehicle_minimap.assert_called_once_with(10)
+
     def test_native_reverse_sample_preserves_yaw_component_order(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -11258,16 +11482,56 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         descriptor = _Descriptor()
-        battle._ground_y = lambda x, unused_z, unused_hint=0.0, **unused: -0.6 * x
+        battle._ground_y = lambda x, unused_z, unused_hint=0.0, **unused: -1.2 * x
 
         battle._ground_pitch((0.0, 0.0, 0.0), 0.0, descriptor)
         position = battle._apply_slope_slide(
             (0.0, 0.0, 0.0), 0.0, 0.1)
 
-        self.assertGreater(battle._local_slope_tangent, 0.44)
+        self.assertAlmostEqual(
+            math.atan(1.2), abs(battle._local_roll), places=6)
+        self.assertGreater(abs(battle._local_roll), 0.61)
         self.assertGreater(battle._local_slide_speed, 0.0)
         self.assertGreater(position[0], 0.0)
-        self.assertLess(position[1], 0.0)
+        self.assertAlmostEqual(-1.2 * position[0], position[1], places=6)
+
+    def test_cross_slope_slide_rejects_a_discontinuous_candidate_plane(self):
+        battle = BattleRuntime(_runtime())
+        descriptor = _Descriptor()
+        calls = [0]
+
+        def discontinuous_ground(x, unused_z, unused_hint=0.0, **unused):
+            calls[0] += 1
+            layer = 0.0 if calls[0] <= 5 else 1.0
+            return -1.2 * x + layer
+
+        battle._ground_y = discontinuous_ground
+        battle._ground_pitch((0.0, 0.0, 0.0), 0.0, descriptor)
+
+        position = battle._apply_slope_slide(
+            (0.0, 0.0, 0.0), 0.0, 0.1)
+
+        self.assertEqual((0.0, 0.0, 0.0), position)
+        self.assertGreater(battle._local_slide_speed, 0.0)
+
+    def test_diagonal_ground_plane_matches_bigworld_ypr_normal(self):
+        battle = BattleRuntime(_runtime())
+        forward_grade = 0.8
+        right_grade = 0.6
+        battle._ground_y = lambda x, z, unused_hint=0.0, **unused: (
+            forward_grade * z + right_grade * x)
+
+        battle._ground_pitch(
+            (0.0, 0.0, 0.0), 0.0, _Descriptor())
+
+        expected_pitch = -math.atan(forward_grade)
+        expected_roll = math.atan2(
+            right_grade, math.sqrt(1.0 + forward_grade ** 2))
+        self.assertAlmostEqual(expected_pitch, battle._local_pitch)
+        self.assertAlmostEqual(expected_roll, battle._local_roll)
+        self.assertAlmostEqual(
+            battle._local_surface_up_cosine,
+            math.cos(battle._local_pitch) * math.cos(battle._local_roll))
 
     def test_airborne_slope_drift_is_carried_without_new_ground_slide(self):
         battle = BattleRuntime(_runtime())

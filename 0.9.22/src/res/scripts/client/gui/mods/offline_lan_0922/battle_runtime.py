@@ -128,6 +128,12 @@ TRACK_SCROLL_LIMITS = (-15.0, 30.0)
 VISION_PUBLISH_EPSILON = 0.5
 # Seconds between two bot-track diagnostic lines.
 TRACK_REPORT_SECONDS = 5.0
+# Maximum vertical disagreement between the suspension probes before they are
+# treated as different terrain layers rather than one drivable plane.
+GROUND_PLANE_EPSILON = 0.35
+# Above the old copied visual limit, smoothing itself can push a hull through
+# a real steep slope.  Continuous terrain past this angle uses its raw pose.
+GROUND_RAW_TILT_RADIANS = 0.61
 # Give the pose animation a little longer than the measured gap so it is
 # still interpolating when the next pose lands.
 POSE_RELAX_STRETCH = 1.35
@@ -1105,6 +1111,8 @@ class BattleRuntime(object):
         self._local_slide_speed = 0.0
         self._local_downhill = (0.0, 0.0, 0.0)
         self._local_slope_tangent = 0.0
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
         self._input_accumulator = 0.0
         self._gun_state = None
@@ -1318,6 +1326,8 @@ class BattleRuntime(object):
         self._local_slide_speed = 0.0
         self._local_downhill = (0.0, 0.0, 0.0)
         self._local_slope_tangent = 0.0
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
         self._input_accumulator = 0.0
         self._gun_state = None
@@ -2185,7 +2195,12 @@ class BattleRuntime(object):
             if factory_type is NativeRemoteVehicleFactory:
                 factory_kwargs.update({
                     'binding': self._binding,
-                    'compatibility': self._runtime.compatibility})
+                    'compatibility': self._runtime.compatibility,
+                    # SnapshotSync already supplies every guest pose on each
+                    # render frame. Authority Bots opt into interpolation per
+                    # entity after creation, so remote humans and live
+                    # authority handoffs never retain the wrong provider.
+                    'interpolate_motion': False})
                 sys.stdout.write(
                     '[Offline LAN 0.9.22] native remote Vehicle presentation '
                     'enabled; copied LAN physics remains authoritative\n')
@@ -2582,7 +2597,8 @@ class BattleRuntime(object):
 
     def on_battle_live(self, message):
         """Start the one server-owned countdown after every map is ready."""
-        if self.state != 'running' or self._battle_live:
+        if (self.state != 'running' or self._battle_live or
+                self._prebattle_deadline is not None):
             return False
         self._observe_destructibles_disabled(message)
         countdown = max(0.0, _number(
@@ -2599,12 +2615,61 @@ class BattleRuntime(object):
             duration = max(1.0, float(network_duration))
         self._config['battleDurationSeconds'] = duration
         self._binding.arena_period('prebattle', countdown)
+        self._reset_prebattle_native_visuals()
         self._show_prebattle_crosshair()
         self._prebattle_deadline = self._clock() + countdown
         self._last_frame_time = self._clock()
         if countdown <= 0.0:
             self._begin_battle()
         return True
+
+    def _reset_prebattle_native_visuals(self):
+        """Close stock's pre-attach visual race before countdown rendering.
+
+        All remote entities are ready at the server-owned countdown barrier.
+        Native ``Vehicle.startVisual`` has therefore finished and can no
+        longer overwrite these gates.  Enemies are forced out of both the
+        world and marker/minimap presentation, while friendly minimap entries
+        are rebound once to the LAN matrix installed after startVisual.
+        """
+        if (self._worker_mode or self._remote_factory is None or
+                self.client is None):
+            return False
+        local_team = int(getattr(self.client, 'team', 1))
+        changed = False
+        for record in self._records.values():
+            if (record.get('local') or not record.get('native_remote') or
+                    not record.get('ready') or record.get('tombstone')):
+                continue
+            vehicle = self._remote_factory.get(record['engine_id'])
+            if vehicle is None or getattr(vehicle, 'model', None) is None:
+                raise RuntimeError(
+                    'prebattle native vehicle presentation is unavailable')
+            state = record.get('state') or {}
+            if int(state.get('team', local_team)) == local_team:
+                if not record.get('native_minimap_rebound'):
+                    self._binding.refresh_vehicle_minimap(
+                        record['engine_id'])
+                    record['native_minimap_rebound'] = True
+                    changed = True
+                continue
+            record['spot_visible'] = False
+            record['spot_marker_visible'] = False
+            record['spot_until'] = 0.0
+            record['direct_spot_visible'] = False
+            vehicle._spot_visible = False
+            vehicle._offlineNativeDrawVisible = False
+            vehicle.show(False)
+            vehicle.targetCaps = []
+            # Runtime state may say it already stopped the marker while a
+            # later stock visual callback registered it again.  At this final
+            # ready barrier, stop the real adaptor unconditionally.
+            self._binding.stop_vehicle_visual(
+                record['engine_id'], False)
+            record['visual_started'] = False
+            vehicle._offlineNativeMarkerVisible = False
+            changed = True
+        return changed
 
     def _show_prebattle_crosshair(self):
         """Draw the aiming reticle during our own countdown.
@@ -3963,8 +4028,10 @@ class BattleRuntime(object):
             getattr(condition, 'ONBOARD_COSINE',
                     math.cos(math.radians(80.0))),
             math.cos(math.radians(80.0)))
-        up_cosine = math.cos(float(self._local_pitch)) * math.cos(
-            float(self._local_roll))
+        up_cosine = self._local_surface_up_cosine
+        if up_cosine is None:
+            up_cosine = math.cos(float(self._local_pitch)) * math.cos(
+                float(self._local_roll))
         if up_cosine <= onboard_cosine:
             level = 2
         elif up_cosine <= warning_cosine:
@@ -5591,6 +5658,7 @@ class BattleRuntime(object):
             start['battle_result'] = snapshot.get('battle_result')
         for outgoing in self._bots.battle_start(start):
             self._send_bot_message(outgoing)
+        self._set_bot_presentation_interpolation(player_id)
         if self._bots.is_authority():
             for state in snapshot.get('bots') or ():
                 try:
@@ -5599,6 +5667,39 @@ class BattleRuntime(object):
                 except (KeyError, TypeError, ValueError):
                     continue
         return True
+
+    def _bot_authority_is_local(self, player_id):
+        local_id = getattr(self.client, 'player_id', None)
+        if player_id is None or local_id is None:
+            return False
+        try:
+            return int(player_id) == int(local_id)
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError('bot authority identity is invalid')
+
+    def _set_bot_presentation_interpolation(self, player_id):
+        """Match native pose providers to the current bot authority."""
+        if self._remote_factory is None:
+            return False
+        setter = getattr(
+            self._remote_factory, 'set_entity_interpolate_motion', None)
+        if not callable(setter):
+            return False
+        enabled = self._bot_authority_is_local(player_id)
+        changed = False
+        for record in self._records.values():
+            if (record.get('kind') != 'bot' or
+                    not record.get('native_remote') or
+                    record.get('tombstone')):
+                continue
+            entity_changed = setter(record['engine_id'], enabled)
+            if not entity_changed:
+                continue
+            record.pop('track_pose_sample', None)
+            if record.get('ready') and record.get('visual_started'):
+                self._binding.refresh_vehicle_minimap(record['engine_id'])
+            changed = True
+        return changed
 
     def on_events(self, message):
         if self.state in ('failed', 'stopped'):
@@ -9906,8 +10007,8 @@ class BattleRuntime(object):
                 return False
         return True
 
-    def _ground_pitch(self, position, yaw, descriptor=None):
-        """Sample the copied 0.8.2 four-point suspension pose."""
+    def _sample_ground_plane(self, position, yaw, descriptor=None):
+        """Fit one continuous terrain plane under the local suspension."""
         length = 5.0
         width = 3.0
         try:
@@ -9935,28 +10036,27 @@ class BattleRuntime(object):
         left_y = self._ground_y(
             position[0] - cos_yaw * half_width,
             position[2] + sin_yaw * half_width, position[1])
-        if None in (front_y, rear_y, right_y, left_y):
-            self._local_downhill = (0.0, 0.0, 0.0)
-            self._local_slope_tangent = 0.0
-            return self._local_pitch
-        pitch = -math.atan2(front_y - rear_y, length) * 0.9
-        roll = math.atan2(right_y - left_y, width) * 0.9
-        tilt = math.sqrt(pitch * pitch + roll * roll)
-        if tilt > 0.61:
-            scale = 0.61 / tilt
-            pitch *= scale
-            roll *= scale
-        self._local_pitch += (pitch - self._local_pitch) * 0.5
-        self._local_roll += (roll - self._local_roll) * 0.5
-        gradient_forward = (rear_y - front_y) / length
-        gradient_right = (left_y - right_y) / width
+        center_y = self._ground_y(
+            position[0], position[2], position[1])
+        if None in (front_y, rear_y, right_y, left_y, center_y):
+            return None
+        long_mid = (front_y + rear_y) * 0.5
+        side_mid = (right_y + left_y) * 0.5
+        if (abs(long_mid - side_mid) > GROUND_PLANE_EPSILON or
+                abs(center_y - long_mid) > GROUND_PLANE_EPSILON or
+                abs(center_y - side_mid) > GROUND_PLANE_EPSILON):
+            return None
+        height_forward = (front_y - rear_y) / length
+        height_right = (right_y - left_y) / width
+        gradient_x = (height_forward * sin_yaw +
+                      height_right * cos_yaw)
+        gradient_z = (height_forward * cos_yaw -
+                      height_right * sin_yaw)
         slope_tangent = math.sqrt(
-            gradient_forward * gradient_forward +
-            gradient_right * gradient_right)
-        downhill_x = (gradient_forward * sin_yaw +
-                      gradient_right * cos_yaw)
-        downhill_z = (gradient_forward * cos_yaw -
-                      gradient_right * sin_yaw)
+            height_forward * height_forward +
+            height_right * height_right)
+        downhill_x = -gradient_x
+        downhill_z = -gradient_z
         downhill_length = math.sqrt(
             downhill_x * downhill_x + downhill_z * downhill_z)
         if downhill_length > 0.001:
@@ -9964,9 +10064,53 @@ class BattleRuntime(object):
             downhill_z /= downhill_length
         else:
             downhill_x = downhill_z = 0.0
-        self._local_downhill = (downhill_x, 0.0, downhill_z)
-        self._local_slope_tangent = slope_tangent
+        return {
+            'center_y': center_y,
+            'gradient_x': gradient_x,
+            'gradient_z': gradient_z,
+            'pitch': -math.atan2(front_y - rear_y, length),
+            # BigWorld applies YPR as yaw, pitch and then roll.  Forward
+            # pitch therefore shortens the horizontal right axis used by the
+            # final roll; dividing by its plane length keeps the displayed
+            # hull normal identical to the fitted terrain normal.
+            'roll': math.atan2(
+                height_right, math.sqrt(
+                    1.0 + height_forward * height_forward)),
+            'slope_tangent': slope_tangent,
+            'up_cosine': 1.0 / math.sqrt(
+                1.0 + slope_tangent * slope_tangent),
+            'downhill': (downhill_x, 0.0, downhill_z),
+        }
+
+    def _commit_ground_plane(self, plane, force_raw=False):
+        """Publish one accepted terrain plane to pose and slide physics."""
+        pitch = float(plane['pitch'])
+        roll = float(plane['roll'])
+        if force_raw:
+            self._local_pitch = pitch
+            self._local_roll = roll
+        else:
+            self._local_pitch += (pitch - self._local_pitch) * 0.5
+            self._local_roll += (roll - self._local_roll) * 0.5
+        self._local_downhill = tuple(plane['downhill'])
+        self._local_slope_tangent = float(plane['slope_tangent'])
+        self._local_surface_up_cosine = float(plane['up_cosine'])
+        self._local_ground_plane = plane
         return self._local_pitch
+
+    def _ground_pitch(self, position, yaw, descriptor=None):
+        """Sample one continuous four-point suspension pose."""
+        plane = self._sample_ground_plane(position, yaw, descriptor)
+        if plane is None:
+            self._local_downhill = (0.0, 0.0, 0.0)
+            self._local_slope_tangent = 0.0
+            self._local_ground_plane = None
+            self._local_surface_up_cosine = None
+            return self._local_pitch
+        force_raw = (
+            math.atan(float(plane['slope_tangent'])) >
+            GROUND_RAW_TILT_RADIANS)
+        return self._commit_ground_plane(plane, force_raw=force_raw)
 
     def _drive_pitch(self, position, yaw):
         """Copy the 0.8.2 close-range drive slope probe exactly.
@@ -10581,9 +10725,6 @@ class BattleRuntime(object):
             return position
         next_x = position[0] + slide_x * self._local_slide_speed * dt
         next_z = position[2] + slide_z * self._local_slide_speed * dt
-        ground = self._ground_y(next_x, next_z, position[1])
-        if ground is None or position[1] - ground >= 4.0:
-            return position
         lateral_speed = abs(slide_dot) * self._local_slide_speed
         lateral_yaw = math.atan2(slide_x, slide_z)
         if (entity is not None and not self._motion_is_clear(
@@ -10592,10 +10733,26 @@ class BattleRuntime(object):
                 self._local_slide_speed = 0.0
                 self._local_air_lateral = (0.0, 0.0)
             return position
-        delta_y = max(-0.35, min(0.35, ground - position[1]))
+        old_plane = self._local_ground_plane
+        if old_plane is None:
+            return position
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        candidate = self._sample_ground_plane(
+            (next_x, position[1], next_z), yaw, descriptor)
+        if candidate is None:
+            return position
+        dx = next_x - position[0]
+        dz = next_z - position[2]
+        expected_y = (float(old_plane['center_y']) +
+                      float(old_plane['gradient_x']) * dx +
+                      float(old_plane['gradient_z']) * dz)
+        if (abs(float(candidate['center_y']) - expected_y) >
+                GROUND_PLANE_EPSILON):
+            return position
+        self._commit_ground_plane(candidate, force_raw=True)
         self._local_vertical_speed = 0.0
         self._local_airborne = False
-        return (next_x, position[1] + delta_y, next_z)
+        return (next_x, float(candidate['center_y']), next_z)
 
     def _local_autorotation_turn(self, entity, turn, drive_intent=0.0,
                                  tracks_blocked=False):
@@ -10949,6 +11106,19 @@ class BattleRuntime(object):
             record['track_params'] = params
         return params
 
+    def _remember_remote_track_turn(self, record, yaw, now):
+        """Measure guest-side belt turning from the interpolated hull pose."""
+        previous = record.get('track_pose_sample')
+        turn = 0.0
+        if previous is not None:
+            elapsed = max(
+                FRAME_SECONDS, min(0.5, float(now) - float(previous[0])))
+            turned = (float(yaw) - float(previous[1]) + math.pi) % (
+                2.0 * math.pi) - math.pi
+            turn = turned / elapsed
+        record['track_pose_sample'] = (float(now), float(yaw))
+        return turn
+
     def _bot_engine_mode(self, alive, speed, turn):
         """Return the exact #1513 ``(power, movementFlags)`` for one bot.
 
@@ -10971,7 +11141,7 @@ class BattleRuntime(object):
             return (ENGINE_MODE_RUNNING, flags)
         return (ENGINE_MODE_IDLE, 0)
 
-    def _update_bot_tracks(self, record, state, now):
+    def _update_bot_tracks(self, record, state, now, turn_override=None):
         """Drive one bot's belts from its authority speed and turn rate."""
         if self._remote_factory is None:
             return False
@@ -10981,7 +11151,9 @@ class BattleRuntime(object):
         alive = bool(state.get('alive', True)) and int(
             state.get('health', 1) or 0) > 0
         speed = _number(state.get('speed'))
-        turn = _number(self._bot_yaw_rates.get(state.get('id')))
+        turn = _number(
+            self._bot_yaw_rates.get(state.get('id'))
+            if turn_override is None else turn_override)
         mode = self._bot_engine_mode(alive, speed, turn)
         left, right = vehicle_physics.track_scroll(
             self._bot_track_params(record, vehicle), speed, turn)
@@ -11751,6 +11923,15 @@ class BattleRuntime(object):
             _engine_rotation(yaw))
         if engine_id is None:
             raise RuntimeError('remote presentation returned no vehicle id')
+        interpolation_setter = getattr(
+            self._remote_factory, 'set_entity_interpolate_motion', None)
+        if callable(interpolation_setter):
+            interpolate_motion = (
+                event.get('kind') == 'bot' and
+                self._bot_authority_is_local(
+                    (self._start_message or {}).get(
+                        'bot_authority_id')))
+            interpolation_setter(engine_id, interpolate_motion)
         self._records[key] = {
             'engine_id': engine_id, 'state': state,
             'kind': event.get('kind'), 'network_id': event.get('id'),
@@ -11856,6 +12037,7 @@ class BattleRuntime(object):
                 # battle UI or shot/sound presentation in the hidden worker.
                 record['simulation_entity'] = True
             elif record.get('native_remote'):
+                vehicle._offlineNativeDrawVisible = initially_visible
                 vehicle.show(initially_visible)
                 vehicle.targetCaps = [1] if initially_visible else []
                 # Stock Vehicle.startVisual registered the native marker.
@@ -11975,17 +12157,23 @@ class BattleRuntime(object):
             # rewinding the live C++ object.
             return
         else:
+            now = self._clock()
             self._binding.set_vehicle_pose(
                 record['engine_id'], self._vector((
                     _number(pose.get('x')), _number(pose.get('y')),
                     _number(pose.get('z')))), _engine_rotation(
                         yaw, _number(pose.get('pitch')),
                         _number(pose.get('roll'))),
-                now=self._clock())
+                now=now)
             self._binding.update_vehicle_aim(
                 record['engine_id'], yaw,
                 _number(pose.get('aim_yaw', yaw)),
                 _number(pose.get('gun_pitch')))
+            if record.get('kind') in ('bot', 'player'):
+                turn = self._remember_remote_track_turn(record, yaw, now)
+                self._run_optional_feature(
+                    'remote track animation', self._update_bot_tracks,
+                    (record, state, now, turn))
 
     def _flush_pending_entities(self, now):
         for unused_key, record in list(self._records.items()):
@@ -12055,6 +12243,7 @@ class BattleRuntime(object):
             'wreck_known', record.get('spot_marker_visible', visible)))
         draw_vehicle = visible or (not alive and wreck_known)
         if record.get('native_remote'):
+            vehicle._offlineNativeDrawVisible = draw_vehicle
             vehicle.show(draw_vehicle)
             vehicle.targetCaps = [1] if visible else []
         else:
@@ -13601,6 +13790,8 @@ class BattleRuntime(object):
         self._local_slide_speed = 0.0
         self._local_downhill = (0.0, 0.0, 0.0)
         self._local_slope_tangent = 0.0
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
         self._local_pitch = 0.0
         self._local_roll = 0.0
