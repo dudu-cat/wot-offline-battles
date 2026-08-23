@@ -158,15 +158,23 @@ PROJECTILE_MAX_SPLASH_TARGETS = 30
 PROJECTILE_MAX_DESTRUCTIBLES = 64
 PROJECTILE_MAX_LIFETIME_MS = 20000
 PROJECTILE_MAX_GRAVITY = 500.0
+PROJECTILE_MAX_VELOCITY = 3000.0
+PROJECTILE_MAX_DISTANCE = 10000.0
+PROJECTILE_MAX_SPLASH_RADIUS = 100.0
 PROJECTILE_CLOCK_LEEWAY_MS = 250
 PROJECTILE_TOLERANCE = 0.001
-PROJECTILE_CAPABILITY = "projectile_ledger_v1"
+PROJECTILE_SHELL_KINDS = frozenset((
+    "HOLLOW_CHARGE", "HIGH_EXPLOSIVE", "ARMOR_PIERCING",
+    "ARMOR_PIERCING_HE", "ARMOR_PIERCING_CR"))
+PROJECTILE_CAPABILITY = "projectile_ledger_v2"
 PROJECTILE_HIT_VEHICLE_CAPABILITY = "projectile_hit_vehicle_v1"
+PROJECTILE_WRECK_HIT_CAPABILITY = "projectile_wreck_hit_v1"
 RANDOM_MAP_CAPABILITY = "random_map_v1"
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = "destructible_catalog_v5"
 SERVER_CAPABILITIES = (
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     PROJECTILE_HIT_VEHICLE_CAPABILITY,
+    PROJECTILE_WRECK_HIT_CAPABILITY,
     RANDOM_MAP_CAPABILITY,
     "team_selection_v1",
 )
@@ -458,6 +466,70 @@ def _bounded_vector(value, lows, highs):
             for index, component in enumerate(value)]
 
 
+def _projectile_source_shot(value):
+    """Return one exact mounted-gun projectile law or reject the wire."""
+    if not isinstance(value, dict) or set(value) != {
+            "speed", "gravity", "maxDistance", "piercingPower", "deadeye",
+            "shell"}:
+        raise ValueError("invalid source shot shape")
+    shell = value.get("shell")
+    if not isinstance(shell, dict) or set(shell) != {
+            "kind", "caliber", "damage", "explosionRadius"}:
+        raise ValueError("invalid source shell shape")
+    kind = shell.get("kind")
+    piercing = value.get("piercingPower")
+    damage = shell.get("damage")
+    deadeye = value.get("deadeye")
+    if (not isinstance(kind, str) or kind not in PROJECTILE_SHELL_KINDS or
+            not isinstance(deadeye, bool) or
+            not isinstance(piercing, list) or len(piercing) != 2 or
+            not isinstance(damage, list) or len(damage) != 2):
+        raise ValueError("invalid source shell data")
+    return {
+        "speed": round(_bounded_float(
+            value.get("speed"), 0.000001, PROJECTILE_MAX_VELOCITY), 6),
+        "gravity": round(_bounded_float(
+            value.get("gravity"), 0.000001, PROJECTILE_MAX_GRAVITY), 6),
+        "maxDistance": round(_bounded_float(
+            value.get("maxDistance"), 0.000001,
+            PROJECTILE_MAX_DISTANCE), 6),
+        "piercingPower": [round(_bounded_float(
+            component, 0.0, 10000.0), 6) for component in piercing],
+        "deadeye": deadeye,
+        "shell": {
+            "kind": kind,
+            "caliber": round(_bounded_float(
+                shell.get("caliber"), 0.000001, 1000.0), 6),
+            "damage": [
+                round(_bounded_float(
+                    damage[0], 0.000001, 10000.0), 6),
+                round(_bounded_float(damage[1], 0.0, 10000.0), 6),
+            ],
+            "explosionRadius": round(_bounded_float(
+                shell.get("explosionRadius"), 0.0,
+                PROJECTILE_MAX_SPLASH_RADIUS), 6),
+        },
+    }
+
+
+def _projectile_source_shot_matches_launch(
+        source_shot, velocity, gravity, max_distance, is_he,
+        splash_radius):
+    """Cross-check duplicated launch physics before ledger admission."""
+    def close(left, right):
+        return abs(float(left) - float(right)) <= max(
+            PROJECTILE_TOLERANCE, abs(float(right)) * 0.000001)
+
+    speed = math.sqrt(sum(component * component for component in velocity))
+    shell = source_shot["shell"]
+    return (
+        close(speed, source_shot["speed"]) and
+        close(gravity, source_shot["gravity"]) and
+        close(max_distance, source_shot["maxDistance"]) and
+        bool(is_he) == (shell["kind"] == "HIGH_EXPLOSIVE") and
+        close(splash_radius, shell["explosionRadius"]))
+
+
 def _message_fingerprint(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True)
@@ -669,6 +741,11 @@ def _critical_payload(value):
     destroyed = sorted(set(
         str(name) for name in value.get("destroyed") or ()
         if str(name) in CRITICAL_DEVICE_NAMES))
+    destroyed_states = set(
+        record["name"] for record in devices
+        if record["state"] == "destroyed")
+    if destroyed_states != set(destroyed):
+        raise ValueError("critical destroyed state disagrees with devices")
     crew_ko = sorted(set(
         str(name) for name in value.get("crew_ko") or ()
         if str(name) in CRITICAL_CREW_NAMES))
@@ -853,6 +930,8 @@ class Player:
     y: float = 0.0
     z: float = 0.0
     yaw: float = 0.0
+    pitch: float = 0.0
+    roll: float = 0.0
     aim_yaw: float = 0.0
     gun_pitch: float = 0.0
     forward: float = 0.0
@@ -1164,6 +1243,8 @@ class BattleState:
                 "shooter_kind": record["shooter_kind"],
                 "shooter_id": record["shooter_id"],
                 "source_vehicle": record["source_vehicle"],
+                "source_shot": _projectile_source_shot(
+                    record["source_shot"]),
                 "shot_seq": record["shot_seq"],
                 "shell_index": record["shell_index"],
                 "team": record["team"],
@@ -1783,6 +1864,8 @@ class BattleState:
                 player.slot, player.team)
             player.y = 0.0
             player.aim_yaw = player.yaw
+            player.pitch = 0.0
+            player.roll = 0.0
             player.gun_pitch = 0.0
             player.bot_order_revision_sent = -1
             player.destructible_revision_sent = -1
@@ -3691,7 +3774,8 @@ class BattleState:
                 "type", "round_id", "shooter_kind", "shooter_id",
                 "shot_seq", "shell_index", "origin", "velocity",
                 "gravity", "max_distance", "max_time_ms", "is_he",
-                "splash_radius", "penetration_factor", "authority_epoch",
+                "splash_radius", "penetration_factor", "source_shot",
+                "authority_epoch",
             }
             if set(message) - allowed:
                 return False
@@ -3708,17 +3792,19 @@ class BattleState:
                     message.get("origin"), (-5000.0, -1000.0, -5000.0),
                     (5000.0, 3000.0, 5000.0))
                 velocity = _bounded_vector(
-                    message.get("velocity"), (-3000.0, -3000.0, -3000.0),
-                    (3000.0, 3000.0, 3000.0))
+                    message.get("velocity"),
+                    (-PROJECTILE_MAX_VELOCITY,) * 3,
+                    (PROJECTILE_MAX_VELOCITY,) * 3)
                 speed = math.sqrt(sum(component * component
                                       for component in velocity))
-                if speed <= 0.001 or speed > 3000.0:
+                if speed <= 0.001 or speed > PROJECTILE_MAX_VELOCITY:
                     raise ValueError("invalid launch speed")
                 gravity = round(_bounded_float(
                     message.get("gravity"), 0.0,
                     PROJECTILE_MAX_GRAVITY, False), 6)
                 max_distance = round(_bounded_float(
-                    message.get("max_distance"), 0.0, 10000.0, False), 6)
+                    message.get("max_distance"), 0.0,
+                    PROJECTILE_MAX_DISTANCE, False), 6)
                 max_time_ms = _exact_int(
                     message.get("max_time_ms"), 1,
                     PROJECTILE_MAX_LIFETIME_MS)
@@ -3726,11 +3812,18 @@ class BattleState:
                     raise ValueError("invalid HE flag")
                 is_he = message["is_he"]
                 splash_radius = round(_bounded_float(
-                    message.get("splash_radius"), 0.0, 100.0), 6)
+                    message.get("splash_radius"), 0.0,
+                    PROJECTILE_MAX_SPLASH_RADIUS), 6)
                 penetration_factor = round(_bounded_float(
                     message.get("penetration_factor"), 0.0, 100.0), 6)
+                source_shot = _projectile_source_shot(
+                    message.get("source_shot"))
                 if not is_he and splash_radius != 0.0:
                     raise ValueError("AP projectile cannot have splash")
+                if not _projectile_source_shot_matches_launch(
+                        source_shot, velocity, gravity, max_distance,
+                        is_he, splash_radius):
+                    raise ValueError("source shot disagrees with launch")
             except (TypeError, ValueError, OverflowError):
                 return False
 
@@ -3744,6 +3837,7 @@ class BattleState:
                 "max_time_ms": max_time_ms, "is_he": is_he,
                 "splash_radius": splash_radius,
                 "penetration_factor": penetration_factor,
+                "source_shot": source_shot,
             }
             launch_fingerprint = _message_fingerprint(normalized)
             if shooter_kind == "player":
@@ -3841,6 +3935,7 @@ class BattleState:
                 "shooter_kind": shooter_kind,
                 "shooter_id": shooter_id,
                 "source_vehicle": source_vehicle,
+                "source_shot": source_shot,
                 "authority_epoch": self.authority_epoch,
                 "shot_yaw": round(
                     ((shot_yaw + math.pi) % (2.0 * math.pi)) - math.pi, 6),
@@ -3875,9 +3970,8 @@ class BattleState:
             raw.get("piercing_loss"), record["piercing_loss"], 100000.0), 6)
         penetration_factor = round(_bounded_float(
             raw.get("penetration_factor"), 0.0, 100.0), 6)
-        if (penetration_factor >
-                record["penetration_factor"] + PROJECTILE_TOLERANCE):
-            raise ValueError("penetration factor increased")
+        if penetration_factor != record["penetration_factor"]:
+            raise ValueError("penetration factor changed")
         destructibles = self._normalize_projectile_destructibles(
             raw.get("destructibles"))
         return {
@@ -3953,7 +4047,6 @@ class BattleState:
                 record["checked_through_ms"] = cursor["checked_through_ms"]
                 record["checked_distance"] = cursor["checked_distance"]
                 record["piercing_loss"] = cursor["piercing_loss"]
-                record["penetration_factor"] = cursor["penetration_factor"]
                 record["last_progress_fingerprint"] = fingerprint
                 changed = True
             self._commit_projectile_destructibles(
@@ -4203,9 +4296,10 @@ class BattleState:
                 "base_checked_ms", "outcome", "resolved_time_ms",
                 "checked_distance", "piercing_loss", "penetration_factor",
                 "impact", "direct", "splash", "destructibles",
-                "hit_vehicle",
+                "hit_vehicle", "wreck_hit",
             }
-            if set(message) not in (allowed, allowed - {"hit_vehicle"}):
+            required = allowed - {"hit_vehicle", "wreck_hit"}
+            if set(message) - allowed or not required.issubset(message):
                 return False
             projectile_id = message.get("projectile_id")
             if (not isinstance(projectile_id, str) or not projectile_id or
@@ -4244,9 +4338,8 @@ class BattleState:
                     100000.0), 6)
                 penetration_factor = round(_bounded_float(
                     message.get("penetration_factor"), 0.0, 100.0), 6)
-                if (penetration_factor >
-                        record["penetration_factor"] + PROJECTILE_TOLERANCE):
-                    raise ValueError("penetration factor increased")
+                if penetration_factor != record["penetration_factor"]:
+                    raise ValueError("penetration factor changed")
                 direct_raw = message.get("direct")
                 splash_raw = message.get("splash")
                 if not isinstance(splash_raw, list):
@@ -4279,6 +4372,39 @@ class BattleState:
                     raise ValueError("non-impact cannot hit a vehicle")
                 if direct_raw is not None and not hit_vehicle:
                     raise ValueError("direct effect needs a vehicle impact")
+                wreck_hit = None
+                if "wreck_hit" in message:
+                    wreck_raw = message.get("wreck_hit")
+                    if (not isinstance(wreck_raw, dict) or
+                            set(wreck_raw) != {"target_kind", "target_id"}):
+                        raise ValueError("invalid wreck impact shape")
+                    wreck_kind = wreck_raw.get("target_kind")
+                    wreck_id = _exact_int(
+                        wreck_raw.get("target_id"), 1, PROJECTILE_MAX_ID)
+                    if wreck_kind not in ("player", "bot"):
+                        raise ValueError("invalid wreck target kind")
+                    wreck_target = (
+                        self.players.get(wreck_id)
+                        if wreck_kind == "player" else
+                        self.bot_states.get(wreck_id))
+                    if wreck_target is None:
+                        raise ValueError("unknown wreck target")
+                    wreck_alive = (
+                        wreck_target.alive if wreck_kind == "player" else
+                        bool(wreck_target.get("alive")))
+                    if wreck_alive:
+                        raise ValueError("wreck target is alive")
+                    if (wreck_kind == record["shooter_kind"] and
+                            wreck_id == record["shooter_id"]):
+                        raise ValueError("projectile cannot hit its own wreck")
+                    wreck_hit = {
+                        "target_kind": wreck_kind,
+                        "target_id": wreck_id,
+                    }
+                if (wreck_hit is not None and
+                        (outcome != "impact" or not hit_vehicle or
+                         direct_raw is not None)):
+                    raise ValueError("wreck impact contract is inconsistent")
                 direct = (self._normalize_projectile_effect(
                     direct_raw, record, impact, False)
                           if direct_raw is not None else None)
@@ -4313,6 +4439,8 @@ class BattleState:
             }
             if impact is not None:
                 impact_event["impact"] = list(impact)
+            if wreck_hit is not None:
+                impact_event["wreck_hit"] = wreck_hit
             self._commit_projectile_destructibles(
                 player_id, destructibles)
             self.pending_events.append(impact_event)
@@ -5344,6 +5472,14 @@ class BattleState:
                     player.y = _clamp(_finite_float(message.get("y"), player.y), -1000.0, 1000.0)
                     player.z = _clamp(_finite_float(message.get("z"), player.z), -2000.0, 2000.0)
                     player.yaw = _finite_float(message.get("yaw"), player.yaw)
+                    if "pitch" in message:
+                        player.pitch = _clamp(
+                            _finite_float(message.get("pitch"), player.pitch),
+                            -0.61, 0.61)
+                    if "roll" in message:
+                        player.roll = _clamp(
+                            _finite_float(message.get("roll"), player.roll),
+                            -0.61, 0.61)
                     player.client_position = True
                 raw_ram = message.get("ram_contact")
                 if isinstance(raw_ram, dict):
@@ -6444,6 +6580,8 @@ class BattleState:
             "y": round(player.y, 4),
             "z": round(player.z, 4),
             "yaw": round(player.yaw, 5),
+            "pitch": round(player.pitch, 5),
+            "roll": round(player.roll, 5),
             "aim_yaw": round(player.aim_yaw, 5),
             "gun_pitch": round(player.gun_pitch, 5),
             "forward": round(player.forward, 4),

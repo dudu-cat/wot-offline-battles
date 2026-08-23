@@ -66,6 +66,15 @@ class _IdentityMatrix(object):
         return value
 
 
+class _TranslateXMatrix(object):
+
+    def __init__(self, offset):
+        self.offset = float(offset)
+
+    def applyPoint(self, value):
+        return _Point(value.x + self.offset, value.y, value.z)
+
+
 def _strict_1513_descriptor():
     health = lambda: _Strict1513Component(
         maxHealth=100, maxRegenHealth=50)
@@ -268,6 +277,499 @@ class CriticalDamageTests(unittest.TestCase):
               'cause': 'shot'}],
             payload['events'])
 
+    def test_hidden_damage_crosses_half_max_health_not_regen_health(self):
+        descriptor = _descriptor()
+        descriptor.engine = {
+            'maxHealth': 100, 'maxRegenHealth': 80,
+            'fireStartingChance': 0.0}
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=descriptor)
+        collision = (1.0, 1.0, _Material('engineHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=30.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, hidden = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 30.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertEqual(70.0, vehicle.devices_hp['engineHealth'])
+        self.assertEqual('normal', hidden['devices'][0]['state'])
+        self.assertEqual([], hidden['events'])
+        self.assertNotIn('engineHealth', vehicle._critical_devices)
+        self.assertEqual(
+            1.0, device_damage.module_stat_factor(
+                vehicle.devices_hp, vehicle._destroyed_devices,
+                descriptor, 'mobility', vehicle._critical_devices))
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=20.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, yellow = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 20.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertEqual(50.0, vehicle.devices_hp['engineHealth'])
+        self.assertIn('engineHealth', vehicle._critical_devices)
+        self.assertEqual(
+            [{'kind': 'device', 'name': 'engineHealth',
+              'old_state': 'normal', 'state': 'critical',
+              'cause': 'shot'}], yellow['events'])
+        self.assertEqual(
+            0.5, device_damage.module_stat_factor(
+                vehicle.devices_hp, vehicle._destroyed_devices,
+                descriptor, 'mobility', vehicle._critical_devices))
+
+    def test_duplicate_boxes_roll_and_damage_one_logical_module_once(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor())
+        collisions = (
+            (1.0, 1.0, _Material('leftTrackHealth'), None),
+            (1.1, 1.0, _Material('leftTrackHealth'), None))
+        chance = mock.Mock(return_value=0.0)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=20.0), \
+                mock.patch('random.random', chance):
+            unused_damage, payload = critical_damage.apply_direct(
+                vehicle, collisions, object(), object(), 0,
+                {'damage': (100.0, 20.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertEqual(80.0, vehicle.devices_hp['leftTrackHealth'])
+        self.assertEqual('normal', payload['devices'][0]['state'])
+        self.assertEqual(1, chance.call_count)
+
+    def test_no_profile_does_not_manufacture_an_internal_critical(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor())
+        armor = types.SimpleNamespace(
+            extra=None, armor=20.0, vehicleDamageFactor=1.0)
+        chance = mock.Mock(return_value=0.0)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_layout',
+                    return_value=None), \
+                mock.patch('random.uniform', return_value=80.0), \
+                mock.patch('random.random', chance):
+            damage, payload = critical_damage.apply_direct(
+                vehicle, ((1.0, 1.0, armor, None),), object(), object(),
+                123, {'damage': (100.0, 80.0)}, attacker_id=2,
+                penetrated=True)
+
+        self.assertEqual(123, damage)
+        self.assertIsNone(payload)
+        self.assertEqual({}, vehicle.devices_hp)
+        chance.assert_not_called()
+
+    def test_internal_interval_is_converted_to_world_metres(self):
+        descriptor = _descriptor()
+        target = types.SimpleNamespace(
+            matrix=object(), getComponents=lambda: (
+                (descriptor.hull, _IdentityMatrix(None)),))
+        layout = {'valid': True, 'targets': (
+            {'parent': 'hull', 'entity': 'engine'},
+            {'parent': 'hull', 'entity': 'fuelTank'})}
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Point
+        math_module.Matrix = _IdentityMatrix
+
+        with mock.patch.dict(sys.modules, {'Math': math_module}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_layout',
+                    return_value=layout), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.internal_geometry.'
+                    'target_interval',
+                    side_effect=((0.2475, 0.3), (0.2525, 0.3))):
+            hits = critical_damage._offh_internal_ray_hits(
+                target, descriptor, _Point(0, 0, 0), _Point(0, 0, 4))
+
+        self.assertAlmostEqual(0.99, hits[0][0])
+        self.assertEqual('engineHealth', hits[0][1])
+        self.assertAlmostEqual(1.01, hits[1][0])
+        self.assertEqual('fuelTankHealth', hits[1][1])
+
+    def test_invalid_layout_fails_closed_for_direct_and_he_geometry(self):
+        descriptor = _descriptor()
+        target = types.SimpleNamespace(
+            matrix=object(), getComponents=lambda: ())
+        invalid = {'valid': False, 'targets': ({
+            'parent': 'hull', 'entity': 'engine'},)}
+
+        with mock.patch.object(
+                critical_damage, '_offh_internal_layout',
+                return_value=invalid), mock.patch(
+                    'gui.mods.offline_lan_0922.internal_geometry.'
+                    'target_interval') as interval:
+            direct = critical_damage._offh_internal_ray_hits(
+                target, descriptor, _Point(0, 0, 0), _Point(0, 0, 1))
+            explosion = critical_damage._offh_internal_cone_hits(
+                target, descriptor, _Point(0, 0, 0), _Point(0, 0, 1),
+                {'caliber': 100.0})
+
+        self.assertIsNone(direct)
+        self.assertIsNone(explosion)
+        interval.assert_not_called()
+
+    def test_he_internal_cone_uses_45_degrees_and_caliber_depth(self):
+        descriptor = _descriptor()
+        target = types.SimpleNamespace(
+            matrix=object(), getComponents=lambda: (
+                (descriptor.hull, _IdentityMatrix(None)),))
+
+        def sphere(entity, center):
+            return {
+                'parent': 'hull', 'entity': entity,
+                'primitives': ({
+                    'shape': 'sphere', 'center': center, 'radius': 0.0,
+                    'primitive_id': entity + ':point'},),
+            }
+
+        layout = {'valid': True, 'targets': (
+            sphere('engine', (0.49, 0.0, 0.5)),   # 44.4 degrees
+            sphere('fuelTank', (0.51, 0.0, 0.5)), # 45.6 degrees
+            sphere('radio', (0.0, 0.0, 1.0)),     # exact depth
+            sphere('ammoBay', (0.0, 0.0, 1.01)),  # beyond depth
+        )}
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Point
+        math_module.Matrix = _IdentityMatrix
+
+        with mock.patch.dict(sys.modules, {'Math': math_module}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_layout',
+                    return_value=layout):
+            hits = critical_damage._offh_internal_cone_hits(
+                target, descriptor, _Point(0, 0, 0), _Point(0, 0, 1),
+                {'caliber': 100.0})
+
+        self.assertEqual(
+            ['engineHealth', 'radioHealth'], [item[1] for item in hits])
+        self.assertAlmostEqual(0.5, hits[0][0])
+        self.assertAlmostEqual(1.0, hits[1][0])
+
+    def test_he_cone_uses_current_component_local_transform(self):
+        descriptor = _descriptor()
+        target = types.SimpleNamespace(
+            matrix=object(), getComponents=lambda: (
+                (descriptor.hull, _TranslateXMatrix(-10.0)),))
+        layout = {'valid': True, 'targets': ({
+            'parent': 'hull', 'entity': 'engine',
+            'primitives': ({
+                'shape': 'sphere', 'center': (0.0, 0.0, 0.5),
+                'radius': 0.0, 'primitive_id': 'engine:point'},),
+        },)}
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Point
+        math_module.Matrix = _IdentityMatrix
+
+        with mock.patch.dict(sys.modules, {'Math': math_module}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_layout',
+                    return_value=layout):
+            hits = critical_damage._offh_internal_cone_hits(
+                target, descriptor, _Point(10, 0, 0), _Point(0, 0, 1),
+                {'caliber': 100.0})
+
+        self.assertEqual([(0.5, 'engineHealth')], hits)
+
+    def test_he_cone_hits_a_volume_that_straddles_the_angle_boundary(self):
+        descriptor = _descriptor()
+        target = types.SimpleNamespace(
+            matrix=object(), getComponents=lambda: (
+                (descriptor.hull, _IdentityMatrix(None)),))
+
+        def box(entity, minimum, maximum):
+            center = tuple((minimum[index] + maximum[index]) * 0.5
+                           for index in range(3))
+            half = tuple((maximum[index] - minimum[index]) * 0.5
+                         for index in range(3))
+            return {
+                'parent': 'hull', 'entity': entity,
+                'minimum': minimum, 'maximum': maximum,
+                'center': center, 'half_extents': half,
+                'primitives': ({
+                    'shape': 'aabb', 'minimum': minimum,
+                    'maximum': maximum, 'center': center,
+                    'half_extents': half,
+                    'primitive_id': entity + ':box'},),
+            }
+
+        layout = {'valid': True, 'targets': (
+            # Nearest point to the apex is (0.45, 0, 0.40), outside 45
+            # degrees, but the upper-left edge reaches (0.45, 0, 0.60).
+            box('engine', (0.45, -0.05, 0.40), (0.65, 0.05, 0.60)),
+            # This box remains wholly outside: min radial 0.61 > max z 0.60.
+            box('radio', (0.61, -0.05, 0.40), (0.75, 0.05, 0.60)),
+        )}
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Point
+        math_module.Matrix = _IdentityMatrix
+
+        with mock.patch.dict(sys.modules, {'Math': math_module}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_layout',
+                    return_value=layout):
+            hits = critical_damage._offh_internal_cone_hits(
+                target, descriptor, _Point(0, 0, 0), _Point(0, 0, 1),
+                {'caliber': 100.0})
+
+        self.assertEqual(['engineHealth'], [item[1] for item in hits])
+
+    def test_he_cone_convex_intersection_supports_profile_primitive_shapes(self):
+        from gui.mods.offline_lan_0922 import internal_hit_layouts
+
+        cases = (
+            ('sphere', {
+                'shape': 'sphere', 'center': (0.55, 0.0, 0.5),
+                'radius': 0.10}, True),
+            ('sphere-out', {
+                'shape': 'sphere', 'center': (0.80, 0.0, 0.5),
+                'radius': 0.10}, False),
+            ('ellipsoid', {
+                'shape': 'ellipsoid', 'center': (0.57, 0.0, 0.5),
+                'radii': (0.10, 0.03, 0.10)}, True),
+            ('ellipsoid-out', {
+                'shape': 'ellipsoid', 'center': (0.80, 0.0, 0.5),
+                'radii': (0.10, 0.03, 0.10)}, False),
+            ('capsule', {
+                'shape': 'capsule', 'center': (0.57, 0.0, 0.5),
+                'radius': 0.03, 'half_length': 0.10, 'axis': 'x'}, True),
+            ('capsule-out', {
+                'shape': 'capsule', 'center': (0.80, 0.0, 0.5),
+                'radius': 0.03, 'half_length': 0.10, 'axis': 'x'}, False),
+            ('oriented-box', {
+                'shape': 'box', 'center': (0.58, 0.0, 0.5),
+                'half_extents': (0.12, 0.03, 0.08),
+                'rotation_yaw_degrees': 25.0}, True),
+            ('oriented-box-out', {
+                'shape': 'box', 'center': (0.85, 0.0, 0.5),
+                'half_extents': (0.10, 0.03, 0.08),
+                'rotation_yaw_degrees': 25.0}, False),
+        )
+        for name, primitive, expected in cases:
+            target = {
+                'center': primitive['center'],
+                'half_extents': primitive.get(
+                    'half_extents', (0.1, 0.1, 0.1)),
+                'minimum': (-1.0, -1.0, -1.0),
+                'maximum': (1.0, 1.0, 1.0),
+            }
+            with self.subTest(shape=name):
+                self.assertIs(
+                    expected,
+                    internal_hit_layouts._primitive_intersects_cone(
+                        target, primitive, (0.0, 0.0, 0.0),
+                        (0.0, 0.0, 1.0), 1.0, 1.0))
+
+    def test_he_proposal_uses_cone_instead_of_solid_internal_ray(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor(),
+            position=object(), matrix=object(), getComponents=lambda: ())
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_cone_hits',
+                    return_value=[(0.5, 'gunHealth')]) as cone_hits, \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_ray_hits',
+                    side_effect=AssertionError('solid ray must not run')), \
+                mock.patch('random.uniform', return_value=60.0), \
+                mock.patch('random.random', return_value=0.0):
+            damage, payload = critical_damage.propose_explosion(
+                vehicle, (), _Point(0, 0, 0), _Point(0, 0, 1), 0,
+                {'kind': 'HIGH_EXPLOSIVE', 'caliber': 100.0,
+                 'damage': (100.0, 60.0)}, attacker_id=2)
+
+        self.assertEqual(0, damage)
+        self.assertFalse(hasattr(vehicle, 'devices_hp'))
+        self.assertEqual(40.0, payload['devices'][0]['hp'])
+        self.assertEqual('critical', payload['devices'][0]['state'])
+        cone_hits.assert_called_once()
+
+    def test_he_native_extra_and_cone_boxes_score_each_module_once(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor())
+        collision = (1.0, 1.0, _Material('gunHealth'), None)
+        chance = mock.Mock(return_value=0.0)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch.object(
+                    critical_damage, '_offh_internal_cone_hits',
+                    return_value=[
+                        (0.5, 'gunHealth'), (0.6, 'radioHealth')]) as cone, \
+                mock.patch('random.uniform', return_value=20.0), \
+                mock.patch('random.random', chance):
+            unused_damage, payload = critical_damage.apply_explosion(
+                vehicle, (collision,), object(), object(), 0,
+                {'kind': 'HIGH_EXPLOSIVE', 'caliber': 100.0,
+                 'damage': (100.0, 20.0)}, attacker_id=2)
+
+        self.assertEqual(80.0, vehicle.devices_hp['gunHealth'])
+        self.assertEqual(80.0, vehicle.devices_hp['radioHealth'])
+        self.assertEqual(2, chance.call_count)
+        self.assertEqual(
+            set(['gunHealth']), cone.call_args.args[-1])
+        self.assertEqual(
+            set(['gunHealth', 'radioHealth']),
+            set(record['name'] for record in payload['devices']))
+
+    def test_deadeye_adds_three_points_only_for_ap_apcr_and_heat(self):
+        collision = (1.0, 1.0, _Material('gunHealth', chance=0.45), None)
+
+        def strike(kind, deadeye):
+            vehicle = types.SimpleNamespace(
+                id=1, health=500, typeDescriptor=_descriptor())
+            with mock.patch.dict(
+                    sys.modules,
+                    {'BigWorld': self.bigworld, 'Math': self.math}), \
+                    mock.patch('random.uniform', return_value=20.0), \
+                    mock.patch('random.random', return_value=0.47):
+                unused_damage, payload = critical_damage.apply_direct(
+                    vehicle, (collision,), object(), object(), 0,
+                    {'kind': kind, 'damage': (100.0, 20.0)},
+                    attacker_id=2, penetrated=False, deadeye=deadeye)
+            return vehicle, payload
+
+        without_deadeye, ordinary = strike('ARMOR_PIERCING', False)
+        self.assertEqual({}, without_deadeye.devices_hp)
+        self.assertIsNone(ordinary)
+        for kind in ('ARMOR_PIERCING', 'ARMOR_PIERCING_CR',
+                     'HOLLOW_CHARGE'):
+            with self.subTest(kind=kind):
+                vehicle, payload = strike(kind, True)
+                self.assertEqual(80.0, vehicle.devices_hp['gunHealth'])
+                self.assertIsNotNone(payload)
+        he_vehicle, he_payload = strike('HIGH_EXPLOSIVE', True)
+        self.assertEqual({}, he_vehicle.devices_hp)
+        self.assertIsNone(he_payload)
+
+    def test_missing_explosion_material_uses_the_crew_blast_fallback(self):
+        material = types.SimpleNamespace(chanceToHitByProjectile=0.33)
+        invalid = types.SimpleNamespace(
+            chanceToHitByExplosion=object())
+
+        self.assertEqual(
+            0.15, device_damage.saving_throw(
+                material, 'commanderHealth', by_explosion=True))
+        self.assertEqual(
+            0.15, device_damage.saving_throw(
+                invalid, 'commanderHealth', by_explosion=True))
+
+    def test_legacy_generator_refuses_to_overwrite_the_active_module(self):
+        import importlib.util
+
+        tool_path = ROOT / '0.9.22' / 'tools' / 'generate_critical_damage.py'
+        spec = importlib.util.spec_from_file_location(
+            'generate_critical_damage_audit', str(tool_path))
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        active = (ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client' /
+                  'gui' / 'mods' / 'offline_lan_0922' /
+                  'critical_damage.py')
+
+        with self.assertRaisesRegex(
+                ValueError, 'must not overwrite the active'):
+            generator.generate(ROOT, active)
+
+    def test_synthetic_distance_obeys_native_exit_plate_filter(self):
+        armor = types.SimpleNamespace(
+            extra=None, armor=20.0, vehicleDamageFactor=1.0)
+        collisions = (
+            (0.0, 1.0, armor, None),
+            (1.0, 1.0, armor, None))
+
+        def strike(distance):
+            vehicle = types.SimpleNamespace(
+                id=1, health=500, typeDescriptor=_descriptor())
+            with mock.patch.dict(
+                    sys.modules,
+                    {'BigWorld': self.bigworld, 'Math': self.math}), \
+                    mock.patch.object(
+                        critical_damage, '_offh_internal_ray_hits',
+                        return_value=[(distance, 'engineHealth')]), \
+                    mock.patch('random.uniform', return_value=60.0), \
+                    mock.patch('random.random', return_value=0.0):
+                unused_damage, payload = critical_damage.apply_direct(
+                    vehicle, collisions, object(), object(), 0,
+                    {'damage': (100.0, 60.0)}, attacker_id=2,
+                    penetrated=True)
+            return vehicle, payload
+
+        inside, inside_payload = strike(0.99)
+        outside, outside_payload = strike(1.01)
+
+        self.assertEqual(40.0, inside.devices_hp['engineHealth'])
+        self.assertEqual('critical', inside_payload['devices'][0]['state'])
+        self.assertEqual({}, outside.devices_hp)
+        self.assertIsNone(outside_payload)
+
+    def test_every_successful_engine_damage_rolls_fire_before_destruction(self):
+        descriptor = _descriptor()
+        descriptor.engine['fireStartingChance'] = 1.0
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=descriptor)
+        collision = (1.0, 1.0, _Material('engineHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=5.0), \
+                mock.patch('random.random', side_effect=(0.0, 0.0)):
+            unused_damage, payload = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 5.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertEqual(95.0, vehicle.devices_hp['engineHealth'])
+        self.assertEqual('normal', payload['devices'][0]['state'])
+        self.assertTrue(vehicle.is_on_fire)
+        self.assertIn(
+            {'kind': 'fire', 'state': True, 'cause': 'shot'},
+            payload['events'])
+
+    def test_fuel_tank_ignites_only_when_module_hp_reaches_zero(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor(),
+            devices_hp={'fuelTankHealth': 30.0})
+        collision = (1.0, 1.0, _Material('fuelTankHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=20.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, holed = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 20.0)}, attacker_id=2,
+                penetrated=False)
+        self.assertEqual(10.0, vehicle.devices_hp['fuelTankHealth'])
+        self.assertFalse(vehicle.is_on_fire)
+        self.assertFalse(any(
+            event['kind'] == 'fire' for event in holed['events']))
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=20.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, destroyed = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 20.0)}, attacker_id=2,
+                penetrated=False)
+        self.assertEqual(0.0, vehicle.devices_hp['fuelTankHealth'])
+        self.assertTrue(vehicle.is_on_fire)
+        self.assertIn(
+            {'kind': 'fire', 'state': True, 'cause': 'shot'},
+            destroyed['events'])
+
     def test_critical_proposal_does_not_mutate_live_vehicle(self):
         self.player.playerVehicleID = 999
         self.player.arena.onVehicleKilled = mock.Mock()
@@ -422,6 +924,108 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertEqual('critical', payload['devices'][0]['state'])
         self.assertEqual('destroyed', payload['events'][0]['old_state'])
         self.assertEqual('critical', payload['events'][0]['state'])
+
+    def test_auto_repair_stays_explicitly_critical_above_half_health(self):
+        descriptor = _descriptor()
+        descriptor.chassis = {'maxHealth': 100, 'maxRegenHealth': 80}
+        vehicle = types.SimpleNamespace(
+            id=1, typeDescriptor=descriptor, health=500,
+            devices_hp={'leftTrackHealth': 0.0},
+            _destroyed_devices=set(['leftTrackHealth']),
+            _critical_devices=set(), _crew_ko=set(), is_on_fire=False,
+            position=object(), matrix=object(), getComponents=lambda: ())
+
+        payload = critical_damage.tick_repair(
+            vehicle, 10.0, repair_skill=0.0)
+        shadow = critical_damage._CriticalProposalVehicle(vehicle)
+
+        self.assertEqual(80.0, vehicle.devices_hp['leftTrackHealth'])
+        self.assertNotIn('leftTrackHealth', vehicle._destroyed_devices)
+        self.assertIn('leftTrackHealth', vehicle._critical_devices)
+        self.assertEqual('critical', payload['devices'][0]['state'])
+        self.assertIn('leftTrackHealth', shadow._critical_devices)
+
+    def test_destroyed_170_hp_engine_repairs_to_130_but_stays_critical(self):
+        descriptor = _descriptor()
+        descriptor.engine = {
+            'maxHealth': 170, 'maxRegenHealth': 130,
+            'fireStartingChance': 0.12}
+        vehicle = types.SimpleNamespace(
+            id=1, typeDescriptor=descriptor, health=500,
+            devices_hp={'engineHealth': 0.0},
+            _destroyed_devices=set(['engineHealth']),
+            _critical_devices=set(), _crew_ko=set(), is_on_fire=False)
+
+        payload = critical_damage.tick_repair(
+            vehicle, 100.0, repair_skill=0.0)
+
+        self.assertEqual(130.0, vehicle.devices_hp['engineHealth'])
+        self.assertNotIn('engineHealth', vehicle._destroyed_devices)
+        self.assertIn('engineHealth', vehicle._critical_devices)
+        self.assertEqual('critical', payload['devices'][0]['state'])
+
+    def test_repair_kit_restores_full_health_and_normal_state(self):
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500,
+            devices_hp={'engineHealth': 80.0},
+            _destroyed_devices=set(),
+            _critical_devices=set(['engineHealth']),
+            _crew_ko=set(), is_on_fire=False)
+
+        payload = critical_damage.repair_device(vehicle, 'engine')
+
+        self.assertEqual(100.0, vehicle.devices_hp['engineHealth'])
+        self.assertNotIn('engineHealth', vehicle._critical_devices)
+        self.assertEqual(
+            [{'kind': 'device', 'name': 'engineHealth',
+              'old_state': 'critical', 'state': 'normal',
+              'cause': 'repair'}], payload['events'])
+
+    def test_network_payload_preserves_explicit_critical_above_half(self):
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500)
+        payload = {
+            'devices': [{'name': 'engineHealth', 'hp': 80.0,
+                         'max_hp': 100.0, 'state': 'critical'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': []}
+
+        events = critical_damage.apply_payload(vehicle, payload)
+
+        self.assertIn('engineHealth', vehicle._critical_devices)
+        self.assertEqual('critical', events[0]['state'])
+        with mock.patch.dict(sys.modules, {'BigWorld': self.bigworld}):
+            self.assertEqual(
+                0.5, critical_damage.stat_factor(vehicle, 'mobility'))
+
+    def test_repaired_track_can_be_destroyed_again(self):
+        vehicle = types.SimpleNamespace(
+            id=1, typeDescriptor=_descriptor(), health=500,
+            devices_hp={'leftTrackHealth': 0.0},
+            _destroyed_devices=set(['leftTrackHealth']),
+            _crew_ko=set(), is_on_fire=False)
+        collision = (1.0, 1.0, _Material('leftTrackHealth'), None)
+        shell = {'damage': (100.0, 120.0)}
+
+        repaired = critical_damage.tick_repair(
+            vehicle, 10.0, repair_skill=0.0)
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=120.0), \
+                mock.patch('random.random', return_value=0.0):
+            damage, destroyed = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0, shell,
+                attacker_id=2, penetrated=False)
+
+        self.assertEqual('critical', repaired['devices'][0]['state'])
+        self.assertEqual(0, damage)
+        self.assertEqual(0.0, vehicle.devices_hp['leftTrackHealth'])
+        self.assertIn('leftTrackHealth', vehicle._destroyed_devices)
+        self.assertEqual(
+            [{'kind': 'device', 'name': 'leftTrackHealth',
+              'old_state': 'critical', 'state': 'destroyed',
+              'cause': 'shot'}],
+            destroyed['events'])
 
     def test_extinguisher_uses_copied_fire_stop_transition(self):
         vehicle = types.SimpleNamespace(

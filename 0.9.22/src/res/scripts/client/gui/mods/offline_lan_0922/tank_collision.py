@@ -264,6 +264,32 @@ def pair_response(contact, inverse_a, inverse_b, velocity_a, velocity_b,
             correction_b_x, correction_b_z, delta_b_x, delta_b_z)
 
 
+def _owner_oriented_contact(contact, center_dx, center_dz,
+                            self_id, other_id):
+    """Give an ambiguous SAT axis reciprocal owner directions.
+
+    When both centres have the same projection on the minimum-overlap axis,
+    SAT cannot infer which side is B -> A.  Letting both owner passes retain
+    the axis' enumeration direction moves coincident tanks together instead
+    of separating them.  Canonicalise the undirected axis, then use the stable
+    pair identity to give the two owners opposite normals.
+    """
+    if contact is None:
+        return None
+    normal_x, normal_z, penetration = contact
+    projection = center_dx * normal_x + center_dz * normal_z
+    if abs(projection) > 1.0e-9:
+        return contact
+    if (normal_x < -1.0e-9 or
+            (abs(normal_x) <= 1.0e-9 and normal_z < 0.0)):
+        normal_x = -normal_x
+        normal_z = -normal_z
+    if self_id > other_id:
+        normal_x = -normal_x
+        normal_z = -normal_z
+    return normal_x, normal_z, penetration
+
+
 def ram_damage(closing_speed, mass_self, mass_other):
     """Return ``(damage_to_other, damage_to_self)`` for one ram event.
 
@@ -397,6 +423,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             other_x, other_z, other_yaw, other_shape)
         if contact is None:
             continue
+        contact = _owner_oriented_contact(
+            contact, center_dx, center_dz, self_id, other_id)
         pair = (min(self_id, other_id), max(self_id, other_id))
         overlap_pairs.add(pair)
 

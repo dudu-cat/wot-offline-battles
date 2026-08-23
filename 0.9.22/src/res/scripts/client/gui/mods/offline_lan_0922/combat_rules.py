@@ -1,37 +1,89 @@
 from __future__ import print_function
 
-"""Exact 0.8.2 armour/HE laws behind a thin #1513 input adapter."""
+"""Pinned #1513 armour and HE laws behind native input adapters."""
 
 import random
 
 
-# The _offh_* functions below retain the 0.8.2 laws; the hull resolver also
-# accepts the already-crossed #1513 destructible loss before vehicle layers.
+# The hull resolver also accepts already-crossed destructible loss before the
+# projectile enters the vehicle's ordered material layers.
+
+
+_OFFH_RANGE_NEAR = 100.0
+_OFFH_RANGE_FAR = 500.0
+_OFFH_RANGE_SPAN = _OFFH_RANGE_FAR - _OFFH_RANGE_NEAR
+_OFFH_MISSING = object()
+
+
+def _offh_range_piercing(shot, dist_m):
+	'''Non-randomized P100/P500 interpolation with the shell range cutoff.'''
+	pp = shot.get('piercingPower', (100.0, 100.0))
+	try:
+		p100 = float(pp[0]); p500 = float(pp[1])
+	except Exception:
+		p100 = p500 = 100.0
+	try:
+		distance = float(dist_m)
+	except Exception:
+		distance = 0.0
+	try:
+		maximum = float(shot.get('maxDistance', 0.0) or 0.0)
+	except Exception:
+		maximum = 0.0
+	# maxDistance is a projectile lifetime boundary, not the interpolation
+	# endpoint.  The descriptor's two piercing values are always P100/P500, and
+	# their fixed slope continues beyond 500 m until the lifetime boundary.
+	if distance <= _OFFH_RANGE_NEAR:
+		return p100
+	if maximum <= 0.0 or distance >= maximum:
+		return 0.0
+	t = (distance - _OFFH_RANGE_NEAR) / _OFFH_RANGE_SPAN
+	return max(0.0, p100 + (p500 - p100) * t)
+
+
+def _offh_material_value(material, name, default=_OFFH_MISSING):
+	if material is None:
+		return default
+	if isinstance(material, dict):
+		return material.get(name, default)
+	return getattr(material, name, default)
+
+
+def _offh_material_flag(material, name, default):
+	value = _offh_material_value(material, name, _OFFH_MISSING)
+	if value is _OFFH_MISSING and name == 'checkCaliberForRicochet':
+		# Exact #1513 MaterialInfo preserves WG's historical field-name typo.
+		value = _offh_material_value(
+			material, 'checkCaliberForRichet', _OFFH_MISSING)
+	if value is _OFFH_MISSING:
+		return bool(default)
+	return bool(value)
 
 
 def _offh_resolve_hull_hit(shot, dist_m, all_hits, initial_pierce_loss=0.0,
 		penetration_factor=None):
-	'''Find the first STRUCTURAL plate behind any spaced armour.
+	'''Resolve external and structural plates in projectile order.
 
 	Returns (result, eff_armor, pierce, spaced_mm, angle_cos) where result is the
 	_offh_penetration verdict for that plate, or None when the round never reaches
-	structure - i.e. the track absorbed it.
+	structure - i.e. an external plate absorbed or ricocheted it.
 
 	Tracks and external devices carry vehicleDamageFactor 0.0: they are not the
-	hull, so they must not take hull damage. What they DO is cost penetration on
-	the way through, which is why a shot that clips the track at a shallow angle
-	(long path, thick effective plate) is swallowed while a square-on hit carries
-	into the hull behind it.
+	hull, so they never take hull damage.  They are nevertheless real plates: the
+	shell must penetrate each one, then pays that plate's effective thickness.
 
-	HEAT is a special case, as in the game: the shaped charge detonates on the
-	first spaced plate it touches and the jet does not survive the standoff, so a
-	track absorbs it outright regardless of the angle.'''
-	import math
+	HEAT continues as a jet after penetrating an external layer.  It pays both
+	the plate and 5 percent of its rolled penetration per 10 cm travelled before
+	the next layer.  One shot-owned penetration factor is reused for every layer.'''
 	if not all_hits:
 		return None
 	shell = (shot.get('shell') or {}) if hasattr(shot, 'get') else {}
 	kind = shell.get('kind', 'ARMOR_PIERCING')
 	spaced = float(initial_pierce_loss or 0.0)
+	factor = penetration_factor
+	base_pierce = None
+	heat_last_plate_distance = None
+	seen_once = set()
 	try:
 		_ordered = sorted(all_hits, key=lambda h: h[0])
 	except Exception:
@@ -43,21 +95,45 @@ def _offh_resolve_hull_hit(shot, dist_m, all_hits, initial_pierce_loss=0.0,
 			continue
 		if _mat is None:
 			continue
-		_vdf = getattr(_mat, 'vehicleDamageFactor', 1.0)
-		_arm = float(getattr(_mat, 'armor', 0.0) or 0.0)
-		if _vdf == 0.0:
-			# spaced: never structure. HEAT dies here; everything else pays armour.
-			if kind == 'HOLLOW_CHARGE':
-				return None
-			_a = abs(float(_ac))
-			if _a > 1.0: _a = 1.0
-			if _a < 0.087: _a = 0.087
-			spaced += _arm / _a
-			continue
+		_comp = _h[3] if len(_h) > 3 else None
+		_once_key = None
+		if _offh_material_flag(_mat, 'collideOnceOnly', False):
+			_mat_kind = _offh_material_value(_mat, 'kind', _OFFH_MISSING)
+			_once_key = ((_comp, _mat_kind) if _mat_kind is not _OFFH_MISSING
+				else (_comp, id(_mat)))
+			if _once_key in seen_once:
+				continue
+		_vdf = _offh_material_value(_mat, 'vehicleDamageFactor', 1.0)
+		_arm = float(_offh_material_value(_mat, 'armor', 0.0) or 0.0)
 		if _arm <= 0.0:
 			continue
+		if factor is None:
+			factor = random.uniform(0.75, 1.25)
+		if base_pierce is None:
+			base_pierce = _offh_range_piercing(shot, dist_m) * float(factor)
+		if kind == 'HOLLOW_CHARGE' and heat_last_plate_distance is not None:
+			try:
+				_gap = max(0.0, float(_d) - heat_last_plate_distance)
+			except Exception:
+				_gap = 0.0
+			# Exact #1513 applies the 50%-per-metre factor to the jet's
+			# remaining penetration before it meets the next plate.
+			_remaining = max(0.0, base_pierce - spaced)
+			spaced += _remaining * min(1.0, 0.5 * _gap)
 		_res, _eff, _p = _offh_penetration(
-			shot, dist_m, _arm, _ac, spaced, penetration_factor)
+			shot, dist_m, _arm, _ac, spaced, factor, _mat,
+			not (kind == 'HOLLOW_CHARGE' and
+				heat_last_plate_distance is not None))
+		if _vdf == 0.0:
+			if _res != 2:
+				return None
+			spaced += _eff
+			if kind == 'HOLLOW_CHARGE':
+				# The native preview starts the air gap behind the nominal plate.
+				heat_last_plate_distance = float(_d) + _arm * 0.001
+			if _once_key is not None:
+				seen_once.add(_once_key)
+			continue
 		return (_res, _eff, _p, spaced, _ac)
 	return None
 
@@ -179,7 +255,7 @@ def _offh_he_apply_tuning(overrides):
 
 
 def _offh_penetration(shot, dist_m, armor, hit_angle_cos, pierce_loss=0.0,
-		penetration_factor=None):
+		penetration_factor=None, material=None, allow_ricochet=True):
 	'''Armour test shared by the player and by bot-vs-bot fire.
 
 	Returns (result, eff_armor, pierce): 0 ricochet, 1 no penetration, 2 penetration.
@@ -189,33 +265,17 @@ def _offh_penetration(shot, dist_m, armor, hit_angle_cos, pierce_loss=0.0,
 	    NAME. Every HEAT round contains 'HE', so both the ricochet and the
 	    no-penetration branch were skipped for it and it always went through.
 	    items/vehicles.py stores a proper shell['kind'] - use that.
-	  * piercingPower is a Vector2 (value at 100 m, value at maxDistance) and it only
-	    ever read [0], so nothing lost penetration with range.
+	  * piercingPower is a Vector2 (P100, P500), not a maxDistance endpoint.
 	Randomisation is WG's own g_cache.commonConfig piercingPowerRandomization = 0.25.
 	'''
-	import math, random
+	import math
 	shell = (shot.get('shell') or {}) if hasattr(shot, 'get') else {}
 	kind = shell.get('kind', 'ARMOR_PIERCING')
-	# ARMOR_PIERCING_HE (AP with HE filler) belongs in the AP family: same
-	# normalisation and the same 70 deg ricochet rule. It was missing, so it fell
-	# through to the HEAT branch - no normalisation, no ricochet, no overmatch.
-	# 0.8.2 ships five kinds (vehicles.py _shellKinds): HOLLOW_CHARGE,
-	# HIGH_EXPLOSIVE, ARMOR_PIERCING, ARMOR_PIERCING_HE, ARMOR_PIERCING_CR.
-	is_ap = kind in ('ARMOR_PIERCING', 'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR')
-	pp = shot.get('piercingPower', (100.0, 100.0))
-	try:
-		p100 = float(pp[0]); pfar = float(pp[1])
-	except Exception:
-		p100 = pfar = 100.0
-	maxd = 0.0
-	try: maxd = float(shot.get('maxDistance', 0.0) or 0.0)
-	except Exception: maxd = 0.0
-	if maxd <= 100.0: maxd = 400.0
-	if dist_m <= 100.0:
-		pierce = p100
-	else:
-		_t = (min(dist_m, maxd) - 100.0) / (maxd - 100.0)
-		pierce = p100 + (pfar - p100) * _t
+	# Exact #1513 shellExtraData gives normalization/calibre ricochet checks only
+	# to AP and APCR.  ARMOR_PIERCING_HE is a solid direct-damage shell, but it
+	# has zero normalization and cannot ricochet.
+	is_normalizing_ap = kind in ('ARMOR_PIERCING', 'ARMOR_PIERCING_CR')
+	pierce = _offh_range_piercing(shot, dist_m)
 	if penetration_factor is None:
 		penetration_factor = random.uniform(0.75, 1.25)
 	pierce *= float(penetration_factor)
@@ -226,20 +286,42 @@ def _offh_penetration(shot, dist_m, armor, hit_angle_cos, pierce_loss=0.0,
 	armor = float(armor or 0.0)
 	if armor <= 0.0:
 		return (2, 0.0, pierce)
-	_ac = abs(float(hit_angle_cos))
-	if _ac > 1.0: _ac = 1.0
-	if _ac < 0.0001: _ac = 0.0001
-	ang = math.acos(_ac)                      # 0 = square on the plate
+	use_hit_angle = _offh_material_flag(material, 'useHitAngle', True)
+	if use_hit_angle:
+		_ac = abs(float(hit_angle_cos))
+		if _ac > 1.0: _ac = 1.0
+		if _ac < 0.0001: _ac = 0.0001
+		ang = math.acos(_ac)                  # 0 = square on the plate
+	else:
+		_ac = 1.0
+		ang = 0.0
 	caliber = float(shell.get('caliber', 100) or 100)
-	# shell normalisation pulls the impact towards the normal: AP 5 deg, APCR 2 deg,
-	# HEAT/HE none. A calibre over three times the plate overmatches it: normalisation
-	# grows and the round can no longer ricochet.
-	norm = math.radians(2.0) if kind == 'ARMOR_PIERCING_CR' else (math.radians(5.0) if is_ap else 0.0)
-	overmatch = is_ap and caliber > armor * 3.0
-	if overmatch:
-		norm *= 1.4 * caliber / (armor * 3.0)
-	elif is_ap and ang > math.radians(70.0):
-		return (0, armor / max(0.087, _ac), pierce)
+	# AP normalizes by 5 degrees and APCR by 2.  Above two calibres the
+	# normalization grows by WG's 1.4*C/(2*A) rule.  The three-calibre rule is
+	# separate: strictly above three calibres suppresses ricochet, but does not
+	# itself guarantee penetration.
+	norm = (math.radians(2.0) if kind == 'ARMOR_PIERCING_CR' else
+		(math.radians(5.0) if kind == 'ARMOR_PIERCING' else 0.0))
+	if (use_hit_angle and is_normalizing_ap and
+			_offh_material_flag(
+				material, 'checkCaliberForHitAngleNorm', True) and
+			caliber > armor * 2.0):
+		norm *= 1.4 * caliber / (armor * 2.0)
+	shell_may_ricochet = (is_normalizing_ap or kind == 'HOLLOW_CHARGE')
+	may_ricochet = (allow_ricochet and use_hit_angle and shell_may_ricochet and
+		_offh_material_flag(material, 'mayRicochet', True))
+	no_ap_ricochet = (is_normalizing_ap and
+		_offh_material_flag(material, 'checkCaliberForRicochet', True) and
+		caliber > armor * 3.0)
+	if may_ricochet:
+		if (is_normalizing_ap and not no_ap_ricochet and
+				_ac <= math.cos(math.radians(70.0))):
+			return (0, armor / max(0.0001, _ac), pierce)
+		# HEAT does not use either calibre rule.  Its auto-ricochet threshold
+		# is 85 degrees in the pinned client's shellExtraData.
+		if (kind == 'HOLLOW_CHARGE' and
+				_ac <= math.cos(math.radians(85.0))):
+			return (0, armor / max(0.0001, _ac), pierce)
 	ang_eff = ang - norm
 	if ang_eff < 0.0: ang_eff = 0.0
 	eff = armor / max(0.0001, math.cos(ang_eff))
@@ -309,10 +391,11 @@ def _call_with_uniform(function, uniform, *args):
 
 def penetration(shot, distance, armor, hit_angle_cos,
                 pierce_loss=0.0, random_uniform=None,
-                penetration_factor=None):
+                penetration_factor=None, material=None):
     return _call_with_uniform(
         _offh_penetration, random_uniform, legacy_shot(shot),
-        distance, armor, hit_angle_cos, pierce_loss, penetration_factor)
+        distance, armor, hit_angle_cos, pierce_loss, penetration_factor,
+        material)
 
 
 def sample_penetration_factor(random_uniform=None):
@@ -323,22 +406,7 @@ def sample_penetration_factor(random_uniform=None):
 
 def range_piercing(shot, distance):
     """Return the non-randomized piercing mean at one travelled distance."""
-    converted = legacy_shot(shot)
-    pp = converted.get('piercingPower', (100.0, 100.0))
-    try:
-        near, far = float(pp[0]), float(pp[1])
-    except Exception:
-        near = far = 100.0
-    try:
-        maximum = float(converted.get('maxDistance', 0.0) or 0.0)
-    except Exception:
-        maximum = 0.0
-    if maximum <= 100.0:
-        maximum = 400.0
-    if distance <= 100.0:
-        return near
-    factor = (min(float(distance), maximum) - 100.0) / (maximum - 100.0)
-    return near + (far - near) * factor
+    return _offh_range_piercing(legacy_shot(shot), distance)
 
 
 def sampled_piercing(shot, distance, penetration_factor,

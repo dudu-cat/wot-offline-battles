@@ -1,11 +1,12 @@
 from __future__ import print_function
 
-"""0.8.2 ammunition, reload and shot-scatter state for pinned #1513.
+"""Ammunition, reload and shot-scatter state for pinned #1513.
 
 The source implementation keeps this state inside ``offline_battle.py``.
 These methods preserve its descriptor reads, bloom/convergence formulas,
-empty-at-countdown start, clip transitions and Gaussian shot dispersion.
-Only storage moved from a closure dictionary to an object.
+empty-at-countdown start and clip transitions. Shot dispersion uses the
+bounded two-sigma model documented for #1513 instead of the unbounded 0.8.2
+offline approximation.
 """
 
 import math
@@ -251,6 +252,37 @@ class GunState(object):
         self.pending_index = None if index == self.shot_index else index
         return False
 
+    def reload_partial_clip(self):
+        """Empty a partial cassette and begin one full reload.
+
+        #1513 sends ``VEHICLE_SETTING.RELOAD_PARTIAL_CLIP`` both for a
+        partially spent cassette and for a queued shell type.  An already
+        empty cassette is already in its full reload cycle and must not have
+        that cycle restarted by another reload-key press.
+        """
+        if self.clip_size <= 1 or not self.shots:
+            return False
+        current = self.shot_index
+        if current >= len(self.ammo) or self.ammo[current] <= 0:
+            return False
+        pending = self.pending_index
+        if pending is not None:
+            if (pending < 0 or pending >= len(self.ammo) or
+                    self.ammo[pending] <= 0):
+                pending = None
+            self.pending_index = None
+        if pending is None and (
+                self.clip >= self.clip_size or
+                (self.clip <= 0 and self.reload_time > 0.0)):
+            return False
+        if pending is not None:
+            self.shot_index = pending
+        self.clip = 0
+        self.reload_time = self.reload
+        self.reload_duration = self.reload
+        self.load_started = False
+        return True
+
     def can_fire(self, battle_live=True):
         if not battle_live or not self.shots or self.reload_time > 0.0:
             return False
@@ -347,13 +379,73 @@ class GunState(object):
                     self.clip_size, self.ammo[self.shot_index])
 
     def scatter(self, direction, perfect_accuracy=False, gauss=None,
-                dispersion_angle=None):
-        gauss = gauss or random.gauss
+                dispersion_angle=None, uniform=None):
+        """Scatter inside the current #1513 aiming cone.
+
+        Retail uses a radial normal distribution with the aiming circle as a
+        hard boundary. Since 8.6 the circle is the two-sigma limit and an
+        outlying normal sample is redistributed from the centre to the edge
+        instead of being left outside or piled on its edge. 9.6 subsequently
+        reweighted the innermost zone, but the exact server-side zone table is
+        not present in the #1513 client.
+
+        The former port added three unbounded ``dispersion / 3`` samples to
+        the world axes. About 1.1 percent of its lateral samples landed beyond
+        the visible circle, which made a partially aimed shell appear to fly
+        somewhere the reticle said was impossible. Sample one documented
+        radial two-sigma value and one azimuth around the barrel, then
+        construct the final unit vector by angular offset so the visible
+        circle and authoritative projectile share one boundary.
+        """
         dispersion = (self.dispersion if dispersion_angle is None
                       else float(dispersion_angle))
-        sigma = 0.0 if perfect_accuracy else dispersion / 3.0
-        direction.x += gauss(0.0, sigma)
-        direction.y += gauss(0.0, sigma)
-        direction.z += gauss(0.0, sigma)
+        if perfect_accuracy or dispersion <= 0.0:
+            return direction
+        gauss = gauss or random.gauss
+        uniform = uniform or random.uniform
+        sigma = dispersion / 2.0
+        radius = abs(gauss(0.0, sigma))
+        if radius > dispersion:
+            radius = dispersion * uniform(0.0, 1.0)
+        angle = uniform(0.0, 2.0 * math.pi)
+        offset_x = radius * math.cos(angle)
+        offset_y = radius * math.sin(angle)
+
+        dx, dy, dz = float(direction.x), float(direction.y), float(direction.z)
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length <= 0.0:
+            return direction
+        dx, dy, dz = dx / length, dy / length, dz / length
+
+        # Cross the barrel with its least-aligned world axis for a stable
+        # orthonormal basis at every turret pitch and yaw.
+        if abs(dx) <= abs(dy) and abs(dx) <= abs(dz):
+            rx, ry, rz = 1.0, 0.0, 0.0
+        elif abs(dy) <= abs(dz):
+            rx, ry, rz = 0.0, 1.0, 0.0
+        else:
+            rx, ry, rz = 0.0, 0.0, 1.0
+        tx = dy * rz - dz * ry
+        ty = dz * rx - dx * rz
+        tz = dx * ry - dy * rx
+        tangent_length = math.sqrt(tx * tx + ty * ty + tz * tz)
+        tx, ty, tz = (tx / tangent_length, ty / tangent_length,
+                      tz / tangent_length)
+        ux = dy * tz - dz * ty
+        uy = dz * tx - dx * tz
+        uz = dx * ty - dy * tx
+
+        if radius > 0.0:
+            ox, oy = offset_x / radius, offset_y / radius
+            side_x, side_y, side_z = (
+                tx * ox + ux * oy,
+                ty * ox + uy * oy,
+                tz * ox + uz * oy)
+            cosine, sine = math.cos(radius), math.sin(radius)
+            direction.x = dx * cosine + side_x * sine
+            direction.y = dy * cosine + side_y * sine
+            direction.z = dz * cosine + side_z * sine
+        else:
+            direction.x, direction.y, direction.z = dx, dy, dz
         direction.normalise()
         return direction

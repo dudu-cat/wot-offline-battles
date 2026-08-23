@@ -113,6 +113,7 @@ class AvatarServerBridge(object):
                  account_commands=None, on_account_int_command=None,
                  on_ready=None, on_leave=None,
                  on_vehicle_enter=None, on_viewpoint_switch=None,
+                 on_monitor_vehicle_devices=None,
                  initial_period='battle', initial_period_seconds=0.0):
         self._avatar = avatar
         self._binding = entity_binding
@@ -124,6 +125,7 @@ class AvatarServerBridge(object):
         self._on_leave = on_leave
         self._on_vehicle_enter = on_vehicle_enter
         self._on_viewpoint_switch = on_viewpoint_switch
+        self._on_monitor_vehicle_devices = on_monitor_vehicle_devices
         self._initial_period = initial_period
         self._initial_period_seconds = max(
             0.0, float(initial_period_seconds))
@@ -521,7 +523,10 @@ class AvatarServerBridge(object):
         return None
 
     def monitorVehicleDamagedDevices(self, vehicle_id):
-        return None
+        if self._destroyed or not callable(
+                self._on_monitor_vehicle_devices):
+            return False
+        return bool(self._on_monitor_vehicle_devices(int(vehicle_id)))
 
     def invalidateMicrophoneMute(self):
         return None

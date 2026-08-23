@@ -119,7 +119,7 @@ _SERVER_PROBES = {
         "client_build": "wot-0.9.22.0.1-cn-1513",
         "vehicle": "ussr:R11_MS-1",
         "capabilities": (
-            "projectile_ledger_v1", "destructible_catalog_v5"),
+            "projectile_ledger_v2", "destructible_catalog_v5"),
         "server_capabilities": ("destructible_catalog_v5",),
     },
 }
@@ -1441,25 +1441,76 @@ def local_addresses(resolver=None):
                    if address and not address.startswith('127.')})
 
 
-def game_is_running(runner=None, executable=GAME_EXECUTABLE):
-    """Report whether a game process runs, through the Windows task list."""
-    if runner is None:
+def _running_process_names():
+    """Return Windows process image names without starting a console tool."""
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        )
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.argtypes = (
+        wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W))
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W))
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if snapshot in (None, 0, invalid_handle):
+        raise ctypes.WinError()
+    names = []
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                names.append(entry.szExeFile)
+                if not kernel32.Process32NextW(
+                        snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return names
+
+
+def game_is_running(executable=GAME_EXECUTABLE, enumerator=None):
+    """Report whether a game process runs without opening a console window."""
+    if enumerator is None:
         if os.name != "nt":
             return False
-        runner = subprocess.run
+        enumerator = _running_process_names
     try:
-        result = runner(
-            ["tasklist", "/FI", "IMAGENAME eq %s" % executable, "/NH"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        names = enumerator()
     except Exception:
-        # A failed lookup must never stop a battle. Report the game as gone
-        # only after the caller's own grace period.
         return False
-    output = getattr(result, "stdout", b"") or b""
-    if isinstance(output, bytes):
-        output = output.decode("utf-8", "replace")
-    return executable.lower() in output.lower()
+    if names is None:
+        return False
+    target = str(executable).casefold()
+    return any(
+        os.path.basename(str(name)).casefold() == target
+        for name in names)
 
 
 def _visible_window_process_paths():

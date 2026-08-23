@@ -198,6 +198,7 @@ class WindowTest(unittest.TestCase):
         return game_root
 
     def test_layout_separates_play_vehicle_and_repair_controls(self):
+        self.assertEqual("0.6.0 alpha.2", wot_launcher.LAUNCHER_VERSION)
         self.assertEqual(
             "Single player",
             self.window.battle_tabs.tab(self.window.single_panel).get("text"))
@@ -214,11 +215,13 @@ class WindowTest(unittest.TestCase):
         self.assertIs(
             self.window.normal_preferences_button.master,
             self.window.repair_panel)
-        self.assertIn("伪红学家", self.window.author_text.get())
-        self.assertIn("tiancaihb", self.window.author_text.get())
-        self.assertIn("QQ群：302519768", self.window.author_text.get())
-        self.assertIn(
-            "github.com/pengw0048/wot-offline-battles",
+        self.assertIs(self.window.report_button.master, self.window.repair_panel)
+        self.assertEqual(
+            "Create error report...",
+            self.window.report_button.cget("text"))
+        self.assertEqual(
+            "作者：伪红学家  Bilibili：@tiancaihb  QQ群：302519768  "
+            "GitHub: https://github.com/pengw0048/wot-offline-battles",
             self.window.author_text.get())
         self.assertEqual(
             "本mod免费传播、开源、欢迎二创，使用无需付费，售卖与本人无关，仅供个人学习交流",
@@ -256,6 +259,7 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(
             "坦克属性修改器",
             reopened.tools_tabs.tab(reopened.vehicle_panel).get("text"))
+        self.assertEqual("一键汇报错误…", reopened.report_button.cget("text"))
 
         reopened.language_choice.set("English")
         reopened._language_selected()
@@ -278,6 +282,54 @@ class WindowTest(unittest.TestCase):
             "Join network battle",
             self.window.network_start_button.cget("text"))
         self.assertIs(self.window.network_start_button, self.window.start_button)
+
+    def test_error_report_button_stays_available_during_a_game(self):
+        self.window._busy = True
+        self.window._update_action_controls()
+
+        self.assertEqual("normal", self.window.report_button.cget("state"))
+
+    def test_error_report_button_packages_and_selects_the_zip(self):
+        report = {
+            "path": os.path.join(self.settings_dir, "reports", "report.zip"),
+            "included": ("server.log", "visible-client.log"),
+            "missing": ("hidden-worker.log",),
+            "notRun": (),
+        }
+        with mock.patch.object(
+                wot_launcher.error_reports, "create_report",
+                return_value=report) as create, mock.patch.object(
+                    wot_launcher.error_reports, "select_in_explorer") \
+                as select:
+            self.assertTrue(self.window._create_error_report())
+            for unused in range(200):
+                if not self.window._report_busy:
+                    break
+                time.sleep(0.01)
+
+        create.assert_called_once_with()
+        select.assert_called_once_with(report["path"])
+        self.assertIn("Created error report", self._log_text())
+        self.assertIn("server.log, visible-client.log", self._log_text())
+        self.assertIn("hidden-worker.log", self._log_text())
+
+    def test_error_report_button_explains_an_empty_latest_session(self):
+        message = (
+            "The latest game session has not produced any diagnostic logs "
+            "yet. No earlier session was included.")
+        with mock.patch.object(
+                wot_launcher.error_reports, "create_report",
+                side_effect=core.LauncherError(message)), mock.patch.object(
+                    wot_launcher.error_reports, "select_in_explorer") \
+                as select:
+            self.assertTrue(self.window._create_error_report())
+            for unused in range(200):
+                if not self.window._report_busy:
+                    break
+                time.sleep(0.01)
+
+        select.assert_not_called()
+        self.assertIn("No earlier session was included", self._log_text())
 
     def test_network_start_always_plans_a_join_session(self):
         self._game()
@@ -567,6 +619,54 @@ class WindowTest(unittest.TestCase):
         cleanup.assert_called_once_with(self.settings_dir)
         self.assertIn("temporary vehicle profile", self._log_text())
 
+    def test_session_report_boundary_wraps_every_game_launch(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": "10.0.0.5",
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": False,
+            "mode": core.MODE_JOIN,
+            "team_size": core.DEFAULT_TEAM_SIZE,
+            "vehicle_profile": None,
+        }
+        boundary = {"id": "20260823T120000Z-111111111111"}
+        order = []
+        with mock.patch.object(
+                wot_launcher.error_reports, "begin_session",
+                side_effect=lambda *args, **kwargs: (
+                    order.append("begin") or boundary)) as begin, \
+                mock.patch.object(
+                    wot_launcher.error_reports, "finalize_session",
+                    side_effect=lambda value: (
+                        order.append("finalize") or True)) as finalize, \
+                mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    return_value={"profile": None, "installedMembers": 0,
+                                  "removedMembers": 0}), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    return_value=0), \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated"), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch("core.listener_status",
+                           return_value=core.LISTENER_COMPATIBLE), \
+                mock.patch.object(
+                    self.window, "_run_game",
+                    side_effect=lambda *args, **kwargs: order.append("game")), \
+                mock.patch.object(self.window, "_stop_worker"), \
+                mock.patch.object(self.window, "_stop_server"), \
+                mock.patch("core.wait_for_game_shutdown", return_value=True):
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        begin.assert_called_once_with(
+            self.settings_dir, needs_worker=False, local_server=False)
+        finalize.assert_called_once_with(boundary)
+        self.assertEqual(["begin", "game", "finalize"], order)
+        self.assertIsNone(self.window._active_report_session)
+
     def test_single_player_orders_server_worker_player_and_profile_cleanup(self):
         session = {
             "client": core.PORT_0_9_22,
@@ -782,11 +882,14 @@ class WindowTest(unittest.TestCase):
                 mock.patch("core.wait_for_server", return_value=True), \
                 mock.patch("core.local_addresses", return_value=[]), \
                 mock.patch("wot_launcher.subprocess.Popen",
-                           return_value=server):
+                           return_value=server) as popen:
             self.assertTrue(self.window._start_server(
                 self.settings_dir, core.PORT_0_9_22, team_size=7,
                 persistent=True))
 
+        self.assertEqual(
+            wot_launcher._no_console_flags(),
+            popen.call_args.kwargs["creationflags"])
         self.assertTrue(self.window._server_persistent)
         self.assertIn(
             "Server log: %s" % core.server_log_path(), self._log_text())
@@ -794,6 +897,45 @@ class WindowTest(unittest.TestCase):
         self.assertFalse(server.terminated)
         self.assertTrue(self.window._stop_server(force=True))
         self.assertTrue(server.terminated)
+
+    def test_new_session_server_uses_its_dedicated_log(self):
+        server = _Process()
+        boundary = {"id": "20260823T120000Z-111111111111"}
+        dedicated = os.path.join(self.settings_dir, "session-server.log")
+        self.window._active_report_session = boundary
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_FREE), \
+                mock.patch("core.wait_for_server", return_value=True), \
+                mock.patch("core.local_addresses", return_value=[]), \
+                mock.patch.object(
+                    wot_launcher.error_reports, "attach_server",
+                    return_value=dedicated) as attach, \
+                mock.patch("wot_launcher.subprocess.Popen",
+                           return_value=server) as popen:
+            self.assertTrue(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22, team_size=7))
+
+        attach.assert_called_once_with(boundary, dedicated=True)
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(
+            boundary["id"],
+            environment[wot_launcher.error_reports.SERVER_SESSION_ENV])
+        self.assertIn("Server log: %s" % dedicated, self._log_text())
+        self.window._stop_server(force=True)
+
+    def test_server_entry_uses_the_session_log_selected_by_environment(self):
+        selected = os.path.join(self.settings_dir, "selected-server.log")
+        with mock.patch.object(
+                wot_launcher.error_reports, "server_log_for_environment",
+                return_value=selected), mock.patch.object(
+                    wot_launcher, "_open_server_log") as open_log, \
+                mock.patch("core.server_root", return_value="/server"), \
+                mock.patch("core.run_server_payload") as run:
+            self.assertEqual(0, wot_launcher._serve(
+                [core.SERVE_FLAG, core.PORT_0_9_22]))
+
+        open_log.assert_called_once_with(selected)
+        run.assert_called_once_with(core.PORT_0_9_22)
 
     def test_server_process_output_is_teed_to_the_live_pipe_and_log_file(self):
         stdout = io.StringIO()
@@ -897,6 +1039,9 @@ class WindowTest(unittest.TestCase):
                 self.settings_dir, "10.0.0.5", 1234, 7))
 
         self.assertEqual(self.settings_dir, popen.call_args.kwargs["cwd"])
+        self.assertEqual(
+            wot_launcher._no_console_flags(),
+            popen.call_args.kwargs["creationflags"])
         environment = popen.call_args.kwargs["env"]
         self.assertEqual(
             "10.0.0.5", environment[core.CLIENT_SERVER_HOST_ENV_0922])

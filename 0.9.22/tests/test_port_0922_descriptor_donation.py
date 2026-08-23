@@ -367,6 +367,9 @@ class ProjectionBuilderTest(unittest.TestCase):
             type=_ShellType('ARMOR_PIERCING'), caliber=45.0,
             damage=(110.0, 110.0), isTracer=False, effectsIndex=3)
         gun = types.SimpleNamespace(
+            name='45mm-20K', id=101,
+            hitTester=_Tester(((-0.25, -0.25, -1.2),
+                               (0.25, 0.25, 1.2), None)),
             shots=(types.SimpleNamespace(
                 shell=shell, speed=700.0, gravity=9.81, maxDistance=720.0,
                 piercingPower=_Vector(80.0, 60.0)),),
@@ -376,22 +379,34 @@ class ProjectionBuilderTest(unittest.TestCase):
             rotationSpeed=0.7, shotDispersionAngle=0.0046,
             maxHealth=54, maxRegenHealth=27)
         chassis = types.SimpleNamespace(
+            name='MS-1', id=201,
             hitTester=_Tester(((-1.5, -0.8, -3.5), (1.5, 0.8, 3.5), None)),
             hullPosition=_Vector(0.0, 0.6, 0.0), rotationSpeed=0.66,
             shotDispersionFactors=(0.14, 0.14),
             maxHealth=170, maxRegenHealth=130)
         hull = types.SimpleNamespace(
+            name='MS-1', id=301,
             hitTester=_Tester(((-1.7, -0.2, -3.5), (1.7, 1.4, 3.5), None)),
             turretPositions=(_Vector(0.0, 1.0, 0.0),),
             primaryArmor=(18.0, 16.0, 16.0))
         vehicle_type = types.SimpleNamespace(
-            name='ussr:R11_MS-1', level=1, tags=('lightTank',))
+            name='ussr:R11_MS-1', level=1, tags=('lightTank',),
+            crewRoles=(('commander', 'gunner', 'radioman', 'loader'),
+                       ('driver',)))
+        turret = types.SimpleNamespace(
+            name='MS-1', id=401,
+            hitTester=_Tester(((-0.9, -0.3, -0.9),
+                               (0.9, 0.8, 0.9), None)),
+            rotationSpeed=0.7, circularVisionRadius=445.0,
+            yawLimits=_Vector(-3.14, 3.14),
+            gunPosition=_Vector(0.0, 0.25, 0.15))
         return types.SimpleNamespace(
             type=vehicle_type, maxHealth=1000, gun=gun,
-            turret={'rotationSpeed': 0.7, 'circularVisionRadius': 445.0},
+            turret=turret,
             physics={'weight': 8000.0, 'speedLimits': (9.4, 4.0)},
             chassis=chassis, hull=hull,
-            engine={'maxHealth': 100, 'maxRegenHealth': 50})
+            engine={'name': 'T-18', 'id': 501,
+                    'maxHealth': 100, 'maxRegenHealth': 50})
 
     def test_projection_round_trips_through_json(self):
         projection = descriptor_donation.project_descriptor(
@@ -401,6 +416,10 @@ class ProjectionBuilderTest(unittest.TestCase):
         self.assertEqual('ussr:R11_MS-1', decoded['name'])
         self.assertEqual(1, decoded['level'])
         self.assertEqual(['lightTank'], decoded['tags'])
+        self.assertEqual('ussr:R11_MS-1', decoded['type']['name'])
+        self.assertEqual(
+            [['commander', 'gunner', 'radioman', 'loader'], ['driver']],
+            decoded['type']['crewRoles'])
         self.assertEqual(1000, decoded['maxHealth'])
         shot = decoded['gun']['shots'][0]
         self.assertEqual(700.0, shot['speed'])
@@ -411,11 +430,41 @@ class ProjectionBuilderTest(unittest.TestCase):
         self.assertEqual([[0.0, 1.0, 0.0]],
                          decoded['hull']['turretPositions'])
         self.assertEqual([-3.14, 3.14], decoded['gun']['turretYawLimits'])
+        self.assertEqual('45mm-20K', decoded['gun']['name'])
         self.assertEqual([[-1.7, -0.2, -3.5], [1.7, 1.4, 3.5], None],
                          decoded['hull']['hitTester']['bbox'])
         self.assertEqual([18.0, 16.0, 16.0],
                          decoded['hull']['primaryArmor'])
+        self.assertEqual([0.0, 0.25, 0.15],
+                         decoded['turret']['gunPosition'])
+        self.assertEqual(
+            [[-0.9, -0.3, -0.9], [0.9, 0.8, 0.9], None],
+            decoded['turret']['hitTester']['bbox'])
+        self.assertEqual(
+            [[-0.25, -0.25, -1.2], [0.25, 0.25, 1.2], None],
+            decoded['gun']['hitTester']['bbox'])
+        self.assertNotIn('materials', decoded['hull'])
+        self.assertNotIn('materials', decoded['turret'])
         self.assertEqual(100.0, decoded['engine']['maxHealth'])
+
+    def test_mounted_shot_projection_is_small_exact_and_json_safe(self):
+        shot = self._descriptor().gun.shots[0]
+
+        projected = json.loads(json.dumps(
+            descriptor_donation.project_shot(shot)))
+
+        self.assertEqual({
+            'speed', 'gravity', 'maxDistance', 'piercingPower', 'deadeye',
+            'shell'},
+            set(projected))
+        self.assertFalse(projected['deadeye'])
+        self.assertEqual({
+            'kind', 'caliber', 'damage', 'explosionRadius'},
+            set(projected['shell']))
+        self.assertEqual([80.0, 60.0], projected['piercingPower'])
+        self.assertEqual([110.0, 110.0], projected['shell']['damage'])
+        self.assertEqual(0.0, projected['shell']['explosionRadius'])
+        self.assertNotIn('effectsIndex', projected['shell'])
 
     def test_high_explosive_radius_comes_from_the_shell_type(self):
         descriptor = self._descriptor()
@@ -466,6 +515,72 @@ class ProjectionBuilderTest(unittest.TestCase):
         self.assertEqual(3.5, shape[1])
         self.assertEqual(-0.8, shape[2])
         self.assertEqual(0.6 + 1.4, shape[3])
+
+    def test_projection_enables_profile_parents_without_native_materials(self):
+        import descriptor_projection
+        from gui.mods.offline_lan_0922 import internal_hit_layouts
+
+        descriptor = self._descriptor()
+        descriptor.type.name = 'ussr:MS-1'
+        projection = json.loads(json.dumps(
+            descriptor_donation.project_descriptor(descriptor)))
+        layout = internal_hit_layouts.build_layout(
+            descriptor_projection.wrap(projection), log_build=False)
+
+        self.assertGreater(len(layout['targets']), 0)
+        self.assertEqual(
+            {'gun', 'hull', 'turret'}, set(layout['required_parents']))
+        self.assertEqual({}, layout['official_geometry'])
+        self.assertTrue(layout['valid'])
+        self.assertEqual(('ussr', 'ms1'), layout['profile_key'])
+        self.assertEqual((), layout['errors'])
+        self.assertEqual(
+            'OPTIONAL_NATIVE_COLLISION_GEOMETRY',
+            layout['logical_entity_sources']['leftTrack']['mode'])
+        self.assertEqual(
+            'OPTIONAL_NATIVE_COLLISION_GEOMETRY',
+            layout['logical_entity_sources']['rightTrack']['mode'])
+
+    def test_missing_compiled_profile_reports_a_tuple_key_without_crashing(self):
+        import descriptor_projection
+        from gui.mods.offline_lan_0922 import internal_hit_layouts
+
+        descriptor = self._descriptor()
+        descriptor.type.name = 'ussr:R999_Not_A_Profile'
+        projection = json.loads(json.dumps(
+            descriptor_donation.project_descriptor(descriptor)))
+        internal_hit_layouts._LAYOUT_CACHE.clear()
+        self.addCleanup(internal_hit_layouts._LAYOUT_CACHE.clear)
+
+        layout = internal_hit_layouts.build_layout(
+            descriptor_projection.wrap(projection), log_build=False)
+
+        self.assertFalse(layout['valid'])
+        self.assertIn(
+            "compiled_vehicle_profile_missing:('ussr', 'r999notaprofile')",
+            layout['errors'])
+
+    def test_modern_catalog_prefix_maps_only_to_an_exact_legacy_profile(self):
+        from gui.mods.offline_lan_0922 import internal_hit_layouts
+
+        known = {
+            'ussr:R11_MS-1': ('ussr', 'ms1'),
+            'ussr:R04_T-34': ('ussr', 't34'),
+            'france:F15_AMX_12t': ('france', 'amx12t'),
+            'usa:A36_Sherman_Jumbo': ('usa', 'shermanjumbo'),
+            'usa:A63_M46_Patton': ('usa', 'm46patton'),
+        }
+        for vehicle_name, expected_key in known.items():
+            with self.subTest(vehicle=vehicle_name):
+                key, profile = internal_hit_layouts._compiled_profile(
+                    vehicle_name)
+                self.assertEqual(expected_key, key)
+                self.assertIsNotNone(profile)
+
+        key, profile = internal_hit_layouts._compiled_profile(
+            'japan:J24_Mi_To_130_tons')
+        self.assertEqual(('japan', 'j24mito130tons'), key)
+        self.assertIsNone(profile)
 
     def test_missing_hull_bbox_fails_closed(self):
         descriptor = self._descriptor()

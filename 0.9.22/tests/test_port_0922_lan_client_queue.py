@@ -386,6 +386,15 @@ class LanClientQueueTests(unittest.TestCase):
         self.assertIn('blocked transport', client.last_error)
 
     def test_failed_fire_enqueue_does_not_consume_fire_sequence(self):
+        source_shot = {
+            'speed': 100.0, 'gravity': 9.81,
+            'maxDistance': 500.0, 'piercingPower': [100.0, 100.0],
+            'deadeye': False,
+            'shell': {
+                'kind': 'ARMOR_PIERCING', 'caliber': 45.0,
+                'damage': [110.0, 110.0], 'explosionRadius': 0.0,
+            },
+        }
         client = self.activate()
         client.ready = True
         client.phase = 'battle'
@@ -395,7 +404,8 @@ class LanClientQueueTests(unittest.TestCase):
         try:
             self.assertIsNone(client.send_fire(
                 position=[0.0, 1.0, 0.0], velocity=[100.0, 0.0, 0.0],
-                gravity=9.81, max_distance=500.0, max_time_ms=5000))
+                gravity=9.81, max_distance=500.0, max_time_ms=5000,
+                source_shot=source_shot))
         finally:
             lan_client_module.MAX_OUTBOUND_MESSAGES = original_limit
         self.assertEqual(0, client._fire_seq)
@@ -406,7 +416,8 @@ class LanClientQueueTests(unittest.TestCase):
         client.round_id = 3
         self.assertEqual(1, client.send_fire(
             position=[0.0, 1.0, 0.0], velocity=[100.0, 0.0, 0.0],
-            gravity=9.81, max_distance=500.0, max_time_ms=5000))
+            gravity=9.81, max_distance=500.0, max_time_ms=5000,
+            source_shot=source_shot))
         self.assertEqual(1, client._fire_seq)
         self.assertEqual(
             'projectile_launch', client._outbound_queue[0][1]['type'])

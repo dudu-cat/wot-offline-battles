@@ -87,10 +87,13 @@ class _Service(object):
         self.current = "32"
         self.choices = [
             {"nation": "ussr", "vehicle": "R11_MS-1",
+             "label": "MS-1",
              "member": vehicle_editor_ui.DEFAULT_MEMBER},
             {"nation": "ussr", "vehicle": "R12_Test",
+             "label": "Test",
              "member": "scripts/item_defs/vehicles/ussr/R12_Test.xml"},
             {"nation": "usa", "vehicle": "A01_T1_Cunningham",
+             "label": "T1_Cunningham",
              "member": (
                  "scripts/item_defs/vehicles/usa/A01_T1_Cunningham.xml")},
         ]
@@ -119,7 +122,15 @@ class _Service(object):
     @staticmethod
     def _field(member, field_path, category, field_label, shared, affected,
                original="32"):
-        scope = ("Shared component; affects %s" % ", ".join(affected)
+        def display_id(vehicle):
+            prefix, separator, remainder = vehicle.partition("_")
+            if (separator and any(character.isdigit()
+                                  for character in prefix)):
+                return remainder
+            return vehicle
+
+        affected_labels = tuple(display_id(vehicle) for vehicle in affected)
+        scope = ("Shared component; affects %s" % ", ".join(affected_labels)
                  if shared else "Affects this vehicle only.")
         return {
                 "member": member,
@@ -129,6 +140,8 @@ class _Service(object):
                 "scope": scope,
                 "shared": shared,
                 "affectedVehicles": affected,
+                "affectedVehicleLabels": affected_labels,
+                "displayVehicle": display_id(affected[0]),
                 "originalValue": original,
                 "packedType": (
                     "string" if field_path.endswith("reloadTime")
@@ -202,7 +215,7 @@ class VehicleEditorWindowTest(unittest.TestCase):
                       self.window.overlay_path.get())
         self.assertEqual(("usa", "ussr"),
                          self.window.nation_box.cget("values"))
-        self.assertEqual(("R11_MS-1", "R12_Test"),
+        self.assertEqual(("MS-1", "Test"),
                          self.window.vehicle_box.cget("values"))
         self.assertEqual(("Vehicle", "Gun"),
                          self.window.category_box.cget("values"))
@@ -219,7 +232,7 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertEqual(
             ("Gun-A / Reload time",),
             self.window.field_box.cget("values"))
-        self.assertIn("R11_MS-1, R12_Test", self.window.scope.get())
+        self.assertIn("MS-1, Test", self.window.scope.get())
         self.assertEqual(
             "scripts/item_defs/vehicles/ussr/components/guns.xml",
             self.window.member.get())
@@ -231,22 +244,22 @@ class VehicleEditorWindowTest(unittest.TestCase):
 
         self.assertTrue(self.window.refresh_vehicles())
 
-        self.assertEqual(("A01_T1_Cunningham",),
+        self.assertEqual(("T1_Cunningham",),
                          self.window.vehicle_box.cget("values"))
-        self.assertEqual("A01_T1_Cunningham", self.window.vehicle.get())
+        self.assertEqual("T1_Cunningham", self.window.vehicle.get())
 
     def test_localized_vehicle_label_selects_the_exact_internal_vehicle(self):
         service = _Service()
-        service.choices[0]["label"] = "MS-1 (R11_MS-1)"
+        service.choices[0]["label"] = "MS-1"
 
         window = vehicle_editor_ui.VehicleEditorWindow(
             self.parent, "C:/WoT", "Fast MS-1", _FakeTk, _FakeTtk,
             self.messagebox, service=service)
 
         self.assertEqual(
-            ("MS-1 (R11_MS-1)", "R12_Test"),
+            ("MS-1", "Test"),
             window.vehicle_box.cget("values"))
-        self.assertEqual("MS-1 (R11_MS-1)", window.vehicle.get())
+        self.assertEqual("MS-1", window.vehicle.get())
         self.assertEqual(
             ("C:/WoT", vehicle_editor_ui.DEFAULT_MEMBER),
             service.topology_calls[-1])

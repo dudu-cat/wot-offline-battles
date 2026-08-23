@@ -235,6 +235,21 @@ class TankCollisionTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0), result['delta_velocity'])
         self.assertNotIn('blocked', result)
 
+    def test_coincident_centres_receive_reciprocal_owner_corrections(self):
+        first = _tank(1, 0.0, 0.0)
+        second = _tank(2, 0.0, 0.0)
+
+        first_result = tank_collision.resolve_tank(first, (second,))
+        second_result = tank_collision.resolve_tank(second, (first,))
+
+        self.assertGreater(first_result['correction'][0], 0.0)
+        self.assertLess(second_result['correction'][0], 0.0)
+        self.assertAlmostEqual(
+            first_result['correction'][0],
+            -second_result['correction'][0])
+        self.assertEqual((0.0, 0.0), first_result['delta_velocity'])
+        self.assertEqual((0.0, 0.0), second_result['delta_velocity'])
+
     def test_mass_weighted_separation_moves_light_tank_farther(self):
         heavy = _tank(1, 0.0, 0.0, mass=60000.0)
         light = _tank(2, 0.8, 0.0, mass=10000.0)

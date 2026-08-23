@@ -788,6 +788,109 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertTrue(result['collision'])
         self.assertEqual(1, len(calls))
 
+    def test_submerged_planner_defers_baked_hazard_to_native_escape_probe(self):
+        class Grid(object):
+            prebaked = True
+
+            def near_baked_navigation(self, unused_position, unused_radius):
+                return True
+
+            def segment_has_baked_hazard(
+                    self, unused_start, unused_end, unused_hazards):
+                return True
+
+            def segment_clear(self, unused_start, unused_end):
+                raise AssertionError('fatal hazard should decide first')
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(grid=Grid())
+        runtime.baked_graph = {'bake': {
+            'vehicle_half_width': 2.15,
+            'edge_clearance_radii': (3.0,),
+        }}
+
+        self.assertFalse(runtime._planner_corridor_clear(
+            (0.0, 0.0, 0.0), 0.0, 0.0))
+        self.assertIsNone(runtime._planner_corridor_clear(
+            (0.0, 0.0, 0.0), 0.0, 0.0, wet_escape=True))
+
+    def test_bot_drowning_requires_ten_continuous_seconds_and_publishes_death(self):
+        depth = [2.0]
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _critical_descriptor(),
+            adapter_factory=lambda *unused: _Adapter(),
+            direction_probe=lambda *unused: {'clear': True},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver,
+            baked_graph=_graph(),
+            water_depth_probe=lambda unused_position: depth[0])
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update({
+            'health': 640, 'alive': True, 'display_health': 640,
+            'speed': 7.0, 'movement_dir': 1, 'rotation_dir': -1,
+            'target_kind': 'human', 'target_id': 1,
+        })
+        runtime._friendly_repositions[11] = {'until': 99.0}
+        payload = _critical_payload(
+            {'name': 'engineHealth', 'hp': 0.0, 'max_hp': 100.0,
+             'state': 'destroyed'},
+            destroyed=('engineHealth',), crew_ko=('commander', 'driver'))
+        original = self.module.critical_damage.apply_drowning
+        drowning_calls = []
+
+        def apply_drowning(shadow):
+            drowning_calls.append(shadow.health)
+            return payload
+
+        self.module.critical_damage.apply_drowning = apply_drowning
+        try:
+            for unused in range(20):
+                self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+            depth[0] = 0.5
+            self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+            self.assertEqual(0.0, state['_drown_time'])
+            self.assertEqual(0.5, state['_water_depth'])
+            depth[0] = 2.0
+            for unused in range(33):
+                self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+            self.assertTrue(state['alive'])
+            self.assertTrue(runtime._advance_bot_drowning(state, 0.3))
+        finally:
+            self.module.critical_damage.apply_drowning = original
+
+        self.assertEqual([640], drowning_calls)
+        self.assertEqual(0, state['health'])
+        self.assertFalse(state['alive'])
+        self.assertEqual(640, state['display_health'])
+        self.assertEqual(5, state['death_reason'])
+        self.assertEqual(['commander', 'driver'],
+                         state['critical']['crew_ko'])
+        self.assertEqual((0.0, 0, 0), (
+            state['speed'], state['movement_dir'], state['rotation_dir']))
+        self.assertIsNone(state['target_kind'])
+        self.assertIsNone(state['target_id'])
+        self.assertNotIn(11, runtime._friendly_repositions)
+        self.assertTrue(runtime._mark_combat_publication(state))
+        projected = self.module.lan_client.project_bot_state(state)
+        self.assertEqual((0, False, 640, 5), (
+            projected['health'], projected['alive'],
+            projected['display_health'], projected['death_reason']))
+        server, unused_manifest, unused_socket = \
+            ServerBotStateRevisionTests._server()
+        for name in ('shell_index', 'next_shell_index', 'ammo_remaining',
+                     'ammo_reload_pending'):
+            server.bot_states[11][name] = projected[name]
+        self.assertTrue(server.update_bot_states(1, {
+            'round_id': server.round_id, 'bots': [projected]}),
+            server.last_bot_state_reject)
+        self.assertEqual((0, False, 640, 5), (
+            server.bot_states[11]['health'],
+            server.bot_states[11]['alive'],
+            server.bot_states[11]['display_health'],
+            server.bot_states[11]['death_reason']))
+
     def test_countdown_prewarms_all_receipts_and_all_bots_start_together(self):
         command = {
             'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
@@ -4633,7 +4736,7 @@ class BotRuntimeTests(unittest.TestCase):
                     self.assertTrue(all(
                         value >= 1 for value in rejected.values()))
 
-    def test_installed_gun_dispersion_and_critical_factors_set_exact_sigma(self):
+    def test_installed_gun_dispersion_sets_bounded_two_sigma_cone(self):
         descriptor = _combat_descriptor(dispersion=0.012)
         gun_state = self.module._BotGunState(descriptor)
         critical = {
@@ -4657,6 +4760,7 @@ class BotRuntimeTests(unittest.TestCase):
                 gun_state, state, descriptor))
 
         sigmas = []
+        uniform_calls = []
 
         class RecordingRandom(object):
             def __init__(self, unused_seed):
@@ -4665,6 +4769,10 @@ class BotRuntimeTests(unittest.TestCase):
             def gauss(self, mean, sigma):
                 sigmas.append((mean, sigma))
                 return 0.0
+
+            def uniform(self, minimum, maximum):
+                uniform_calls.append((minimum, maximum))
+                return minimum
 
         original_random = self.module.random.Random
         self.module.random.Random = RecordingRandom
@@ -4677,13 +4785,31 @@ class BotRuntimeTests(unittest.TestCase):
         finally:
             self.module.random.Random = original_random
 
-        self.assertEqual(3, len(sigmas))
+        self.assertEqual(1, len(sigmas))
         for mean, sigma in sigmas:
             self.assertEqual(0.0, mean)
             self.assertAlmostEqual(
-                0.012 * device_damage.CREW_KO_TIME_FACTOR * 2.0 / 3.0, sigma)
+                0.012 * device_damage.CREW_KO_TIME_FACTOR, sigma)
+        self.assertEqual([(0.0, 2.0 * math.pi)], uniform_calls)
         self.assertAlmostEqual(0.4, state['shot_yaw'])
         self.assertAlmostEqual(0.1, state['shot_pitch'])
+
+    def test_bot_clip_scatter_never_leaves_the_presented_aiming_circle(self):
+        dispersion = 0.0046
+        nominal = self.module.ai_driver.barrel_direction(0.2, -0.05)
+
+        for fire_seq in range(1, 31):
+            shot_yaw, shot_pitch = self.module._dispersed_barrel_angles(
+                24, 7, fire_seq, 0.2, -0.05, dispersion)
+            physical = (
+                math.sin(shot_yaw) * math.cos(shot_pitch),
+                math.sin(shot_pitch),
+                math.cos(shot_yaw) * math.cos(shot_pitch))
+            dot = sum(nominal[index] * physical[index]
+                      for index in range(3))
+            offset = math.acos(max(-1.0, min(1.0, dot)))
+
+            self.assertLessEqual(offset, dispersion + 1.0e-12)
 
     def test_live_reload_penalty_preserves_completed_reload_fraction(self):
         gun_state = self.module._BotGunState(_combat_descriptor())
@@ -5415,6 +5541,21 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([1.0, 0.0], drive_inputs)
         self.assertEqual([1.0, 0.0], turn_inputs)
 
+    def test_explicit_yellow_state_applies_above_the_hp_threshold(self):
+        descriptor = _critical_descriptor()
+        descriptor.hull.ammoBayHealth = types.SimpleNamespace(
+            maxHealth=100, maxRegenHealth=70)
+        state = {
+            'critical': _critical_payload({
+                'name': 'ammoBayHealth', 'hp': 70.0, 'max_hp': 100.0,
+                'state': 'critical',
+            }),
+        }
+
+        self.assertEqual(
+            2.0, self.module._critical_factor(
+                state, descriptor, 'reload'))
+
     def test_bot_fire_burns_five_percent_per_second_and_ends_at_ten_seconds(self):
         descriptor = _critical_descriptor()
         runtime = self.module.BotRuntime(
@@ -6133,6 +6274,35 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertGreater(runtime.states[12]['x'], 0.8)
         self.assertEqual(0, runtime.states[11]['movement_dir'])
         self.assertEqual(0, runtime.states[12]['movement_dir'])
+
+    def test_exactly_coincident_bots_separate_in_opposite_directions(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 25000.0
+        descriptor.hull.hitTester = _HitTester1513(
+            (-1.5, -1.0, -3.5), (1.5, 1.0, 3.5))
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver,
+            baked_graph=_graph())
+        start = dict(self.start, bots=[
+            {'id': 11, 'team': 1, 'slot': 0, 'name': 'First'},
+            {'id': 12, 'team': 2, 'slot': 0, 'name': 'Second'},
+        ])
+        runtime.battle_start(start)
+        runtime.states[11].update(x=0.0, y=0.0, z=0.0, yaw=0.0)
+        runtime.states[12].update(x=0.0, y=0.0, z=0.0, yaw=0.0)
+
+        runtime.update(.04, 1.0)
+
+        self.assertGreater(runtime.states[11]['x'], 0.0)
+        self.assertLess(runtime.states[12]['x'], 0.0)
+        self.assertGreater(
+            abs(runtime.states[11]['x'] - runtime.states[12]['x']), 2.0)
 
     def test_bot_push_decay_is_equal_across_render_rates(self):
         def run_for_one_second(frame_rate):

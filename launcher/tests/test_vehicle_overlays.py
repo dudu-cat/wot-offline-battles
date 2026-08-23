@@ -544,7 +544,7 @@ class VehicleOverlayTest(unittest.TestCase):
                 ("Observer", "R11_MS-1", "R12_Test"),
                 record["affectedVehicles"])
             self.assertIn(
-                "Observer, R11_MS-1, R12_Test", record["scope"])
+                "Observer, MS-1, Test", record["scope"])
 
         self.assertEqual(self.ENGINES, engine["member"])
         self.assertEqual(self.GUNS, gun["member"])
@@ -566,20 +566,71 @@ class VehicleOverlayTest(unittest.TestCase):
 
         ms1 = next(choice for choice in choices
                    if choice["vehicle"] == "R11_MS-1")
-        self.assertEqual("MS-1 (R11_MS-1)", ms1["label"])
+        self.assertEqual("MS-1", ms1["label"])
+        self.assertEqual("R11_MS-1", ms1["vehicle"])
+        self.assertEqual(self.VEHICLE, ms1["member"])
 
-    def test_type_5_heavy_localized_label_remains_unambiguous(self):
+    def test_type_5_heavy_is_read_from_the_japanese_roster(self):
         class _Translations(object):
             @staticmethod
             def gettext(key):
                 return "五式重战" if key == "J20_Type_2605_short" else key
 
-        label = vehicle_overlays._vehicle_label({
-            "vehicle": "J20_Type_2605",
-            "shortUserString": "#japan_vehicles:J20_Type_2605_short",
-        }, _Translations())
+        list_member = "scripts/item_defs/vehicles/japan/list.xml"
+        vehicle_member = (
+            "scripts/item_defs/vehicles/japan/J20_Type_2605.xml")
+        roster = packed.PackedElement(children=[
+            (b"xmlns:xmlref", scalar(
+                packed.TYPE_STRING, b"http://www.w3.org/2001/XInclude")),
+            (b"J20_Type_2605", element([
+                (b"userString", scalar(
+                    packed.TYPE_STRING,
+                    b"#japan_vehicles:J20_Type_2605")),
+                (b"shortUserString", scalar(
+                    packed.TYPE_STRING,
+                    b"#japan_vehicles:J20_Type_2605_short")),
+                (b"tags", scalar(packed.TYPE_STRING, b"heavyTank")),
+            ])),
+        ])
+        self.members[list_member] = packed.write_packed_xml(roster)
+        self.members[vehicle_member] = self.members[self.VEHICLE]
+        self._write_package()
 
-        self.assertEqual("五式重战 (J20_Type_2605)", label)
+        with mock.patch.object(
+                vehicle_overlays, "_vehicle_translations",
+                side_effect=lambda unused_root, nation: (
+                    _Translations() if nation == "japan" else None)):
+            choices = vehicle_overlays.list_vehicle_choices(self.game)
+
+        type5 = next(choice for choice in choices
+                     if choice["vehicle"] == "J20_Type_2605")
+        self.assertEqual("五式重战 (Type_2605)", type5["label"])
+        self.assertEqual(vehicle_member, type5["member"])
+
+    def test_catalog_prefix_is_hidden_only_in_human_facing_fields(self):
+        record = vehicle_overlays._choice_record(
+            "ussr", "R11_MS-1", "vehicle", self.VEHICLE,
+            {"fieldPath": "speedLimits/forward"}, False,
+            "R11_MS-1", ("R11_MS-1", "R12_Test"))
+
+        self.assertEqual("R11_MS-1", record["vehicle"])
+        self.assertEqual(("R11_MS-1", "R12_Test"),
+                         record["affectedVehicles"])
+        self.assertEqual("MS-1", record["displayVehicle"])
+        self.assertEqual(("MS-1", "Test"),
+                         record["affectedVehicleLabels"])
+        self.assertNotIn("R11_", record["scope"])
+
+    def test_untranslated_vehicle_label_uses_the_prefix_free_id(self):
+        self.assertEqual(
+            "Type_2605",
+            vehicle_overlays._vehicle_label({
+                "vehicle": "J20_Type_2605",
+                "shortUserString": "#japan_vehicles:J20_Type_2605_short",
+            }, None))
+        self.assertEqual(
+            "Prototype",
+            vehicle_overlays._vehicle_display_id("X99_Prototype"))
 
     def test_vehicle_local_gun_values_win_and_hull_health_is_editable(self):
         root = packed.read_packed_xml(self.members[self.VEHICLE])

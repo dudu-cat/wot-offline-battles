@@ -110,6 +110,11 @@ FRIENDLY_REPOSITION_SECONDS = 4.0
 MAX_WORLD_RECEIPTS_PER_FRAME = 13
 FIRE_DURATION_SECONDS = 10.0
 FIRE_TICK_SECONDS = 1.0
+BOT_WATER_AVOID_DEPTH = 0.90
+BOT_DROWNING_PROBE_SECONDS = 0.30
+BOT_DROWNING_DEPTH = 1.60
+BOT_DROWNING_SECONDS = 10.0
+BOT_DROWNING_DEATH_REASON = 5
 
 
 def _cache_deadline(now, entity_id, interval, salt=0, stagger=False):
@@ -376,22 +381,27 @@ def _shot_ballistics(descriptor, shell_index):
 def _critical_parts(state):
     critical = state.get('critical')
     if not isinstance(critical, dict):
-        return {}, set(), set()
+        return {}, set(), set(), set()
     devices = {}
+    yellow = set()
     for record in critical.get('devices') or ():
         if isinstance(record, dict) and record.get('name'):
-            devices[str(record['name'])] = _number(record.get('hp'))
+            name = str(record['name'])
+            devices[name] = _number(record.get('hp'))
+            if record.get('state') == 'critical':
+                yellow.add(name)
     destroyed = set(str(name) for name in
                     (critical.get('destroyed') or ()))
+    yellow.difference_update(destroyed)
     crew_ko = set(str(name) for name in (critical.get('crew_ko') or ()))
-    return devices, destroyed, crew_ko
+    return devices, destroyed, crew_ko, yellow
 
 
 def _critical_factor(state, descriptor, stat):
-    devices, destroyed, crew_ko = _critical_parts(state)
+    devices, destroyed, crew_ko, yellow = _critical_parts(state)
     return (device_damage.crew_stat_factor(crew_ko, stat) *
             device_damage.module_stat_factor(
-                devices, destroyed, descriptor, stat))
+                devices, destroyed, descriptor, stat, yellow))
 
 
 def _critical_signature(payload):
@@ -922,15 +932,40 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
     if (math.isnan(dispersion_angle) or math.isinf(dispersion_angle) or
             dispersion_angle <= 0.0):
         raise ValueError('bot shot dispersion must be positive')
-    sigma = dispersion_angle / 3.0
-    direction[0] += generator.gauss(0.0, sigma)
-    direction[1] += generator.gauss(0.0, sigma)
-    direction[2] += generator.gauss(0.0, sigma)
-    length = math.sqrt(sum(value * value for value in direction))
-    if length <= 1e-9:
-        direction = [0.0, 0.0, 1.0]
+    # #1513's aiming circle is a hard two-sigma angular boundary.  The former
+    # three independent world-axis Gaussians were unbounded and could publish
+    # a bot shell outside the circle used by the player gun and marker.
+    sigma = dispersion_angle / 2.0
+    radius = abs(generator.gauss(0.0, sigma))
+    if radius > dispersion_angle:
+        radius = dispersion_angle * generator.uniform(0.0, 1.0)
+    azimuth = generator.uniform(0.0, 2.0 * math.pi)
+
+    dx, dy, dz = direction
+    if abs(dx) <= abs(dy) and abs(dx) <= abs(dz):
+        reference = (1.0, 0.0, 0.0)
+    elif abs(dy) <= abs(dz):
+        reference = (0.0, 1.0, 0.0)
     else:
-        direction = [value / length for value in direction]
+        reference = (0.0, 0.0, 1.0)
+    tangent = (
+        dy * reference[2] - dz * reference[1],
+        dz * reference[0] - dx * reference[2],
+        dx * reference[1] - dy * reference[0])
+    tangent_length = math.sqrt(sum(value * value for value in tangent))
+    tangent = tuple(value / tangent_length for value in tangent)
+    up = (
+        dy * tangent[2] - dz * tangent[1],
+        dz * tangent[0] - dx * tangent[2],
+        dx * tangent[1] - dy * tangent[0])
+    side = tuple(
+        tangent[index] * math.cos(azimuth) +
+        up[index] * math.sin(azimuth)
+        for index in range(3))
+    cosine, sine = math.cos(radius), math.sin(radius)
+    direction = [
+        direction[index] * cosine + side[index] * sine
+        for index in range(3)]
     horizontal = math.sqrt(direction[0] * direction[0] +
                            direction[2] * direction[2])
     return (math.atan2(direction[0], direction[2]),
@@ -1092,7 +1127,8 @@ class BotRuntime(object):
                  obstacle_probe=None, bounds=None, cover_probe=None,
                  native_motion=False, baked_graph=None, probe_clock=None,
                  motion_resolver=None, motion_report=None,
-                 world_receipt_probe=None, probe_timing_seconds=0.0):
+                 world_receipt_probe=None, probe_timing_seconds=0.0,
+                 water_depth_probe=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.direction_probe = self._adapt_direction_probe(
@@ -1156,6 +1192,9 @@ class BotRuntime(object):
         self.motion_resolver = motion_resolver
         self.motion_report = motion_report
         self.world_receipt_probe = world_receipt_probe
+        self._water_depth_probe = (
+            water_depth_probe if callable(water_depth_probe) else
+            (lambda unused_position: -1.0))
         probe_clock = probe_clock if callable(probe_clock) else None
         self._probe_timing_seconds = max(
             0.0, _number(probe_timing_seconds))
@@ -2182,6 +2221,51 @@ class BotRuntime(object):
                 (float(step), float(now), bool(was_on_fire)))
         return changed
 
+    def _advance_bot_drowning(self, state, step):
+        """Apply the copied 0.8.2 continuous-deep-water bot death law."""
+        if (not state.get('alive', False) or
+                _number(state.get('health')) <= 0.0 or step <= 0.0):
+            return False
+        check = (_number(state.get('_drown_check')) + float(step))
+        state['_drown_check'] = check
+        if check < BOT_DROWNING_PROBE_SECONDS:
+            return False
+        elapsed = min(check, 0.5)
+        state['_drown_check'] = 0.0
+        depth = _number(self._water_depth_probe(_position(state)), -1.0)
+        state['_water_depth'] = depth
+        if depth <= BOT_DROWNING_DEPTH:
+            state['_drown_time'] = 0.0
+            state['_drowning'] = False
+            return False
+        state['_drowning'] = True
+        state['_drown_time'] = (
+            _number(state.get('_drown_time')) + elapsed)
+        if state['_drown_time'] <= BOT_DROWNING_SECONDS:
+            return False
+
+        display_health = max(0, int(_number(state.get('health'))))
+        descriptor = self._descriptors.get(state['id'], {})
+        shadow = _BotCriticalVehicle(
+            state, descriptor, None,
+            _number(state.get('combat_fire_timer')))
+        critical = critical_damage.apply_drowning(shadow)
+        if isinstance(critical, dict):
+            state['critical'] = _canonical_critical(critical)
+        state['health'] = 0
+        state['alive'] = False
+        state['display_health'] = display_health
+        state['death_reason'] = BOT_DROWNING_DEATH_REASON
+        state['_drowned'] = True
+        state['_drowning'] = False
+        self._friendly_repositions.pop(state['id'], None)
+        state['speed'] = 0.0
+        state['movement_dir'] = 0
+        state['rotation_dir'] = 0
+        state['target_kind'] = None
+        state['target_id'] = None
+        return True
+
     def apply_snapshot(self, message):
         """Apply only server-owned combat state to the authority simulation.
 
@@ -2930,7 +3014,8 @@ class BotRuntime(object):
             return 1
         return 2
 
-    def _planner_corridor_clear(self, position, yaw, speed):
+    def _planner_corridor_clear(self, position, yaw, speed,
+                                wet_escape=False):
         """Rank one candidate through the validated baked static corridor.
 
         ``True`` or ``False`` is advisory to LocalDriver only. ``None`` asks
@@ -2938,6 +3023,8 @@ class BotRuntime(object):
         graph contract is unavailable or failed.  This result is never stored
         in the native motion cache and can never authorize a realised step.
         """
+        if wet_escape:
+            return None
         navigator = self.navigator
         grid = getattr(navigator, 'grid', None)
         graph = self.baked_graph
@@ -4790,6 +4877,9 @@ class BotRuntime(object):
             self._advance_bot_critical(state, step, now)
             if not state['alive']:
                 continue
+            self._advance_bot_drowning(state, step)
+            if not state['alive']:
+                continue
             position = _position(state)
             tick_poses[state['id']] = position
             tick_safe[state['id']] = prebaked_navigation.pose_is_safe(
@@ -4822,7 +4912,9 @@ class BotRuntime(object):
 
             def sample_clear(sample_yaw):
                 advisory = self._planner_corridor_clear(
-                    position, sample_yaw, state.get('speed', 0.0))
+                    position, sample_yaw, state.get('speed', 0.0),
+                    _number(state.get('_water_depth'), -1.0) >
+                    BOT_WATER_AVOID_DEPTH)
                 if advisory is not None:
                     return bool(advisory)
                 return self._probe_is_clear(
@@ -5041,7 +5133,7 @@ class BotRuntime(object):
                 target is not None and
                 command.get('combat_mode') != 'base_defense')
             state['hull_aiming'] = bool(hull_aiming)
-            unused_devices, destroyed_devices, unused_crew = (
+            unused_devices, destroyed_devices, unused_crew, unused_yellow = (
                 _critical_parts(state))
             if destroyed_devices.intersection((
                     'engineHealth', 'leftTrackHealth',

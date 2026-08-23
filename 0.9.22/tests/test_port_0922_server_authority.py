@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import sys
 import unittest
 from unittest import mock
@@ -40,8 +41,17 @@ def _player(player_id, team=1, x=398.0, z=402.0):
 def _projection():
     return {
         'name': 'ussr:R11_MS-1', 'level': 1, 'tags': ('lightTank',),
+        'type': {
+            'name': 'ussr:R11_MS-1', 'level': 1,
+            'tags': ('lightTank',),
+            'crewRoles': (
+                ('commander', 'gunner', 'radioman', 'loader'),
+                ('driver',)),
+        },
         'maxHealth': 1000,
         'gun': {
+            'hitTester': {'bbox': [(-0.25, -0.25, -1.2),
+                                   (0.25, 0.25, 1.2), None]},
             'shots': [{
                 'shell': {'kind': 'ARMOR_PIERCING', 'caliber': 45.0,
                           'damage': [110.0, 110.0], 'effectsIndex': 0},
@@ -55,7 +65,13 @@ def _projection():
             'aimingTime': 2.0, 'maxAmmo': 50,
             'maxHealth': 54, 'maxRegenHealth': 27,
         },
-        'turret': {'rotationSpeed': 0.7, 'circularVisionRadius': 445.0},
+        'turret': {
+            'hitTester': {'bbox': [(-0.9, -0.3, -0.9),
+                                   (0.9, 0.8, 0.9), None]},
+            'rotationSpeed': 0.7, 'circularVisionRadius': 445.0,
+            'yawLimits': (-3.14159, 3.14159),
+            'gunPosition': (0.0, 0.25, 0.15),
+        },
         'physics': {'weight': 8000.0, 'enginePower': 220000.0,
                     'speedLimits': (9.4, 4.0)},
         'chassis': {
@@ -70,6 +86,27 @@ def _projection():
                                    None]},
             'turretPositions': ((0.0, 1.0, 0.0),),
             'primaryArmor': (18.0, 16.0, 16.0),
+        },
+    }
+
+
+def _mounted_source_shot(state, shooter_id, velocity, gravity, maximum):
+    descriptor = state.descriptor_store.get(
+        state.players[shooter_id].vehicle)
+    shot = descriptor.gun.shots[0]
+    shell = shot.shell
+    return {
+        'speed': sum(float(value) ** 2 for value in velocity) ** 0.5,
+        'gravity': float(gravity),
+        'maxDistance': float(maximum),
+        'piercingPower': [float(value) for value in shot.piercingPower],
+        'deadeye': False,
+        'shell': {
+            'kind': str(shell.kind),
+            'caliber': float(shell.caliber),
+            'damage': [float(value) for value in shell.damage],
+            'explosionRadius': float(getattr(
+                shell, 'explosionRadius', 0.0) or 0.0),
         },
     }
 
@@ -104,6 +141,85 @@ def _state_with_authority(ready_world=True, clock=None):
     if ready_world:
         _prime_destructible_map(state)
     return state
+
+
+class ServerCriticalProposalStateTest(unittest.TestCase):
+    def test_destroyed_list_must_match_device_states_exactly(self):
+        normal = {
+            'devices': [{
+                'name': 'engineHealth', 'hp': 100.0, 'max_hp': 100.0,
+                'state': 'normal'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        destroyed = copy.deepcopy(normal)
+        destroyed['devices'][0].update(hp=0.0, state='destroyed')
+
+        with self.assertRaisesRegex(ValueError, 'destroyed state'):
+            _critical_payload(dict(destroyed, destroyed=[]))
+        with self.assertRaisesRegex(ValueError, 'destroyed state'):
+            _critical_payload(dict(
+                normal, destroyed=['engineHealth']))
+
+    def test_protocol_device_hp_and_phase_survive_successive_proposals(self):
+        descriptor = wrap(_projection())
+        target = _player(2, team=2, x=0.0, z=20.0)
+
+        first = {
+            'devices': [{
+                'name': 'engineHealth', 'hp': 70.0, 'max_hp': 100.0,
+                'state': 'normal'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        BattleState._commit_external_player_critical(target, first)
+        after_first = server_battle_authority._TargetMock(
+            target.player_id, target.health, descriptor,
+            (target.x, target.y, target.z), target.yaw,
+            {'critical': target.critical})
+
+        self.assertEqual(70.0, after_first.devices_hp['engineHealth'])
+        self.assertNotIn('engineHealth', after_first._critical_devices)
+
+        second = {
+            'devices': [{
+                'name': 'engineHealth', 'hp': 40.0, 'max_hp': 100.0,
+                'state': 'critical'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        BattleState._commit_external_player_critical(target, second)
+        after_second = server_battle_authority._TargetMock(
+            target.player_id, target.health, descriptor,
+            (target.x, target.y, target.z), target.yaw,
+            {'critical': target.critical})
+
+        self.assertEqual(40.0, after_second.devices_hp['engineHealth'])
+        self.assertEqual(
+            {'engineHealth'}, after_second._critical_devices)
+
+    def test_rotating_turret_profile_parent_uses_current_aim(self):
+        descriptor = wrap(_projection())
+        hull_yaw = 0.25
+        target = server_battle_authority._TargetMock(
+            2, 1000, descriptor, (0.0, 0.0, 0.0), hull_yaw,
+            {'critical': {}}, aim_yaw=hull_yaw + 0.5 * math.pi,
+            gun_pitch=0.0)
+        components = dict(
+            (name, matrix) for component, matrix in target.getComponents()
+            for name in ('chassis', 'hull', 'turret', 'gun')
+            if component is getattr(descriptor, name))
+
+        self.assertEqual(
+            {'chassis', 'hull', 'turret', 'gun'}, set(components))
+        point = server_battle_authority.Vector3(0.0, 1.6, 1.0)
+        hull_point = components['hull'].applyPoint(point)
+        turret_point = components['turret'].applyPoint(point)
+        self.assertAlmostEqual(1.0, hull_point.y)
+        self.assertAlmostEqual(1.0, hull_point.z)
+        self.assertAlmostEqual(-1.0, turret_point.x)
+        self.assertAlmostEqual(0.0, turret_point.y)
+        self.assertAlmostEqual(0.0, turret_point.z)
 
 
 class ServerAuthorityElectionTest(unittest.TestCase):
@@ -209,6 +325,28 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
         state.pending_live_message = None
         return state
+
+    def test_human_hull_pitch_and_roll_reach_server_narrow_phase(self):
+        state = self._live_state()
+
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.4,
+            'pitch': 0.25, 'roll': -0.3,
+        })
+        authority = state.server_authority
+        public = state._public_player(state.players[1])
+        published = authority._players_payload()[0]
+        target = next(authority._chord_targets({
+            'shooter_kind': 'bot', 'shooter_id': 99,
+        }))
+
+        self.assertEqual(0.25, public['pitch'])
+        self.assertEqual(-0.3, public['roll'])
+        self.assertEqual(0.25, published['pitch'])
+        self.assertEqual(-0.3, published['roll'])
+        self.assertEqual(0.25, target['pitch'])
+        self.assertEqual(-0.3, target['roll'])
 
     def test_bots_publish_states_and_move_on_server_ticks(self):
         state = self._live_state()
@@ -390,7 +528,7 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
         return state, authority
 
     def _launch_human(self, state, velocity=(0.0, 0.0, 100.0),
-                      max_time_ms=2000, shot_seq=1):
+                      max_time_ms=2000, shot_seq=1, source_shot=None):
         message = {
             'type': 'projectile_launch',
             'round_id': state.round_id,
@@ -406,6 +544,8 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
             'is_he': False,
             'splash_radius': 0.0,
             'penetration_factor': 1.0,
+            'source_shot': (source_shot or _mounted_source_shot(
+                state, 1, velocity, 9.81, 200.0)),
         }
         self.assertTrue(state.launch_projectile(1, message))
         return '%d:p:1:%d' % (state.round_id, shot_seq)
@@ -425,6 +565,95 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
         self.assertNotIn(projectile_id, state.projectiles)
         self.assertEqual(
             'impact', state.projectile_tombstones[projectile_id]['outcome'])
+
+    def test_e50_mounted_105mm_alpha_survives_stock_75mm_descriptor(self):
+        state, authority = self._live_state()
+        stock = _projection()
+        stock['name'] = 'germany:G54_E-50'
+        stock['gun']['shots'][0]['shell'].update(
+            caliber=75.0, damage=[135.0, 100.0])
+        state.descriptor_store.add('germany:G54_E-50', stock)
+        state.players[1].vehicle = 'germany:G54_E-50'
+        frozen = _mounted_source_shot(
+            state, 1, (0.0, 0.0, 100.0), 9.81, 200.0)
+        frozen['shell'].update(caliber=105.0, damage=[390.0, 150.0])
+        captured = []
+        original = state.resolve_projectile
+
+        def capture(player_id, message):
+            captured.append(copy.deepcopy(message))
+            return original(player_id, message)
+
+        state.resolve_projectile = capture
+        with mock.patch.object(
+                server_battle_authority.random, 'uniform',
+                side_effect=lambda low, high: (low + high) / 2.0):
+            projectile_id = self._launch_human(
+                state, source_shot=frozen)
+            ledger_source_shot = copy.deepcopy(
+                state.projectiles[projectile_id]['source_shot'])
+            self._tick_until_terminal(state, projectile_id)
+
+        stock_shot = authority._source_descriptor({
+            'source_vehicle': 'germany:G54_E-50'}).gun.shots[0]
+        self.assertEqual(135.0, stock_shot.shell.damage[0])
+        self.assertEqual([390.0, 150.0],
+                         ledger_source_shot['shell']['damage'])
+        self.assertEqual(390, captured[-1]['direct']['potential_damage'])
+        self.assertEqual(390, captured[-1]['direct']['damage'])
+
+    def test_dead_vehicle_blocks_server_projectile_without_taking_damage(self):
+        state, unused_authority = self._live_state()
+        wreck = state.players[2]
+        wreck.health = 0
+        wreck.alive = False
+        state.players[3] = _player(3, team=2, x=0.0, z=40.0)
+        captured = []
+        original = state.resolve_projectile
+
+        def capture(player_id, message):
+            captured.append(copy.deepcopy(message))
+            return original(player_id, message)
+
+        state.resolve_projectile = capture
+        projectile_id = self._launch_human(state)
+        self._tick_until_terminal(state, projectile_id)
+
+        self.assertEqual(1000, state.players[3].health)
+        self.assertTrue(captured[-1]['hit_vehicle'])
+        self.assertIsNone(captured[-1]['direct'])
+        self.assertEqual(
+            {'target_kind': 'player', 'target_id': 2},
+            captured[-1]['wreck_hit'])
+        self.assertLess(captured[-1]['impact'][2], wreck.z)
+
+    def test_dead_bot_blocks_server_projectile_without_taking_damage(self):
+        state, authority = self._live_state()
+        authority._bots.apply_snapshot = lambda unused_message: None
+        wreck_id = min(state.bot_states)
+        for bot_id, bot in state.bot_states.items():
+            bot.update(x=200.0, y=0.0, z=200.0)
+        wreck = state.bot_states[wreck_id]
+        wreck.update(x=0.0, y=0.0, z=20.0, health=0, alive=False)
+        state.players[2].z = 40.0
+        captured = []
+        original = state.resolve_projectile
+
+        def capture(player_id, message):
+            captured.append(copy.deepcopy(message))
+            return original(player_id, message)
+
+        state.resolve_projectile = capture
+        projectile_id = self._launch_human(state)
+        self._tick_until_terminal(state, projectile_id)
+
+        self.assertEqual(1000, state.players[2].health)
+        self.assertTrue(captured[-1]['hit_vehicle'])
+        self.assertIsNone(captured[-1]['direct'])
+        self.assertEqual(
+            {'target_kind': 'bot', 'target_id': wreck_id},
+            captured[-1]['wreck_hit'])
+        self.assertLess(captured[-1]['impact'][2], wreck['z'])
 
     def test_disconnected_shooter_projectile_still_resolves(self):
         state, unused_authority = self._live_state()
@@ -527,7 +756,11 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
         state, authority = self._live_state()
         bot_id = sorted(state.bot_states)[0]
         bot = dict(state.bot_states[bot_id])
-        bot.update({'fire_seq': 1, 'shot_yaw': 0.0, 'shot_pitch': 0.0})
+        frozen_origin = (7.0, 8.0, 9.0)
+        bot.update({
+            'fire_seq': 1, 'shot_yaw': 0.0, 'shot_pitch': 0.0,
+            'shot_origin': frozen_origin,
+        })
         state.bot_states[bot_id].update(bot)
         state.bot_pending_projectile_launches.add((bot_id, 1))
         now = float(state.tick) / TICK_HZ
@@ -537,10 +770,71 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
         self.assertTrue(authority._launch_bot_projectile(bot, 1, now))
         projectile_id = '%d:b:%d:1' % (state.round_id, bot_id)
         self.assertIn(projectile_id, state.projectiles)
+        self.assertEqual(list(frozen_origin),
+                         state.projectiles[projectile_id]['origin'])
         self.assertEqual(20000,
                          state.projectiles[projectile_id]['max_time_ms'])
         authority._reconcile_projectiles(state._projectile_snapshot())
         self.assertTrue(authority._projectiles.contains(projectile_id))
+
+    def test_rapid_bot_clip_registers_each_edge_before_launching_it(self):
+        state, authority = self._live_state()
+        bot_id = next(bot_id for bot_id, bot in state.bot_states.items()
+                      if int(bot['team']) == 1)
+        for other_id, other in state.bot_states.items():
+            other.update(x=200.0, y=0.0, z=200.0)
+        shooter = state.bot_states[bot_id]
+        shooter.update(x=0.0, y=0.0, z=0.0, alive=True, health=1000)
+        state.players[1].x = 100.0
+        state.players[1].z = 100.0
+        state.players[2].x = 0.0
+        state.players[2].y = 0.0
+        state.players[2].z = 20.0
+        state.players[2].health = 5000
+        state.players[2].max_health = 5000
+        original_update = state.update_bot_states
+
+        def admit_edge(unused_authority, payload):
+            launch = payload['launches'][0]
+            sequence = int(launch['fire_seq'])
+            shooter['fire_seq'] = sequence
+            shooter['shell_index'] = int(launch['shell_index'])
+            state.bot_pending_projectile_launches.add((bot_id, sequence))
+            return True
+
+        state.update_bot_states = admit_edge
+        try:
+            for sequence in range(1, 5):
+                authority._route({
+                    'type': 'bot_state',
+                    'bots': [{'id': bot_id, 'fire_seq': sequence}],
+                    'launches': [{
+                        'id': bot_id, 'fire_seq': sequence,
+                        'shell_index': 0, 'class_tag': 'lightTank',
+                        'shot_yaw': 0.0, 'shot_pitch': 0.0,
+                        'shot_origin': (0.0, 1.0, 0.0),
+                    }],
+                }, float(state.tick) / TICK_HZ)
+        finally:
+            state.update_bot_states = original_update
+
+        projectile_ids = ['%d:b:%d:%d' % (
+            state.round_id, bot_id, sequence) for sequence in range(1, 5)]
+        self.assertTrue(all(projectile_id in state.projectiles
+                            for projectile_id in projectile_ids))
+        self.assertEqual(4, state._statistics_row('bot', bot_id)[
+            'shots_fired'])
+        self.assertEqual(set(), state.bot_pending_projectile_launches)
+        for unused in range(30):
+            state.tick_once(1.0 / TICK_HZ)
+            if all(projectile_id in state.projectile_tombstones
+                   for projectile_id in projectile_ids):
+                break
+        self.assertTrue(all(
+            state.projectile_tombstones.get(projectile_id, {}).get(
+                'outcome') == 'impact'
+            for projectile_id in projectile_ids))
+        self.assertLess(state.players[2].health, 5000)
 
 
 _TRACK_CRITICAL = {
@@ -550,6 +844,18 @@ _TRACK_CRITICAL = {
     'fire': False, 'ammo_rack_death': False,
     'events': [{'kind': 'device', 'name': 'leftTrackHealth',
                 'state': 'destroyed', 'cause': 'shot'}],
+}
+
+_AMMO_RACK_CRITICAL = {
+    'devices': [{'name': 'ammoBayHealth', 'hp': 0.0, 'max_hp': 100.0,
+                 'state': 'destroyed'}],
+    'destroyed': ['ammoBayHealth'], 'crew_ko': [],
+    'fire': False, 'ammo_rack_death': True,
+    'events': [
+        {'kind': 'device', 'name': 'ammoBayHealth',
+         'old_state': 'normal', 'state': 'destroyed', 'cause': 'shot'},
+        {'kind': 'ammo_rack', 'state': 'destroyed', 'cause': 'shot'},
+    ],
 }
 
 _WHOLE_CREW_CRITICAL = {
@@ -612,6 +918,8 @@ class VehicleStatisticsTest(unittest.TestCase):
             'is_he': False,
             'splash_radius': 0.0,
             'penetration_factor': 1.0,
+            'source_shot': _mounted_source_shot(
+                state, shooter_id, (0.0, 0.0, 100.0), 9.81, 200.0),
         }
         self.assertTrue(state.launch_projectile(shooter_id, launch))
         return '%d:p:%d:%d' % (state.round_id, shooter_id, shot_seq)
@@ -636,7 +944,7 @@ class VehicleStatisticsTest(unittest.TestCase):
                 'critical_target_ack_seq': target.critical_ack_seq,
                 'hull_damage': damage,
             })
-        self.assertTrue(state.resolve_projectile(SERVER_AUTHORITY_ID, {
+        resolution = {
             'type': 'projectile_resolve',
             'round_id': state.round_id,
             'authority_epoch': state.authority_epoch,
@@ -651,7 +959,10 @@ class VehicleStatisticsTest(unittest.TestCase):
             'direct': direct,
             'splash': [],
             'destructibles': [],
-        }))
+        }
+        self.assertTrue(state.resolve_projectile(
+            SERVER_AUTHORITY_ID, resolution))
+        return resolution
 
     def _assists(self, state):
         return [event for event in state.pending_events
@@ -711,6 +1022,69 @@ class VehicleStatisticsTest(unittest.TestCase):
         self.assertEqual(
             0, state.vehicle_statistics[('player', 1)][
                 'damage_assisted_track'])
+
+    def test_owner_repair_opens_a_second_server_accepted_track_break(self):
+        state = self._live_state()
+        target = state.players[2]
+        self._shoot(state, 1, 2, 0, critical=_TRACK_CRITICAL)
+        first_base = target.critical_report_base_revision
+
+        repaired = {
+            'devices': [{'name': 'leftTrackHealth', 'hp': 50.0,
+                         'max_hp': 100.0, 'state': 'critical'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False,
+            'events': [{'kind': 'device', 'name': 'leftTrackHealth',
+                        'old_state': 'destroyed', 'state': 'critical',
+                        'cause': 'repair'}],
+        }
+        self.assertTrue(state._apply_reported_health(target, {
+            'reported_health': target.health,
+            'reported_critical': repaired,
+            'reported_critical_base_revision': first_base,
+            'reported_critical_seq': 1,
+        }))
+        self.assertEqual(1, target.critical_ack_seq)
+
+        second_break = dict(_TRACK_CRITICAL)
+        second_break['events'] = [{
+            'kind': 'device', 'name': 'leftTrackHealth',
+            'old_state': 'critical', 'state': 'destroyed', 'cause': 'shot'}]
+        self._shoot(
+            state, 1, 2, 0, shot_seq=2, critical=second_break)
+
+        self.assertIn('leftTrackHealth', target.critical['destroyed'])
+        self.assertGreater(
+            target.critical_report_base_revision, first_base)
+        self.assertEqual(0, target.critical_ack_seq)
+        hits = [event for event in state.pending_events
+                if event.get('kind') == 'hit']
+        self.assertEqual(2, len(hits))
+        self.assertTrue(hits[-1]['critical_accepted'])
+
+    def test_ammo_rack_death_clamps_health_and_terminal_retry_is_idempotent(self):
+        state = self._live_state()
+        target = state.players[2]
+        target.health = 880
+        target.max_health = 880
+        target.display_health = 880
+
+        resolution = self._shoot(
+            state, 1, 2, 890, critical=_AMMO_RACK_CRITICAL)
+        self.assertTrue(state.resolve_projectile(
+            SERVER_AUTHORITY_ID, resolution))
+
+        self.assertEqual(0, target.health)
+        self.assertFalse(target.alive)
+        self.assertEqual(
+            880, state.vehicle_statistics[('player', 1)]['damage_dealt'])
+        self.assertEqual(
+            1, state.vehicle_statistics[('player', 1)]['kills'])
+        hits = [event for event in state.pending_events
+                if event.get('kind') == 'hit']
+        self.assertEqual(1, len(hits))
+        self.assertEqual(880, hits[0]['damage'])
+        self.assertTrue(hits[0]['critical']['ammo_rack_death'])
 
     def test_round_end_result_carries_the_accumulated_totals(self):
         state = self._live_state()
@@ -1051,10 +1425,20 @@ class SplashEffectsTest(unittest.TestCase):
         victim = state.bot_states[victim_id]
         impact = (float(victim['x']) + 2.0, float(victim['y']),
                   float(victim['z']))
-        with server_battle_authority.engine_modules(lambda: 0.0):
+        with server_battle_authority.engine_modules(lambda: 0.0), \
+                mock.patch.object(
+                    server_battle_authority.critical_damage,
+                    'propose_explosion', wraps=(
+                        server_battle_authority.critical_damage.
+                        propose_explosion)) as explosion:
             effects = authority._splash_effects(
                 {'shooter_kind': 'bot', 'shooter_id': 99,
-                 'shell_index': 0, 'is_he': True}, impact, None)
+                 'shell_index': 0, 'is_he': True,
+                 'source_shot':
+                    server_battle_authority._source_shot_from_descriptor(
+                        authority._bots._descriptors[99].gun.shots[0])},
+                impact, None)
+        self.assertGreater(explosion.call_count, 0)
         self.assertTrue(any(
             effect['target_id'] == victim_id and effect['damage'] > 0
             for effect in effects))
@@ -1076,10 +1460,89 @@ class SplashEffectsTest(unittest.TestCase):
         with server_battle_authority.engine_modules(lambda: 0.0):
             effects = authority._splash_effects(
                 {'shooter_kind': 'bot', 'shooter_id': 99,
-                 'shell_index': 0, 'is_he': True}, impact,
+                 'shell_index': 0, 'is_he': True,
+                 'source_shot':
+                    server_battle_authority._source_shot_from_descriptor(
+                        authority._bots._descriptors[99].gun.shots[0])}, impact,
                 {'target_kind': 'bot', 'target_id': victim_id})
         self.assertFalse(any(
             effect['target_id'] == victim_id for effect in effects))
+
+    def test_direct_he_uses_the_explosion_cone_not_the_solid_ray(self):
+        state = _state_with_authority()
+        state.request_start(1, '01_karelia')
+        state.mark_battle_ready(1, {'round_id': state.round_id})
+        authority = state.server_authority
+        authority.descriptors.add('he:test', self._he_projection())
+        descriptor = authority.descriptors.get('he:test')
+        shot = server_battle_authority._source_shot_from_descriptor(
+            descriptor.gun.shots[0])
+        target = {
+            'kind': 'player', 'id': 1, 'health': 1000,
+            'descriptor': descriptor,
+            'position': (0.0, 0.0, 20.0), 'yaw': 0.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0, 'state': {
+                'critical': {},
+            },
+            'collisions': (), 'ray_start': (0.0, 1.0, 10.0),
+            'ray_end': (0.0, 1.0, 30.0),
+        }
+        meta = {
+            'shooter_kind': 'bot', 'shooter_id': 99, 'shot_seq': 1,
+            'source_shot': shot, 'penetration_factor': 1.0,
+        }
+        projectile = {'distance': 20.0, 'position': (0.0, 1.0, 19.0)}
+
+        with mock.patch.object(
+                server_battle_authority.combat_rules, 'resolve_hull_hit',
+                return_value=(2,)), mock.patch.object(
+                    server_battle_authority.combat_rules, 'damage',
+                    return_value=120), mock.patch.object(
+                        server_battle_authority.critical_damage,
+                        'propose_explosion', return_value=(120, None)) as cone, \
+                mock.patch.object(
+                    server_battle_authority.critical_damage,
+                    'propose_direct', side_effect=AssertionError(
+                        'HE must not use a solid internal ray')):
+            effect = authority._direct_effect(meta, projectile, target)
+
+        self.assertEqual(120, effect['damage'])
+        self.assertEqual(1, cone.call_count)
+        direction = cone.call_args[0][3]
+        self.assertGreater(direction.z, 0.0)
+
+    def test_donated_descriptor_produces_a_real_he_internal_cone_hit(self):
+        descriptor = wrap(self._he_projection())
+        target = server_battle_authority._TargetMock(
+            2, 1000, descriptor, (0.0, 0.0, 0.0), 0.0,
+            {'critical': {}}, aim_yaw=0.0, gun_pitch=0.0)
+        shell = server_battle_authority._source_shot_from_descriptor(
+            descriptor.gun.shots[0])['shell']
+
+        with server_battle_authority.engine_modules(lambda: 0.0):
+            layout = (server_battle_authority.critical_damage.
+                      _offh_internal_layout(descriptor))
+            self.assertIsNotNone(layout)
+            self.assertTrue(layout['valid'])
+            engine = next(record for record in layout['targets']
+                          if record['entity'] == 'engine')
+            center = engine['center']
+            # Hull-local -> vehicle/world at yaw zero. Place the burst half a
+            # metre behind the engine so the 122 mm shell's 1.22 m cone
+            # crosses the actual donated profile volume.
+            burst = server_battle_authority.Vector3(
+                center[0], center[1] + 0.6, center[2] - 0.5)
+            direction = server_battle_authority.Vector3(0.0, 0.0, 1.0)
+            with mock.patch('random.uniform', return_value=450.0), \
+                    mock.patch('random.random', return_value=0.0):
+                unused_damage, payload = (
+                    server_battle_authority.critical_damage.propose_explosion(
+                        target, (), burst, direction, 0, shell, 99))
+
+        self.assertIsNotNone(payload)
+        self.assertIn(
+            'engineHealth',
+            set(record['name'] for record in payload['devices']))
 
 
 class NarrowPhaseTest(unittest.TestCase):
@@ -1096,9 +1559,57 @@ class NarrowPhaseTest(unittest.TestCase):
         entry = _segment_hull_entry((0.0, 1.0, 40.0), (0.0, 1.0, 10.0),
                                     target)
         self.assertIsNotNone(entry)
+        # Server authority intentionally owns only one donated hull OBB face;
+        # turret plates, spaced armor and native material flags are not part
+        # of this projection and must not be synthesized here.
+        self.assertEqual(1, len(entry['collisions']))
         collision = entry['collisions'][0]
+        self.assertEqual('hull', collision.compName)
+        self.assertFalse(hasattr(collision.matInfo, 'extra'))
         self.assertAlmostEqual(18.0, collision.matInfo.armor)
         self.assertGreater(collision.hitAngleCos, 0.9)
+
+    def test_module_trace_stops_ten_calibres_after_first_collision(self):
+        shot = server_battle_authority._source_shot_from_descriptor(
+            wrap(_projection()).gun.shots[0])
+        shot['shell']['caliber'] = 100.0
+        collisions = (
+            server_battle_authority._SyntheticCollision(
+                5.0, 1.0, 20.0, 'hull'),
+            server_battle_authority._SyntheticCollision(
+                5.99, 1.0, 0.0, 'inside'),
+            server_battle_authority._SyntheticCollision(
+                6.01, 1.0, 0.0, 'tooFar'),
+        )
+
+        limited, trace_start, trace_end = (
+            server_battle_authority._critical_vehicle_trace(
+                shot, (0.0, 0.0, 0.0), (0.0, 0.0, 10.0), collisions))
+
+        self.assertEqual([5.0, 5.99], [item.dist for item in limited])
+        self.assertAlmostEqual(0.0, trace_start.z)
+        self.assertAlmostEqual(6.0, trace_end.z)
+
+    def test_module_trace_extends_full_budget_past_a_late_chord_hit(self):
+        shot = server_battle_authority._source_shot_from_descriptor(
+            wrap(_projection()).gun.shots[0])
+        shot['shell']['caliber'] = 100.0
+        collisions = (
+            server_battle_authority._SyntheticCollision(
+                9.80, 1.0, 20.0, 'hull'),
+            server_battle_authority._SyntheticCollision(
+                10.79, 1.0, 0.0, 'inside'),
+            server_battle_authority._SyntheticCollision(
+                10.81, 1.0, 0.0, 'outside'),
+        )
+
+        limited, unused_start, trace_end = (
+            server_battle_authority._critical_vehicle_trace(
+                shot, (0.0, 0.0, 0.0),
+                (10.0, 0.0, 0.0), collisions))
+
+        self.assertEqual([9.80, 10.79], [item.dist for item in limited])
+        self.assertAlmostEqual(10.8, trace_end.x)
 
     def test_side_shot_hits_side_armor(self):
         target = self._target()

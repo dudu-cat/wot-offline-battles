@@ -285,7 +285,8 @@ class VehicleEditorWindow(object):
     def _scope_text(self, record):
         if self._language != i18n.LANGUAGE_CHINESE:
             return record["scope"]
-        affected = tuple(record.get("affectedVehicles", ()))
+        affected = tuple(record.get(
+            "affectedVehicleLabels", record.get("affectedVehicles", ())))
         if record.get("shared"):
             field_parts = record.get("fieldPath", "").split("/")
             component = record.get("component")
@@ -295,7 +296,8 @@ class VehicleEditorWindow(object):
                 self._category_label(record.get("categoryLabel", "")),
                 component or "-", record.get("nation", self.nation.get()),
                 len(affected), ", ".join(affected))
-        vehicle = record.get("vehicle", self.vehicle.get())
+        vehicle = record.get(
+            "displayVehicle", record.get("vehicle", self.vehicle.get()))
         mode = record.get("mode")
         if mode == "all":
             return "同时存入 %s 的行驶模式与攻城模式数据；一次修改会应用到两者。" % vehicle

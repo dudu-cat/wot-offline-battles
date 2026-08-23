@@ -73,6 +73,14 @@ MODULE_TARGETS = (
 	'engine', 'ammoBay', 'gun', 'turretRotator', 'leftTrack', 'rightTrack',
 	'surveyingDevice', 'radio', 'fuelTank')
 
+# Tracks are scored from the native external collision extras when those are
+# available.  A donated server descriptor deliberately carries component
+# bounds, not the client's MaterialInfo table, so absence of the two track
+# extras must not invalidate otherwise complete interior profile geometry.
+# They remain explicitly unavailable rather than being replaced with guessed
+# boxes.
+OPTIONAL_NATIVE_GEOMETRY_TARGETS = frozenset(('leftTrack', 'rightTrack'))
+
 _MODULE_EXTRA_NAMES = {
 	'engine': 'engineHealth',
 	'ammoBay': 'ammoBayHealth',
@@ -209,7 +217,24 @@ def _compiled_profile(vehicle_name):
 	key = _profile_key(vehicle_name)
 	if key is None:
 		return None, None
-	return key, _layout_profiles.PROFILES.get(key)
+	profile = _layout_profiles.PROFILES.get(key)
+	if profile is not None:
+		return key, profile
+	# #1513 names include a national catalog prefix (for example
+	# ``ussr:R11_MS-1``), while the adopted 0.8.2 profile is keyed as
+	# ``ussr:MS-1``.  Only try the suffix when the prefix really contains a
+	# digit, and only accept an exact compiled key; newer vehicles therefore
+	# still fail closed instead of being matched heuristically.
+	parts = str(vehicle_name or '').split(':', 1)
+	if len(parts) == 2 and '_' in parts[1]:
+		prefix, suffix = parts[1].split('_', 1)
+		if (any(character.isdigit() for character in prefix) and
+				any(character.isalpha() for character in prefix)):
+			alias = (key[0], _normal_name(suffix))
+			profile = _layout_profiles.PROFILES.get(alias)
+			if profile is not None:
+				return alias, profile
+	return key, None
 
 
 def _profile_record(profile):
@@ -653,7 +678,7 @@ def build_layout(vehicle_descriptor, log_build=True):
 		errors.append('compiled_profile_invalid')
 	if profile is None:
 		errors.append('compiled_vehicle_profile_missing:%s' % (
-			profile_key or vehicle_name))
+			str(profile_key or vehicle_name)))
 
 	active_crew_roles = tuple(tuple(item.get('roles', ())) for item in crew)
 	if profile is not None and profile['crew_roles'] != active_crew_roles:
@@ -732,10 +757,15 @@ def build_layout(vehicle_descriptor, log_build=True):
 					if profile is not None else None),
 			}
 		else:
-			logical_entity_sources[entity] = {
-				'mode': 'MISSING',
-			}
-			errors.append('geometry_source_missing:%s' % entity)
+			if entity in OPTIONAL_NATIVE_GEOMETRY_TARGETS:
+				logical_entity_sources[entity] = {
+					'mode': 'OPTIONAL_NATIVE_COLLISION_GEOMETRY',
+				}
+			else:
+				logical_entity_sources[entity] = {
+					'mode': 'MISSING',
+				}
+				errors.append('geometry_source_missing:%s' % entity)
 
 	required_parents = set(item['parent'] for item in candidate_specs)
 	for parent_name in sorted(required_parents):
@@ -1070,6 +1100,10 @@ def validate_layout(layout):
 		elif mode == _LAYOUT_MODE:
 			if entity not in profile_entities:
 				missing.append('geometry:' + entity)
+		elif mode == 'OPTIONAL_NATIVE_COLLISION_GEOMETRY':
+			# Honest server boundary: no native MaterialInfo was donated, and no
+			# synthetic track box participates in the interior resolver.
+			continue
 		else:
 			missing.append('geometry_source:' + entity)
 	parent_transforms = layout.get('parent_transforms', {})
@@ -1835,15 +1869,290 @@ def _primitive_distance_record(point, target, primitive):
 	return _vector_length(delta), closest
 
 
+def _vector_add(first, second):
+	return tuple(float(first[index]) + float(second[index])
+		for index in range(3))
+
+
+def _vector_subtract(first, second):
+	return tuple(float(first[index]) - float(second[index])
+		for index in range(3))
+
+
+def _vector_scale(vector, factor):
+	return tuple(float(value) * float(factor) for value in vector)
+
+
+def _vector_dot(first, second):
+	return sum(float(first[index]) * float(second[index])
+		for index in range(3))
+
+
+def _vector_cross(first, second):
+	return (
+		float(first[1]) * float(second[2]) -
+			float(first[2]) * float(second[1]),
+		float(first[2]) * float(second[0]) -
+			float(first[0]) * float(second[2]),
+		float(first[0]) * float(second[1]) -
+			float(first[1]) * float(second[0]),
+	)
+
+
+def _vector_near_zero(vector, epsilon=0.00000001):
+	return _vector_dot(vector, vector) <= float(epsilon) * float(epsilon)
+
+
+def _triple_product(first, second, third):
+	return _vector_cross(_vector_cross(first, second), third)
+
+
+def _primitive_center(target, primitive):
+	center = primitive.get('center', target.get('center'))
+	if center is not None:
+		return tuple(float(value) for value in center)
+	minimum = primitive.get('minimum', target.get('minimum'))
+	maximum = primitive.get('maximum', target.get('maximum'))
+	return tuple((float(minimum[index]) + float(maximum[index])) * 0.5
+		for index in range(3))
+
+
+def _yaw_vector(vector, degrees):
+	angle = math.radians(float(degrees or 0.0))
+	cosine = math.cos(angle)
+	sine = math.sin(angle)
+	return (
+		float(vector[0]) * cosine - float(vector[2]) * sine,
+		float(vector[1]),
+		float(vector[0]) * sine + float(vector[2]) * cosine,
+	)
+
+
+def _primitive_support(target, primitive, direction):
+	'''Farthest point of one convex internal primitive in ``direction``.'''
+	shape = str(primitive.get('shape', 'aabb') or 'aabb').lower()
+	center = _primitive_center(target, primitive)
+	direction = tuple(float(value) for value in direction)
+	direction_length = _vector_length(direction)
+	unit = ((1.0, 0.0, 0.0) if direction_length <= 0.00000001 else
+		tuple(value / direction_length for value in direction))
+	if shape == 'sphere':
+		radius = max(0.0, float(primitive.get('radius', 0.0) or 0.0))
+		return _vector_add(center, _vector_scale(unit, radius))
+	if shape == 'ellipsoid':
+		radii = tuple(max(0.0001, float(value)) for value in primitive.get(
+			'radii', primitive.get('half_extents', target.get(
+				'half_extents', (0.1, 0.1, 0.1)))))
+		yaw = float(primitive.get('rotation_yaw_degrees', target.get(
+			'rotation_yaw_degrees', 0.0)) or 0.0)
+		local_direction = _yaw_vector(direction, -yaw)
+		denominator = math.sqrt(sum(
+			(radii[index] * local_direction[index]) ** 2
+			for index in range(3)))
+		if denominator <= 0.00000001:
+			return center
+		local_support = tuple(
+			(radii[index] * radii[index] * local_direction[index]) /
+			denominator for index in range(3))
+		return _vector_add(center, _yaw_vector(local_support, yaw))
+	if shape == 'capsule':
+		radius = max(0.0, float(primitive.get('radius', 0.1) or 0.0))
+		half_length = max(0.0, float(primitive.get(
+			'half_length', 0.0) or 0.0))
+		axis_name = str(primitive.get('axis', 'y') or 'y').lower()
+		axis = {'x': (1.0, 0.0, 0.0), 'y': (0.0, 1.0, 0.0),
+			'z': (0.0, 0.0, 1.0)}.get(axis_name, (0.0, 1.0, 0.0))
+		axis = _yaw_vector(axis, primitive.get('rotation_yaw_degrees',
+			target.get('rotation_yaw_degrees', 0.0)))
+		end = _vector_scale(axis, half_length if _vector_dot(
+			direction, axis) >= 0.0 else -half_length)
+		return _vector_add(center, _vector_add(
+			end, _vector_scale(unit, radius)))
+	half = primitive.get('half_extents', target.get('half_extents'))
+	if half is None:
+		minimum = primitive.get('minimum', target.get('minimum'))
+		maximum = primitive.get('maximum', target.get('maximum'))
+		half = tuple((float(maximum[index]) - float(minimum[index])) * 0.5
+			for index in range(3))
+	half = tuple(max(0.0, float(value)) for value in half)
+	yaw = float(primitive.get('rotation_yaw_degrees', target.get(
+		'rotation_yaw_degrees', 0.0)) or 0.0)
+	local_direction = _yaw_vector(direction, -yaw)
+	local_support = tuple(half[index] if local_direction[index] >= 0.0
+		else -half[index] for index in range(3))
+	return _vector_add(center, _yaw_vector(local_support, yaw))
+
+
+def _cone_support(apex, axis, depth, tangent, direction):
+	'''Farthest point of a capped right circular cone in ``direction``.'''
+	direction = tuple(float(value) for value in direction)
+	axial = _vector_dot(direction, axis)
+	perpendicular = _vector_subtract(direction, _vector_scale(axis, axial))
+	perpendicular_length = _vector_length(perpendicular)
+	coefficient = axial + float(tangent) * perpendicular_length
+	if depth <= 0.0 or coefficient <= 0.0:
+		return tuple(apex)
+	base = _vector_add(apex, _vector_scale(axis, depth))
+	if perpendicular_length <= 0.00000001:
+		return base
+	rim_direction = _vector_scale(perpendicular, 1.0 / perpendicular_length)
+	return _vector_add(base, _vector_scale(
+		rim_direction, float(depth) * float(tangent)))
+
+
+def _gjk_line(simplex):
+	a = simplex[-1]
+	b = simplex[-2]
+	ab = _vector_subtract(b, a)
+	ao = _vector_scale(a, -1.0)
+	if _vector_dot(ab, ao) <= 0.0:
+		simplex[:] = [a]
+		return False, ao
+	direction = _triple_product(ab, ao, ab)
+	if not _vector_near_zero(direction):
+		return False, direction
+	denominator = _vector_dot(ab, ab)
+	projection = (_vector_dot(ao, ab) / denominator
+		if denominator > 0.000000000001 else 0.0)
+	if projection <= 1.0 + 0.0000001:
+		return True, (0.0, 0.0, 0.0)
+	simplex[:] = [b]
+	return False, _vector_scale(b, -1.0)
+
+
+def _gjk_triangle(simplex):
+	a = simplex[-1]
+	b = simplex[-2]
+	c = simplex[-3]
+	ab = _vector_subtract(b, a)
+	ac = _vector_subtract(c, a)
+	ao = _vector_scale(a, -1.0)
+	abc = _vector_cross(ab, ac)
+	if _vector_dot(_vector_cross(abc, ac), ao) > 0.0:
+		if _vector_dot(ac, ao) > 0.0:
+			simplex[:] = [c, a]
+			return _gjk_line(simplex)
+		simplex[:] = [b, a]
+		return _gjk_line(simplex)
+	if _vector_dot(_vector_cross(ab, abc), ao) > 0.0:
+		simplex[:] = [b, a]
+		return _gjk_line(simplex)
+	if _vector_dot(abc, ao) > 0.0:
+		return False, abc
+	simplex[:] = [b, c, a]
+	return False, _vector_scale(abc, -1.0)
+
+
+def _gjk_tetrahedron(simplex):
+	a = simplex[-1]
+	b = simplex[-2]
+	c = simplex[-3]
+	d = simplex[-4]
+	ao = _vector_scale(a, -1.0)
+	ab = _vector_subtract(b, a)
+	ac = _vector_subtract(c, a)
+	ad = _vector_subtract(d, a)
+	faces = (
+		([c, b, a], _vector_cross(ab, ac), ad),
+		([d, c, a], _vector_cross(ac, ad), ab),
+		([b, d, a], _vector_cross(ad, ab), ac),
+	)
+	for face, normal, opposite in faces:
+		if _vector_dot(normal, opposite) > 0.0:
+			normal = _vector_scale(normal, -1.0)
+		if _vector_dot(normal, ao) > 0.0:
+			simplex[:] = face
+			return _gjk_triangle(simplex)
+	return True, (0.0, 0.0, 0.0)
+
+
+def _gjk_intersects(support, initial_direction):
+	direction = tuple(float(value) for value in initial_direction)
+	if _vector_near_zero(direction):
+		direction = (1.0, 0.0, 0.0)
+	first = support(direction)
+	simplex = [first]
+	direction = _vector_scale(first, -1.0)
+	if _vector_near_zero(direction):
+		return True
+	for unused_index in range(48):
+		point = support(direction)
+		if _vector_dot(point, direction) < -0.0000001:
+			return False
+		if any(_vector_length(_vector_subtract(point, existing)) <=
+				0.00000001 for existing in simplex):
+			return False
+		simplex.append(point)
+		if len(simplex) == 2:
+			contains, direction = _gjk_line(simplex)
+		elif len(simplex) == 3:
+			contains, direction = _gjk_triangle(simplex)
+		else:
+			contains, direction = _gjk_tetrahedron(simplex)
+		if contains or _vector_near_zero(direction):
+			return True
+	return False
+
+
+def _primitive_intersects_cone(target, primitive, apex, axis, depth,
+		tangent):
+	center = _primitive_center(target, primitive)
+	cone_center = _vector_add(apex, _vector_scale(axis, depth * 0.5))
+	initial = _vector_subtract(center, cone_center)
+	def support(direction):
+		return _vector_subtract(
+			_primitive_support(target, primitive, direction),
+			_cone_support(apex, axis, depth, tangent,
+				_vector_scale(direction, -1.0)))
+	return _gjk_intersects(support, initial)
+
+
+def _primitive_cone_entry(target, primitive, apex, axis, depth, tangent):
+	'''First axial depth at which the growing finite cone touches a primitive.'''
+	if not _primitive_intersects_cone(
+			target, primitive, apex, axis, depth, tangent):
+		return None
+	distance, closest = _primitive_distance_record(
+		apex, target, primitive)
+	if distance <= 0.0000001:
+		return 0.0
+	# Preserve an exact entry for points/volumes whose apex-nearest point is
+	# already inside the cone. The binary convex-intersection search below is
+	# needed only for the edge-straddling case that the old closest-point-only
+	# test missed.
+	delta = _vector_subtract(closest, apex)
+	axial = _vector_dot(delta, axis)
+	radial = _vector_length(_vector_subtract(
+		delta, _vector_scale(axis, axial)))
+	if (axial >= -0.0000001 and axial <= float(depth) + 0.0000001 and
+			radial <= max(0.0, axial) * float(tangent) + 0.0000001):
+		return max(0.0, axial)
+	low = 0.0
+	high = float(depth)
+	for unused_index in range(14):
+		middle = (low + high) * 0.5
+		if _primitive_intersects_cone(
+				target, primitive, apex, axis, middle, tangent):
+			high = middle
+		else:
+			low = middle
+	return high
+
+
 @TRACE_CALL('modules', 'resolve_internal_explosion')
 def resolve_explosion(layout, parent_contexts, radius_m, mode='sphere',
-		cone_cos=0.92387953, excluded_entities=None):
+		cone_cos=0.92387953, excluded_entities=None, cone_depth_m=None):
 	if not layout or not layout.get('valid'):
 		return ()
 	radius = max(0.0, float(radius_m or 0.0))
 	if radius <= 0.0001:
 		return ()
 	excluded = set(excluded_entities or ())
+	cone_cosine = max(0.0001, min(1.0, float(cone_cos)))
+	cone_tangent = (math.sqrt(max(0.0, 1.0 - cone_cosine * cone_cosine)) /
+		cone_cosine)
+	cone_depth = (max(0.0, float(cone_depth_m))
+		if cone_depth_m is not None else radius * cone_cosine)
 	candidates = []
 	for target in layout.get('targets', ()):
 		if target.get('entity') in excluded:
@@ -1870,8 +2179,13 @@ def resolve_explosion(layout, parent_contexts, radius_m, mode='sphere',
 			if to_length > 0.0001:
 				alignment = sum(direction[axis] * to_target[axis]
 					for axis in range(3)) / to_length
-			if mode == 'cone' and alignment + 0.0001 < float(cone_cos):
-				continue
+			cone_entry = None
+			if mode == 'cone':
+				cone_entry = _primitive_cone_entry(
+					target, primitive, point, direction, cone_depth,
+					cone_tangent)
+				if cone_entry is None:
+					continue
 			record = dict(target)
 			record['primitive_id'] = primitive.get('primitive_id')
 			record['physical_interval_index'] = primitive_index
@@ -1881,6 +2195,9 @@ def resolve_explosion(layout, parent_contexts, radius_m, mode='sphere',
 			record['explosion_scale'] = max(0.0, 1.0 - distance / radius)
 			record['explosion_mode'] = mode
 			record['explosion_alignment'] = alignment
+			if cone_entry is not None:
+				record['cone_entry_axial_m'] = float(cone_entry)
+				record['cone_depth_m'] = float(cone_depth)
 			record['path_length_m'] = 0.0
 			record['penetration_resistance_mm'] = 0.0
 			record['penetration_resistance_source'] = (
@@ -1890,7 +2207,8 @@ def resolve_explosion(layout, parent_contexts, radius_m, mode='sphere',
 			record['projectile_stopped'] = False
 			candidates.append(record)
 	candidates.sort(key=lambda item: (
-		float(item.get('explosion_distance_m', 0.0)),
+		float(item.get('cone_entry_axial_m', item.get(
+			'explosion_distance_m', 0.0))),
 		item.get('parent', ''), item.get('zone_id', ''),
 		item.get('physical_interval_index', 0)))
 	result = []

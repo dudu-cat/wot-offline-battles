@@ -72,8 +72,7 @@ and configuration stay in
 mods\configs\offline_lan_0922. Other authors' .wotmod files stay where they
 are.
 
-Two limits to expect. Bot tracks and road wheels do not turn, so a broken enemy
-track has no visual cue. The exact #1513 client is 32-bit; its executable is
+One limit to expect. The exact #1513 client is 32-bit; its executable is
 large-address-aware and can normally address about 4 GB on 64-bit Windows, but
 a very long session can still run out of memory and exit. Restart the client
 between long sessions.
@@ -83,8 +82,11 @@ Cancelling is nonfatal, but other PCs may remain unable to connect. Run this
 trusted-LAN server only on a network you trust.
 
 The launcher keeps its settings in
-%LOCALAPPDATA%\WoTOfflineBattles\launcher.json and writes the server log of a
-hosted battle to %LOCALAPPDATA%\WoTOfflineBattles\server.log.
+%LOCALAPPDATA%\WoTOfflineBattles\launcher.json. "Create error report" copies
+only the exact log slices from the latest launcher game session into a ZIP in
+%LOCALAPPDATA%\WoTOfflineBattles\reports, then selects that ZIP in Windows
+Explorer. Player and hidden-worker logs are kept separate; configuration,
+vehicle profiles, saved results, and other user data are never included.
 
 If the hosted server never opens port 28782, another server may already use
 that port. Close it and start the game again.

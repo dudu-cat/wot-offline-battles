@@ -39,6 +39,23 @@ def wire_copy(value):
     return json.loads(json.dumps(value, separators=(',', ':')))
 
 
+def source_shot(speed, gravity, maximum, is_he=False, radius=0.0,
+                damage=(390.0, 150.0), deadeye=False):
+    return {
+        'speed': speed,
+        'gravity': gravity,
+        'maxDistance': maximum,
+        'piercingPower': [220.0, 200.0],
+        'deadeye': bool(deadeye),
+        'shell': {
+            'kind': 'HIGH_EXPLOSIVE' if is_he else 'ARMOR_PIERCING',
+            'caliber': 105.0,
+            'damage': list(damage),
+            'explosionRadius': radius,
+        },
+    }
+
+
 class ProjectileWireTests(unittest.TestCase):
     def test_player_siege_snapshot_pair_is_strict_when_present(self):
         self.assertTrue(module._valid_player_siege_contract({}))
@@ -70,6 +87,7 @@ class ProjectileWireTests(unittest.TestCase):
         client.server_capabilities = [
             module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+            module.PROJECTILE_WRECK_HIT_CAPABILITY,
             module.RANDOM_MAP_CAPABILITY,
         ]
         with client._outbound_lock:
@@ -91,12 +109,20 @@ class ProjectileWireTests(unittest.TestCase):
             'penetration_factor': 1.25,
         }
         values.update(overrides)
+        frozen_shot = values.get('source_shot')
+        if frozen_shot is None:
+            frozen_shot = source_shot(
+                math.sqrt(sum(component * component
+                              for component in values['velocity'])),
+                values['gravity'], values['max_distance'],
+                values['is_he'], values['splash_radius'])
         return client.send_projectile_launch(
             shooter_kind, shooter_id, shot_seq, values['shell_index'],
             values['origin'], values['velocity'], values['gravity'],
             values['max_distance'], values['max_time_ms'], values['is_he'],
             values['splash_radius'], authority_epoch=authority_epoch,
-            penetration_factor=values['penetration_factor'])
+            penetration_factor=values['penetration_factor'],
+            source_shot=frozen_shot)
 
     def test_player_launch_is_frozen_fifo_wire_and_commits_sequence(self):
         client = self.active_client()
@@ -117,6 +143,7 @@ class ProjectileWireTests(unittest.TestCase):
             'type', 'round_id', 'shooter_kind', 'shooter_id', 'shot_seq',
             'shell_index', 'origin', 'velocity', 'gravity', 'max_distance',
             'max_time_ms', 'is_he', 'splash_radius', 'penetration_factor',
+            'source_shot',
         }, set(message))
         self.assertEqual('player', message['shooter_kind'])
         self.assertEqual(7, message['shooter_id'])
@@ -160,6 +187,13 @@ class ProjectileWireTests(unittest.TestCase):
 
     def test_launch_rejects_non_plain_nonfinite_and_out_of_bounds_physics(self):
         client = self.active_client()
+        default_speed = math.sqrt(11300.0)
+        valid_source = source_shot(
+            default_speed, 9.81, 720.0, True, 4.5)
+        extra_source = wire_copy(valid_source)
+        extra_source['shell']['unknown'] = 1
+        tuple_source = wire_copy(valid_source)
+        tuple_source['piercingPower'] = (220.0, 200.0)
 
         invalid = (
             {'origin': (1.0, 2.0, 3.0)},
@@ -171,6 +205,10 @@ class ProjectileWireTests(unittest.TestCase):
             {'max_time_ms': 20001},
             {'penetration_factor': 101.0},
             {'is_he': False, 'splash_radius': 1.0},
+            {'source_shot': dict(valid_source, speed=700.0)},
+            {'source_shot': dict(valid_source, gravity=10.0)},
+            {'source_shot': extra_source},
+            {'source_shot': tuple_source},
         )
         for values in invalid:
             with self.subTest(values=values):
@@ -194,7 +232,8 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual(1, client.send_fire(
             shell_index=1, position=[1.0, 2.0, 3.0],
             velocity=[100.0, 0.0, 0.0], gravity=9.81,
-            max_distance=500.0, max_time_ms=5000))
+            max_distance=500.0, max_time_ms=5000,
+            source_shot=source_shot(100.0, 9.81, 500.0)))
         self.assertEqual(
             'projectile_launch', client._outbound_queue[0][1]['type'])
 
@@ -280,6 +319,39 @@ class ProjectileWireTests(unittest.TestCase):
             [0.0, 0.0, 0.0], None, [], hit_vehicle=True))
 
         self.assertNotIn('hit_vehicle', client._outbound_queue[-1][1])
+
+    def test_wreck_impact_is_a_strict_presentation_only_field(self):
+        client = self.active_client()
+        wreck_hit = {'target_kind': 'bot', 'target_id': 17}
+
+        self.assertTrue(client.send_projectile_resolve(
+            4, 'player:7:1', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], None, [], hit_vehicle=True,
+            wreck_hit=wreck_hit))
+        message = client._outbound_queue[-1][1]
+        self.assertEqual(wreck_hit, message['wreck_hit'])
+        self.assertIsNone(message['direct'])
+
+        self.assertFalse(client.send_projectile_resolve(
+            4, 'player:7:2', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], self.effect('bot', 17), [],
+            hit_vehicle=True, wreck_hit=wreck_hit))
+        self.assertFalse(client.send_projectile_resolve(
+            4, 'player:7:2', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], None, [], hit_vehicle=False,
+            wreck_hit=wreck_hit))
+        self.assertFalse(client.send_projectile_resolve(
+            4, 'player:7:2', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], None, [], hit_vehicle=True,
+            wreck_hit={'target_kind': 'bot', 'target_id': True}))
+
+        client.server_capabilities.remove(
+            module.PROJECTILE_WRECK_HIT_CAPABILITY)
+        self.assertTrue(client.send_projectile_resolve(
+            4, 'player:7:2', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], None, [], hit_vehicle=True,
+            wreck_hit=wreck_hit))
+        self.assertNotIn('wreck_hit', client._outbound_queue[-1][1])
 
     def test_random_map_requires_an_advertised_server_capability(self):
         client = self.active_client()
@@ -369,9 +441,20 @@ class ProjectileWireTests(unittest.TestCase):
         }
 
     def test_welcome_requires_server_echoed_capability(self):
+        self.assertEqual(
+            'projectile_ledger_v2', module.PROJECTILE_LEDGER_CAPABILITY)
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
         client._handle_message(self.welcome([]))
+        self.assertFalse(client.ready)
+        self.assertEqual(
+            'projectile ledger capability mismatch', client.last_error)
+
+        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client.running = True
+        client._handle_message(self.welcome([
+            'projectile_ledger_v1',
+            module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY]))
         self.assertFalse(client.ready)
         self.assertEqual(
             'projectile ledger capability mismatch', client.last_error)
@@ -397,6 +480,8 @@ class ProjectileWireTests(unittest.TestCase):
             'shooter_kind': 'player',
             'shooter_id': 7,
             'source_vehicle': 'ussr:R11_MS-1',
+            'source_shot': source_shot(
+                math.sqrt(10100.0), 9.81, 500.0),
             'shot_seq': 1,
             'shell_index': 0,
             'team': 1,

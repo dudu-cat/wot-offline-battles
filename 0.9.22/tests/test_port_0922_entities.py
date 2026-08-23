@@ -687,6 +687,21 @@ class _Sender(object):
 
 
 class AvatarServerBridgeTests(unittest.TestCase):
+    def test_damaged_device_monitor_delegates_to_runtime_owner(self):
+        module = _avatar_bridge_module()
+        monitored = []
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender(), on_monitor_vehicle_devices=lambda vehicle_id:
+            monitored.append(vehicle_id) or True)
+
+        self.assertTrue(bridge.monitorVehicleDamagedDevices(91))
+        self.assertTrue(bridge.monitorVehicleDamagedDevices(0))
+
+        self.assertEqual([91, 0], monitored)
+
     def test_vehicle_pose_is_prepared_before_native_enter_barrier(self):
         module = _avatar_bridge_module()
         prepared = []

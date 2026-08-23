@@ -134,7 +134,10 @@ does not follow a target and the target may dodge it.
 Direct fire and SPG fire use moving-target lead before launch. The same launch
 record drives local and relayed tracer presentation.
 
-The matching server advertises and requires `projectile_ledger_v1`. It owns
+The matching server advertises and requires `projectile_ledger_v2`. Version 2
+also freezes the mounted shell law in every launch, so clients and servers
+with the older mandatory launch shape fail during capability negotiation
+instead of accepting a battle and rejecting its first shot. It owns
 launch identity, checked-through progress, active snapshots, authority epochs
 and terminal tombstones. A launched shell remains live if its shooter leaves;
 an elected successor restores active records and continues only from the

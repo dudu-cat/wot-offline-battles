@@ -20,7 +20,8 @@ from gui.mods.offline_lan_0922.authority_worker_probe import \
     AuthorityWorkerProbe, write_probe_record
 from gui.mods.offline_lan_0922.battle_feedback import (
     SixthSenseController, VehicleStatePresenter)
-from gui.mods.offline_lan_0922.bot_runtime import BotRuntime, PROBE_KINDS
+from gui.mods.offline_lan_0922.bot_runtime import (
+    BOT_WATER_AVOID_DEPTH, BotRuntime, PROBE_KINDS)
 from gui.mods.offline_lan_0922.entities.avatar_server import AvatarServerBridge
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
@@ -38,8 +39,8 @@ from gui.mods.offline_lan_0922.projectile_runtime import (
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
-    ballistics, combat_rules, critical_damage, destructibles_compat,
-    gun_mechanics,
+    ballistics, combat_rules, critical_damage, descriptor_donation,
+    destructibles_compat, gun_mechanics, lan_client as lan_protocol,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
     prebaked_navigation, native_mapping_mask, spotting, tank_collision,
     vehicle_blacklist, vehicle_physics, world_collision)
@@ -89,7 +90,13 @@ TARGET_OUTLINE_SECONDS = 0.05
 BOT_DESTRUCTIBLE_SECONDS = 0.10
 BOT_DESTRUCTIBLE_TRAVEL_METRES = 3.0
 BOT_SOFT_RECAST_BUDGET = 24
+# A bot already beyond the shared baked/native limit may still choose an
+# escape corridor below; otherwise the first wet sample traps it.
+BOT_WATER_ESCAPE_DEEPEN_EPSILON = 0.10
+BOT_WATER_ESCAPE_IMPROVEMENT = 0.15
 CRITICAL_REPAIR_NETWORK_SECONDS = 1.0
+# tankmen.xml commander_expert.delay in the pinned #1513 client.
+EXPERT_DEVICE_DELAY_SECONDS = 4.0
 PROJECTILE_PROGRESS_SECONDS = 0.10
 PROJECTILE_MAX_TIME_MS = 20000
 PROJECTILE_MAX_ACTIVE = 128
@@ -856,6 +863,32 @@ def _selected_vehicle_has_sixth_sense():
     return False
 
 
+def _crew_has_finished_skill(crew, wanted):
+    """Return whether one mounted crewman has a finished active perk."""
+    wanted = str(wanted).lower()
+    for entry in (crew or ()):
+        member = (entry[1] if isinstance(entry, tuple) and len(entry) == 2
+                  else entry)
+        if member is None:
+            continue
+        skills = getattr(member, 'skills', None)
+        if skills is None:
+            skills = getattr(
+                getattr(member, 'descriptor', None), 'skills', ())
+        for skill in (skills or ()):
+            if str(getattr(skill, 'name', skill)).lower() != wanted:
+                continue
+            if not bool(getattr(skill, 'isActive', True)):
+                continue
+            try:
+                level = float(getattr(skill, 'level', 100.0))
+            except (TypeError, ValueError):
+                level = 0.0
+            if level >= 100.0:
+                return True
+    return False
+
+
 class _LANInputSender(object):
 
     def __init__(self, owner):
@@ -934,6 +967,8 @@ class _LANInputSender(object):
         ram_contact = ram_getter() if callable(ram_getter) else None
         keyword_args = {
             'speed': getattr(self.owner, '_local_speed', 0.0),
+            'pitch': getattr(self.owner, '_local_pitch', 0.0),
+            'roll': getattr(self.owner, '_local_roll', 0.0),
             'ram_contact': ram_contact,
             'reported_health': health,
             'reported_critical': (report or {}).get('critical'),
@@ -1001,6 +1036,12 @@ class BattleRuntime(object):
             if PERFORMANCE_DIAGNOSTICS else None)
         self._sixth_sense = None
         self._has_sixth_sense = False
+        self._has_expert = False
+        self._has_deadeye = False
+        self._expert_visibility_enabled = False
+        self._expert_target_id = 0
+        self._expert_target_due = 0.0
+        self._expert_target_signature = None
         self._records = {}
         self._last_snapshot = None
         self._last_frame_time = None
@@ -1121,6 +1162,10 @@ class BattleRuntime(object):
         self._drown_time = 0.0
         self._drown_level = 0
         self._drown_started = None
+        self._overturn_check = 0.0
+        self._overturn_time = 0.0
+        self._overturn_level = 0
+        self._overturn_started = None
         self._outlined_engine_id = None
         self._outlined_entity = None
         self._outlined_vehicle = None
@@ -1204,6 +1249,12 @@ class BattleRuntime(object):
         self._has_sixth_sense = (
             False if self._worker_mode else
             _selected_vehicle_has_sixth_sense())
+        self._has_expert = False
+        self._has_deadeye = False
+        self._expert_visibility_enabled = False
+        self._expert_target_id = 0
+        self._expert_target_due = 0.0
+        self._expert_target_signature = None
         self._last_snapshot = None
         self._last_frame_time = None
         self._standard_space_visibility = None
@@ -1316,6 +1367,10 @@ class BattleRuntime(object):
         self._drown_time = 0.0
         self._drown_level = 0
         self._drown_started = None
+        self._overturn_check = 0.0
+        self._overturn_time = 0.0
+        self._overturn_level = 0
+        self._overturn_started = None
         self._next_spotting_time = 0.0
         self._foliage = None
         projectile_now = self._clock()
@@ -1392,7 +1447,13 @@ class BattleRuntime(object):
                 int(local_identity.get('team', self.client.team)),
                 arena_type_id=getattr(arena_type, 'id', 0))
             lobby_boundary = self._preflight_lobby_retirement()
-            self._garage_loadout_snapshot()
+            garage_loadout = self._garage_loadout_snapshot()
+            self._has_expert = (
+                not self._worker_mode and _crew_has_finished_skill(
+                    garage_loadout.get('crew'), 'commander_expert'))
+            self._has_deadeye = (
+                not self._worker_mode and _crew_has_finished_skill(
+                    garage_loadout.get('crew'), 'gunner_sniper'))
             self._install_battle_gui_guard()
             self._enter_battle_loading()
             self._retire_lobby_entities(lobby_boundary)
@@ -2050,6 +2111,8 @@ class BattleRuntime(object):
                 on_leave=self._defer_avatar_leave,
                 on_vehicle_enter=self._prepare_local_presentation,
                 on_viewpoint_switch=self._switch_postmortem_viewpoint,
+                on_monitor_vehicle_devices=(
+                    self.monitor_vehicle_damaged_devices),
                 # ClientArena starts in WAITING.  Keep that stock state while
                 # bot presentations finish, then publish PREBATTLE exactly
                 # once from on_battle_live after the shared ready barrier.
@@ -2264,6 +2327,7 @@ class BattleRuntime(object):
                 motion_resolver=self._resolve_bot_motion,
                 motion_report=self._report_bot_destructible_contact,
                 world_receipt_probe=self._direction_world_receipt,
+                water_depth_probe=self._water_depth,
                 baked_graph=self._navigation_graph,
                 # Keep the mature 0.8.2 authority model: the copied physics
                 # integrator owns bot poses and the engine interpolates those
@@ -3358,7 +3422,8 @@ class BattleRuntime(object):
                 return None
             height = float(hit[0].y)
             if height <= float(hint_y) + 4.5:
-                if self._water_depth((x, height, z)) > 1.0:
+                if self._water_depth((x, height, z)) > \
+                        BOT_WATER_AVOID_DEPTH:
                     return None
                 return height
             probe_top = height - 0.35
@@ -3373,6 +3438,9 @@ class BattleRuntime(object):
                          descriptor=None):
         """Copy the 0.8.2 dual-height, three-lane hull corridor probe."""
         x, y, z = _xyz(position)
+        current_water = self._water_depth((x, y, z))
+        wet_escape = current_water > BOT_WATER_AVOID_DEPTH
+        last_water = current_water
         far_distance = 20.0 if abs(float(speed or 0.0)) > 5.0 else 15.0
         previous_y = y
         previous_distance = 0.0
@@ -3413,9 +3481,15 @@ class BattleRuntime(object):
                         'water': False, 'slope': 99.0}
             next_y = float(ground[0].y)
             water_depth = self._water_depth((nx, next_y, nz))
-            if water_depth > 1.0:
+            if (wet_escape and
+                    water_depth > current_water +
+                    BOT_WATER_ESCAPE_DEEPEN_EPSILON):
                 return {'clear': False, 'collision': False,
                         'water': True, 'slope': 0.0}
+            if not wet_escape and water_depth > BOT_WATER_AVOID_DEPTH:
+                return {'clear': False, 'collision': False,
+                        'water': True, 'slope': 0.0}
+            last_water = water_depth
             delta = next_y - previous_y
             slope = delta / max(0.1, run)
             if abs(slope) > abs(maximum_slope):
@@ -3502,6 +3576,12 @@ class BattleRuntime(object):
                             'water': False, 'slope': slope}
             previous_y = next_y
             previous_distance = distance
+        if (wet_escape and
+                last_water > max(
+                    BOT_WATER_AVOID_DEPTH,
+                    current_water - BOT_WATER_ESCAPE_IMPROVEMENT)):
+            return {'clear': False, 'collision': False,
+                    'water': True, 'slope': 0.0}
         result = {'clear': True, 'collision': False,
                   'water': False, 'slope': maximum_slope}
         if deferred:
@@ -3696,6 +3776,109 @@ class BattleRuntime(object):
         self._apply_health(record, state, 0, drowning_reason)
         return True
 
+    def _present_overturn_level(self, level):
+        status_group = getattr(
+            self._runtime.constants, 'VEHICLE_MISC_STATUS', None)
+        levels = getattr(
+            self._runtime.constants, 'OVERTURN_WARNING_LEVEL', None)
+        callback = getattr(self._avatar, 'updateVehicleMiscStatus', None)
+        if (status_group is None or levels is None or
+                not hasattr(status_group, 'VEHICLE_IS_OVERTURNED') or
+                not callable(callback) or self._server is None):
+            return False
+        if level == 2:
+            warning_level = levels.DANGER
+            started = (self._overturn_started
+                       if self._overturn_started is not None
+                       else self._server_clock())
+            period = (float(started), 30.0)
+        elif level == 1:
+            warning_level = levels.CAUTION
+            period = (0.0, 0.0)
+        else:
+            warning_level = levels.SAFE
+            period = (0.0, 0.0)
+        callback(
+            self._server.vehicle_id,
+            int(status_group.VEHICLE_IS_OVERTURNED),
+            int(warning_level), period)
+        return True
+
+    def _tick_overturn(self, dt, now):
+        """Present #1513 overturn warning and its 30 second self-destruction."""
+        if dt <= 0.0 or self._server is None:
+            return False
+        record = self._records.get('player:%s' % self.client.player_id)
+        if record is None:
+            return False
+        authoritative = record.get('state') or {}
+        if (not bool(authoritative.get('alive', True)) or
+                _number(authoritative.get('health', 1.0)) <= 0.0):
+            return False
+        entity = self._server_entity(record['engine_id'])
+        if entity is None or _number(getattr(entity, 'health', 0.0)) <= 0.0:
+            return False
+        condition = getattr(
+            self._runtime.constants, 'OVERTURN_CONDITION', None)
+        ignore_delay = _number(
+            getattr(condition, 'IGNOR_DELAY', 0.1), 0.1)
+        warning_cosine = _number(
+            getattr(condition, 'WARNING_COSINE',
+                    math.cos(math.radians(70.0))),
+            math.cos(math.radians(70.0)))
+        onboard_cosine = _number(
+            getattr(condition, 'ONBOARD_COSINE',
+                    math.cos(math.radians(80.0))),
+            math.cos(math.radians(80.0)))
+        up_cosine = math.cos(float(self._local_pitch)) * math.cos(
+            float(self._local_roll))
+        if up_cosine <= onboard_cosine:
+            level = 2
+        elif up_cosine <= warning_cosine:
+            level = 1
+        else:
+            level = 0
+        if level == 0:
+            self._overturn_check = 0.0
+            self._overturn_time = 0.0
+            self._overturn_started = None
+            entity._offh_overturned = False
+            self._avatar._offh_overturned = False
+            if self._overturn_level != 0:
+                self._overturn_level = 0
+                self._present_overturn_level(0)
+            return False
+        self._overturn_check += float(dt)
+        if self._overturn_check + 0.000001 < max(0.0, ignore_delay):
+            return False
+        if level != self._overturn_level:
+            self._overturn_level = level
+            self._overturn_time = 0.0
+            self._overturn_started = (
+                self._server_clock() if level == 2 else None)
+            self._present_overturn_level(level)
+        entity._offh_overturned = level == 2
+        self._avatar._offh_overturned = level == 2
+        if level != 2:
+            self._overturn_time = 0.0
+            self._overturn_started = None
+            return False
+        self._overturn_time += float(dt)
+        if self._overturn_time + 0.000001 < 30.0:
+            return False
+        overturn_reason = self._attack_reason('OVERTURN', 7)
+        state = dict(record.get('state') or {})
+        state['health'] = 0
+        state['alive'] = False
+        state['display_health'] = 0
+        state['death_reason'] = overturn_reason
+        record['state'] = state
+        self._queue_local_damage_report(
+            reason=overturn_reason, display_health=0,
+            attribute_attacker=False)
+        self._apply_health(record, state, 0, overturn_reason)
+        return True
+
     def _has_los(self, observer, target):
         start = self._vector((observer[0], observer[1] + 2.5,
                               observer[2]))
@@ -3746,7 +3929,8 @@ class BattleRuntime(object):
                 continue
             point = (x, ground, z)
             water_depth = self._water_depth(point)
-            if water_depth > 1.0 or not segment_clear(current, point):
+            if (water_depth > BOT_WATER_AVOID_DEPTH or
+                    not segment_clear(current, point)):
                 continue
             occluded = not self._has_los(point, target_position)
             if not occluded:
@@ -3762,7 +3946,8 @@ class BattleRuntime(object):
                 if peek_y is None:
                     continue
                 peek_point = (peek_x, peek_y, peek_z)
-                if (self._water_depth(peek_point) <= 1.0 and
+                if (self._water_depth(peek_point) <=
+                        BOT_WATER_AVOID_DEPTH and
                         segment_clear(point, peek_point) and
                         self._has_los(peek_point, target_position)):
                     peek = peek_point
@@ -3883,6 +4068,8 @@ class BattleRuntime(object):
     def _update_local_presentation(self, entity, dt=0.0):
         if self._local_matrix is None or self._local_model is None:
             raise RuntimeError('player presentation is not attached')
+        previous_yaw = float(getattr(
+            self._local_matrix, 'yaw', self._local_yaw))
         previous_position = _xyz(self._local_matrix.translation)
         position = self._vector(self._local_position)
         dt = max(0.0, float(dt))
@@ -3912,9 +4099,45 @@ class BattleRuntime(object):
             entity, position, self._local_yaw, self._local_matrix,
             self._local_speed, self._local_turn_speed,
             velocity, acceleration)
+        self._reset_full_turret_sniper_aim(previous_yaw)
         self._local_camera_velocity = velocity
         self._update_local_tracks(entity)
         return position
+
+    def _reset_full_turret_sniper_aim(self, previous_yaw):
+        """Keep #1513's world aim stable across a copied hull-yaw step."""
+        yaw_delta = ((float(self._local_yaw) - float(previous_yaw) + math.pi) %
+                     (2.0 * math.pi) - math.pi)
+        if abs(yaw_delta) <= 0.000001:
+            return False
+        handler = getattr(self._avatar, 'inputHandler', None)
+        modes = getattr(self._runtime.avatar_input_handler, '_CTRL_MODE', None)
+        if (handler is None or modes is None or
+                getattr(handler, '_AvatarInputHandler__ctrlModeName', None) !=
+                modes.SNIPER):
+            return False
+        descriptor = self._local_descriptor
+        if descriptor is None and self._server is not None:
+            entity = self._server_entity(self._server.vehicle_id)
+            descriptor = getattr(entity, 'typeDescriptor', None)
+        gun = _field(descriptor, 'gun')
+        # Exact #1513 SniperControlMode enables horizontal stabilization only
+        # for a fully rotating turret. Limited-traverse and turretless guns
+        # intentionally remain hull-relative and must keep following the hull.
+        if gun is None or _field(gun, 'turretYawLimits') is not None:
+            return False
+        control = getattr(handler, '_AvatarInputHandler__curCtrl', None)
+        camera = getattr(control, 'camera', None)
+        aiming_system = getattr(camera, 'aimingSystem', None)
+        reset = getattr(aiming_system, 'resetIdealDirection', None)
+        if not callable(reset):
+            raise RuntimeError(
+                '#1513 sniper world-aim reset boundary is unavailable')
+        # SniperAimingSystem retains mouse-owned worldYaw/worldPitch. Rebase its
+        # ideal turret angle after our out-of-filter hull update so the next
+        # native camera tick does not integrate that yaw into the world aim.
+        reset()
+        return True
 
     def _local_engine_mode_value(self, alive):
         """Return the exact #1513 ``(power, movementFlags)`` engine mode."""
@@ -3999,10 +4222,148 @@ class BattleRuntime(object):
 
     def _on_client_ready(self):
         self._client_ready_received = True
+        self._enable_expert_visibility()
         if self.state == 'running':
             self._sender.send_current()
             if self._ammo_callback_token is None:
                 self._ammo_tick()
+
+    def _enable_expert_visibility(self):
+        """Enable #1513's native target-device monitor for Expert."""
+        if (not self._has_expert or self._expert_visibility_enabled or
+                self._worker_mode or self._avatar is None or
+                self._server is None):
+            return False
+        statuses = getattr(
+            self._runtime.constants, 'VEHICLE_MISC_STATUS', None)
+        status = getattr(
+            statuses, 'OTHER_VEHICLE_DAMAGED_DEVICES_VISIBLE', None)
+        callback = getattr(self._avatar, 'updateVehicleMiscStatus', None)
+        if status is None or not callable(callback):
+            raise RuntimeError(
+                '#1513 Expert visibility boundary is unavailable')
+        # PlayerAvatar reads floatArgs[0] before dispatching the status even
+        # though this particular branch only consumes intArg.
+        callback(self._server.vehicle_id, int(status), 1, (0.0,))
+        self._expert_visibility_enabled = True
+        return True
+
+    def _hide_expert_devices(self, vehicle_id):
+        provider = getattr(self._avatar, 'guiSessionProvider', None)
+        shared = getattr(provider, 'shared', None)
+        feedback = getattr(shared, 'feedback', None)
+        callback = getattr(feedback, 'hideVehicleDamagedDevices', None)
+        if callable(callback):
+            callback(int(vehicle_id or 0))
+            return True
+        return False
+
+    def monitor_vehicle_damaged_devices(self, vehicle_id):
+        """Own the cell half of #1513's Expert target-monitor mailbox."""
+        try:
+            vehicle_id = int(vehicle_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        previous = self._expert_target_id
+        if vehicle_id <= 0:
+            self._expert_target_id = 0
+            self._expert_target_due = 0.0
+            self._expert_target_signature = None
+            if previous:
+                self._hide_expert_devices(previous)
+            return True
+        if not self._has_expert or self.state not in (
+                'creating_map', 'running'):
+            return False
+        record = None
+        for candidate in self._records.values():
+            if int(candidate.get('engine_id', 0) or 0) == vehicle_id:
+                record = candidate
+                break
+        if (record is None or record.get('local') or
+                record.get('tombstone')):
+            return False
+        state = record.get('state') or {}
+        if int(state.get('team', 0) or 0) == int(self.client.team):
+            return False
+        if previous == vehicle_id:
+            return True
+        if previous:
+            self._hide_expert_devices(previous)
+        self._expert_target_id = vehicle_id
+        self._expert_target_due = (
+            self._clock() + EXPERT_DEVICE_DELAY_SECONDS)
+        self._expert_target_signature = None
+        return True
+
+    @staticmethod
+    def _expert_extra_index(descriptor, name):
+        selected = None
+        extras_dict = getattr(descriptor, 'extrasDict', None)
+        if extras_dict is not None:
+            selected = extras_dict.get(str(name))
+        extras = getattr(descriptor, 'extras', None)
+        iterator = (extras.items() if hasattr(extras, 'items') else
+                    enumerate(extras or ()))
+        for index, extra in iterator:
+            if (extra is selected or
+                    str(getattr(extra, 'name', '')) == str(name)):
+                return int(index)
+        return None
+
+    def _tick_expert_target(self, now):
+        """Publish canonical module phases after Expert's four-second delay."""
+        vehicle_id = int(self._expert_target_id or 0)
+        if (not self._has_expert or vehicle_id <= 0 or
+                float(now) < self._expert_target_due):
+            return False
+        record = None
+        for candidate in self._records.values():
+            if int(candidate.get('engine_id', 0) or 0) == vehicle_id:
+                record = candidate
+                break
+        entity = self._server_entity(vehicle_id)
+        if (record is None or record.get('local') or
+                record.get('tombstone') or entity is None or
+                not self._record_alive(record, entity)):
+            self.monitor_vehicle_damaged_devices(0)
+            return False
+        critical = (record.get('critical_state') or
+                    (record.get('state') or {}).get('critical') or {})
+        damaged = []
+        destroyed = []
+        destroyed_names = set(str(name) for name in
+                              critical.get('destroyed') or ())
+        for device in critical.get('devices') or ():
+            if not isinstance(device, dict):
+                continue
+            name = str(device.get('name', ''))
+            phase = str(device.get('state', ''))
+            index = self._expert_extra_index(entity.typeDescriptor, name)
+            if index is None:
+                continue
+            if phase == 'destroyed' or name in destroyed_names:
+                destroyed.append(index)
+            elif phase == 'critical':
+                damaged.append(index)
+        if bool(critical.get('fire')):
+            fire_index = self._expert_extra_index(
+                entity.typeDescriptor, 'fire')
+            if fire_index is not None:
+                damaged.append(fire_index)
+        signature = (tuple(sorted(set(damaged))),
+                     tuple(sorted(set(destroyed))))
+        if signature == self._expert_target_signature:
+            return False
+        callback = getattr(
+            self._avatar, 'showOtherVehicleDamagedDevices', None)
+        if not callable(callback):
+            raise RuntimeError(
+                '#1513 Expert damaged-device callback is unavailable')
+        callback(vehicle_id, signature[0], signature[1])
+        if self._expert_target_id == vehicle_id:
+            self._expert_target_signature = signature
+        return True
 
     @staticmethod
     def _equipment_kind(descriptor):
@@ -4791,6 +5152,22 @@ class BattleRuntime(object):
             return self._sender.send_current(siege_enabled=bool(value))
         if code == getattr(settings, 'ACTIVATE_EQUIPMENT', None):
             return self._activate_equipment(value)
+        partial_clip = getattr(settings, 'RELOAD_PARTIAL_CLIP', None)
+        if code == partial_clip:
+            if self._gun_state is None:
+                return False
+            state = self._gun_state
+            previous_reload = state.reload_time
+            previous_duration = state.reload_duration
+            if not state.reload_partial_clip():
+                return False
+            if previous_reload > 0.0:
+                self._publish_reload_event(
+                    0.0, previous_duration, force=True)
+            self._publish_ammo_state(state, force=True)
+            self._publish_reload_event(
+                state.reload_time, state.reload_duration, force=True)
+            return True
         current_shells = getattr(settings, 'CURRENT_SHELLS', None)
         next_shells = getattr(settings, 'NEXT_SHELLS', None)
         if code not in (current_shells, next_shells) or self._gun_state is None:
@@ -5689,6 +6066,47 @@ class BattleRuntime(object):
         record['state'] = state
         return self._apply_vehicle_statistics(record, state)
 
+    def _defer_blind_frag(self, target_key, target_record, attacker_record):
+        """Hide one local frag until the destroyed enemy becomes team-known."""
+        pending = attacker_record.setdefault('_blind_frag_targets', set())
+        if target_key in pending:
+            return False
+        pending.add(target_key)
+        target_record['_blind_frag_attacker'] = (
+            '%s:%s' % (attacker_record.get('kind'),
+                       attacker_record.get('network_id')))
+        target_record['_blind_frag_target'] = target_key
+        return True
+
+    def _reveal_blind_frag(self, target_record):
+        attacker_key = target_record.pop('_blind_frag_attacker', None)
+        target_key = target_record.pop('_blind_frag_target', None)
+        if attacker_key is None or target_key is None:
+            return False
+        attacker = self._records.get(attacker_key)
+        if attacker is None:
+            return False
+        pending = attacker.get('_blind_frag_targets')
+        if not isinstance(pending, set):
+            return False
+        pending.discard(target_key)
+        if not pending:
+            attacker.pop('_blind_frag_targets', None)
+        return self._apply_vehicle_statistics(
+            attacker, attacker.get('state') or {})
+
+    def _flush_blind_frags(self):
+        changed = False
+        for record in tuple(self._records.values()):
+            if record.get('_blind_frag_targets'):
+                record.pop('_blind_frag_targets', None)
+                changed = self._apply_vehicle_statistics(
+                    record, record.get('state') or {}) or changed
+        for record in tuple(self._records.values()):
+            record.pop('_blind_frag_attacker', None)
+            record.pop('_blind_frag_target', None)
+        return changed
+
     def _record_position(self, record):
         if record.get('local'):
             return tuple(self._local_position)
@@ -5716,6 +6134,38 @@ class BattleRuntime(object):
         if shell is None:
             raise RuntimeError('combat attacker shell is unavailable')
         return shot, shell
+
+    @staticmethod
+    def _critical_hit_mask(critical):
+        """Pack #1513's device/destroyed/crew hit-direction bit fields."""
+        devices = {
+            'engineHealth': 0, 'ammoBayHealth': 1,
+            'fuelTankHealth': 2, 'radioHealth': 3,
+            'leftTrackHealth': 4, 'rightTrackHealth': 4,
+            'gunHealth': 5, 'turretRotatorHealth': 6,
+            'surveyingDeviceHealth': 7,
+        }
+        crew = {
+            'commander': 0, 'driver': 1, 'radioman': 2,
+            'gunner': 3, 'loader': 4,
+        }
+        result = 0
+        for critical_event in (critical or {}).get('events') or ():
+            if critical_event.get('cause', 'shot') != 'shot':
+                continue
+            kind = critical_event.get('kind')
+            state = critical_event.get('state')
+            name = str(critical_event.get('name', ''))
+            if kind == 'device' and name in devices:
+                if state == 'critical':
+                    result |= 1 << devices[name]
+                elif state == 'destroyed':
+                    result |= 1 << (12 + devices[name])
+            elif kind == 'crew' and state == 'destroyed':
+                role = name.rstrip('0123456789')
+                if role in crew:
+                    result |= 1 << (24 + crew[role])
+        return result
 
     def _present_combat_hit(self, event, target_record, attacker_record,
                             attacker_id):
@@ -5749,15 +6199,15 @@ class BattleRuntime(object):
                 -(attacker_position[0] - target_position[0]),
                 -(attacker_position[2] - target_position[2]))
             self._avatar.showOwnVehicleHitDirection(
-                hit_yaw, int(attacker_id or 0), damage, 0,
+                hit_yaw, int(attacker_id or 0), damage,
+                self._critical_hit_mask(event.get('critical')),
                 damage <= 0, combat_rules.is_he(shot),
                 int(target_record['engine_id']))
 
-        # #1513 reaches the armour effect only from Vehicle.showDamageFromShot,
-        # which returns before any effect while the target is not started.  An
-        # unspotted target keeps its crew voice and ribbon, not its impact.
+        # Retail does not disclose a blind hit through the target effect.  The
+        # projectile ends at the hidden vehicle, with no armour/explosion FX.
         if (not target_record.get('local') and
-                not target_record.get('spot_visible', True)):
+                not self._combat_target_is_spotted(target_record)):
             return False
 
         effects_index = _field(shell, 'effectsIndex', None)
@@ -5868,6 +6318,25 @@ class BattleRuntime(object):
         return team
 
     @staticmethod
+    def _combat_target_is_spotted(record):
+        """Return whether team knowledge may disclose combat feedback.
+
+        ``spot_visible`` is only the 565 m world-model gate.  A radio-spotted
+        target outside that AOI still has a marker and must keep ordinary hit
+        feedback, so the marker/team-knowledge gate owns this decision.
+        """
+        return bool(record.get(
+            'spot_marker_visible', record.get('spot_visible', True)))
+
+    def _is_blind_local_attack(self, target_record, attacker_record):
+        """Keep a local hit on an unspotted enemy presentation-silent."""
+        if (not attacker_record.get('local') or target_record.get('local') or
+                self._combat_record_team(target_record) ==
+                self._combat_record_team(attacker_record)):
+            return False
+        return not self._combat_target_is_spotted(target_record)
+
+    @staticmethod
     def _combat_event_source(event):
         if 'source' not in event:
             raise RuntimeError('ordered combat event has no source')
@@ -5954,6 +6423,11 @@ class BattleRuntime(object):
     def _present_combat_feedback(self, event, target_record,
                                  attacker_record, reason_id=None):
         """Feed accepted server combat through stock #1513 feedback RPCs."""
+        if self._is_blind_local_attack(target_record, attacker_record):
+            # showShotResults owns commander hit voices; onBattleEvents owns
+            # damage/critical/kill ribbons and counters.  Neither may disclose
+            # an enemy which this team has not spotted.
+            return False
         feedback_common = getattr(
             self._runtime, 'battle_feedback_common', None)
         event_types = getattr(feedback_common, 'BATTLE_EVENT_TYPE', None)
@@ -6008,17 +6482,57 @@ class BattleRuntime(object):
                 if flags_type is None:
                     raise RuntimeError(
                         '#1513 VEHICLE_HIT_FLAGS are unavailable')
-                flags = int(flags_type.ATTACK_IS_DIRECT_PROJECTILE)
-                shot_result = max(
-                    0, min(int(event.get('shot_result', 2)), 2))
-                if shot_result == 2:
+                explosion = bool(event.get('splash'))
+                if explosion:
+                    flags = int(flags_type.ATTACK_IS_EXTERNAL_EXPLOSION)
                     flags |= int(
-                        flags_type.MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE)
-                elif shot_result == 1:
-                    flags |= int(
-                        flags_type.MATERIAL_WITH_POSITIVE_DF_NOT_PIERCED_BY_PROJECTILE)
+                        flags_type.
+                        MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_EXPLOSION)
+                    critical_cause = 'explosion'
+                    device_flag = int(
+                        flags_type.DEVICE_DAMAGED_BY_EXPLOSION)
+                    chassis_flag = int(
+                        flags_type.CHASSIS_DAMAGED_BY_EXPLOSION)
+                    gun_flag = int(
+                        flags_type.GUN_DAMAGED_BY_EXPLOSION)
                 else:
-                    flags |= int(flags_type.RICOCHET)
+                    flags = int(flags_type.ATTACK_IS_DIRECT_PROJECTILE)
+                    shot_result = max(
+                        0, min(int(event.get('shot_result', 2)), 2))
+                    if shot_result == 2:
+                        flags |= int(
+                            flags_type.
+                            MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE)
+                    elif shot_result == 1:
+                        flags |= int(
+                            flags_type.
+                            MATERIAL_WITH_POSITIVE_DF_NOT_PIERCED_BY_PROJECTILE)
+                    else:
+                        flags |= int(flags_type.RICOCHET)
+                    critical_cause = 'shot'
+                    device_flag = int(
+                        flags_type.DEVICE_DAMAGED_BY_PROJECTILE)
+                    chassis_flag = int(
+                        flags_type.CHASSIS_DAMAGED_BY_PROJECTILE)
+                    gun_flag = int(
+                        flags_type.GUN_DAMAGED_BY_PROJECTILE)
+                for critical_event in (
+                        (critical or {}).get('events') or ()):
+                    if critical_event.get(
+                            'cause', 'shot') != critical_cause:
+                        continue
+                    kind = critical_event.get('kind')
+                    state = critical_event.get('state')
+                    if kind == 'fire' and bool(state):
+                        flags |= int(flags_type.FIRE_STARTED)
+                    elif (kind == 'device' and
+                          state in ('critical', 'destroyed')):
+                        name = str(critical_event.get('name', ''))
+                        flags |= device_flag
+                        if name in ('leftTrackHealth', 'rightTrackHealth'):
+                            flags |= chassis_flag
+                        elif name == 'gunHealth':
+                            flags |= gun_flag
                 if bool(event.get('dead')):
                     flags |= int(flags_type.VEHICLE_KILLED)
                 callback = getattr(self._avatar, 'showShotResults', None)
@@ -6094,6 +6608,16 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'ordered combat event attacker has no native entity: %s:%s' %
                 (attacker_kind, attacker))
+        blind_local_attack = bool(
+            attacker_record is not None and
+            self._is_blind_local_attack(record, attacker_record))
+        dead_target = (
+            _number(state.get('health', 0.0)) <= 0.0 or
+            not bool(state.get('alive', True)))
+        if (blind_local_attack and dead_target and
+                attacker_record is not None):
+            self._defer_blind_frag(
+                target_key, record, attacker_record)
         if (entity is not None and attacker is not None and
                 not record.get('local')):
             entity.last_killer_id = int(attacker_id or 0)
@@ -6122,7 +6646,8 @@ class BattleRuntime(object):
         death_reason = int(event['death_reason'])
         self._apply_health(
             record, state, attacker_id, death_reason, force_cause=True,
-            attack_reason_id=(0 if attack_reason is None else attack_reason))
+            attack_reason_id=(0 if attack_reason is None else attack_reason),
+            suppress_combat_presentation=blind_local_attack)
         if not update_state:
             record['state'] = latest_state
         return True
@@ -6227,11 +6752,13 @@ class BattleRuntime(object):
             frags = int(state.get('frags', 0))
         except (TypeError, ValueError):
             frags = 0
+        hidden_frags = len(record.get('_blind_frag_targets') or ())
+        presented_frags = frags - hidden_frags
         changed = False
-        if record.get('presented_frags') != frags:
+        if record.get('presented_frags') != presented_frags:
             self._binding.arena_vehicle_statistics(
-                record['engine_id'], frags)
-            record['presented_frags'] = frags
+                record['engine_id'], presented_frags)
+            record['presented_frags'] = presented_frags
             changed = True
         team_killer = bool(state.get('team_killer', False))
         if team_killer and not record.get('presented_team_killer'):
@@ -6298,7 +6825,9 @@ class BattleRuntime(object):
 
     def _present_critical(self, record, events, attacker_id):
         """Map copied state transitions to audited stock #1513 UI callbacks."""
-        if self._worker_mode:
+        if (self._worker_mode or
+                (not record.get('local') and
+                 not self._combat_target_is_spotted(record))):
             return False
         entity = self._server_entity(record['engine_id'])
         if entity is None or entity.typeDescriptor is None:
@@ -6574,6 +7103,7 @@ class BattleRuntime(object):
         if (self._round_finished_notified or self._avatar is None or
                 self.state != 'running'):
             return False
+        self._flush_blind_frags()
         finish_reason = getattr(self._runtime.constants, 'FINISH_REASON', None)
         if finish_reason is None:
             raise RuntimeError('FINISH_REASON is unavailable')
@@ -6859,7 +7389,8 @@ class BattleRuntime(object):
         required = (
             'projectile_id', 'source_vehicle', 'shot_seq', 'shell_index', 'origin',
             'velocity', 'gravity', 'max_time_ms', 'is_he',
-            'splash_radius', 'penetration_factor', 'launch_server_time_ms')
+            'splash_radius', 'penetration_factor', 'launch_server_time_ms',
+            'source_shot')
         if (maximum is None or shooter_kind is None or shooter_id is None or
                 any(name not in raw for name in required)):
             return None
@@ -6880,6 +7411,8 @@ class BattleRuntime(object):
             launch_server_time = int(raw['launch_server_time_ms'])
             splash_radius = float(raw['splash_radius'])
             penetration_factor = float(raw['penetration_factor'])
+            source_shot = lan_protocol._strict_projectile_source_shot(
+                raw['source_shot'])
         except (TypeError, ValueError, OverflowError):
             return None
         values = (origin + velocity + (
@@ -6894,6 +7427,9 @@ class BattleRuntime(object):
                 launch_server_time < 0 or splash_radius < 0.0 or
                 penetration_factor < 0.0 or
                 not isinstance(raw['is_he'], bool) or
+                not lan_protocol._projectile_source_shot_matches_launch(
+                    source_shot, velocity, gravity, maximum,
+                    raw['is_he'], splash_radius) or
                 any(math.isnan(value) or math.isinf(value)
                     for value in values)):
             return None
@@ -6902,6 +7438,7 @@ class BattleRuntime(object):
             'shooter_kind': shooter_kind,
             'shooter_id': shooter_id,
             'source_vehicle': source_vehicle,
+            'source_shot': source_shot,
             'shot_seq': shot_seq,
             'shell_index': shell_index,
             'origin': origin,
@@ -6933,10 +7470,10 @@ class BattleRuntime(object):
             # and accumulated penetration state may advance in snapshots.
             frozen = (
                 'shooter_kind', 'shooter_id', 'source_vehicle',
-                'shot_seq', 'shell_index',
+                'source_shot', 'shot_seq', 'shell_index',
                 'origin', 'velocity', 'gravity', 'max_distance',
                 'max_time_ms', 'is_he', 'splash_radius',
-                'launch_server_time_ms')
+                'penetration_factor', 'launch_server_time_ms')
             if any(meta.get(name) != normalized.get(name)
                    for name in frozen):
                 raise RuntimeError('canonical projectile launch changed')
@@ -6958,8 +7495,6 @@ class BattleRuntime(object):
                     meta['checked_distance'] = normalized[
                         'checked_distance']
                     meta['piercing_loss'] = normalized['piercing_loss']
-                    meta['penetration_factor'] = normalized[
-                        'penetration_factor']
         return meta
 
     def _accept_projectile_event(self, event):
@@ -7091,11 +7626,86 @@ class BattleRuntime(object):
                     visual['velocity'][0],
                     visual['velocity'][1] - visual['gravity'] * elapsed,
                     visual['velocity'][2])
+        if isinstance(event.get('wreck_hit'), dict):
+            self._present_projectile_wreck_hit(projectile_id, event)
         self._stop_projectile_visual(projectile_id, event)
         if self._projectiles is not None:
             self._projectiles.remove(projectile_id)
         self._projectile_meta.pop(projectile_id, None)
         self._projectile_terminal_data.pop(projectile_id, None)
+        return True
+
+    def _present_projectile_wreck_hit(self, projectile_id, event):
+        """Play the stock armour-hit family on one visible retained wreck."""
+        if self._worker_mode:
+            return False
+        wreck_hit = event.get('wreck_hit')
+        if (not isinstance(wreck_hit, dict) or
+                set(wreck_hit) != {'target_kind', 'target_id'}):
+            return False
+        target_kind = wreck_hit.get('target_kind')
+        try:
+            target_id = int(wreck_hit.get('target_id'))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if target_kind not in ('player', 'bot') or target_id <= 0:
+            return False
+        target_record = self._records.get(
+            '%s:%s' % (target_kind, target_id))
+        if target_record is None:
+            return False
+        target = self._server_entity(target_record.get('engine_id'))
+        if (target is None or not getattr(target, 'isStarted', False) or
+                self._record_alive(target_record, target) or
+                (not target_record.get('local') and
+                 not target_record.get('spot_visible', True))):
+            return False
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None:
+            return False
+        shot = self._projectile_shot(meta)
+        shell = _field(shot, 'shell', None)
+        effects_index = _field(shell, 'effectsIndex', None)
+        if effects_index is None:
+            return False
+        try:
+            effects_descr = self._runtime.vehicles.g_cache.shotEffects[
+                int(effects_index)]
+            stages, effects, unused = effects_descr['armorHit']
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return False
+        impact = event.get('impact')
+        if not isinstance(impact, (list, tuple)) or len(impact) < 3:
+            return False
+        direction_value = meta.get('terminal_velocity')
+        if not direction_value:
+            visual = self._projectile_visual_meta.get(projectile_id)
+            direction_value = visual.get('velocity') if visual else None
+        if not direction_value:
+            source = self._projectile_source_entity(meta)
+            source_position = getattr(source, 'position', None)
+            if source_position is not None:
+                direction_value = tuple(
+                    _number(impact[index]) - _number(source_position[index])
+                    for index in range(3))
+        if not direction_value:
+            return False
+        direction = self._vector(_xyz(direction_value))
+        if direction.length <= 0.0:
+            return False
+        direction.normalise()
+        hit_position = self._vector(_xyz(impact))
+        terrain_effects = getattr(self._avatar, 'terrainEffects', None)
+        add_effect = getattr(terrain_effects, 'addNew', None)
+        if not callable(add_effect):
+            return False
+        self._report_effect(
+            'wreck_hit', 'armorHit', effects_index, impact, direction)
+        add_effect(
+            hit_position, effects, stages, None, dir=direction,
+            start=hit_position - direction.scale(0.4),
+            end=hit_position + direction.scale(0.4),
+            showShockWave=False, showFlashBang=False)
         return True
 
     def _ensure_projectile_visual(self, normalized, now):
@@ -7486,15 +8096,59 @@ class BattleRuntime(object):
         return None
 
     def _projectile_shot(self, meta):
+        frozen = meta.get('source_shot')
         source = self._projectile_source_entity(meta)
         descriptor = (getattr(source, 'typeDescriptor', None)
                       if source is not None else None)
         if descriptor is None:
             descriptor = self._projectile_source_descriptor(meta)
-        if descriptor is None:
-            return {}
-        return self._descriptor_shot(
+        descriptor_shot = (self._descriptor_shot(
             descriptor, meta.get('shell_index'))
+            if descriptor is not None else None)
+        if not isinstance(frozen, dict):
+            return descriptor_shot or {}
+        # Physical values are immutable launch evidence.  Retain only
+        # descriptor-owned cosmetic keys so stock tracers/explosions still
+        # render when a disconnected shooter's fitted gun is unavailable.
+        result = dict(frozen)
+        shell = dict(frozen.get('shell') or {})
+        descriptor_shell = _field(descriptor_shot, 'shell', None)
+        for name in ('compactDescr', 'effectsIndex', 'isTracer'):
+            value = _field(descriptor_shell, name, None)
+            if value is not None:
+                shell[name] = value
+        result['shell'] = shell
+        return result
+
+    @staticmethod
+    def _vehicle_trace(shot, query_start, query_end, collisions):
+        """Cap vehicle material/module tracing at ten shell calibres.
+
+        The historical limit starts at the first vehicle material, including
+        tracks and spaced armour.  Keeping the original query origin lets the
+        native collision distances and reconstructed internal hit boxes share
+        one physical distance axis.
+        """
+        collisions = tuple(collisions or ())
+        delta = query_end - query_start
+        length = float(delta.length)
+        if not collisions or length <= 0.000001:
+            return collisions, query_start, query_start
+        try:
+            first = min(float(collision.dist) for collision in collisions)
+        except (AttributeError, TypeError, ValueError):
+            raise TypeError('#1513 collision contains an invalid distance')
+        first = max(0.0, min(length, first))
+        legacy = combat_rules.legacy_shot(shot)
+        caliber = _number((legacy.get('shell') or {}).get('caliber'), 0.0)
+        trace_distance = first + max(0.0, caliber) / 100.0
+        limited = tuple(
+            collision for collision in collisions
+            if float(collision.dist) <= trace_distance + 0.000001)
+        direction = delta
+        direction.normalise()
+        return (limited, query_start,
+                query_start + direction.scale(trace_distance))
 
     def _projectile_source_descriptor(self, meta):
         descriptor = meta.get('source_descriptor')
@@ -7542,11 +8196,8 @@ class BattleRuntime(object):
         target_key = terminal_data.get('target_key')
         record = self._records.get(target_key)
         source = self._projectile_source_entity(meta)
-        source_descriptor = (getattr(source, 'typeDescriptor', None)
-                             if source is not None else None)
-        if source_descriptor is None:
-            source_descriptor = self._projectile_source_descriptor(meta)
-        if record is None or source_descriptor is None:
+        shot = self._projectile_shot(meta)
+        if record is None or not shot:
             return None
         target = self._server_entity(record.get('engine_id'))
         collisions = terminal_data.get('collisions')
@@ -7554,33 +8205,61 @@ class BattleRuntime(object):
         if (target is None or not collisions or query is None or
                 not self._record_alive(record, target)):
             return None
+        collisions, trace_start, trace_end = self._vehicle_trace(
+            shot, query[0], query[1], collisions)
+        if not combat_rules.is_he(shot):
+            original_length = float((query[1] - query[0]).length)
+            trace_length = float((trace_end - trace_start).length)
+            if trace_length > original_length + 0.000001:
+                if record.get('local') and self._local_matrix is not None:
+                    extended = collide_vehicle_at_matrix(
+                        target, self._local_matrix, query[0], trace_end,
+                        self._runtime.math)
+                elif record.get('native_remote'):
+                    extended = collide_vehicle_at_matrix(
+                        target, target.matrix, query[0], trace_end,
+                        self._runtime.math)
+                else:
+                    extended = target.collideSegmentExt(
+                        query[0], trace_end)
+                if extended:
+                    collisions, trace_start, trace_end = self._vehicle_trace(
+                        shot, query[0], trace_end, tuple(extended))
         factor = terminal_data.get('penetration_factor')
-        damage, result = self._shell_damage(
-            source_descriptor, collisions, state.get('distance', 0.0),
-            shell_index=meta.get('shell_index'),
+        resolved = combat_rules.resolve_hull_hit(
+            shot, state.get('distance', 0.0), collisions,
             pierce_loss=terminal_data.get('piercing_loss', 0.0),
-            penetration_factor=factor,
-            target_descriptor=getattr(target, 'typeDescriptor', None))
+            penetration_factor=factor)
+        result = 1 if resolved is None else resolved[0]
+        armor = combat_rules.he_nominal_armor(
+            collisions, getattr(target, 'typeDescriptor', None))
+        damage = combat_rules.damage(shot, result, armor)
         hull_damage = damage
-        damage, critical = self._critical_hit(
-            target, source_descriptor, collisions,
-            query[0], query[1], damage, result,
-            int(getattr(source, 'id', meta.get('shooter_id', 0))),
-            meta.get('shell_index'))
+        legacy_shell = combat_rules.legacy_shot(shot).get('shell') or {}
+        attacker_id = int(getattr(
+            source, 'id', meta.get('shooter_id', 0)))
+        deadeye = bool(_field(shot, 'deadeye', False))
+        layers = combat_rules.collision_layers(collisions)
+        if combat_rules.is_he(shot):
+            damage, critical = critical_damage.propose_explosion(
+                target, layers, self._vector(terminal_data['impact']),
+                trace_end - trace_start, damage, legacy_shell, attacker_id,
+                deadeye=deadeye)
+        else:
+            damage, critical = critical_damage.propose_direct(
+                target, layers, trace_start, trace_end, damage,
+                legacy_shell, attacker_id, penetrated=int(result) == 2,
+                deadeye=deadeye)
+        critical = self._critical_with_crew_roster(target, critical)
         return self._projectile_effect(
             record, damage, result, terminal_data['impact'],
             critical, hull_damage)
 
     def _projectile_splash_effects(self, meta, impact, direct_key):
         source = self._projectile_source_entity(meta)
-        source_descriptor = (getattr(source, 'typeDescriptor', None)
-                             if source is not None else None)
-        if source_descriptor is None:
-            source_descriptor = self._projectile_source_descriptor(meta)
-        if source_descriptor is None:
+        shot = self._projectile_shot(meta)
+        if not shot:
             return []
-        shot = self._descriptor_shot(
-            source_descriptor, meta.get('shell_index'))
         radius = combat_rules.he_radius(shot)
         if radius <= 0.0:
             return []
@@ -7625,11 +8304,11 @@ class BattleRuntime(object):
             if damage <= 0:
                 continue
             hull_damage = damage
-            damage, critical = critical_damage.propose_direct(
+            damage, critical = critical_damage.propose_explosion(
                 target, combat_rules.collision_layers(collisions),
-                burst, self._vector(position), damage, legacy_shell,
+                burst, aim - burst, damage, legacy_shell,
                 int(getattr(source, 'id', meta.get('shooter_id', 0))),
-                penetrated=False, by_explosion=True)
+                deadeye=bool(_field(shot, 'deadeye', False)))
             critical = self._critical_with_crew_roster(target, critical)
             effects.append(self._projectile_effect(
                 record, damage, 2, impact, critical, hull_damage))
@@ -7666,15 +8345,30 @@ class BattleRuntime(object):
         hit_vehicle = bool(
             outcome == 'impact' and data is not None and
             data.get('target_key') is not None)
+        wreck_hit = None
+        if hit_vehicle and direct is None:
+            target_record = self._records.get(data.get('target_key'))
+            target = (self._server_entity(target_record.get('engine_id'))
+                      if target_record is not None else None)
+            if (target_record is not None and
+                    not self._record_alive(target_record, target)):
+                target_kind = target_record.get('kind')
+                if target_kind == 'human':
+                    target_kind = 'player'
+                if target_kind in ('player', 'bot'):
+                    wreck_hit = {
+                        'target_kind': target_kind,
+                        'target_id': int(target_record.get('network_id')),
+                    }
         pending = {
             'state': state, 'outcome': outcome, 'impact': impact,
             'direct': direct, 'splash': splash,
-            'hit_vehicle': hit_vehicle,
+            'hit_vehicle': hit_vehicle, 'wreck_hit': wreck_hit,
         }
         # Retail plays a ground explosion only for a terminal on the world; a
         # vehicle terminal shows the armour-hit family instead.  Record the
-        # verdict now, because the relayed terminal event carries no target
-        # identity (only this presentation classification).
+        # verdict now; only a retained wreck additionally carries its bounded
+        # presentation identity, never a damage proposal.
         meta['hit_vehicle'] = hit_vehicle
         meta['terminal_velocity'] = tuple(state.get('velocity') or ())
         meta['pending_resolution'] = pending
@@ -7705,6 +8399,7 @@ class BattleRuntime(object):
             penetration_factor=float(
                 meta.get('penetration_factor', 1.0)),
             hit_vehicle=bool(pending.get('hit_vehicle')),
+            wreck_hit=pending.get('wreck_hit'),
             destructibles=[dict(value) for value in
                            meta.get('destructibles_pending', ())])
         if sent:
@@ -8066,12 +8761,14 @@ class BattleRuntime(object):
                 boundary = next_boundary
             if not self._worker_mode:
                 self._tick_critical_states(dt)
+                self._tick_expert_target(now)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['critical'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
             if self._battle_live and not self._worker_mode:
                 self._tick_drowning(dt, now)
+                self._tick_overturn(dt, now)
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['drown'] = max(0.0, next_boundary - boundary)
@@ -8617,6 +9314,7 @@ class BattleRuntime(object):
             raise RuntimeError(
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
+        self.monitor_vehicle_damaged_devices(chosen)
 
     def _target_angular_radius(self, vehicle, distance, tight=False):
         """The half-angle this vehicle's own hull subtends at this range.
@@ -8818,6 +9516,8 @@ class BattleRuntime(object):
         self._outlined_entity = None
         self._outlined_vehicle = None
         self._outlined_model = None
+        if engine_id is not None:
+            self.monitor_vehicle_damaged_devices(0)
         if entity is None and engine_id is None:
             return not self._outline_blocked
         set_candidate = getattr(
@@ -9754,6 +10454,7 @@ class BattleRuntime(object):
             return
         is_alive = getattr(entity, 'isAlive', None)
         stopped = (self._battle_result is not None or
+                   self._overturn_level == 2 or
                    (callable(is_alive) and not is_alive()) or
                    (not callable(is_alive) and
                     (_number(getattr(entity, 'health', 0.0)) <= 0.0 or
@@ -9772,7 +10473,8 @@ class BattleRuntime(object):
             if (self._local_matrix is not None and
                     self._local_model is not None):
                 self._update_local_presentation(entity, dt)
-            if self._local_damage_report is not None or self._drown_level == 2:
+            if (self._local_damage_report is not None or
+                    self._drown_level == 2 or self._overturn_level == 2):
                 self._sender.send_current()
             return
 
@@ -10568,7 +11270,8 @@ class BattleRuntime(object):
             max_time_ms, is_he,
             combat_rules.he_radius(shot) if is_he else 0.0,
             authority_epoch=getattr(self.client, 'authority_epoch', None),
-            penetration_factor=combat_rules.sample_penetration_factor())
+            penetration_factor=combat_rules.sample_penetration_factor(),
+            source_shot=descriptor_donation.project_shot(shot))
         return accepted == int(shot_seq)
 
     def _resolve_bot_shot(self, state, shot_seq):
@@ -10673,6 +11376,8 @@ class BattleRuntime(object):
         if penetration_factor is None:
             penetration_factor = combat_rules.sample_penetration_factor()
         hit_entity = self._server_entity(hit_record['engine_id'])
+        target_collisions, trace_start, trace_end = self._vehicle_trace(
+            shot, start, end, target_collisions)
         damage, result = self._shell_damage(
             source.typeDescriptor, target_collisions, distance,
             shell_index=state.get('shell_index'),
@@ -10682,8 +11387,10 @@ class BattleRuntime(object):
         impact = start + direction.scale(distance)
         hull_damage = damage
         damage, critical = self._critical_hit(
-            hit_entity, source.typeDescriptor, target_collisions, start, end,
-            damage, result, source.id, state.get('shell_index'))
+            hit_entity, source.typeDescriptor, target_collisions,
+            trace_start, trace_end,
+            damage, result, source.id, state.get('shell_index'),
+            burst_position=impact, deadeye=False)
         critical_contract = self._critical_proposal_contract(
             hit_record, critical, hull_damage)
         sent = False
@@ -11109,6 +11816,7 @@ class BattleRuntime(object):
         A destroyed vehicle keeps its model drawn as cover once the spotting
         gate closes, which is what retail does with a wreck.
         """
+        previously_spotted = self._combat_target_is_spotted(record)
         visible = bool(visible)
         if marker_visible is None:
             marker_visible = record.pop(
@@ -11116,18 +11824,30 @@ class BattleRuntime(object):
         marker_visible = bool(marker_visible)
         record['spot_visible'] = visible
         record['spot_marker_visible'] = marker_visible
+        if marker_visible:
+            self._reveal_blind_frag(record)
         if not record.get('presentation') or not record.get('ready'):
             return visible
         vehicle = self._remote_factory.get(record['engine_id'])
         if vehicle is None or vehicle.model is None:
             raise RuntimeError('spotted remote vehicle has no model')
         vehicle._spot_visible = visible
-        draw_vehicle = visible or not self._record_alive(record, vehicle)
+        alive = self._record_alive(record, vehicle)
+        if not alive and previously_spotted:
+            record['wreck_known'] = True
+        wreck_known = bool(record.get(
+            'wreck_known', record.get('spot_marker_visible', visible)))
+        draw_vehicle = visible or (not alive and wreck_known)
         if record.get('native_remote'):
             vehicle.show(draw_vehicle)
             vehicle.targetCaps = [1] if visible else []
         else:
             vehicle.appearance.changeVisibility(draw_vehicle)
+        if draw_vehicle:
+            # A fire transition received while this enemy was hidden had no
+            # drawable compound.  Reconcile the durable fire state whenever
+            # the wreck/live model becomes visible again.
+            self._sync_fire_effect(vehicle)
         if marker_visible and not record.get('visual_started'):
             self._binding.start_vehicle_visual(record['engine_id'], True)
             record['visual_started'] = True
@@ -11137,6 +11857,18 @@ class BattleRuntime(object):
                 self._present_vehicle_dead(record, True)
         elif not marker_visible and record.get('visual_started'):
             self._stop_remote_visual(record)
+        if (marker_visible and
+                record.get('deferred_health_presentation', False)):
+            provider = getattr(self._avatar, 'guiSessionProvider', None)
+            present_health = getattr(provider, 'setVehicleHealth', None)
+            if not callable(present_health):
+                raise RuntimeError(
+                    '#1513 remote vehicle health presenter is unavailable')
+            state = record.get('state') or {}
+            health = max(0, int(state.get(
+                'display_health', state.get('health', 0)) or 0))
+            present_health(False, record['engine_id'], health, 0, 0)
+            record.pop('deferred_health_presentation', None)
         return visible
 
     def _strategic_spg_view_active(self):
@@ -11173,6 +11905,9 @@ class BattleRuntime(object):
         """Publish a split spotting state through the legacy two-arg seam."""
         model_visible, marker_visible = self._spot_presentation_visibility(
             entity, remembered)
+        if (not self._record_alive(record, entity) and
+                self._combat_target_is_spotted(record)):
+            record['wreck_known'] = True
         # A number of engine-free harnesses replace the historic two-argument
         # method.  Store the marker edge first so those focused harnesses stay
         # useful while production consumes both states below.
@@ -11670,9 +12405,12 @@ class BattleRuntime(object):
         return True
 
     def _apply_health(self, record, state, attacker_id=0, reason_id=None,
-                      force_cause=False, attack_reason_id=None):
+                      force_cause=False, attack_reason_id=None,
+                      suppress_combat_presentation=False):
         if 'health' not in state:
             return
+        suppress_combat_presentation = bool(
+            suppress_combat_presentation and not record.get('local'))
         health = max(0, int(state.get('health', 0)))
         if reason_id is None:
             reason_id = max(0, int(state.get('death_reason', 0) or 0))
@@ -11716,6 +12454,8 @@ class BattleRuntime(object):
                 death_cause = 'world_collision'
             elif reason_id == self._attack_reason('DROWNING', 5):
                 death_cause = 'drowning'
+            elif reason_id == self._attack_reason('OVERTURN', 7):
+                death_cause = 'overturn'
             else:
                 death_cause = 'shot'
             death_payload = critical_damage.apply_death(
@@ -11733,13 +12473,14 @@ class BattleRuntime(object):
                 # the stock death-panel lifecycle and Flash rejects the call.
                 # Stop the native fire extra, but leave the death HUD to the
                 # stock Vehicle/PlayerAvatar consumer below.
-                if not self._worker_mode:
+                if (not self._worker_mode and
+                        not suppress_combat_presentation):
                     self._sync_fire_effect(entity)
                 if record.get('local'):
                     self._queue_local_damage_report(
                         critical=death_payload,
                         attribute_attacker=death_cause not in (
-                            'drowning', 'world_collision'))
+                            'drowning', 'world_collision', 'overturn'))
         preserve_inactive_hull = dead and display_health > 0
         native_health = display_health if preserve_inactive_hull else health
         if self._worker_mode:
@@ -11763,14 +12504,19 @@ class BattleRuntime(object):
             return
         entity.health = native_health
         health_changed = getattr(entity, 'onHealthChanged', None)
-        if callable(health_changed):
+        if (not suppress_combat_presentation and
+                callable(health_changed)):
             health_changed(
                 native_health, int(attacker_id), int(attack_reason_id))
-        else:
+        elif not record.get('native_remote'):
+            # Synthetic remotes need their local alive bit refreshed.  A
+            # stock Vehicle property callback is deliberately skipped here:
+            # it owns the same death/effect presentation we are suppressing.
             notifier = getattr(entity, 'set_health', None)
             if callable(notifier):
                 notifier(previous)
-        if record.get('presentation'):
+        if (record.get('presentation') and
+                not suppress_combat_presentation):
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             present_health = getattr(provider, 'setVehicleHealth', None)
             if not callable(present_health):
@@ -11779,9 +12525,17 @@ class BattleRuntime(object):
             present_health(
                 False, engine_id, native_health,
                 int(attacker_id), int(attack_reason_id))
+            record.pop('deferred_health_presentation', None)
+        elif record.get('presentation'):
+            # Reconcile the current bar without an attacker cause if this
+            # target is spotted later.  Until then, no floating damage text is
+            # allowed to disclose the blind hit.
+            record['deferred_health_presentation'] = True
         previous_crew_active = getattr(entity, 'isCrewActive', crew_active)
         entity.isCrewActive = crew_active
-        if previous_crew_active != crew_active:
+        if (previous_crew_active != crew_active and
+                (not suppress_combat_presentation or
+                 not record.get('native_remote'))):
             crew_notifier = getattr(entity, 'set_isCrewActive', None)
             if callable(crew_notifier):
                 crew_notifier(previous_crew_active)
@@ -11794,8 +12548,9 @@ class BattleRuntime(object):
             # existing compound stays in place as wreck cover.
             if self._outlined_engine_id == engine_id:
                 self._clear_target_outline()
-            self._release_target_lock(engine_id)
-            self._present_vehicle_dead(record, False)
+            if not suppress_combat_presentation:
+                self._release_target_lock(engine_id)
+                self._present_vehicle_dead(record, False)
         if record.get('local'):
             if dead:
                 self._local_speed = 0.0
@@ -11806,11 +12561,15 @@ class BattleRuntime(object):
                 engine_id, display_health, int(reason_id),
                 crew_active, False)
         if not previous_dead and dead:
-            killed = getattr(self._binding, 'arena_vehicle_killed', None)
-            if callable(killed):
-                killed(engine_id, int(attacker_id), int(reason_id))
-            if not record.get('local'):
-                self._fallback_postmortem_viewpoint(engine_id)
+            record['wreck_known'] = bool(
+                not suppress_combat_presentation and
+                self._combat_target_is_spotted(record))
+            if not suppress_combat_presentation:
+                killed = getattr(self._binding, 'arena_vehicle_killed', None)
+                if callable(killed):
+                    killed(engine_id, int(attacker_id), int(reason_id))
+                if not record.get('local'):
+                    self._fallback_postmortem_viewpoint(engine_id)
         if (record.get('presentation') and self._remote_factory is not None and
                 not self._record_alive(record, entity)):
             self._remote_factory.request_wreck(engine_id)
@@ -11899,7 +12658,7 @@ class BattleRuntime(object):
     def shoot(self, aim_yaw, gun_pitch):
         if (self.state != 'running' or not self._battle_live or
                 self._battle_result is not None or
-                self._drown_level == 2):
+                self._drown_level == 2 or self._overturn_level == 2):
             return False
         if self._server is None:
             return False
@@ -11953,7 +12712,9 @@ class BattleRuntime(object):
             max_time_ms=PROJECTILE_MAX_TIME_MS,
             is_he=is_he,
             splash_radius=(combat_rules.he_radius(shot) if is_he else 0.0),
-            penetration_factor=penetration_factor)
+            penetration_factor=penetration_factor,
+            source_shot=descriptor_donation.project_shot(
+                shot, deadeye=self._has_deadeye))
         if not shot_seq:
             return False
         # #1513 Vehicle.showShooting owns the withShot=1 transition when the
@@ -12037,6 +12798,8 @@ class BattleRuntime(object):
         if penetration_factor is None:
             penetration_factor = combat_rules.sample_penetration_factor()
         target = self._server_entity(target_record['engine_id'])
+        target_collisions, trace_start, trace_end = self._vehicle_trace(
+            shot, start, end, target_collisions)
         damage, result = self._shell_damage(
             entity.typeDescriptor, target_collisions, distance,
             shell_index=shell_index,
@@ -12046,8 +12809,10 @@ class BattleRuntime(object):
         impact = start + direction.scale(distance)
         hull_damage = damage
         damage, critical = self._critical_hit(
-            target, entity.typeDescriptor, target_collisions, start, end,
-            damage, result, entity.id, shell_index)
+            target, entity.typeDescriptor, target_collisions,
+            trace_start, trace_end,
+            damage, result, entity.id, shell_index,
+            burst_position=impact, deadeye=self._has_deadeye)
         critical_contract = self._critical_proposal_contract(
             target_record, critical, hull_damage)
         if target_record.get('kind') == 'bot':
@@ -12208,11 +12973,10 @@ class BattleRuntime(object):
             if damage <= 0:
                 continue
             hull_damage = damage
-            damage, critical = critical_damage.propose_direct(
+            damage, critical = critical_damage.propose_explosion(
                 target, combat_rules.collision_layers(collisions),
-                burst_position, self._vector(position), damage,
-                legacy_shell, attacker_engine_id, penetrated=False,
-                by_explosion=True)
+                burst_position, aim - burst_position, damage,
+                legacy_shell, attacker_engine_id, deadeye=False)
             critical = self._critical_with_crew_roster(target, critical)
             if self._send_splash_hit(
                     record, attacker_kind, attacker_id, shot_seq, damage,
@@ -12247,7 +13011,8 @@ class BattleRuntime(object):
 
     def _critical_hit(self, target, source_descriptor, collisions,
                       start, end, damage, result, attacker_id,
-                      shell_index=None):
+                      shell_index=None, burst_position=None,
+                      deadeye=False):
         """Adapt #1513 collision objects to the copied 0.8.2 crit loop."""
         if target is None or getattr(target, 'typeDescriptor', None) is None:
             return damage, None
@@ -12257,10 +13022,17 @@ class BattleRuntime(object):
         index = max(0, min(int(shell_index), max(0, len(shots) - 1)))
         shot = shots[index] if shots else {}
         shell = (combat_rules.legacy_shot(shot).get('shell') or {})
-        damage, critical = critical_damage.propose_direct(
-            target, combat_rules.collision_layers(collisions),
-            start, end, damage, shell, attacker_id,
-            penetrated=int(result) == 2)
+        layers = combat_rules.collision_layers(collisions)
+        if combat_rules.is_he(shot):
+            damage, critical = critical_damage.propose_explosion(
+                target, layers,
+                burst_position if burst_position is not None else start,
+                end - start, damage, shell, attacker_id,
+                deadeye=deadeye)
+        else:
+            damage, critical = critical_damage.propose_direct(
+                target, layers, start, end, damage, shell, attacker_id,
+                penetrated=int(result) == 2, deadeye=deadeye)
         return damage, self._critical_with_crew_roster(target, critical)
 
     @staticmethod
@@ -12563,6 +13335,12 @@ class BattleRuntime(object):
         if self._frame_diagnostics is not None:
             self._frame_diagnostics.reset()
         self._has_sixth_sense = False
+        self._has_expert = False
+        self._has_deadeye = False
+        self._expert_visibility_enabled = False
+        self._expert_target_id = 0
+        self._expert_target_due = 0.0
+        self._expert_target_signature = None
         self._last_snapshot = None
         self._last_frame_time = None
         self._last_health = {}
@@ -12647,6 +13425,10 @@ class BattleRuntime(object):
         self._drown_time = 0.0
         self._drown_level = 0
         self._drown_started = None
+        self._overturn_check = 0.0
+        self._overturn_time = 0.0
+        self._overturn_level = 0
+        self._overturn_started = None
         self._battle_live = False
         self._prebattle_deadline = None
         self._next_spotting_time = 0.0

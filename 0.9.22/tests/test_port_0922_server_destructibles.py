@@ -232,11 +232,20 @@ class ShotTraversalTest(unittest.TestCase):
         driver._bots = _FakeBots({9: wrap(projection)})
         return driver, state, world
 
+    @staticmethod
+    def _meta(driver):
+        shot = driver._bots._descriptors[9].gun.shots[0]
+        return {
+            'shooter_kind': 'bot', 'shooter_id': 9, 'shot_seq': 1,
+            'shell_index': 0, 'penetration_factor': 1.0,
+            'source_shot':
+                server_battle_authority._source_shot_from_descriptor(shot),
+        }
+
     def test_ap_shell_pierces_a_fence_with_fixed_loss(self):
         driver, state, world = self._driver_with_shell(
             'ARMOR_PIERCING', fence_at=(24.0, 0.0, 24.0), health=10.0)
-        meta = {'shooter_kind': 'bot', 'shooter_id': 9, 'shot_seq': 1,
-                'shell_index': 0, 'penetration_factor': 1.0}
+        meta = self._meta(driver)
         stop = driver._traverse_shot_destructibles(
             meta, {'distance': 0.0}, (24.0, 0.8, 4.0), (24.0, 0.8, 44.0),
             1.0)
@@ -252,8 +261,7 @@ class ShotTraversalTest(unittest.TestCase):
     def test_he_shell_stops_at_the_fence_but_destroys_it(self):
         driver, unused_state, world = self._driver_with_shell(
             'HIGH_EXPLOSIVE', fence_at=(24.0, 0.0, 24.0), health=10.0)
-        meta = {'shooter_kind': 'bot', 'shooter_id': 9, 'shot_seq': 1,
-                'shell_index': 0, 'penetration_factor': 1.0}
+        meta = self._meta(driver)
         stop = driver._traverse_shot_destructibles(
             meta, {'distance': 0.0}, (24.0, 0.8, 4.0), (24.0, 0.8, 44.0),
             1.0)
@@ -261,11 +269,31 @@ class ShotTraversalTest(unittest.TestCase):
         self.assertTrue(stop['world'])
         self.assertTrue(world.is_destroyed(_signature(24.0, 0.0, 24.0)))
 
+    def test_apcr_shell_pierces_the_same_eligible_fence(self):
+        driver, unused_state, unused_world = self._driver_with_shell(
+            'ARMOR_PIERCING_CR', fence_at=(24.0, 0.0, 24.0), health=19.0)
+        meta = self._meta(driver)
+        stop = driver._traverse_shot_destructibles(
+            meta, {'distance': 0.0}, (24.0, 0.8, 4.0), (24.0, 0.8, 44.0),
+            1.0)
+        self.assertIsNone(stop)
+        self.assertEqual(
+            25.0, driver._piercing_loss[driver._wire_projectile_id(meta)])
+
+    def test_heat_shell_stops_at_the_first_fence(self):
+        driver, unused_state, world = self._driver_with_shell(
+            'HOLLOW_CHARGE', fence_at=(24.0, 0.0, 24.0), health=1.0)
+        meta = self._meta(driver)
+        stop = driver._traverse_shot_destructibles(
+            meta, {'distance': 0.0}, (24.0, 0.8, 4.0), (24.0, 0.8, 44.0),
+            1.0)
+        self.assertEqual('destructible', stop['hit_kind'])
+        self.assertTrue(world.is_destroyed(_signature(24.0, 0.0, 24.0)))
+
     def test_tough_destructible_stops_ap_shells_too(self):
         driver, unused_state, unused_world = self._driver_with_shell(
             'ARMOR_PIERCING', fence_at=(24.0, 0.0, 24.0), health=120.0)
-        meta = {'shooter_kind': 'bot', 'shooter_id': 9, 'shot_seq': 1,
-                'shell_index': 0, 'penetration_factor': 1.0}
+        meta = self._meta(driver)
         stop = driver._traverse_shot_destructibles(
             meta, {'distance': 0.0}, (24.0, 0.8, 4.0), (24.0, 0.8, 44.0),
             1.0)

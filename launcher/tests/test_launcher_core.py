@@ -82,7 +82,7 @@ class GameRootTest(unittest.TestCase):
     def test_another_0_9_22_build_is_not_treated_as_the_pinned_client(self):
         self._write("version.xml", "<version> v.0.9.22.0.1 #0789 </version>")
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod")
         self.assertIsNone(core.detect_port(self.root))
 
     def test_another_0_9_22_patch_is_not_treated_as_the_pinned_client(self):
@@ -102,12 +102,12 @@ class GameRootTest(unittest.TestCase):
     def test_unsupported_client_reports_no_port(self):
         self._write("version.xml", "<version> v.1.0.0 #1 </version>")
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod")
         self.assertIsNone(core.detect_port(self.root))
 
     def test_an_installed_0_9_22_package_is_not_a_version_fallback(self):
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod")
         self.assertIsNone(core.detect_port(self.root))
         self.assertIsNone(core.inspect_game_root(self.root)["client"])
 
@@ -116,7 +116,7 @@ class GameRootTest(unittest.TestCase):
             "version.xml",
             "<broken><version>v.0.9.22.0.1 #1513</version>")
         self._write(
-            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod")
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod")
         self.assertIsNone(core.detect_port(self.root))
         self.assertIsNone(core.inspect_game_root(self.root)["client"])
 
@@ -1139,11 +1139,28 @@ class PayloadStagingTest(unittest.TestCase):
                 json.dump({"maps": records}, stream)
 
     def test_supported_server_entry_points_are_staged(self):
+        expected_ports = {core.PORT_0_9_22}
+        self.assertEqual(expected_ports, set(stage_payload.PAYLOAD_FILES))
+        self.assertEqual(expected_ports, set(stage_payload.PAYLOAD_TREES))
+        self.assertEqual(expected_ports, set(stage_payload.CLIENT_TREES))
+        self.assertEqual(expected_ports, set(stage_payload.CLIENT_FILES))
         for port_version in core.SUPPORTED_PORTS:
             self.assertTrue(
                 os.path.isfile(core.server_script(port_version, self.target)),
                 port_version)
         self.assertFalse(os.path.exists(os.path.join(self.target, "0.8.2")))
+
+    def test_windows_distribution_guard_rejects_legacy_and_map_studio_paths(self):
+        script_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "build_launcher.ps1")
+        with open(script_path, "r", encoding="utf-8") as stream:
+            script = stream.read()
+
+        self.assertIn('$PathSegments -contains "0.8.2"', script)
+        self.assertIn('"mapstudio"', script)
+        self.assertIn(
+            "0.8.2 and Map Studio must remain outside the launcher "
+            "distribution", script)
 
     def test_the_0_9_22_server_finds_its_client_modules(self):
         self.assertTrue(os.path.isfile(os.path.join(
@@ -1171,9 +1188,10 @@ class PayloadStagingTest(unittest.TestCase):
                          "mod_offhangar.py"),
             os.path.join("0.8.2", "gui", "maps", "a.dds"),
             os.path.join(overlay, "mods", "0.9.22.0.1",
-                         "org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod"),
+                         "org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod"),
             os.path.join(overlay, "mods", "configs", "offline_lan_0922",
                          "config.json"),
+            os.path.join(overlay, "map_studio", "editor.py"),
         ]
         for relative in relative_paths:
             path = os.path.join(source, relative)
@@ -1187,7 +1205,7 @@ class PayloadStagingTest(unittest.TestCase):
         stage_payload.stage_clients(target, source)
         expected = {
             "0.9.22": ("mods/0.9.22.0.1/"
-                       "org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod",
+                       "org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod",
                        "mods/configs/offline_lan_0922/config.json",
                        "offline_worker_starter.exe",
                        "mods/0.9.22.0.1/offline_instance_guard_native.pyd",
@@ -1205,6 +1223,9 @@ class PayloadStagingTest(unittest.TestCase):
                 archive.close()
             for member in members:
                 self.assertIn(member, names)
+            self.assertFalse(any(
+                "mapstudio" in name.replace("_", "").lower()
+                for name in names))
         self.assertFalse(os.path.exists(os.path.join(target, "0.8.2.zip")))
 
     def test_client_staging_without_a_built_package_reports_it(self):
@@ -1240,10 +1261,10 @@ class PayloadStagingTest(unittest.TestCase):
             ] = "secret"
         paths[os.path.join(
             overlay, "mods/0.9.22.0.1",
-            "org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod")] = "x"
+            "org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod")] = "x"
         paths[os.path.join(
             overlay, "mods/0.9.22.0.1",
-            "org.peng.offline_lan_0922_0.6.0-alpha.1.wotmod.sha256")] = "secret"
+            "org.peng.offline_lan_0922_0.6.0-alpha.2.wotmod.sha256")] = "secret"
         paths[os.path.join(
             overlay, "mods/configs/offline_lan_0922/config.json")] = "x"
         paths[os.path.join(
@@ -1564,10 +1585,6 @@ class LocalAddressTest(unittest.TestCase):
 class GameProcessTest(unittest.TestCase):
     """The client can restart itself once while it starts up."""
 
-    class _Result(object):
-        def __init__(self, stdout):
-            self.stdout = stdout
-
     class _Process(object):
         def __init__(self, states):
             self.states = list(states)
@@ -1597,22 +1614,18 @@ class GameProcessTest(unittest.TestCase):
         def wait(self, timeout=None):
             return self.exit_code
 
-    def test_a_listed_process_means_the_game_runs(self):
-        listing = ("WorldOfTanks.exe   9876 Console   1   1,234,567 K\r\n"
-                   ).encode("utf-8")
-        self.assertTrue(core.game_is_running(
-            runner=lambda *args, **kwargs: self._Result(listing)))
+    def test_native_process_enumerator_matches_the_image_name(self):
+        names = ["explorer.exe", "WorldOfTanks.exe"]
 
-    def test_an_empty_listing_means_the_game_is_gone(self):
-        listing = b"INFO: No tasks are running which match the criteria.\r\n"
+        self.assertTrue(core.game_is_running(enumerator=lambda: names))
         self.assertFalse(core.game_is_running(
-            runner=lambda *args, **kwargs: self._Result(listing)))
+            executable="OtherGame.exe", enumerator=lambda: names))
 
-    def test_a_failed_lookup_reports_the_game_as_gone(self):
-        def fail(*args, **kwargs):
-            raise OSError("tasklist is missing")
+    def test_failed_native_process_enumerator_reports_the_game_as_gone(self):
+        def fail():
+            raise OSError("process snapshot is unavailable")
 
-        self.assertFalse(core.game_is_running(runner=fail))
+        self.assertFalse(core.game_is_running(enumerator=fail))
 
     def test_visible_game_window_matches_the_selected_client_path(self):
         selected = core.game_executable("/selected-game")

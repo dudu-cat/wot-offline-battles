@@ -164,7 +164,43 @@ class GunMechanicsParityTests(unittest.TestCase):
         self.assertEqual(0, state.clip)
         self.assertAlmostEqual(state.reload, state.reload_time)
 
-    def test_scatter_uses_082_three_axis_gaussian(self):
+    def test_partial_clip_reload_empties_the_cassette_for_full_reload(self):
+        state = GunState(_descriptor())
+        state.clip = 2
+        state.reload_time = state.clip_reload
+        state.reload_duration = state.clip_reload
+
+        self.assertTrue(state.reload_partial_clip())
+
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertEqual(state.reload, state.reload_duration)
+
+    def test_partial_clip_reload_promotes_a_queued_shell(self):
+        state = GunState(
+            _descriptor(), ammo_layout={1: 20, 2: 10, 3: 5})
+        state.clip = state.clip_size
+        state.reload_time = 0.0
+        state.pending_index = 1
+
+        self.assertTrue(state.reload_partial_clip())
+
+        self.assertEqual(1, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+
+    def test_partial_clip_reload_does_not_restart_an_empty_cycle(self):
+        state = GunState(_descriptor())
+        state.clip = 0
+        state.reload_time = 2.0
+        state.reload_duration = state.reload
+
+        self.assertFalse(state.reload_partial_clip())
+
+        self.assertEqual(2.0, state.reload_time)
+
+    def test_scatter_uses_0922_two_sigma_barrel_plane_distribution(self):
         state = GunState(_descriptor())
         calls = []
 
@@ -174,9 +210,9 @@ class GunMechanicsParityTests(unittest.TestCase):
 
         direction = state.scatter(_Vector(0.0, 0.0, 1.0), gauss=gauss)
 
-        self.assertEqual(3, len(calls))
+        self.assertEqual(1, len(calls))
         self.assertTrue(all(
-            abs(sigma - state.dispersion / 3.0) < 1e-12
+            abs(sigma - state.dispersion / 2.0) < 1e-12
             for unused_mean, sigma in calls))
         self.assertAlmostEqual(1.0, math.sqrt(
             direction.x ** 2 + direction.y ** 2 + direction.z ** 2))
@@ -193,7 +229,38 @@ class GunMechanicsParityTests(unittest.TestCase):
             _Vector(0.0, 0.0, 1.0), gauss=gauss,
             dispersion_angle=0.03)
 
-        self.assertEqual([(0.0, 0.01)] * 3, calls)
+        self.assertEqual([(0.0, 0.015)], calls)
+
+    def test_outlying_normal_sample_is_redistributed_inside_aiming_circle(self):
+        state = GunState(_descriptor())
+        direction = _Vector(0.0, 0.0, 1.0)
+        draws = iter((0.25, 0.0))
+
+        state.scatter(
+            direction,
+            gauss=lambda unused_mean, sigma: sigma * 3.0,
+            uniform=lambda unused_low, unused_high: next(draws))
+
+        deviation = math.acos(max(-1.0, min(1.0, direction.z)))
+        self.assertAlmostEqual(state.dispersion * 0.25, deviation)
+        self.assertLessEqual(deviation, state.dispersion)
+
+    def test_scatter_boundary_holds_for_an_arbitrary_barrel_direction(self):
+        state = GunState(_descriptor())
+        original = _Vector(1.0, 2.0, 3.0)
+        original.normalise()
+        direction = _Vector(original.x, original.y, original.z)
+        draws = iter((1.0, math.pi * 0.5))
+
+        state.scatter(
+            direction,
+            gauss=lambda unused_mean, sigma: sigma * 4.0,
+            uniform=lambda unused_low, unused_high: next(draws))
+
+        dot = (original.x * direction.x + original.y * direction.y +
+               original.z * direction.z)
+        deviation = math.acos(max(-1.0, min(1.0, dot)))
+        self.assertAlmostEqual(state.dispersion, deviation)
 
     def _loaded_state(self):
         state = GunState(_descriptor(clip=(1, 1.0)),

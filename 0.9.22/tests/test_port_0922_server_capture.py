@@ -241,6 +241,17 @@ class ServerCaptureTests(unittest.TestCase):
                 'max_distance': 1000.0, 'max_time_ms': 10000,
                 'is_he': False, 'splash_radius': 0.0,
                 'penetration_factor': 1.0,
+                'source_shot': {
+                    'speed': 100.0, 'gravity': 9.81,
+                    'maxDistance': 1000.0,
+                    'piercingPower': [100.0, 100.0],
+                    'deadeye': False,
+                    'shell': {
+                        'kind': 'ARMOR_PIERCING', 'caliber': 45.0,
+                        'damage': [110.0, 110.0],
+                        'explosionRadius': 0.0,
+                    },
+                },
             }
             self.assertTrue(state.launch_projectile(1, launch))
             projectile_id = '%d:b:11:%d' % (state.round_id, shot_seq)

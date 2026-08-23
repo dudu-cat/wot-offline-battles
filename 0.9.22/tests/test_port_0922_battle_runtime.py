@@ -463,8 +463,9 @@ class _Descriptor(object):
     def __init__(self, name='ussr:R11_MS-1', loaded=True):
         self.name = name
         shell = types.SimpleNamespace(
-            compactDescr=101, damage=(100.0,), caliber=37.0,
-            kind='ARMOR_PIERCING', effectsIndex=3)
+            compactDescr=101, damage=(100.0, 50.0), caliber=37.0,
+            kind='ARMOR_PIERCING', effectsIndex=3,
+            explosionRadius=0.0)
         shot = types.SimpleNamespace(
             shell=shell, piercingPower=(1000.0, 800.0),
             speed=800.0, gravity=9.81, maxDistance=500.0)
@@ -737,6 +738,7 @@ class _Avatar(object):
         self.gun_tracking_calls = []
         self.gun_marker_updates = []
         self.damage_info = []
+        self.other_vehicle_devices = []
         self.hit_directions = []
         self.shot_results = []
         self.dispersion_queries = []
@@ -788,7 +790,9 @@ class _Avatar(object):
                 viewPoints=self.view_points,
                 messages=types.SimpleNamespace(),
                 feedback=types.SimpleNamespace(
-                    setVehicleState=mock.Mock()),
+                    setVehicleState=mock.Mock(),
+                    showVehicleDamagedDevices=mock.Mock(),
+                    hideVehicleDamagedDevices=mock.Mock()),
                 vehicleState=types.SimpleNamespace()))
         self.vehicleTypeDescriptor = types.SimpleNamespace(
             extras=tuple(range(16)))
@@ -878,6 +882,11 @@ class _Avatar(object):
                               attacker_id, equipment_id):
         self.damage_info.append((vehicle_id, damage_index, extra_index,
                                  attacker_id, equipment_id))
+
+    def showOtherVehicleDamagedDevices(
+            self, vehicle_id, damaged_extras, destroyed_extras):
+        self.other_vehicle_devices.append((
+            vehicle_id, tuple(damaged_extras), tuple(destroyed_extras)))
 
     def showOwnVehicleHitDirection(self, hit_yaw, attacker_id, damage,
                                    crits, is_blocked, is_shell_he,
@@ -1521,19 +1530,31 @@ def _runtime():
             DISABLED=0, SWITCHING_ON=1, ENABLED=2, SWITCHING_OFF=3),
         VEHICLE_SETTING=types.SimpleNamespace(
             CURRENT_SHELLS=0, NEXT_SHELLS=1, SIEGE_MODE_ENABLED=3,
-            ACTIVATE_EQUIPMENT=16),
+            ACTIVATE_EQUIPMENT=16, RELOAD_PARTIAL_CLIP=17),
         VEHICLE_MISC_STATUS=types.SimpleNamespace(
+            OTHER_VEHICLE_DAMAGED_DEVICES_VISIBLE=0,
             LOADER_INTUITION_WAS_USED=2, VEHICLE_DROWN_WARNING=4,
+            VEHICLE_IS_OVERTURNED=3,
             SIEGE_MODE_STATE_CHANGED=9),
         DROWN_WARNING_LEVEL=types.SimpleNamespace(
             SAFE=0, CAUTION=1, DANGER=2),
+        OVERTURN_WARNING_LEVEL=types.SimpleNamespace(
+            SAFE=0, CAUTION=1, DANGER=2),
+        OVERTURN_CONDITION=types.SimpleNamespace(
+            IGNOR_DELAY=0.1,
+            WARNING_COSINE=math.cos(math.radians(70.0)),
+            ONBOARD_COSINE=math.cos(math.radians(80.0)),
+            OVERTURN_COSINE=math.cos(math.radians(120.0)),
+            HULL_PRESSURE=0.2),
         ATTACK_REASON=types.SimpleNamespace(
             SHOT='shot', FIRE='fire', RAM='ram',
             WORLD_COLLISION='world_collision',
-            DEATH_ZONE='death_zone', DROWNING='drowning'),
+            DEATH_ZONE='death_zone', DROWNING='drowning',
+            OVERTURN='overturn'),
         ATTACK_REASON_INDICES={
             'shot': 0, 'fire': 1, 'ram': 2,
-            'world_collision': 3, 'death_zone': 4, 'drowning': 5},
+            'world_collision': 3, 'death_zone': 4, 'drowning': 5,
+            'overturn': 7},
         AMMOBAY_DESTRUCTION_MODE=types.SimpleNamespace(
             POWDER_BURN_OFF=0, POWDER_EXPLOSION=1, HE_DETONATION=2),
         DAMAGE_INFO_INDICES={
@@ -1548,10 +1569,18 @@ def _runtime():
             NOT_RUNNING=0, DEPLOYING=1, UNAVAILABLE=2, READY=3,
             PREPARING=4, ACTIVE=5, COOLDOWN=6, EXHAUSTED=255),
         VEHICLE_HIT_FLAGS=types.SimpleNamespace(
-            ATTACK_IS_DIRECT_PROJECTILE=1,
-            MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE=2,
-            MATERIAL_WITH_POSITIVE_DF_NOT_PIERCED_BY_PROJECTILE=4,
-            RICOCHET=8, VEHICLE_KILLED=16),
+            VEHICLE_KILLED=1, FIRE_STARTED=4, RICOCHET=8,
+            MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE=16,
+            MATERIAL_WITH_POSITIVE_DF_NOT_PIERCED_BY_PROJECTILE=32,
+            DEVICE_DAMAGED_BY_PROJECTILE=1024,
+            CHASSIS_DAMAGED_BY_PROJECTILE=2048,
+            GUN_DAMAGED_BY_PROJECTILE=4096,
+            MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_EXPLOSION=8192,
+            DEVICE_DAMAGED_BY_EXPLOSION=65536,
+            CHASSIS_DAMAGED_BY_EXPLOSION=131072,
+            GUN_DAMAGED_BY_EXPLOSION=262144,
+            ATTACK_IS_DIRECT_PROJECTILE=1048576,
+            ATTACK_IS_EXTERNAL_EXPLOSION=2097152),
         FINISH_REASON=types.SimpleNamespace(
             EXTERMINATION=1, BASE=2, TIMEOUT=3, FAILURE=4, TECHNICAL=5))
     arena = types.SimpleNamespace(
@@ -3408,6 +3437,43 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             ('fire cleanup', compound), ('effect key off', compound),
             ('effect stop', compound)], log)
 
+    def test_a_fire_received_while_hidden_starts_when_the_bot_is_respotted(self):
+        runtime = _runtime()
+        log = []
+        fire = _FireExtra(log)
+        descriptor = _Descriptor()
+        descriptor.extrasDict = {'fire': fire}
+        descriptor.extras = {22: fire}
+        factory = RemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7)
+        vehicle_id = factory.create(descriptor, {
+            'publicInfo': {'team': 2, 'name': 'Bot'},
+            'health': 500, 'isCrewActive': True,
+            'gunAnglesPacked': 0}, _Vector(), (0.0, 0.0, 0.0))
+        vehicle = factory.get(vehicle_id)
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._remote_factory = factory
+        record = {
+            'engine_id': vehicle_id, 'local': False, 'ready': True,
+            'presentation': True, 'native_remote': False,
+            'visual_started': False, 'spot_visible': False,
+            'spot_marker_visible': False,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:11': record}
+        ignited = ({'kind': 'fire', 'state': True, 'cause': 'shot'},)
+
+        with mock.patch.dict(sys.modules, _bound_effects_modules(log)):
+            vehicle.is_on_fire = True
+            self.assertFalse(battle._present_critical(record, ignited, 0))
+            self.assertFalse(fire.isRunningFor(vehicle))
+            self.assertTrue(battle._set_record_spot_visibility(
+                record, True, True))
+            self.assertTrue(fire.isRunningFor(vehicle))
+
+        factory.destroy_all()
+
     def test_a_burning_local_player_drives_the_same_fire_extra(self):
         runtime = _runtime()
         log = []
@@ -4380,6 +4446,42 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._publish_ammo_state.assert_called_once_with(state, force=True)
         battle._publish_reload_event.assert_called_once_with(
             state.reload_time, state.reload_duration, force=True)
+
+    def test_partial_clip_setting_starts_one_full_native_reload_cycle(self):
+        runtime = _runtime()
+        descriptor = _two_shell_descriptor()
+        descriptor.gun.clip = (3, 1.0)
+        battle = BattleRuntime(runtime)
+        state = gun_mechanics.GunState(
+            descriptor, ammo_layout={101: 20, 102: 10})
+        state.reload = 6.0
+        state.clip = 2
+        state.reload_time = 0.75
+        state.reload_duration = 1.0
+        battle._gun_state = state
+        battle._publish_ammo_state = mock.Mock()
+        battle._publish_reload_event = mock.Mock()
+
+        self.assertTrue(battle.change_vehicle_setting(
+            runtime.constants.VEHICLE_SETTING.RELOAD_PARTIAL_CLIP, 0))
+
+        self.assertEqual(0, state.clip)
+        self.assertEqual(6.0, state.reload_time)
+        battle._publish_ammo_state.assert_called_once_with(state, force=True)
+        self.assertEqual([
+            mock.call(0.0, 1.0, force=True),
+            mock.call(6.0, 6.0, force=True),
+        ], battle._publish_reload_event.call_args_list)
+
+    def test_partial_clip_setting_is_ignored_by_a_single_shot_gun(self):
+        battle, state, settings = self._shell_change_battle()
+
+        self.assertFalse(battle.change_vehicle_setting(
+            settings.RELOAD_PARTIAL_CLIP, 0))
+
+        self.assertEqual(1, state.clip)
+        battle._publish_ammo_state.assert_not_called()
+        battle._publish_reload_event.assert_not_called()
 
     def test_a_first_press_mid_reload_leaves_the_reload_running(self):
         battle, state, settings = self._shell_change_battle()
@@ -6511,11 +6613,45 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
 
+        self.assertEqual(1.5, battle._water_depth((0.0, 0.0, 0.0)))
         result = battle._direction_probe((0.0, 0.0, 0.0), 0.0)
 
         self.assertTrue(result['water'])
         self.assertFalse(result['clear'])
         self.assertIsNone(battle._navigation_ground(0.0, 8.0, 0.0))
+
+    def test_direction_probe_allows_a_submerged_bot_to_escape_shallower(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._water_depth = mock.Mock(side_effect=(2.0, 1.5, 0.5))
+
+        result = battle._direction_probe((0.0, 0.0, 0.0), 0.0)
+
+        self.assertTrue(result['clear'])
+        self.assertFalse(result['water'])
+        self.assertEqual(3, battle._water_depth.call_count)
+
+    def test_direction_probe_rejects_new_deep_water_and_failed_escape(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        cases = (
+            ((0.0, 0.91), 'dry entry'),
+            ((2.0, 2.11), 'deeper water'),
+            ((2.0, 1.9, 1.9), 'no final improvement'),
+        )
+
+        for depths, label in cases:
+            with self.subTest(label=label):
+                battle._water_depth = mock.Mock(side_effect=depths)
+                result = battle._direction_probe(
+                    (0.0, 0.0, 0.0), 0.0)
+                self.assertFalse(result['clear'])
+                self.assertTrue(result['water'])
+
+        self.assertEqual(
+            0.90, battle_runtime_module.BOT_WATER_AVOID_DEPTH)
 
     def test_local_drowning_uses_native_warning_and_preserves_display_hp(self):
         runtime = _runtime()
@@ -6558,6 +6694,70 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(5, battle._local_damage_report['reason'])
         self.assertEqual(500,
                          battle._local_damage_report['display_health'])
+        self.assertNotIn('attacker', battle._local_damage_report)
+        self.assertNotIn('attacker_bot', battle._local_damage_report)
+
+    def test_local_overturn_warning_resets_when_the_hull_is_righted(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._records = {
+            'player:1': {
+                'engine_id': 10, 'state': {'health': 500, 'alive': True},
+                'kind': 'player', 'network_id': 1, 'local': True}}
+        battle._local_pitch = math.radians(75.0)
+
+        self.assertFalse(battle._tick_overturn(0.1, 1.0))
+        self.assertEqual((10, 3, 1, (0.0, 0.0)),
+                         battle._avatar.misc_status)
+
+        battle._local_pitch = 0.0
+        self.assertFalse(battle._tick_overturn(0.1, 1.1))
+        self.assertEqual((10, 3, 0, (0.0, 0.0)),
+                         battle._avatar.misc_status)
+        self.assertEqual(0.0, battle._overturn_time)
+
+    def test_local_overturn_destroys_after_thirty_seconds_without_attacker(self):
+        runtime = _runtime()
+        runtime.bigworld.serverTime = lambda: 900.0
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._records = {
+            'player:1': {
+                'engine_id': 10, 'state': {'health': 500, 'alive': True},
+                'kind': 'player', 'network_id': 1, 'local': True}}
+        battle._local_pitch = math.radians(90.0)
+        battle._local_last_attacker = ('player', 9)
+        critical = {
+            'devices': [], 'destroyed': [], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False,
+            'events': []}
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'critical_damage.apply_death', return_value=critical) as death:
+            self.assertFalse(battle._tick_overturn(0.1, 1.0))
+            self.assertEqual((10, 3, 2, (900.0, 30.0)),
+                             battle._avatar.misc_status)
+            battle._overturn_time = 29.95
+            self.assertTrue(battle._tick_overturn(0.1, 1.1))
+
+        death.assert_called_once_with(entity, 'overturn')
+        self.assertEqual(0, entity.health)
+        self.assertEqual((10, 0, 7, False, False),
+                         battle._avatar.health_update)
+        self.assertEqual(7, battle._local_damage_report['reason'])
         self.assertNotIn('attacker', battle._local_damage_report)
         self.assertNotIn('attacker_bot', battle._local_damage_report)
 
@@ -7028,29 +7228,51 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.entities.update({10: target, 11: attacker})
         battle._local_position = (0.0, 0.0, 0.0)
         target_record = {
-            'engine_id': 10, 'state': {'health': 500},
+            'engine_id': 10, 'state': {'team': 1, 'health': 500},
             'kind': 'player', 'network_id': 1, 'local': True}
         attacker_record = {
             'engine_id': 11,
-            'state': {'health': 500, 'x': 10.0, 'y': 0.0, 'z': 0.0},
+            'spot_visible': False, 'spot_marker_visible': False,
+            'state': {'team': 2, 'health': 500,
+                      'x': 10.0, 'y': 0.0, 'z': 0.0},
             'kind': 'bot', 'network_id': 2, 'local': False}
         event = {
             'kind': 'bot_human_hit', 'world_pose': True,
             'x': 0.5, 'y': 1.0, 'z': 0.0, 'shell_index': 0,
-            'shot_result': 2, 'damage': 144, 'source': 'shot'}
+            'shot_result': 2, 'damage': 144, 'source': 'shot',
+            'dead': False, 'attack_reason': 0, 'death_reason': 0,
+            'critical': {'events': [
+                {'kind': 'device', 'name': 'engineHealth',
+                 'state': 'critical', 'cause': 'shot'},
+                {'kind': 'device', 'name': 'leftTrackHealth',
+                 'state': 'destroyed', 'cause': 'shot'},
+                {'kind': 'crew', 'name': 'gunner1',
+                 'state': 'destroyed', 'cause': 'shot'},
+                {'kind': 'crew', 'name': 'radioman1',
+                 'state': 'destroyed', 'cause': 'shot'},
+            ]}}
 
         self.assertTrue(battle._present_combat_hit(
             event, target_record, attacker_record, 11))
+        self.assertTrue(battle._present_combat_feedback(
+            event, target_record, attacker_record))
 
         direction = battle._avatar.hit_directions[-1]
         self.assertEqual((11, 144, 10),
                          (direction[1], direction[2], direction[6]))
+        self.assertEqual(
+            ((1 << 0) | (1 << (12 + 4)) |
+             (1 << (24 + 2)) | (1 << (24 + 3))),
+            direction[3])
         self.assertAlmostEqual(-math.pi / 2.0, direction[0])
         effect = battle._avatar.terrainEffects.addNew.call_args
         self.assertEqual(('hitFx', 'hitStages'),
                          (effect.args[1], effect.args[2]))
         self.assertTrue(effect.kwargs['showShockWave'])
         self.assertTrue(effect.kwargs['showFlashBang'])
+        self.assertEqual([10, 9], [
+            value['eventType']
+            for value in battle._avatar.battle_events[0]])
 
     def test_he_splash_uses_the_stock_vehicle_explosion_effect(self):
         runtime = _runtime()
@@ -7113,11 +7335,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             effect = battle._avatar.terrainEffects.addNew.call_args
             self.assertEqual(expected, (effect.args[1], effect.args[2]))
 
-    def test_an_unspotted_target_keeps_the_voice_and_loses_the_impact(self):
-        """#1513 reaches the armour effect only through
-        Vehicle.showDamageFromShot, which returns while the target is not
-        started.  showShotResults and onBattleEvents are Avatar RPCs that
-        never test visibility."""
+    def test_an_unspotted_target_discloses_no_shot_feedback(self):
+        """Pierce, block, critical and kill stay silent until spotted."""
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
@@ -7132,34 +7351,173 @@ class BattleRuntimeContractTests(unittest.TestCase):
         target = {
             'engine_id': 11, 'local': False, 'kind': 'bot',
             'network_id': 2, 'spot_visible': False,
+            'spot_marker_visible': False,
             'state': {'team': 2, 'health': 500,
                       'x': 10.0, 'y': 0.0, 'z': 0.0}}
         attacker = {
             'engine_id': 10, 'local': True, 'kind': 'player',
             'network_id': 1, 'state': {'team': 1, 'health': 500}}
-        event = {
+        base_event = {
             'kind': 'bot_hit', 'world_pose': True,
             'x': 9.5, 'y': 1.0, 'z': 0.0, 'shell_index': 0,
-            'shot_result': 2, 'damage': 144, 'dead': False,
             'attack_reason': 0, 'death_reason': 0, 'source': 'shot'}
+        cases = (
+            {'shot_result': 2, 'damage': 144, 'dead': False},
+            {'shot_result': 1, 'damage': 0, 'dead': False},
+            {'shot_result': 1, 'damage': 0, 'dead': False,
+             'critical': {'events': [{
+                 'kind': 'device', 'name': 'leftTrackHealth',
+                 'state': 'destroyed', 'cause': 'shot'}]}},
+            {'shot_result': 2, 'damage': 500, 'dead': True},
+        )
+        for case in cases:
+            event = dict(base_event)
+            event.update(case)
+            self.assertFalse(battle._present_combat_hit(
+                event, target, attacker, 10))
+            self.assertFalse(battle._present_combat_feedback(
+                event, target, attacker))
 
-        self.assertFalse(battle._present_combat_hit(
+        battle._avatar.terrainEffects.addNew.assert_not_called()
+        self.assertEqual([], battle._avatar.shot_results)
+        self.assertEqual([], battle._avatar.battle_events)
+
+        # Radio/team spotting is sufficient even when the model itself is
+        # outside the ordinary world-model AOI.
+        target['spot_marker_visible'] = True
+        event = dict(base_event)
+        event.update(cases[0])
+        self.assertTrue(battle._present_combat_hit(
             event, target, attacker, 10))
         self.assertTrue(battle._present_combat_feedback(
             event, target, attacker))
-
-        battle._avatar.terrainEffects.addNew.assert_not_called()
+        battle._avatar.terrainEffects.addNew.assert_called_once()
         self.assertEqual(1, len(battle._avatar.shot_results))
-        self.assertEqual(
-            11, battle._avatar.shot_results[0][0] & 0xffffffff)
         self.assertEqual([7], [
             value['eventType']
             for value in battle._avatar.battle_events[0]])
 
-        target['spot_visible'] = True
-        self.assertTrue(battle._present_combat_hit(
-            event, target, attacker, 10))
-        battle._avatar.terrainEffects.addNew.assert_called_once()
+    def test_a_blind_kill_applies_authority_without_client_disclosure(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._avatar.playerVehicleID = 10
+        battle._synchronise_player_identity(10)
+        attacker = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                            {'health': 500})
+        target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
+                          (0, 0, 0), {'health': 500})
+        target.model.visible = False
+        runtime.bigworld.entities.update({10: attacker, 11: target})
+        target_record = {
+            'engine_id': 11, 'local': False, 'kind': 'bot',
+            'network_id': 2, 'presentation': True, 'native_remote': True,
+            'ready': True, 'visual_started': False,
+            'spot_visible': False, 'spot_marker_visible': False,
+            'state': {'team': 2, 'health': 500, 'alive': True,
+                      'x': 0.0, 'y': 0.0, 'z': 10.0}}
+        battle._records = {
+            'player:1': {
+                'engine_id': 10, 'local': True, 'kind': 'player',
+                'network_id': 1, 'presented_frags': 0,
+                'state': {'team': 1, 'health': 500, 'alive': True,
+                          'frags': 0}},
+            'bot:2': target_record,
+        }
+        request_wreck = mock.Mock(return_value=True)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda engine_id: target if engine_id == 11 else None,
+            request_wreck=request_wreck)
+        event = {
+            'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
+            'health': 0, 'dead': True, 'attack_reason': 0,
+            'death_reason': 0, 'source': 'shot', 'world_pose': True,
+            'x': 0.0, 'y': 1.0, 'z': 10.0, 'shell_index': 0,
+            'shot_result': 2, 'damage': 500}
+
+        with mock.patch.object(
+                critical_damage, 'apply_death', return_value=None):
+            self.assertTrue(battle._apply_combat_event(event))
+
+        self.assertEqual(0, target.health)
+        self.assertEqual(0, target_record['state']['health'])
+        self.assertFalse(target_record['wreck_known'])
+        self.assertTrue(target_record['deferred_health_presentation'])
+        self.assertFalse(hasattr(target, 'health_change'))
+        self.assertFalse(battle._set_record_spot_visibility(
+            target_record, False, False))
+        self.assertFalse(target.model.visible)
+        request_wreck.assert_called_once_with(11)
+        battle._avatar.guiSessionProvider.setVehicleHealth.assert_not_called()
+        battle._avatar.guiSessionProvider.shared.feedback.\
+            setVehicleState.assert_not_called()
+        battle._binding.arena_vehicle_killed.assert_not_called()
+        battle._avatar.terrainEffects.addNew.assert_not_called()
+        self.assertEqual([], battle._avatar.shot_results)
+        self.assertEqual([], battle._avatar.battle_events)
+
+        statistics = {
+            'kind': 'vehicle_statistics', 'actor_kind': 'player',
+            'actor_id': 1, 'frags': 1, 'team_killer': False}
+        self.assertFalse(battle._apply_vehicle_statistics_event(statistics))
+        battle._binding.arena_vehicle_statistics.assert_not_called()
+
+        self.assertTrue(battle._set_record_spot_visibility(
+            target_record, True, True))
+        battle._binding.arena_vehicle_statistics.assert_called_once_with(
+            10, 1)
+
+    def test_blind_critical_state_has_no_remote_vehicle_effect(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(11, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[11] = entity
+        hidden = {
+            'engine_id': 11, 'local': False,
+            'spot_visible': False, 'spot_marker_visible': False}
+        ammo_rack = ({
+            'kind': 'ammo_rack', 'state': 'destroyed', 'cause': 'shot'},)
+
+        self.assertFalse(battle._present_critical(hidden, ammo_rack, 10))
+        self.assertEqual([], entity.ammo_bay_effects)
+
+        hidden['spot_marker_visible'] = True
+        self.assertTrue(battle._present_critical(hidden, ammo_rack, 10))
+        self.assertEqual([(2, 0.0, 0.0)], entity.ammo_bay_effects)
+
+    def test_a_later_spot_reconciles_blind_damage_without_attack_cause(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        entity = _Vehicle(11, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[11] = entity
+        record = {
+            'engine_id': 11, 'local': False, 'presentation': True,
+            'native_remote': True, 'ready': True,
+            'spot_visible': False, 'spot_marker_visible': False,
+            'visual_started': False,
+            'state': {'team': 2, 'health': 400, 'alive': True}}
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda engine_id: entity if engine_id == 11 else None)
+
+        battle._apply_health(
+            record, record['state'], attacker_id=10, reason_id=0,
+            force_cause=True, attack_reason_id=0,
+            suppress_combat_presentation=True)
+
+        present_health = battle._avatar.guiSessionProvider.setVehicleHealth
+        present_health.assert_not_called()
+        self.assertTrue(record['deferred_health_presentation'])
+
+        battle._set_record_spot_visibility(record, False, True)
+
+        present_health.assert_called_once_with(False, 11, 400, 0, 0)
+        self.assertNotIn('deferred_health_presentation', record)
 
     def test_critical_presentation_uses_exact_causes_and_ammo_effect(self):
         runtime = _runtime()
@@ -7190,6 +7548,93 @@ class BattleRuntimeContractTests(unittest.TestCase):
             battle._avatar.damage_info)
         self.assertEqual([(2, 0.0, 0.0)], entity.ammo_bay_effects)
 
+    def test_expert_is_only_enabled_for_a_finished_active_perk(self):
+        finished = types.SimpleNamespace(
+            name='commander_expert', level=100.0, isActive=True)
+        unfinished = types.SimpleNamespace(
+            name='commander_expert', level=99.0, isActive=True)
+        inactive = types.SimpleNamespace(
+            name='commander_expert', level=100.0, isActive=False)
+
+        self.assertTrue(battle_runtime_module._crew_has_finished_skill(
+            [types.SimpleNamespace(skills=(finished,))],
+            'commander_expert'))
+        self.assertFalse(battle_runtime_module._crew_has_finished_skill(
+            [types.SimpleNamespace(skills=(unfinished, inactive))],
+            'commander_expert'))
+
+    def test_expert_visibility_uses_exact_misc_status_boundary(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._has_expert = True
+
+        self.assertTrue(battle._enable_expert_visibility())
+        self.assertFalse(battle._enable_expert_visibility())
+
+        self.assertEqual([(
+            10,
+            runtime.constants.VEHICLE_MISC_STATUS.
+            OTHER_VEHICLE_DAMAGED_DEVICES_VISIBLE,
+            1, (0.0,))], battle._avatar.misc_statuses)
+
+    def test_expert_publishes_extra_indices_after_four_second_lock(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle.state = 'running'
+        battle._avatar = runtime.bigworld.avatar
+        battle._has_expert = True
+        clock = [10.0]
+        battle._clock = lambda: clock[0]
+        fire = types.SimpleNamespace(name='fire')
+        engine = types.SimpleNamespace(name='engineHealth')
+        track = types.SimpleNamespace(name='leftTrackHealth')
+        descriptor = types.SimpleNamespace(
+            extras=(fire, engine, track),
+            extrasDict={
+                'fire': fire, 'engineHealth': engine,
+                'leftTrackHealth': track})
+        entity = types.SimpleNamespace(
+            id=11, typeDescriptor=descriptor, health=500,
+            isCrewActive=True, isAlive=lambda: True)
+        runtime.bigworld.entities[11] = entity
+        critical = {
+            'devices': [
+                {'name': 'engineHealth', 'state': 'critical'},
+                {'name': 'leftTrackHealth', 'state': 'destroyed'},
+            ],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [],
+            'fire': True, 'ammo_rack_death': False, 'events': []}
+        record = {
+            'engine_id': 11, 'local': False, 'ready': True,
+            'critical_state': critical,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:2': record}
+
+        self.assertTrue(battle.monitor_vehicle_damaged_devices(11))
+        self.assertFalse(battle._tick_expert_target(13.999))
+        self.assertTrue(battle._tick_expert_target(14.0))
+        self.assertFalse(battle._tick_expert_target(15.0))
+        self.assertEqual([(11, (0, 1), (2,))],
+                         battle._avatar.other_vehicle_devices)
+
+        record['critical_state'] = dict(critical)
+        record['critical_state']['devices'] = [
+            {'name': 'engineHealth', 'state': 'destroyed'},
+            {'name': 'leftTrackHealth', 'state': 'destroyed'},
+        ]
+        record['critical_state']['destroyed'] = [
+            'engineHealth', 'leftTrackHealth']
+        self.assertTrue(battle._tick_expert_target(15.1))
+        self.assertEqual((11, (0,), (1, 2)),
+                         battle._avatar.other_vehicle_devices[-1])
+
+        self.assertTrue(battle.monitor_vehicle_damaged_devices(0))
+        feedback = battle._avatar.guiSessionProvider.shared.feedback
+        feedback.hideVehicleDamagedDevices.assert_called_once_with(11)
+
     def test_server_hit_uses_stock_shot_result_and_battle_feedback(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -7216,10 +7661,92 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, len(battle._avatar.shot_results))
         packed = battle._avatar.shot_results[0][0]
         self.assertEqual(11, packed & 0xffffffff)
-        self.assertEqual(3, packed >> 32)
+        flags = runtime.constants.VEHICLE_HIT_FLAGS
+        self.assertEqual(
+            flags.ATTACK_IS_DIRECT_PROJECTILE |
+            flags.MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_PROJECTILE |
+            flags.DEVICE_DAMAGED_BY_PROJECTILE,
+            packed >> 32)
         self.assertEqual([7, 6], [
             value['eventType']
             for value in battle._avatar.battle_events[0]])
+
+    def test_shot_results_include_confirmed_track_gun_and_fire_flags(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._synchronise_player_identity(10)
+        target = {
+            'engine_id': 11, 'local': False, 'kind': 'bot',
+            'network_id': 2, 'state': {'team': 2}}
+        attacker = {
+            'engine_id': 10, 'local': True, 'kind': 'player',
+            'network_id': 1, 'state': {'team': 1}}
+        event = {
+            'kind': 'bot_hit', 'damage': 0, 'shot_result': 1,
+            'dead': False, 'attack_reason': 0, 'death_reason': 0,
+            'source': 'shot', 'critical': {'events': [
+                {'kind': 'device', 'name': 'leftTrackHealth',
+                 'state': 'destroyed', 'cause': 'shot'},
+                {'kind': 'device', 'name': 'gunHealth',
+                 'state': 'critical', 'cause': 'shot'},
+                {'kind': 'fire', 'state': True, 'cause': 'shot'},
+            ]}}
+
+        self.assertTrue(battle._present_combat_feedback(
+            event, target, attacker))
+
+        packed = battle._avatar.shot_results[0][0]
+        flags = runtime.constants.VEHICLE_HIT_FLAGS
+        self.assertEqual(11, packed & 0xffffffff)
+        self.assertEqual(
+            flags.ATTACK_IS_DIRECT_PROJECTILE |
+            flags.MATERIAL_WITH_POSITIVE_DF_NOT_PIERCED_BY_PROJECTILE |
+            flags.DEVICE_DAMAGED_BY_PROJECTILE |
+            flags.CHASSIS_DAMAGED_BY_PROJECTILE |
+            flags.GUN_DAMAGED_BY_PROJECTILE |
+            flags.FIRE_STARTED,
+            packed >> 32)
+
+    def test_splash_uses_external_explosion_and_explosion_module_flags(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._avatar.playerVehicleID = 10
+        battle._synchronise_player_identity(10)
+        target = {
+            'engine_id': 11, 'local': False, 'kind': 'bot',
+            'network_id': 2, 'state': {'team': 2}}
+        attacker = {
+            'engine_id': 10, 'local': True, 'kind': 'player',
+            'network_id': 1, 'state': {'team': 1}}
+        event = {
+            'kind': 'bot_hit', 'damage': 80, 'shot_result': 2,
+            'dead': False, 'attack_reason': 0, 'death_reason': 0,
+            'source': 'shot', 'splash': True,
+            'critical': {'events': [
+                {'kind': 'device', 'name': 'leftTrackHealth',
+                 'state': 'destroyed', 'cause': 'explosion'},
+                {'kind': 'device', 'name': 'gunHealth',
+                 'state': 'critical', 'cause': 'explosion'},
+                {'kind': 'fire', 'state': True, 'cause': 'explosion'},
+            ]}}
+
+        self.assertTrue(battle._present_combat_feedback(
+            event, target, attacker))
+
+        packed = battle._avatar.shot_results[0][0]
+        flags = runtime.constants.VEHICLE_HIT_FLAGS
+        self.assertEqual(11, packed & 0xffffffff)
+        self.assertEqual(
+            flags.ATTACK_IS_EXTERNAL_EXPLOSION |
+            flags.MATERIAL_WITH_POSITIVE_DF_PIERCED_BY_EXPLOSION |
+            flags.DEVICE_DAMAGED_BY_EXPLOSION |
+            flags.CHASSIS_DAMAGED_BY_EXPLOSION |
+            flags.GUN_DAMAGED_BY_EXPLOSION |
+            flags.FIRE_STARTED,
+            packed >> 32)
 
     def test_a_moving_bot_is_fed_belt_speeds_and_a_running_engine(self):
         runtime = _runtime()
@@ -9689,6 +10216,74 @@ class BattleRuntimeContractTests(unittest.TestCase):
             battle._local_position,
             tuple(camera.vehicleMProv.translation))
 
+    @staticmethod
+    def _sniper_hull_turn_fixture(turret_yaw_limits):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor()
+        descriptor.gun.turretYawLimits = turret_yaw_limits
+        entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_descriptor = descriptor
+        battle._attach_local_presentation()
+
+        class AimingSystem(object):
+            def __init__(self):
+                self.world_yaw = 0.8
+                self.world_pitch = -0.12
+                self.ideal_turret_yaw = 0.8
+                self.reset_calls = 0
+
+            def resetIdealDirection(self):
+                self.reset_calls += 1
+                self.ideal_turret_yaw = (
+                    (self.world_yaw - battle._local_matrix.yaw + math.pi) %
+                    (2.0 * math.pi) - math.pi)
+
+        aiming = AimingSystem()
+        handler = battle._avatar.inputHandler
+        handler._AvatarInputHandler__ctrlModeName = 'sniper'
+        handler._AvatarInputHandler__curCtrl = types.SimpleNamespace(
+            camera=types.SimpleNamespace(aimingSystem=aiming))
+        return battle, entity, aiming
+
+    def test_full_turret_sniper_keeps_mouse_world_aim_across_hull_turns(self):
+        battle, entity, aiming = self._sniper_hull_turn_fixture(None)
+
+        battle._local_yaw = 0.35
+        battle._update_local_presentation(entity)
+
+        self.assertEqual(1, aiming.reset_calls)
+        self.assertAlmostEqual(0.8, aiming.world_yaw)
+        self.assertAlmostEqual(-0.12, aiming.world_pitch)
+        self.assertAlmostEqual(0.45, aiming.ideal_turret_yaw)
+
+        # A mouse step remains world-space input. A pose refresh with no new
+        # hull turn must not overwrite or rebase it.
+        aiming.world_yaw += 0.1
+        battle._update_local_presentation(entity)
+        self.assertEqual(1, aiming.reset_calls)
+        self.assertAlmostEqual(0.9, aiming.world_yaw)
+
+        battle._local_yaw = 0.55
+        battle._update_local_presentation(entity)
+        self.assertEqual(2, aiming.reset_calls)
+        self.assertAlmostEqual(0.9, aiming.world_yaw)
+        self.assertAlmostEqual(0.35, aiming.ideal_turret_yaw)
+
+    def test_limited_traverse_sniper_remains_hull_relative(self):
+        battle, entity, aiming = self._sniper_hull_turn_fixture((-0.2, 0.2))
+
+        battle._local_yaw = 0.35
+        battle._update_local_presentation(entity)
+
+        self.assertEqual(0, aiming.reset_calls)
+        self.assertAlmostEqual(0.8, aiming.ideal_turret_yaw)
+
     def test_prebattle_draws_the_reticle_but_fences_the_server_marker(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -11859,6 +12454,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle.shoot(0.2, -0.1))
         self.assertEqual([], producer.calls)
+        launch = [message for message in client.sent
+                  if message[0] == 'fire'][-1]
+        self.assertEqual(
+            [100.0, 50.0], launch[2]['source_shot']['shell']['damage'])
         battle._show_shot({'attacker': 1})
         shot_angle = producer.factor
         first_tick = producer(0.5, 0)[0]
@@ -13186,7 +13785,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         with mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
-                'critical_damage.propose_direct',
+                'critical_damage.propose_explosion',
                 side_effect=lambda *args, **kwargs: (
                     args[4] + 111, {'events': []})) as apply_critical:
             count = battle._he_splash(
@@ -13203,7 +13802,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(7, sent.kwargs[
             'critical_target_base_revision'])
         self.assertEqual(3, sent.kwargs['critical_target_ack_seq'])
-        self.assertTrue(apply_critical.call_args.kwargs['by_explosion'])
+        self.assertFalse(apply_critical.call_args.kwargs['deadeye'])
+        self.assertGreater(apply_critical.call_args.args[3].length, 0.0)
 
     def test_health_transition_calls_native_vehicle_death_path(self):
         runtime = _runtime()

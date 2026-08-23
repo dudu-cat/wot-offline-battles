@@ -125,6 +125,15 @@ class Matrix(object):
                                float(position[2])]
         return matrix
 
+    @classmethod
+    def from_pose(cls, yaw, pitch, roll, position):
+        matrix = cls()
+        matrix._rows = [list(axis) for axis in _pose_axes(
+            float(yaw), float(pitch), float(roll))]
+        matrix._translation = [float(position[0]), float(position[1]),
+                               float(position[2])]
+        return matrix
+
     @property
     def translation(self):
         return Vector3(*self._translation)
@@ -203,27 +212,131 @@ def install_engine_modules(clock):
             sys.modules[name] = module
 
 
+class _ComponentTransform(object):
+    """Vehicle-local to one donated component's current local space."""
+
+    __slots__ = ('_hull', '_turret', '_gun', '_turret_yaw', '_gun_pitch',
+                 '_stage')
+
+    def __init__(self, hull, turret, gun, turret_yaw, gun_pitch, stage):
+        self._hull = hull
+        self._turret = turret
+        self._gun = gun
+        self._turret_yaw = float(turret_yaw)
+        self._gun_pitch = float(gun_pitch)
+        self._stage = str(stage)
+
+    @staticmethod
+    def _subtract(point, offset):
+        return Vector3(point.x - offset.x, point.y - offset.y,
+                       point.z - offset.z)
+
+    @staticmethod
+    def _rotate_y_inverse(point, angle):
+        sine, cosine = math.sin(angle), math.cos(angle)
+        return Vector3(cosine * point.x - sine * point.z, point.y,
+                       sine * point.x + cosine * point.z)
+
+    @staticmethod
+    def _rotate_x_inverse(point, angle):
+        sine, cosine = math.sin(angle), math.cos(angle)
+        return Vector3(point.x, cosine * point.y + sine * point.z,
+                       -sine * point.y + cosine * point.z)
+
+    def applyPoint(self, point):
+        point = Vector3(point)
+        if self._stage == 'chassis':
+            return point
+        point = self._subtract(point, self._hull)
+        if self._stage == 'hull':
+            return point
+        point = self._subtract(point, self._turret)
+        point = self._rotate_y_inverse(point, self._turret_yaw)
+        if self._stage == 'turret':
+            return point
+        point = self._subtract(point, self._gun)
+        return self._rotate_x_inverse(point, self._gun_pitch)
+
+
+def _component_offset(value):
+    try:
+        return Vector3(value)
+    except (TypeError, ValueError, IndexError):
+        return Vector3()
+
+
+def _target_components(descriptor, hull_yaw, aim_yaw, gun_pitch):
+    """Rebuild the four #1513 parent transforms from donated mount offsets.
+
+    These transforms place the adopted profile boxes. They deliberately do
+    not claim or synthesize native armor/material collision layers.
+    """
+    chassis = _field(descriptor, 'chassis', None)
+    hull = _field(descriptor, 'hull', None)
+    turret = _field(descriptor, 'turret', None)
+    gun = _field(descriptor, 'gun', None)
+    hull_offset = _component_offset(
+        _field(chassis, 'hullPosition', (0.0, 0.0, 0.0)))
+    turret_positions = _field(hull, 'turretPositions', ()) or ()
+    turret_offset = _component_offset(
+        turret_positions[0] if turret_positions else (0.0, 0.0, 0.0))
+    gun_offset = _component_offset(
+        _field(turret, 'gunPosition', (0.0, 0.0, 0.0)))
+    relative_yaw = ((float(aim_yaw) - float(hull_yaw) + math.pi) %
+                    (2.0 * math.pi)) - math.pi
+    result = []
+    for name, component in (('chassis', chassis), ('hull', hull),
+                            ('turret', turret), ('gun', gun)):
+        if component is None:
+            continue
+        result.append((component, _ComponentTransform(
+            hull_offset, turret_offset, gun_offset, relative_yaw,
+            gun_pitch, name)))
+    return tuple(result)
+
+
 class _TargetMock(object):
     """Detached target state for the copied crit law's proposal path."""
 
     def __init__(self, identity, health, descriptor, position, yaw,
-                 combat_state):
+                 combat_state, aim_yaw=None, gun_pitch=0.0, pitch=0.0,
+                 roll=0.0):
         self.id = identity
         self.health = int(health)
         self.typeDescriptor = descriptor
         self.position = Vector3(*position)
-        self.matrix = Matrix.from_yaw_position(yaw, position)
+        self.matrix = Matrix.from_pose(yaw, pitch, roll, position)
         critical = combat_state.get('critical') or {}
-        self.devices_hp = dict(
-            (name, float(value))
-            for name, value in (critical.get('devices_hp') or {}).items())
-        self._destroyed_devices = set(critical.get('destroyed') or ())
+        self.devices_hp = {}
+        self._destroyed_devices = set(
+            str(name) for name in critical.get('destroyed') or ())
+        self._critical_devices = set()
+        for record in critical.get('devices') or ():
+            if not isinstance(record, dict) or not record.get('name'):
+                continue
+            name = str(record['name'])
+            try:
+                self.devices_hp[name] = max(
+                    0.0, float(record.get('hp', 0.0)))
+            except (TypeError, ValueError):
+                continue
+            state = str(record.get('state') or '')
+            if state == 'destroyed':
+                self._destroyed_devices.add(name)
+            elif state == 'critical':
+                self._critical_devices.add(name)
+        self._critical_devices.difference_update(self._destroyed_devices)
         self._crew_ko = set(critical.get('crew_ko') or ())
         self.is_on_fire = bool(critical.get('fire', False))
+        self._ammo_rack_death = bool(
+            critical.get('ammo_rack_death', False))
         self._offline_proposal_only = True
+        self._components = _target_components(
+            descriptor, yaw, yaw if aim_yaw is None else aim_yaw,
+            gun_pitch)
 
     def getComponents(self):
-        return ()
+        return self._components
 
 
 class ServerBattleAuthority(object):
@@ -622,6 +735,7 @@ class ServerBattleAuthority(object):
                 'team': int(player.team),
                 'x': float(player.x), 'y': float(player.y),
                 'z': float(player.z), 'yaw': float(player.yaw),
+                'pitch': float(player.pitch), 'roll': float(player.roll),
                 'speed': float(player.speed),
                 'alive': bool(player.alive),
                 'health': int(player.health),
@@ -641,8 +755,13 @@ class ServerBattleAuthority(object):
         if kind == 'bot_manifest':
             self.state.update_bot_manifest(SERVER_AUTHORITY_ID, payload)
         elif kind == 'bot_state':
-            self._resolve_bot_fire(message, now)
-            self.state.update_bot_states(SERVER_AUTHORITY_ID, payload)
+            # The canonical ledger admits a bot projectile only after this
+            # exact fire edge has entered ``bot_pending_projectile_launches``.
+            # Resolving first left rapid clips perpetually one sequence behind:
+            # every next round replaced the compact launch before its pending
+            # edge could be consumed.
+            if self.state.update_bot_states(SERVER_AUTHORITY_ID, payload):
+                self._resolve_bot_fire(message, now)
         elif kind == 'bot_observation':
             relay = self.state.update_bot_observation(
                 SERVER_AUTHORITY_ID, payload)
@@ -656,7 +775,7 @@ class ServerBattleAuthority(object):
     # -- bot projectiles -------------------------------------------------------
 
     def _resolve_bot_fire(self, message, now):
-        for state in message.get('bots') or ():
+        for state in (message.get('launches') or message.get('bots') or ()):
             try:
                 bot_id = int(state.get('id'))
                 fire_seq = int(state.get('fire_seq', 0))
@@ -686,8 +805,9 @@ class ServerBattleAuthority(object):
             return False
         profile = state.get('profile')
         profile = profile if isinstance(profile, dict) else {}
+        class_tag = state.get('class_tag', profile.get('class_tag'))
         max_time_ms = PROJECTILE_MAX_TIME_MS
-        if str(profile.get('class_tag') or '') == 'SPG':
+        if str(class_tag or '') == 'SPG':
             try:
                 origin = tuple(float(value)
                                for value in state['shot_origin'])
@@ -699,9 +819,14 @@ class ServerBattleAuthority(object):
             except (KeyError, TypeError, ValueError):
                 return False
         else:
-            origin = _muzzle_origin(state, descriptor,
-                                    shot_yaw=shot_yaw)
-            if origin is None:
+            try:
+                origin = tuple(float(value)
+                               for value in state['shot_origin'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if (len(origin) != 3 or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in origin)):
                 return False
             cosine = math.cos(shot_pitch)
             velocity = (math.sin(shot_yaw) * cosine * speed,
@@ -727,6 +852,7 @@ class ServerBattleAuthority(object):
                                    if is_he else 0.0),
             'penetration_factor': float(
                 combat_rules.sample_penetration_factor()),
+            'source_shot': _source_shot_from_descriptor(shot),
             'authority_epoch': int(self.state.authority_epoch),
         }
         accepted = self.state.launch_projectile(SERVER_AUTHORITY_ID, message)
@@ -737,7 +863,8 @@ class ServerBattleAuthority(object):
         return (
             meta['projectile_id'], meta['shooter_kind'],
             meta['shooter_id'], meta['source_vehicle'], meta['shot_seq'],
-            meta['shell_index'], meta['team'], meta['origin'],
+            meta['shell_index'], _source_shot_signature(meta['source_shot']),
+            meta['team'], meta['origin'],
             meta['velocity'], meta['gravity'], meta['max_distance'],
             meta['max_time_ms'], meta['is_he'], meta['splash_radius'],
             meta['penetration_factor'], meta['launch_server_time_ms'],
@@ -751,6 +878,7 @@ class ServerBattleAuthority(object):
             shooter_kind = str(raw['shooter_kind'])
             shooter_id = int(raw['shooter_id'])
             source_vehicle = str(raw['source_vehicle'])
+            source_shot = _normalize_source_shot(raw['source_shot'])
             shot_seq = int(raw['shot_seq'])
             shell_index = int(raw['shell_index'])
             team = int(raw['team'])
@@ -786,11 +914,16 @@ class ServerBattleAuthority(object):
                 authority_epoch != int(self.state.authority_epoch) or
                 not isinstance(raw.get('is_he'), bool)):
             return None
+        if not _source_shot_matches_launch(
+                source_shot, velocity, gravity, maximum,
+                raw['is_he'], splash_radius):
+            return None
         return {
             'projectile_id': projectile_id,
             'shooter_kind': shooter_kind,
             'shooter_id': shooter_id,
             'source_vehicle': source_vehicle,
+            'source_shot': source_shot,
             'shot_seq': shot_seq,
             'shell_index': shell_index,
             'team': team,
@@ -835,8 +968,6 @@ class ServerBattleAuthority(object):
                 self._piercing_loss[wire_id] = max(
                     float(meta['piercing_loss']),
                     float(self._piercing_loss.get(wire_id, 0.0)))
-                continue
-            if self._source_descriptor(meta) is None:
                 continue
             launch_time = float(meta['launch_server_time_ms']) / 1000.0
             if launch_time > self._projectiles.now + 1.0e-9:
@@ -906,7 +1037,7 @@ class ServerBattleAuthority(object):
         static_fraction = self.world.segment_hit_fraction(
             start, end, include_destructibles=False)
         nearest = None
-        for target in self._chord_targets(meta):
+        for target in self._chord_targets(meta, include_wrecks=True):
             entry = _segment_hull_entry(start, end, target)
             if entry is None:
                 continue
@@ -940,11 +1071,7 @@ class ServerBattleAuthority(object):
         if not self.world.has_destructible_identities():
             return None
         wire_id = self._wire_projectile_id(meta)
-        shooter_descriptor = self._source_descriptor(meta)
-        if shooter_descriptor is None:
-            return None
-        shot = _descriptor_shot(shooter_descriptor,
-                                meta.get('shell_index'))
+        shot = meta.get('source_shot') or {}
         shell_kind = str(_field(_field(shot, 'shell', {}) or {},
                                 'kind', '') or '')
         chord = tuple(float(end[index]) - float(start[index])
@@ -1008,14 +1135,16 @@ class ServerBattleAuthority(object):
                         'world': True, 'hit_kind': 'destructible'}
         return None
 
-    def _chord_targets(self, meta, include_shooter=False):
+    def _chord_targets(self, meta, include_shooter=False,
+                       include_wrecks=False):
         shooter_key = ('%s:%s' % (meta.get('shooter_kind'),
                                   meta.get('shooter_id')))
         if include_shooter:
             shooter_key = None
         for player in self.state.players.values():
             if (not player.connected or not player.participating or
-                    not player.alive or not player.client_position):
+                    not player.client_position or
+                    (not player.alive and not include_wrecks)):
                 continue
             key = 'player:%s' % player.player_id
             if key == shooter_key:
@@ -1027,11 +1156,16 @@ class ServerBattleAuthority(object):
                 'kind': 'player', 'id': int(player.player_id),
                 'position': (player.x, player.y, player.z),
                 'yaw': float(player.yaw), 'descriptor': descriptor,
+                'pitch': float(player.pitch),
+                'roll': float(player.roll),
+                'aim_yaw': float(player.aim_yaw),
+                'gun_pitch': float(player.gun_pitch),
                 'health': int(player.health),
+                'wreck': not bool(player.alive),
                 'state': {'critical': dict(player.critical or {})},
             }
         for bot_id, state in self.state.bot_states.items():
-            if not state.get('alive'):
+            if not state.get('alive') and not include_wrecks:
                 continue
             key = 'bot:%s' % bot_id
             if key == shooter_key:
@@ -1047,8 +1181,12 @@ class ServerBattleAuthority(object):
                 'yaw': float(state.get('yaw', 0.0)),
                 'pitch': float(state.get('pitch', 0.0) or 0.0),
                 'roll': float(state.get('roll', 0.0) or 0.0),
+                'aim_yaw': float(state.get(
+                    'aim_yaw', state.get('yaw', 0.0)) or 0.0),
+                'gun_pitch': float(state.get('gun_pitch', 0.0) or 0.0),
                 'descriptor': descriptor,
                 'health': int(state.get('health', 0)),
+                'wreck': not bool(state.get('alive')),
                 'state': state,
             }
 
@@ -1132,7 +1270,8 @@ class ServerBattleAuthority(object):
         impact = tuple(state.get('position') or (0.0, 0.0, 0.0))
         direct = None
         target = terminal.get('target')
-        if outcome == 'impact' and target is not None:
+        if (outcome == 'impact' and target is not None and
+                not target.get('wreck')):
             direct = self._direct_effect(meta, state, target)
         splash = []
         if outcome == 'impact' and meta.get('is_he'):
@@ -1160,10 +1299,17 @@ class ServerBattleAuthority(object):
             'impact': ([float(impact[0]), float(impact[1]),
                         float(impact[2])]
                        if outcome == 'impact' else None),
+            'hit_vehicle': bool(outcome == 'impact' and target is not None),
             'direct': direct,
             'splash': splash,
             'destructibles': self._shot_receipts.pop(wire_id, []),
         }
+        if (outcome == 'impact' and target is not None and
+                target.get('wreck')):
+            message['wreck_hit'] = {
+                'target_kind': target['kind'],
+                'target_id': int(target['id']),
+            }
         if self.state.resolve_projectile(SERVER_AUTHORITY_ID, message):
             self._forget_projectile(wire_id)
         else:
@@ -1173,11 +1319,9 @@ class ServerBattleAuthority(object):
 
     def _splash_effects(self, meta, impact, direct):
         """Splash damage from the copied HE law over donated hull armor."""
-        shooter_descriptor = self._source_descriptor(meta)
-        if shooter_descriptor is None:
+        shot = meta.get('source_shot') or {}
+        if not shot:
             return []
-        shot = _descriptor_shot(shooter_descriptor,
-                                meta.get('shell_index'))
         radius = combat_rules.he_radius(shot)
         if radius <= 0.0:
             return []
@@ -1202,12 +1346,19 @@ class ServerBattleAuthority(object):
             hull_damage = damage
             mock = _TargetMock(
                 target['id'], target['health'], target['descriptor'],
-                position, target['yaw'], target.get('state') or {})
-            damage, critical = critical_damage.propose_direct(
+                position, target['yaw'], target.get('state') or {},
+                target.get('aim_yaw', target['yaw']),
+                target.get('gun_pitch', 0.0),
+                target.get('pitch', 0.0), target.get('roll', 0.0))
+            direction = Vector3(
+                float(position[0]) - float(impact[0]),
+                float(position[1]) - float(impact[1]),
+                float(position[2]) - float(impact[2]))
+            damage, critical = critical_damage.propose_explosion(
                 mock, combat_rules.collision_layers(()),
-                Vector3(*impact), Vector3(*position), damage, shell,
-                int(meta.get('shooter_id', 0)), penetrated=False,
-                by_explosion=True)
+                Vector3(*impact), direction, damage, shell,
+                int(meta.get('shooter_id', 0)),
+                deadeye=bool(shot.get('deadeye', False)))
             effect = {
                 'target_kind': target['kind'],
                 'target_id': int(target['id']),
@@ -1234,12 +1385,12 @@ class ServerBattleAuthority(object):
             int(meta.get('shot_seq', 0)))
 
     def _direct_effect(self, meta, state, target):
-        shooter_descriptor = self._source_descriptor(meta)
-        if shooter_descriptor is None:
+        shot = meta.get('source_shot') or {}
+        if not shot:
             return None
-        shot = _descriptor_shot(shooter_descriptor,
-                                meta.get('shell_index'))
-        collisions = target['collisions']
+        collisions, trace_start, trace_end = _critical_vehicle_trace(
+            shot, target['ray_start'], target['ray_end'],
+            target['collisions'])
         distance = float(state.get('distance', 0.0))
         resolved = combat_rules.resolve_hull_hit(
             shot, distance, collisions,
@@ -1261,13 +1412,30 @@ class ServerBattleAuthority(object):
         mock = _TargetMock(
             target['id'], target['health'], target['descriptor'],
             target['position'], target['yaw'],
-            target.get('state') or {})
+            target.get('state') or {},
+            target.get('aim_yaw', target['yaw']),
+            target.get('gun_pitch', 0.0),
+            target.get('pitch', 0.0), target.get('roll', 0.0))
         shell = (combat_rules.legacy_shot(shot).get('shell') or {})
-        damage, critical = critical_damage.propose_direct(
-            mock, combat_rules.collision_layers(collisions),
-            Vector3(*target['ray_start']), Vector3(*target['ray_end']),
-            damage, shell, int(meta.get('shooter_id', 0)),
-            penetrated=int(result) == 2)
+        critical_collisions = combat_rules.collision_layers(collisions)
+        if str(shell.get('kind') or '') == 'HIGH_EXPLOSIVE':
+            ray_start = target['ray_start']
+            ray_end = target['ray_end']
+            direction = Vector3(
+                float(ray_end[0]) - float(ray_start[0]),
+                float(ray_end[1]) - float(ray_start[1]),
+                float(ray_end[2]) - float(ray_start[2]))
+            damage, critical = critical_damage.propose_explosion(
+                mock, critical_collisions, Vector3(*state['position']),
+                direction, damage, shell, int(meta.get('shooter_id', 0)),
+                deadeye=bool(shot.get('deadeye', False)))
+        else:
+            damage, critical = critical_damage.propose_direct(
+                mock, critical_collisions,
+                trace_start, trace_end, damage, shell,
+                int(meta.get('shooter_id', 0)),
+                penetrated=int(result) == 2,
+                deadeye=bool(shot.get('deadeye', False)))
         effect = {
             'target_kind': target['kind'],
             'target_id': int(target['id']),
@@ -1364,6 +1532,110 @@ def _number(value, default=0.0):
     return value if math.isfinite(value) else float(default)
 
 
+_PROJECTILE_SHELL_KINDS = frozenset((
+    'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
+    'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
+
+
+def _source_number(value, minimum, maximum):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError('source shot requires a plain number')
+    parsed = float(value)
+    if (not math.isfinite(parsed) or parsed < minimum or parsed > maximum):
+        raise ValueError('source shot number is outside bounds')
+    return parsed
+
+
+def _normalize_source_shot(value):
+    """Validate the immutable mounted-gun law from the canonical ledger."""
+    if not isinstance(value, dict) or set(value) != {
+            'speed', 'gravity', 'maxDistance', 'piercingPower', 'deadeye',
+            'shell'}:
+        raise ValueError('invalid source shot shape')
+    shell = value.get('shell')
+    if not isinstance(shell, dict) or set(shell) != {
+            'kind', 'caliber', 'damage', 'explosionRadius'}:
+        raise ValueError('invalid source shell shape')
+    kind = shell.get('kind')
+    piercing = value.get('piercingPower')
+    damage = shell.get('damage')
+    deadeye = value.get('deadeye')
+    if (not isinstance(kind, str) or kind not in _PROJECTILE_SHELL_KINDS or
+            not isinstance(deadeye, bool) or
+            not isinstance(piercing, list) or len(piercing) != 2 or
+            not isinstance(damage, list) or len(damage) != 2):
+        raise ValueError('invalid source shell data')
+    return {
+        'speed': _source_number(value.get('speed'), 0.000001, 3000.0),
+        'gravity': _source_number(value.get('gravity'), 0.000001, 500.0),
+        'maxDistance': _source_number(
+            value.get('maxDistance'), 0.000001, 10000.0),
+        'piercingPower': [
+            _source_number(component, 0.0, 10000.0)
+            for component in piercing],
+        'deadeye': deadeye,
+        'shell': {
+            'kind': kind,
+            'caliber': _source_number(
+                shell.get('caliber'), 0.000001, 1000.0),
+            'damage': [
+                _source_number(damage[0], 0.000001, 10000.0),
+                _source_number(damage[1], 0.0, 10000.0),
+            ],
+            'explosionRadius': _source_number(
+                shell.get('explosionRadius'), 0.0, 100.0),
+        },
+    }
+
+
+def _source_shot_from_descriptor(shot):
+    shell = _field(shot, 'shell', {}) or {}
+    shell_type = _field(shell, 'type', {}) or {}
+    kind = _field(shell, 'kind', None)
+    if not kind:
+        kind = _field(shell_type, 'name', None)
+    radius = _field(shell, 'explosionRadius', None)
+    if radius is None:
+        radius = _field(shell_type, 'explosionRadius', 0.0)
+    return _normalize_source_shot({
+        'speed': _field(shot, 'speed'),
+        'gravity': _field(shot, 'gravity'),
+        'maxDistance': _field(shot, 'maxDistance'),
+        'piercingPower': list(_field(shot, 'piercingPower', ()) or ()),
+        'deadeye': False,
+        'shell': {
+            'kind': kind,
+            'caliber': _field(shell, 'caliber'),
+            'damage': list(_field(shell, 'damage', ()) or ()),
+            'explosionRadius': radius,
+        },
+    })
+
+
+def _source_shot_signature(shot):
+    shell = shot['shell']
+    return (
+        shot['speed'], shot['gravity'], shot['maxDistance'],
+        tuple(shot['piercingPower']), shot['deadeye'],
+        shell['kind'], shell['caliber'],
+        tuple(shell['damage']), shell['explosionRadius'])
+
+
+def _source_shot_matches_launch(
+        shot, velocity, gravity, maximum, is_he, splash_radius):
+    def close(left, right):
+        return abs(float(left) - float(right)) <= max(
+            0.001, abs(float(right)) * 0.000001)
+
+    speed = math.sqrt(sum(component * component for component in velocity))
+    shell = shot['shell']
+    return (
+        close(speed, shot['speed']) and close(gravity, shot['gravity']) and
+        close(maximum, shot['maxDistance']) and
+        bool(is_he) == (shell['kind'] == 'HIGH_EXPLOSIVE') and
+        close(splash_radius, shell['explosionRadius']))
+
+
 def _descriptor_shot(descriptor, shell_index=None):
     shots = tuple(_field(_field(descriptor, 'gun', {}), 'shots', ()) or ())
     if shell_index is None:
@@ -1393,6 +1665,36 @@ def _muzzle_origin(state, descriptor, shot_yaw=None):
                 else state.get('yaw', 0.0) or 0.0)
     return (x + math.sin(yaw) * forward, y + height,
             z + math.cos(yaw) * forward)
+
+
+def _critical_vehicle_trace(shot, query_start, query_end, collisions):
+    """Cap one vehicle's armor/module trace at ten shell calibres.
+
+    The distance budget starts at the first vehicle collision, including a
+    future donated track or spaced-armor layer. The server currently supplies
+    only one hull OBB face, but keeping this rule generic prevents a full
+    projectile substep from becoming an internal-module ray.
+    """
+    collisions = tuple(collisions or ())
+    start = Vector3(*query_start)
+    end = Vector3(*query_end)
+    delta = end - start
+    length = float(delta.length)
+    if not collisions or length <= 0.000001:
+        return collisions, start, start
+    try:
+        first = min(float(collision.dist) for collision in collisions)
+    except (AttributeError, TypeError, ValueError):
+        raise TypeError('server collision contains an invalid distance')
+    first = max(0.0, min(length, first))
+    legacy = combat_rules.legacy_shot(shot)
+    caliber = _number((legacy.get('shell') or {}).get('caliber'), 0.0)
+    trace_distance = first + max(0.0, caliber) / 100.0
+    limited = tuple(
+        collision for collision in collisions
+        if float(collision.dist) <= trace_distance + 0.000001)
+    delta.normalise()
+    return limited, start, start + delta.scale(trace_distance)
 
 
 def _fraction_along(start, end, point):
@@ -1500,7 +1802,12 @@ def _segment_hull_entry(start, end, target):
         'descriptor': descriptor,
         'position': position,
         'yaw': yaw,
+        'pitch': float(target.get('pitch', 0.0) or 0.0),
+        'roll': float(target.get('roll', 0.0) or 0.0),
+        'aim_yaw': float(target.get('aim_yaw', yaw)),
+        'gun_pitch': float(target.get('gun_pitch', 0.0) or 0.0),
         'state': target.get('state') or {},
+        'wreck': bool(target.get('wreck')),
         'collisions': (collision,),
         'ray_start': tuple(float(value) for value in start),
         'ray_end': tuple(float(value) for value in end),

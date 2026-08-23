@@ -12,8 +12,9 @@ import uuid
 PROTOCOL_VERSION = 5
 CLIENT_BUILD = 'wot-0.9.22.0.1-cn-1513'
 RANDOM_MAP_OPTION = 'server_random'
-PROJECTILE_LEDGER_CAPABILITY = 'projectile_ledger_v1'
+PROJECTILE_LEDGER_CAPABILITY = 'projectile_ledger_v2'
 PROJECTILE_HIT_VEHICLE_CAPABILITY = 'projectile_hit_vehicle_v1'
+PROJECTILE_WRECK_HIT_CAPABILITY = 'projectile_wreck_hit_v1'
 RANDOM_MAP_CAPABILITY = 'random_map_v1'
 TEAM_SELECTION_CAPABILITY = 'team_selection_v1'
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
@@ -47,6 +48,9 @@ MAX_PROJECTILE_DISTANCE = 10000.0
 MAX_PROJECTILE_TIME_MS = 20000
 MAX_PROJECTILE_SPLASH_RADIUS = 100.0
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
+PROJECTILE_SHELL_KINDS = frozenset((
+    'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
+    'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
 RESULT_INTERACTION_LIMITS = {
@@ -400,6 +404,85 @@ def _projectile_float_range(value, minimum, maximum):
     return parsed
 
 
+def _strict_projectile_source_shot(value):
+    """Validate the immutable mounted-gun law carried by one launch."""
+    if not isinstance(value, dict) or set(value) != {
+            'speed', 'gravity', 'maxDistance', 'piercingPower', 'deadeye',
+            'shell'}:
+        return None
+    shell = value.get('shell')
+    if not isinstance(shell, dict) or set(shell) != {
+            'kind', 'caliber', 'damage', 'explosionRadius'}:
+        return None
+    kind = shell.get('kind')
+    piercing = value.get('piercingPower')
+    damage = shell.get('damage')
+    deadeye = value.get('deadeye')
+    if (not isinstance(kind, string_types) or
+            kind not in PROJECTILE_SHELL_KINDS or
+            not isinstance(deadeye, bool) or
+            not isinstance(piercing, list) or len(piercing) != 2 or
+            not isinstance(damage, list) or len(damage) != 2):
+        return None
+    speed = _projectile_float_range(
+        value.get('speed'), 0.000001, MAX_PROJECTILE_VELOCITY)
+    gravity = _projectile_float_range(
+        value.get('gravity'), 0.000001, MAX_PROJECTILE_GRAVITY)
+    maximum = _projectile_float_range(
+        value.get('maxDistance'), 0.000001, MAX_PROJECTILE_DISTANCE)
+    piercing = [
+        _projectile_float_range(component, 0.0, 10000.0)
+        for component in piercing]
+    caliber = _projectile_float_range(
+        shell.get('caliber'), 0.000001, 1000.0)
+    damage = [
+        _projectile_float_range(damage[0], 0.000001, 10000.0),
+        _projectile_float_range(damage[1], 0.0, 10000.0),
+    ]
+    radius = _projectile_float_range(
+        shell.get('explosionRadius'), 0.0,
+        MAX_PROJECTILE_SPLASH_RADIUS)
+    if (speed is None or gravity is None or maximum is None or
+            any(component is None for component in piercing) or
+            caliber is None or any(component is None for component in damage) or
+            radius is None):
+        return None
+    return {
+        'speed': speed,
+        'gravity': gravity,
+        'maxDistance': maximum,
+        'piercingPower': piercing,
+        'deadeye': deadeye,
+        'shell': {
+            'kind': kind,
+            'caliber': caliber,
+            'damage': damage,
+            'explosionRadius': radius,
+        },
+    }
+
+
+def _projectile_source_shot_matches_launch(
+        source_shot, velocity, gravity, max_distance, is_he,
+        splash_radius):
+    """Reject a duplicated launch field that disagrees with its shot law."""
+    if source_shot is None or velocity is None:
+        return False
+
+    def close(left, right):
+        return abs(float(left) - float(right)) <= max(
+            0.001, abs(float(right)) * 0.000001)
+
+    speed = math.sqrt(sum(component * component for component in velocity))
+    shell = source_shot['shell']
+    return (
+        close(speed, source_shot['speed']) and
+        close(gravity, source_shot['gravity']) and
+        close(max_distance, source_shot['maxDistance']) and
+        bool(is_he) == (shell['kind'] == 'HIGH_EXPLOSIVE') and
+        close(splash_radius, shell['explosionRadius']))
+
+
 def _strict_vector3(value, maximum_abs):
     """Return one detached JSON vector, rejecting tuples and coercion gaps."""
     if not isinstance(value, list) or len(value) != 3:
@@ -529,6 +612,19 @@ def _strict_projectile_effect(value):
     return result
 
 
+def _strict_projectile_wreck_hit(value):
+    """Validate one presentation-only impact on a destroyed vehicle."""
+    if not isinstance(value, dict) or set(value) != {
+            'target_kind', 'target_id'}:
+        return None
+    kind = value.get('target_kind')
+    target_id = _projectile_int_range(
+        value.get('target_id'), 1, MAX_PROJECTILE_ID)
+    if kind not in ('player', 'bot') or target_id is None:
+        return None
+    return {'target_kind': kind, 'target_id': target_id}
+
+
 def _strict_projectile_destructible(value):
     """Validate one shot-created destructible receipt for ledger CAS."""
     if not isinstance(value, dict):
@@ -577,8 +673,9 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         return False
     expected = frozenset((
         'projectile_id', 'shooter_kind', 'shooter_id', 'shot_seq',
-        'source_vehicle', 'shell_index', 'team', 'origin', 'velocity', 'gravity',
-        'max_distance', 'max_time_ms', 'is_he', 'splash_radius',
+        'source_vehicle', 'source_shot', 'shell_index', 'team', 'origin',
+        'velocity', 'gravity', 'max_distance', 'max_time_ms', 'is_he',
+        'splash_radius',
         'penetration_factor', 'launch_server_time_ms',
         'checked_through_ms', 'checked_distance', 'piercing_loss',
         'authority_epoch'))
@@ -590,6 +687,8 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
             projectile.get('projectile_id'))
         shooter_kind = projectile.get('shooter_kind')
         source_vehicle = projectile.get('source_vehicle')
+        source_shot = _strict_projectile_source_shot(
+            projectile.get('source_shot'))
         shooter_id = _projectile_int_range(
             projectile.get('shooter_id'), 1, MAX_PROJECTILE_ID)
         shot_seq = _projectile_int_range(
@@ -635,6 +734,9 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
                 velocity is None or gravity is None or
                 max_distance is None or max_time_ms is None or
                 not isinstance(is_he, bool) or splash_radius is None or
+                not _projectile_source_shot_matches_launch(
+                    source_shot, velocity, gravity, max_distance, is_he,
+                    splash_radius) or
                 penetration_factor is None or launch_time is None or
                 launch_time > server_time_ms or checked_through is None or
                 checked_through > max_time_ms or checked_distance is None or
@@ -1109,7 +1211,8 @@ class LANClient(object):
                    reported_reason=None, reported_display_health=None,
                    reported_attacker=None, reported_attacker_bot=None,
                    reported_critical_base_revision=None,
-                   reported_critical_seq=None, siege_enabled=None):
+                   reported_critical_seq=None, siege_enabled=None,
+                   pitch=None, roll=None):
         if not self.ready or self.phase != 'battle':
             return False
         message = {
@@ -1126,6 +1229,12 @@ class LANClient(object):
             message['y'] = _finite_float(position[1])
             message['z'] = _finite_float(position[2])
             message['yaw'] = _finite_float(yaw)
+            if pitch is not None:
+                message['pitch'] = max(
+                    -0.61, min(0.61, _finite_float(pitch)))
+            if roll is not None:
+                message['roll'] = max(
+                    -0.61, min(0.61, _finite_float(roll)))
         if speed is not None:
             message['speed'] = max(
                 -200.0, min(200.0, _finite_float(speed)))
@@ -1188,7 +1297,8 @@ class LANClient(object):
     def send_fire(self, shell_index=0, position=None, yaw=None,
                   aim_yaw=None, gun_pitch=None, velocity=None, gravity=None,
                   max_distance=None, max_time_ms=None, is_he=False,
-                  splash_radius=0.0, penetration_factor=1.0):
+                  splash_radius=0.0, penetration_factor=1.0,
+                  source_shot=None):
         """Compatibility wrapper for a modern player projectile launch.
 
         A #1513 client must never fall back to the old instantaneous ``input``
@@ -1202,12 +1312,14 @@ class LANClient(object):
         return self.send_projectile_launch(
             'player', self.player_id, None, shell_index, position, velocity,
             gravity, max_distance, max_time_ms, is_he, splash_radius,
-            penetration_factor=penetration_factor)
+            penetration_factor=penetration_factor,
+            source_shot=source_shot)
 
     def send_projectile_launch(
             self, shooter_kind, shooter_id, shot_seq, shell_index, origin,
             velocity, gravity, max_distance, max_time_ms, is_he,
-            splash_radius, authority_epoch=None, penetration_factor=1.0):
+            splash_radius, authority_epoch=None, penetration_factor=1.0,
+            source_shot=None):
         """Enqueue one immutable projectile launch and return its shot seq."""
         if not self.ready or self.phase != 'battle':
             return None
@@ -1228,13 +1340,17 @@ class LANClient(object):
             splash_radius, 0.0, MAX_PROJECTILE_SPLASH_RADIUS)
         parsed_penetration = _projectile_float_range(
             penetration_factor, 0.0, 100.0)
+        parsed_source_shot = _strict_projectile_source_shot(source_shot)
         if (parsed_shooter_id is None or parsed_shell is None or
                 parsed_origin is None or parsed_velocity is None or
                 parsed_gravity is None or parsed_distance is None or
                 parsed_time is None or parsed_splash is None or
                 parsed_penetration is None or
                 not isinstance(is_he, bool) or
-                (not is_he and parsed_splash != 0.0)):
+                (not is_he and parsed_splash != 0.0) or
+                not _projectile_source_shot_matches_launch(
+                    parsed_source_shot, parsed_velocity, parsed_gravity,
+                    parsed_distance, is_he, parsed_splash)):
             return None
 
         parsed_epoch = None
@@ -1271,6 +1387,7 @@ class LANClient(object):
                 'shooter_id': parsed_shooter_id,
                 'shot_seq': parsed_seq,
                 'shell_index': parsed_shell,
+                'source_shot': parsed_source_shot,
                 'origin': parsed_origin,
                 'velocity': parsed_velocity,
                 'gravity': parsed_gravity,
@@ -1363,7 +1480,7 @@ class LANClient(object):
             self, authority_epoch, projectile_id, base_checked_ms, outcome,
             resolved_time_ms, impact, direct, splash, checked_distance=0.0,
             piercing_loss=0.0, penetration_factor=1.0,
-            destructibles=None, hit_vehicle=None):
+            destructibles=None, hit_vehicle=None, wreck_hit=None):
         """Resolve one server-ledger projectile with an atomic effect set."""
         if self.phase != 'battle' or not self.is_bot_authority():
             return False
@@ -1388,6 +1505,11 @@ class LANClient(object):
             parsed_hit_vehicle = hit_vehicle
         else:
             return False
+        parsed_wreck_hit = None
+        if wreck_hit is not None:
+            parsed_wreck_hit = _strict_projectile_wreck_hit(wreck_hit)
+            if parsed_wreck_hit is None:
+                return False
         if destructibles is None:
             destructibles = []
         if (not isinstance(destructibles, list) or
@@ -1436,6 +1558,10 @@ class LANClient(object):
             return False
         if parsed_direct is not None and not parsed_hit_vehicle:
             return False
+        if (parsed_wreck_hit is not None and
+                (outcome != 'impact' or not parsed_hit_vehicle or
+                 parsed_direct is not None)):
+            return False
         message = {
             'type': 'projectile_resolve',
             'round_id': self.round_id,
@@ -1454,6 +1580,9 @@ class LANClient(object):
         }
         if self.has_projectile_hit_vehicle():
             message['hit_vehicle'] = parsed_hit_vehicle
+        if (parsed_wreck_hit is not None and
+                self.has_projectile_wreck_hit()):
+            message['wreck_hit'] = parsed_wreck_hit
         return self._send(message)
 
     def send_hit(self, target_id, shot_seq, damage, shot_result,
@@ -1524,6 +1653,10 @@ class LANClient(object):
 
     def has_projectile_hit_vehicle(self):
         return (PROJECTILE_HIT_VEHICLE_CAPABILITY in
+                self.server_capabilities)
+
+    def has_projectile_wreck_hit(self):
+        return (PROJECTILE_WRECK_HIT_CAPABILITY in
                 self.server_capabilities)
 
     def has_random_map(self):

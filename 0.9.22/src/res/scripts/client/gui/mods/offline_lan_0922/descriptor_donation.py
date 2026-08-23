@@ -94,7 +94,8 @@ def _hit_tester_bbox(component):
     return [minimum, maximum, None]
 
 
-_GUN_FIELDS = (
+_COMPONENT_ID_FIELDS = ('name', 'id', 'compactDescr')
+_GUN_FIELDS = _COMPONENT_ID_FIELDS + (
     'reloadTime', 'clip', 'turretYawLimits', 'pitchLimits',
     'rotationSpeed', 'shotDispersionAngle', 'shotDispersionFactors',
     'aimingTime', 'maxAmmo', 'maxHealth', 'maxRegenHealth', 'burst',
@@ -106,21 +107,58 @@ _SHELL_FIELDS = (
     'kind', 'caliber', 'damage', 'explosionRadius', 'piercingPower',
     'effectsIndex', 'isTracer',
 )
-_TURRET_FIELDS = (
+_PROJECTILE_SHELL_FIELDS = (
+    'kind', 'caliber', 'damage', 'explosionRadius',
+)
+_TURRET_FIELDS = _COMPONENT_ID_FIELDS + (
     'rotationSpeed', 'circularVisionRadius', 'primaryArmor', 'maxHealth',
     'maxRegenHealth', 'turretRotatorHealth', 'surveyingDeviceHealth',
-    'invisibilityFactor', 'yawLimits',
+    'invisibilityFactor', 'yawLimits', 'gunPosition',
 )
-_CHASSIS_FIELDS = (
+_CHASSIS_FIELDS = _COMPONENT_ID_FIELDS + (
     'hullPosition', 'rotationSpeed', 'shotDispersionFactors',
     'maxHealth', 'maxRegenHealth', 'terrainResistance',
 )
-_HULL_FIELDS = (
+_HULL_FIELDS = _COMPONENT_ID_FIELDS + (
     'turretPositions', 'primaryArmor', 'maxHealth', 'maxRegenHealth',
     'ammoBayHealth',
 )
-_COMPONENT_HEALTH_FIELDS = ('maxHealth', 'maxRegenHealth')
+_COMPONENT_HEALTH_FIELDS = _COMPONENT_ID_FIELDS + (
+    'maxHealth', 'maxRegenHealth')
 _TYPE_FIELDS = ('invisibility', 'invisibilityFactorAtShot', 'crewRoles')
+
+
+def _complete_shell_projection(shell, names, default_radius=False):
+    """Project #1513's split shell/type representation into one mapping."""
+    projection = _copy_fields(shell, names)
+    shell_type = _value(shell, 'type')
+    if 'kind' not in projection:
+        kind = _value(shell_type, 'name')
+        if kind:
+            projection['kind'] = str(kind)
+    if 'explosionRadius' not in projection:
+        radius = _json_safe(_value(shell_type, 'explosionRadius'))
+        if radius is not None:
+            projection['explosionRadius'] = radius
+        elif default_radius:
+            projection['explosionRadius'] = 0.0
+    return projection
+
+
+def project_shot(shot, deadeye=False):
+    """Freeze one mounted gun shot's physical law as plain JSON values.
+
+    A vehicle type name and shell index do not identify the fitted gun in a
+    remote #1513 process.  This deliberately small projection is therefore
+    carried with the projectile itself; cosmetic shell data remains part of
+    the full descriptor donation.
+    """
+    projection = _copy_fields(shot, _SHOT_FIELDS)
+    projection['deadeye'] = bool(deadeye)
+    projection['shell'] = _complete_shell_projection(
+        _value(shot, 'shell', {}), _PROJECTILE_SHELL_FIELDS,
+        default_radius=True)
+    return projection
 
 
 def project_descriptor(descriptor):
@@ -134,30 +172,36 @@ def project_descriptor(descriptor):
         'maxHealth': int(_value(descriptor, 'maxHealth', 1) or 1),
     }
     projection.update(_copy_fields(vehicle_type, _TYPE_FIELDS))
+    # The shared internal-profile resolver reads the same nested ``type``
+    # surface as a live VehicleDescr.  Keep the historical top-level fields
+    # for the server's existing consumers, while donating only this small
+    # identity/crew view rather than native collision materials.
+    projection['type'] = {
+        'name': projection['name'],
+        'level': projection['level'],
+        'tags': list(projection['tags']),
+    }
+    projection['type'].update(_copy_fields(vehicle_type, _TYPE_FIELDS))
     gun = _value(descriptor, 'gun', {})
     gun_projection = _copy_fields(gun, _GUN_FIELDS)
     shots = []
     for shot in (_value(gun, 'shots', ()) or ()):
         shot_projection = _copy_fields(shot, _SHOT_FIELDS)
         shell = _value(shot, 'shell', {})
-        shell_projection = _copy_fields(shell, _SHELL_FIELDS)
-        # #1513 stores the shell kind as shell.type (a ShellType whose .name
-        # is the kind string) and explosionRadius on the HighExplosive type.
-        shell_type = _value(shell, 'type')
-        if 'kind' not in shell_projection:
-            kind = _value(shell_type, 'name')
-            if kind:
-                shell_projection['kind'] = str(kind)
-        if 'explosionRadius' not in shell_projection:
-            radius = _json_safe(_value(shell_type, 'explosionRadius'))
-            if radius is not None:
-                shell_projection['explosionRadius'] = radius
+        shell_projection = _complete_shell_projection(shell, _SHELL_FIELDS)
         shot_projection['shell'] = shell_projection
         shots.append(shot_projection)
     gun_projection['shots'] = shots
+    bbox = _hit_tester_bbox(gun)
+    if bbox is not None:
+        gun_projection['hitTester'] = {'bbox': bbox}
     projection['gun'] = gun_projection
     turret = _value(descriptor, 'turret', {})
-    projection['turret'] = _copy_fields(turret, _TURRET_FIELDS)
+    turret_projection = _copy_fields(turret, _TURRET_FIELDS)
+    bbox = _hit_tester_bbox(turret)
+    if bbox is not None:
+        turret_projection['hitTester'] = {'bbox': bbox}
+    projection['turret'] = turret_projection
     physics = _value(descriptor, 'physics', {}) or {}
     projection['physics'] = _json_safe(dict(
         (str(key), physics[key]) for key in physics) if

@@ -87,6 +87,15 @@ class LanProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'BOOL'):
             self.client.send_input(0.0, 0.0, siege_enabled=1)
 
+    def test_input_carries_the_local_hull_pitch_and_roll(self):
+        self.assertTrue(self.client.send_input(
+            0.0, 0.0, position=(1.0, 2.0, 3.0), yaw=0.4,
+            pitch=0.25, roll=-0.3))
+
+        message = self.sent[-1]
+        self.assertEqual(0.25, message['pitch'])
+        self.assertEqual(-0.3, message['roll'])
+
     def test_waiting_room_publishes_one_changed_garage_vehicle(self):
         self.client.phase = 'waiting'
         self.client.vehicle = 'ussr:R11_MS-1'
@@ -400,6 +409,17 @@ class LanProtocolTests(unittest.TestCase):
             'gravity': 9.81,
             'max_distance': 720.0,
             'max_time_ms': 20000,
+            'source_shot': {
+                'speed': 900.0, 'gravity': 9.81,
+                'maxDistance': 720.0,
+                'piercingPower': [220.0, 200.0],
+                'deadeye': False,
+                'shell': {
+                    'kind': 'ARMOR_PIERCING', 'caliber': 105.0,
+                    'damage': [390.0, 150.0],
+                    'explosionRadius': 0.0,
+                },
+            },
         }
         self.client._send = lambda unused_message: False
 

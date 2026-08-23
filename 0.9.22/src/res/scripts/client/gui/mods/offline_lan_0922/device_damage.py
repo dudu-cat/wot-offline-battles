@@ -38,8 +38,9 @@ MIN_FIRE_STARTING_DAMAGE = 21        # miscParams/minFireStartingDamage
 DEFAULT_FIRE_BURN_FRACTION = 0.0875  # engine default healthBurnPerSec fraction
 
 # --- RECONSTRUCTED (server-only in 2012; tune against era gameplay) ----------
-# Fraction of max HP below which a functional module shows as 'critical' (orange).
-# Anchored to maxRegenHealth (~50%), the level crew auto-repair restores to.
+# Fraction of max HP at or below which a functional module shows as
+# 'critical' (orange).  This is a damage-state threshold; maxRegenHealth is a
+# separate auto-repair destination and must not decide the first yellow state.
 CRITICAL_HP_FRACTION = 0.5
 # Seconds to auto-repair a destroyed module back to functional with a nominal
 # crew at 0% Repair *secondary* skill (major qualification 100%), no toolbox, no
@@ -397,7 +398,7 @@ def clamp_vision_factor(factor):
     return value
 
 
-def module_stat_factor(devices_hp, destroyed, td, stat):
+def module_stat_factor(devices_hp, destroyed, td, stat, critical=None):
     """Multiplier for a stat from MODULE state, the counterpart of
     crew_stat_factor. >1 worsens time-like stats (reload, dispersion, aim_time);
     <1 worsens capability-like stats (mobility, turret_speed, vision, signal).
@@ -407,6 +408,7 @@ def module_stat_factor(devices_hp, destroyed, td, stat):
         return 1.0
     names, dmg_f, dead_f = spec
     dead = destroyed or ()
+    yellow = critical or ()
     hp_map = devices_hp or {}
     f = 1.0
     for n in names:
@@ -417,7 +419,8 @@ def module_stat_factor(devices_hp, destroyed, td, stat):
         hp = hp_map.get(n)
         if hp is None:
             continue
-        if device_state(hp, device_max_hp(td, n)) == 'critical':
+        if (n in yellow or
+                device_state(hp, device_max_hp(td, n)) == 'critical'):
             f *= dmg_f
     return f
 
@@ -515,11 +518,11 @@ def saving_throw(h_mat, name, by_explosion=False):
     attr = 'chanceToHitByExplosion' if by_explosion else 'chanceToHitByProjectile'
     val = getattr(h_mat, attr, None) if h_mat is not None else None
     if val is None:
-        val = _FALLBACK_CHANCE.get(name, 0.33)
+        val = fallback_chance(name, by_explosion)
     try:
         return float(val)
     except (TypeError, ValueError):
-        return _FALLBACK_CHANCE.get(name, 0.33)
+        return fallback_chance(name, by_explosion)
 
 
 def is_crit_only(name):
@@ -582,17 +585,16 @@ def device_state(current_hp, max_hp):
     """UI/gameplay state from HP: 'destroyed' (0), 'critical' (orange, functional),
     or 'normal' (undamaged).
 
-    ANY hp loss reads as critical, which is what the game shows: a module turns
-    orange the moment it is damaged and is only white again at full health. The old
-    CRITICAL_HP_FRACTION threshold here meant crew-repaired modules came back looking
-    perfectly fine - a track sits at its regen cap of 130 out of 170, nowhere near
-    below 50%, so it reported 'normal' while being visibly damaged and much easier to
-    break a second time. CRITICAL_HP_FRACTION still serves as the regen-cap fallback
-    in device_regen_hp; it was never meant as a UI threshold.
+    A successful module hit above 50% remaining HP is hidden damage: it still
+    consumes module HP, but does not turn the icon yellow or apply a damaged
+    module penalty.  Auto-repair is the exceptional transition and is tracked
+    explicitly by critical_damage, because some #1513 maxRegenHealth values are
+    above this threshold.
     """
     if current_hp <= 0:
         return 'destroyed'
-    if max_hp and current_hp < max_hp:
+    if (max_hp and float(current_hp) <=
+            float(max_hp) * CRITICAL_HP_FRACTION):
         return 'critical'
     return 'normal'
 
@@ -685,6 +687,7 @@ if __name__ == '__main__':
     # States
     check('state destroyed', device_state(0, 180) == 'destroyed')
     check('state critical', device_state(50, 180) == 'critical')
+    check('state hidden damage above half', device_state(100, 180) == 'normal')
     check('state normal', device_state(180, 180) == 'normal')
 
     # Crit-only classification
@@ -758,13 +761,13 @@ if __name__ == '__main__':
           module_stat_factor(dh, set(), td, 'mobility') == 1.0 and
           module_stat_factor(dh, set(), td, 'reload') == 1.0)
     dmg = dict(dh)
-    dmg['engineHealth'] = 60
+    dmg['engineHealth'] = 50
     check('damaged engine halves throttle',
           abs(module_stat_factor(dmg, set(), td, 'mobility') - 0.5) < 1e-9)
     check('destroyed engine is hard-gated, not scaled',
           module_stat_factor(dmg, set(['engineHealth']), td, 'mobility') == 0.0)
     dmg2 = dict(dh)
-    dmg2['ammoBayHealth'] = 100
+    dmg2['ammoBayHealth'] = 90
     check('damaged ammo bay doubles the reload',
           abs(module_stat_factor(dmg2, set(), td, 'reload') - 2.0) < 1e-9)
     dmg3 = dict(dh)

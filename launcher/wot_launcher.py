@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop launcher for the World of Tanks offline-battle client ports.
+"""Desktop launcher for the supported World of Tanks offline-battle client.
 
 The launcher installs client payloads, manages the hidden single-player
 authority, and can run a persistent LAN server explicitly.
@@ -15,14 +15,16 @@ import threading
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import core
+    import error_reports
     import i18n
     import vehicle_editor_ui
     import vehicle_overlays
 else:
-    from . import core, i18n, vehicle_editor_ui, vehicle_overlays
+    from . import (
+        core, error_reports, i18n, vehicle_editor_ui, vehicle_overlays)
 
 
-LAUNCHER_VERSION = "0.6.0-alpha.1"
+LAUNCHER_VERSION = "0.6.0 alpha.2"
 WINDOW_TITLE = "World of Tanks Offline Battles %s" % LAUNCHER_VERSION
 
 _CHINESE = {
@@ -58,6 +60,7 @@ _CHINESE = {
     "Normal client stuck loading? Clean preferences...":
         "正式客户端卡在加载界面？点击清理配置…",
     "Reset all offline data...": "重置全部离线数据…",
+    "Create error report...": "一键汇报错误…",
     "Activity log": "运行日志",
     "Close game": "关闭游戏",
     "Select the folder that contains %s.": "请选择包含 %s 的目录。",
@@ -83,6 +86,20 @@ _CHINESE = {
     "post-battle results, configuration, and isolated client graphics/input "
     "preferences. Other mods and the normal World of Tanks profile are kept. "
     "Continue?": "这会删除本 Mod 保存的地址、账号设置、车库配件、战后结果、配置，以及独立的客户端画面/输入偏好。其他 Mod 和正常的 World of Tanks 配置会保留。是否继续？",
+    "No launcher game session is available to report yet.":
+        "还没有可汇报的启动器游戏场次。",
+    "The latest game session has not produced any diagnostic logs yet. No "
+    "earlier session was included.":
+        "最近一局还没有产生诊断日志；不会混入更早场次的日志。",
+    "The latest diagnostic session boundary is unreadable.":
+        "最近一局的日志边界无法读取；不会打包旧日志。",
+    "Created error report: %s": "已创建错误报告：%s",
+    "Included logs: %s": "已包含日志：%s",
+    "Missing logs from this session: %s": "本局缺少日志：%s",
+    "Not run in this session: %s": "本局未运行：%s",
+    "Could not create the error report: %s": "无法创建错误报告：%s",
+    "Could not select the report in Windows Explorer: %s":
+        "无法在 Windows 资源管理器中选中报告：%s",
 }
 
 
@@ -230,6 +247,8 @@ class LauncherWindow(object):
         self._game = None
         self._busy = False
         self._maintenance_busy = False
+        self._report_busy = False
+        self._active_report_session = None
         self._stop_requested = False
         self._close_pending = False
         self._selected_client = None
@@ -489,6 +508,11 @@ class LauncherWindow(object):
             command=self._clean_normal_client_preferences)
         self.normal_preferences_button.grid(
             row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.report_button = tk.Button(
+            self.repair_panel, text="",
+            command=self._create_error_report)
+        self.report_button.grid(
+            row=2, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.repair_panel.grid_columnconfigure(0, weight=1)
         self.repair_panel.grid_columnconfigure(1, weight=1)
 
@@ -499,7 +523,7 @@ class LauncherWindow(object):
                                 wrap="none")
         self.log_view.pack(fill="both", expand=True)
         self.author_text = tk.StringVar(value=(
-            "作者：伪红学家  B站：tiancaihb  QQ群：302519768  GitHub: "
+            "作者：伪红学家  Bilibili：@tiancaihb  QQ群：302519768  GitHub: "
             "https://github.com/pengw0048/wot-offline-battles"))
         self.author_entry = tk.Entry(
             frame, textvariable=self.author_text, state="readonly",
@@ -576,6 +600,7 @@ class LauncherWindow(object):
         self.normal_preferences_button.config(text=self._t(
             "Normal client stuck loading? Clean preferences..."))
         self.reset_button.config(text=self._t("Reset all offline data..."))
+        self.report_button.config(text=self._t("Create error report..."))
         self.log_panel.config(text=self._t("Activity log"))
         self._update_action_controls()
         if refresh:
@@ -702,6 +727,8 @@ class LauncherWindow(object):
         self.repair_button.config(state=maintenance_state)
         self.normal_preferences_button.config(state=maintenance_state)
         self.reset_button.config(state=maintenance_state)
+        self.report_button.config(
+            state="disabled" if self._report_busy else "normal")
         profile_state = (
             "readonly" if maintenance_state == "normal" and
             self.mode.get() == core.MODE_SINGLE else "disabled")
@@ -855,6 +882,47 @@ class LauncherWindow(object):
             self.log_view.config(state="disabled")
 
         self.root.after(0, append)
+
+    def _create_error_report(self):
+        if self._report_busy:
+            return False
+        self._report_busy = True
+        self._update_action_controls()
+
+        def run():
+            try:
+                result = error_reports.create_report()
+            except core.LauncherError as error:
+                self._log(self._t(str(error)))
+            except Exception as error:
+                self._log(self._t(
+                    "Could not create the error report: %s") % error)
+            else:
+                self._log(self._t("Created error report: %s") %
+                          result["path"])
+                self._log(self._t("Included logs: %s") %
+                          ", ".join(result["included"]))
+                if result["missing"]:
+                    self._log(self._t(
+                        "Missing logs from this session: %s") %
+                        ", ".join(result["missing"]))
+                if result["notRun"]:
+                    self._log(self._t("Not run in this session: %s") %
+                              ", ".join(result["notRun"]))
+                try:
+                    error_reports.select_in_explorer(result["path"])
+                except core.LauncherError as error:
+                    self._log(self._t(
+                        "Could not select the report in Windows Explorer: "
+                        "%s") % error)
+            finally:
+                self._report_busy = False
+                self.root.after(0, self._update_action_controls)
+
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        return True
 
     def _set_busy(self, busy):
         self._busy = busy
@@ -1186,6 +1254,27 @@ class LauncherWindow(object):
         needs_worker = (
             session["client"] == core.PORT_0_9_22 and
             session["mode"] == core.MODE_SINGLE)
+        report_session = None
+        reused_server = self._server_is_running()
+        try:
+            report_session = error_reports.begin_session(
+                game_root, needs_worker=needs_worker,
+                local_server=(session["needs_server"] or reused_server))
+            self._active_report_session = report_session
+        except Exception as error:
+            self._active_report_session = None
+            self._log(
+                "Error reporting is unavailable for this session: %s" %
+                error)
+        if report_session is not None and reused_server:
+            try:
+                error_reports.attach_server(
+                    report_session, dedicated=False)
+            except Exception as error:
+                self._log(
+                    "The persistent server log boundary could not be "
+                    "recorded: %s" %
+                    error)
         try:
             self._log("Installing the %s mod into %s..." %
                       (session["client"], game_root))
@@ -1294,6 +1383,15 @@ class LauncherWindow(object):
                 except vehicle_overlays.VehicleOverlayError as error:
                     self._log(
                         "Could not restore original vehicle data: %s" % error)
+            if report_session is not None:
+                try:
+                    error_reports.finalize_session(report_session)
+                except Exception as error:
+                    self._log(
+                        "Could not freeze this session's diagnostic logs: "
+                        "%s" % error)
+            if self._active_report_session is report_session:
+                self._active_report_session = None
             self._set_busy(False)
             if self._close_pending:
                 self.root.after(0, self._finish_close)
@@ -1353,8 +1451,22 @@ class LauncherWindow(object):
             port_version, game_root, team_size=max(team1_size, team2_size),
             team1_size=team1_size, team2_size=team2_size,
             loopback_only=loopback_only)
+        server_log_path = core.server_log_path()
+        report_session = self._active_report_session
+        if report_session is not None:
+            try:
+                attached_path = error_reports.attach_server(
+                    report_session, dedicated=True)
+                if attached_path is not None:
+                    server_log_path = attached_path
+                    environment[error_reports.SERVER_SESSION_ENV] = (
+                        report_session["id"])
+            except Exception as error:
+                self._log(
+                    "This session's server log could not be isolated: %s" %
+                    error)
         self._log("Starting the %s LAN server..." % port_version)
-        self._log("Server log: %s" % core.server_log_path())
+        self._log("Server log: %s" % server_log_path)
         self._server = subprocess.Popen(
             command, env=environment, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, creationflags=_no_console_flags())
@@ -1405,6 +1517,14 @@ class LauncherWindow(object):
                 starter)
         previous_marker_token = core.worker_ready_marker_token(game_root)
         self._log("Starting the hidden simulation worker...")
+        if self._active_report_session is not None:
+            try:
+                error_reports.expect_worker_starter_reset(
+                    self._active_report_session)
+            except Exception as error:
+                self._log(
+                    "The worker starter log boundary could not be recorded: "
+                    "%s" % error)
         self._worker = subprocess.Popen(
             core.worker_child_command(game_root), cwd=game_root,
             env=core.worker_environment(
@@ -1527,10 +1647,10 @@ class LauncherWindow(object):
         self.root.mainloop()
 
 
-def _open_server_log():
+def _open_server_log(path=None):
     """Persist one bounded server run while preserving the live pipe."""
     try:
-        path = core.server_log_path()
+        path = path or core.server_log_path()
         directory = os.path.dirname(path)
         if directory and not os.path.isdir(directory):
             os.makedirs(directory)
@@ -1559,7 +1679,7 @@ def _serve(argv):
     if port_version not in core.SUPPORTED_PORTS:
         print("Unsupported client version: %s" % port_version)
         return 2
-    _open_server_log()
+    _open_server_log(error_reports.server_log_for_environment())
     print("Starting the %s LAN server from %s" %
           (port_version, core.server_root()))
     try:

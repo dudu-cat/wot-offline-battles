@@ -63,6 +63,7 @@ _COMPONENT_MEMBER = re.compile(
 _VEHICLE_MEMBER = re.compile(
     r"^scripts/item_defs/vehicles/([a-z][a-z0-9_]*)/"
     r"([A-Za-z0-9][A-Za-z0-9_.-]*)\.xml$")
+_VEHICLE_CATALOG_PREFIX = re.compile(r"^[A-Za-z]{1,2}[0-9]{2,3}_")
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
@@ -701,8 +702,14 @@ def _vehicle_translations(game_root, nation):
 
 
 def _vehicle_label(record, translations):
-    """Show a stock localized name while retaining the exact resource ID."""
+    """Return one readable label without exposing the catalog prefix.
+
+    ``record['vehicle']`` remains the exact stable resource ID used for every
+    package lookup.  Only the label shown by the editor drops prefixes such as
+    ``R11_`` or ``J20_``.
+    """
     vehicle = record["vehicle"]
+    display_id = _vehicle_display_id(vehicle)
     for raw_key in (
             record.get("shortUserString"), record.get("userString")):
         key = raw_key or ""
@@ -711,8 +718,17 @@ def _vehicle_label(record, translations):
         key = key.lstrip("#")
         localized = translations.gettext(key) if translations and key else key
         if localized and localized not in (key, vehicle):
-            return "%s (%s)" % (localized, vehicle)
-    return vehicle
+            if localized.casefold() == display_id.casefold():
+                return localized
+            return "%s (%s)" % (localized, display_id)
+    return display_id
+
+
+def _vehicle_display_id(vehicle):
+    """Strip only the nation's numeric catalog prefix for presentation."""
+    value = str(vehicle or "")
+    display = _VEHICLE_CATALOG_PREFIX.sub("", value, count=1)
+    return display or value
 
 
 def _vehicle_roster_from_archive(archive, counts, nation=None):
@@ -980,21 +996,26 @@ def _field_label(category, field_path):
 def _choice_record(nation, vehicle, category, member, field, shared,
                    component, affected, mode=None, paired_member=None):
     affected = tuple(sorted(affected))
+    display_vehicle = _vehicle_display_id(vehicle)
+    affected_labels = tuple(_vehicle_display_id(name) for name in affected)
     if shared:
         scope = ("Shared %s %s; affects %d vehicle%s in %s: %s" % (
             _CATEGORY_LABELS[category].lower(), component, len(affected),
             "" if len(affected) == 1 else "s", nation,
-            ", ".join(affected)))
+            ", ".join(affected_labels)))
     elif mode == "all":
         scope = (
             "Stored in both the travel-mode and Siege-mode descriptors for "
-            "%s; one edit is applied to both." % vehicle)
+            "%s; one edit is applied to both." % display_vehicle)
     elif mode == "travel":
-        scope = "Stored in the travel-mode descriptor for %s only." % vehicle
+        scope = ("Stored in the travel-mode descriptor for %s only." %
+                 display_vehicle)
     elif mode == "siege":
-        scope = "Stored in the Siege-mode descriptor for %s only." % vehicle
+        scope = ("Stored in the Siege-mode descriptor for %s only." %
+                 display_vehicle)
     else:
-        scope = "Stored in %s only; affects this vehicle only." % vehicle
+        scope = ("Stored in %s only; affects this vehicle only." %
+                 display_vehicle)
         if (field["fieldPath"] == "hull/maxHealth" or
                 re.fullmatch(
                     r"turrets\d+/[^/]+/maxHealth",
@@ -1011,6 +1032,7 @@ def _choice_record(nation, vehicle, category, member, field, shared,
     result.update({
         "nation": nation,
         "vehicle": vehicle,
+        "displayVehicle": display_vehicle,
         "category": category,
         "categoryLabel": _CATEGORY_LABELS[category],
         "fieldLabel": field_label,
@@ -1018,6 +1040,7 @@ def _choice_record(nation, vehicle, category, member, field, shared,
         "shared": bool(shared),
         "component": component,
         "affectedVehicles": affected,
+        "affectedVehicleLabels": affected_labels,
         "scope": scope,
         "mode": mode,
         "pairedMember": paired_member,

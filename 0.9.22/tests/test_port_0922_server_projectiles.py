@@ -44,6 +44,23 @@ def _state(players=2):
     return state
 
 
+def _source_shot(speed, gravity, maximum, is_he=False, radius=0.0,
+                 damage=(390.0, 150.0), deadeye=False):
+    return {
+        'speed': speed,
+        'gravity': gravity,
+        'maxDistance': maximum,
+        'piercingPower': [220.0, 200.0],
+        'deadeye': bool(deadeye),
+        'shell': {
+            'kind': 'HIGH_EXPLOSIVE' if is_he else 'ARMOR_PIERCING',
+            'caliber': 105.0,
+            'damage': list(damage),
+            'explosionRadius': radius,
+        },
+    }
+
+
 def _launch(shooter_id=1, shot_seq=1, shooter_kind='player', **changes):
     message = {
         'type': 'projectile_launch', 'round_id': 1,
@@ -55,9 +72,15 @@ def _launch(shooter_id=1, shot_seq=1, shooter_kind='player', **changes):
         'is_he': False, 'splash_radius': 0.0,
         'penetration_factor': 1.0,
     }
+    message.update(changes)
+    if 'source_shot' not in message:
+        message['source_shot'] = _source_shot(
+            math.sqrt(sum(component * component
+                          for component in message['velocity'])),
+            message['gravity'], message['max_distance'],
+            message['is_he'], message['splash_radius'])
     if shooter_kind == 'bot':
         message['authority_epoch'] = 1
-    message.update(changes)
     return message
 
 
@@ -193,9 +216,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(['1:p:1:1'], sorted(state.projectiles))
         shot = state.pending_events[-1]
         self.assertEqual('ussr:R11_MS-1', shot['source_vehicle'])
+        self.assertEqual(message['source_shot'], shot['source_shot'])
         self.assertEqual(
             'ussr:R11_MS-1',
             state._projectile_snapshot()[0]['source_vehicle'])
+        self.assertEqual(
+            message['source_shot'],
+            state._projectile_snapshot()[0]['source_shot'])
         self.assertEqual('shot', shot['kind'])
         self.assertEqual([0.0, 1.0, 0.0], shot['origin'])
         self.assertEqual([100.0, 0.0, 0.0], shot['velocity'])
@@ -211,6 +238,31 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertFalse(state.launch_projectile(
             1, _launch(shot_seq=3)))
         self.assertEqual(1, state.players[1].fire_seq)
+
+    def test_launch_rejects_malformed_or_inconsistent_source_shot(self):
+        valid = _launch()
+        invalid = []
+        for mutate in (
+                lambda shot: shot.update(speed=101.0),
+                lambda shot: shot.update(gravity='9.81'),
+                lambda shot: shot.update(extra=1),
+                lambda shot: shot['shell'].update(damage=[390.0]),
+                lambda shot: shot['shell'].update(kind='HIGH_EXPLOSIVE'),
+                lambda shot: shot['shell'].update(explosionRadius=4.0),
+                lambda shot: shot['shell'].update(caliber=True)):
+            candidate = json.loads(json.dumps(valid))
+            mutate(candidate['source_shot'])
+            invalid.append(candidate)
+        missing = json.loads(json.dumps(valid))
+        missing.pop('source_shot')
+        invalid.append(missing)
+
+        state = _state()
+        for message in invalid:
+            with self.subTest(message=message):
+                self.assertFalse(state.launch_projectile(1, message))
+        self.assertEqual(0, state.players[1].fire_seq)
+        self.assertFalse(state.projectiles)
 
     def test_retail_spg_gravity_is_admitted_and_snapshotted(self):
         state = _state()
@@ -270,7 +322,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         cursor = {
             'projectile_id': projectile_id, 'base_checked_ms': 0,
             'checked_through_ms': 200, 'checked_distance': 20.0,
-            'piercing_loss': 3.0, 'penetration_factor': 0.8,
+            'piercing_loss': 3.0, 'penetration_factor': 1.0,
             'destructibles': [],
         }
         message = {
@@ -285,14 +337,14 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(200, record['checked_through_ms'])
         self.assertEqual(20.0, record['checked_distance'])
         self.assertEqual(3.0, record['piercing_loss'])
-        self.assertEqual(0.8, record['penetration_factor'])
+        self.assertEqual(1.0, record['penetration_factor'])
         stale = dict(cursor, checked_through_ms=201)
         self.assertFalse(state.progress_projectiles(
             1, dict(message, cursors=[stale])))
         self.assertFalse(state.progress_projectiles(
             1, dict(message, cursors=[dict(
                 cursor, base_checked_ms=200, checked_through_ms=200,
-                penetration_factor=1.0)])))
+                penetration_factor=0.999999)])))
 
     def test_progress_destructibles_are_atomic_and_idempotent(self):
         state = _state()
@@ -300,7 +352,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         cursor = {
             'projectile_id': '1:p:1:1', 'base_checked_ms': 0,
             'checked_through_ms': 100, 'checked_distance': 10.0,
-            'piercing_loss': 1.0, 'penetration_factor': 0.9,
+            'piercing_loss': 1.0, 'penetration_factor': 1.0,
             'destructibles': [_destructible()],
         }
         message = {
@@ -442,6 +494,16 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertFalse(state.resolve_projectile(
             1, dict(message, checked_distance=11.0)))
 
+    def test_resolve_cannot_lower_the_launch_penetration_roll(self):
+        state = _state()
+        self.assertTrue(state.launch_projectile(1, _launch()))
+
+        self.assertFalse(state.resolve_projectile(
+            1, _resolve('1:p:1:1', penetration_factor=0.75)))
+
+        self.assertIn('1:p:1:1', state.projectiles)
+        self.assertEqual(1000, state.players[2].health)
+
     def test_wreck_terminal_can_have_no_damage_but_still_hit_a_vehicle(self):
         state = _state()
         self.assertTrue(state.launch_projectile(1, _launch()))
@@ -455,6 +517,47 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             if value.get('kind') == 'projectile_impact')
         self.assertTrue(event['hit_vehicle'])
         self.assertEqual(1000, state.players[2].health)
+
+    def test_wreck_impact_relays_identity_without_combat_statistics(self):
+        state = _state()
+        state.players[2].health = 0
+        state.players[2].alive = False
+        self.assertTrue(state.launch_projectile(1, _launch()))
+        message = _resolve(
+            '1:p:1:1', direct=None, hit_vehicle=True,
+            wreck_hit={'target_kind': 'player', 'target_id': 2})
+
+        self.assertTrue(state.resolve_projectile(1, message))
+
+        events = [event for event in state.pending_events
+                  if event.get('projectile_id') == '1:p:1:1']
+        self.assertEqual(['shot', 'projectile_impact'],
+                         [event['kind'] for event in events])
+        self.assertEqual(
+            {'target_kind': 'player', 'target_id': 2},
+            events[-1]['wreck_hit'])
+        self.assertEqual({}, state.vehicle_interactions)
+
+    def test_wreck_impact_contract_rejects_live_or_damage_targets(self):
+        state = _state()
+        self.assertTrue(state.launch_projectile(1, _launch()))
+        wreck_hit = {'target_kind': 'player', 'target_id': 2}
+
+        self.assertFalse(state.resolve_projectile(1, _resolve(
+            '1:p:1:1', direct=None, hit_vehicle=True,
+            wreck_hit=wreck_hit)))
+        state.players[2].health = 0
+        state.players[2].alive = False
+        self.assertFalse(state.resolve_projectile(1, _resolve(
+            '1:p:1:1', hit_vehicle=True, wreck_hit=wreck_hit)))
+        self.assertFalse(state.resolve_projectile(1, _resolve(
+            '1:p:1:1', direct=None, hit_vehicle=True, wreck_hit=None)))
+        self.assertFalse(state.resolve_projectile(1, _resolve(
+            '1:p:1:1', direct=None, hit_vehicle=True,
+            wreck_hit={'target_kind': 'player', 'target_id': 99})))
+        self.assertTrue(state.resolve_projectile(1, _resolve(
+            '1:p:1:1', direct=None, hit_vehicle=True,
+            wreck_hit=wreck_hit)))
 
     def test_hit_event_reports_only_damage_the_target_had_left(self):
         state = _state()
@@ -587,9 +690,17 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual('shot', legacy.pending_events[-1]['kind'])
 
     def test_capability_and_active_snapshot_wire_bound(self):
+        self.assertEqual('projectile_ledger_v2', PROJECTILE_CAPABILITY)
         modern = BattleState(map_name='04_himmelsdorf')
         player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {
             'client_build': CLIENT_BUILD_0922, 'name': 'P'})
+        self.assertIsNone(player)
+        self.assertEqual('unsupported_capabilities', error)
+        player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {
+            'client_build': CLIENT_BUILD_0922, 'name': 'P',
+            'capabilities': [
+                'projectile_ledger_v1',
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY]})
         self.assertIsNone(player)
         self.assertEqual('unsupported_capabilities', error)
         player, error = modern.add_player(_Socket(), ('127.0.0.1', 1), {

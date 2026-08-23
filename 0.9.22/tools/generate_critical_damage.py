@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the #1513 critical-damage module from copied 0.8.2 closures.
+"""Extract an audit-only critical-damage baseline from 0.8.2 closures.
 
-The generated file keeps the battle-law bodies from ``offline_battle.py``.
-Only presentation and transport live in the handwritten footer: the 0.8.2
-mock/Flash calls cannot be used by stock #1513 Vehicle entities.
+The active #1513 module now contains intentional penetration, internal-geometry,
+HE and persistent-device-state adaptations that this historical extractor does
+not reproduce.  It may emit a comparison file, but it must never overwrite the
+active module.
 """
 
 from pathlib import Path
@@ -36,11 +37,9 @@ BLOCKS = (
 
 HEADER = '''from __future__ import print_function
 
-"""Generated 0.8.2 critical-damage law with thin #1513 state adapters.
+"""Audit-only 0.8.2 critical-damage baseline with thin #1513 adapters.
 
-Do not edit copied functions in this file.  Run
-``0.9.22/tools/generate_critical_damage.py`` and let the source audit
-compare every copied body with ``offline_battle.py``.
+This extracted baseline is not the active #1513 implementation.
 """
 
 import random
@@ -524,12 +523,19 @@ def extract_block(source, kind, name):
     raise ValueError('missing %s %s' % (kind, name))
 
 
-def generate(repo_root):
+def generate(repo_root, output_path=None):
     repo_root = Path(repo_root).resolve()
     source_path = (repo_root / '0.8.2/scripts/client/gui/mods/offhangar' /
                    'offline_battle.py')
-    target_path = (repo_root / '0.9.22/src/res/scripts/client/gui/mods' /
-                   'offline_lan_0922/critical_damage.py')
+    active_path = (repo_root / '0.9.22/src/res/scripts/client/gui/mods' /
+                   'offline_lan_0922/critical_damage.py').resolve()
+    if output_path is None:
+        raise ValueError(
+            'audit baseline extraction requires an explicit output path')
+    target_path = Path(output_path).resolve()
+    if target_path == active_path:
+        raise ValueError(
+            'legacy baseline must not overwrite the active #1513 module')
     source = source_path.read_text(encoding='utf-8')
     copied = []
     for kind, name in BLOCKS:
@@ -608,5 +614,7 @@ def generate(repo_root):
 
 
 if __name__ == '__main__':
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parents[2]
-    print(generate(root))
+    if len(sys.argv) != 3:
+        raise SystemExit(
+            'usage: generate_critical_damage.py REPO_ROOT OUTPUT_PATH')
+    print(generate(Path(sys.argv[1]), Path(sys.argv[2])))

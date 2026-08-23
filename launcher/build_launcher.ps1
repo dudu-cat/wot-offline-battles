@@ -54,6 +54,35 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"
 }
 
+$AppRoot = Join-Path $DistRoot $AppName
+$ClientPayloadRoot = Join-Path $AppRoot "_internal\client"
+$ServerPayloadRoot = Join-Path $AppRoot "_internal\servers"
+$ClientPayloads = @(
+    Get-ChildItem -LiteralPath $ClientPayloadRoot -File -Force)
+$ServerPayloads = @(
+    Get-ChildItem -LiteralPath $ServerPayloadRoot -Directory -Force)
+if ($ClientPayloads.Count -ne 1 -or
+        $ClientPayloads[0].Name -ne "0.9.22.zip") {
+    throw "Launcher must carry only the 0.9.22 client payload"
+}
+if ($ServerPayloads.Count -ne 1 -or
+        $ServerPayloads[0].Name -ne "0.9.22") {
+    throw "Launcher must carry only the 0.9.22 server payload"
+}
+$ForbiddenEntries = @(
+    Get-ChildItem -LiteralPath $AppRoot -Recurse -Force |
+        Where-Object {
+            $RelativePath = $_.FullName.Substring($AppRoot.Length)
+            $PathSegments = $RelativePath -split '[\\/]'
+            ($PathSegments -contains "0.8.2") -or
+                (($RelativePath -replace
+                    '[^A-Za-z0-9]', '').ToLowerInvariant()).Contains(
+                        "mapstudio")
+        })
+if ($ForbiddenEntries.Count -ne 0) {
+    throw "0.8.2 and Map Studio must remain outside the launcher distribution"
+}
+
 Copy-Item -Force `
     (Join-Path $LauncherRoot "LAUNCHER_README.txt") `
     (Join-Path $DistRoot "$AppName\README.txt")
