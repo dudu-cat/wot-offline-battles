@@ -548,6 +548,11 @@ class WindowTest(unittest.TestCase):
         self.assertFalse(hasattr(self.window, "single_team_size_box"))
         self.assertFalse(hasattr(self.window, "network_team_size_box"))
 
+    def test_team_is_selected_only_in_the_waiting_room(self):
+        self.assertFalse(hasattr(self.window, "preferred_team"))
+        self.assertFalse(hasattr(self.window, "single_preferred_team_box"))
+        self.assertFalse(hasattr(self.window, "network_preferred_team_box"))
+
     def test_server_button_is_an_explicit_online_action(self):
         self._game("0.9.22.0.1", "1513")
         self.assertEqual("disabled", self.window.server_button.cget("state"))
@@ -669,6 +674,31 @@ class WindowTest(unittest.TestCase):
         self.assertNotIn("team_size", saved)
         self.assertNotIn("team1_size", saved)
         self.assertNotIn("team2_size", saved)
+
+    def test_legacy_preferred_team_is_ignored_and_removed(self):
+        game_root = self._game("0.9.22.0.1", "1513")
+        core.save_settings({
+            "game_root": game_root,
+            "preferred_team": 2,
+        })
+        reopened = wot_launcher.LauncherWindow(
+            _FakeTk, _FakeTtk, self.dialog)
+        session = {
+            "client": core.PORT_0_9_22,
+            "mode": core.MODE_SINGLE,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": True,
+            "vehicle_profile": None,
+        }
+        with mock.patch("core.plan_session", return_value=session) as plan, \
+                mock.patch("wot_launcher.threading.Thread") as thread:
+            reopened._start()
+
+        self.assertNotIn("preferred_team", plan.call_args.kwargs)
+        thread.return_value.start.assert_called_once_with()
+        reopened._save_settings()
+        self.assertNotIn("preferred_team", core.load_settings())
 
 
     def test_a_selected_game_folder_joins_the_known_list(self):
@@ -1305,6 +1335,31 @@ class WindowTest(unittest.TestCase):
             saved = stream.read()
         self.assertIn("server stdout\n", saved)
         self.assertIn("server stderr\n", saved)
+
+    def test_server_output_bypasses_a_narrow_windows_code_page(self):
+        class _Cp1252Pipe(object):
+            encoding = "cp1252"
+
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def write(self, value):
+                self.buffer.write(value.encode(self.encoding))
+                return len(value)
+
+            def flush(self):
+                pass
+
+        primary = _Cp1252Pipe()
+        log_stream = io.StringIO()
+        tee = wot_launcher._TeeTextStream(
+            primary, log_stream, wot_launcher.threading.RLock())
+
+        message = "服务器已启动\n"
+        self.assertEqual(len(message), tee.write(message))
+
+        self.assertEqual(message, primary.buffer.getvalue().decode("utf-8"))
+        self.assertEqual(message, log_stream.getvalue())
 
     def test_server_log_keeps_only_the_current_bounded_run(self):
         log_path = os.path.join(self.settings_dir, "server.log")

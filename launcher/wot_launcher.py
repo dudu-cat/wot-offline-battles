@@ -36,7 +36,6 @@ _CHINESE = {
     "Single player": "单人游戏",
     "Online": "联网游戏",
     "Player name": "玩家名",
-    "Preferred team": "选择队伍",
     "The launcher starts the private server and hidden simulation client "
     "automatically.": "启动游戏时会自动运行隐藏服务器和模拟客户端。",
     "Start single-player battle": "开始单人战斗",
@@ -120,7 +119,6 @@ _CHINESE = {
 }
 
 
-_PREFERRED_TEAM_CHOICES = ("Auto", "1", "2")
 COLLECT_CRASH_REPORTS_SETTING = "collect_crash_reports"
 PROCDUMP_CONSENT_SETTING = "procdump_download_consent"
 PROCDUMP_PATH_ENV = "WOT_OFFLINE_PROCDUMP_PATH"
@@ -204,9 +202,29 @@ class _TeeTextStream(object):
         with self._lock:
             result = None
             if self._primary is not None:
-                result = self._primary.write(value)
+                result = self._write_primary(value)
             self._write_log(value)
             return len(value) if result is None else result
+
+    def _write_primary(self, value):
+        """Write Unicode without trusting the inherited Windows code page."""
+        try:
+            return self._primary.write(value)
+        except UnicodeEncodeError:
+            # Frozen server children inherit a byte pipe whose TextIOWrapper
+            # can still advertise the active Windows ANSI code page. Bypass
+            # that wrapper so the launcher parent receives valid UTF-8.
+            buffer = getattr(self._primary, "buffer", None)
+            if buffer is not None:
+                try:
+                    buffer.write(value.encode("utf-8", "replace"))
+                    return len(value)
+                except Exception:
+                    pass
+            encoding = getattr(self._primary, "encoding", None) or "ascii"
+            safe_value = value.encode(
+                encoding, "backslashreplace").decode(encoding, "strict")
+            return self._primary.write(safe_value)
 
     def flush(self):
         with self._lock:
@@ -353,14 +371,6 @@ class LauncherWindow(object):
                       else core.MODE_JOIN)
         self.mode = tk.StringVar(value=saved_mode)
         self.player_name = tk.StringVar(value=settings.get("name", ""))
-        preferred_team = settings.get(
-            "preferred_team", core.DEFAULT_PREFERRED_TEAM)
-        try:
-            preferred_team = core.parse_preferred_team(preferred_team)
-        except core.LauncherError:
-            preferred_team = core.DEFAULT_PREFERRED_TEAM
-        self.preferred_team = tk.StringVar(
-            value=("Auto" if preferred_team == 0 else str(preferred_team)))
         self.join_address = tk.StringVar(
             value=settings.get(
                 "join_address", "%s:%d" %
@@ -380,24 +390,15 @@ class LauncherWindow(object):
             self.single_panel, textvariable=self.player_name, width=52)
         self.single_player_name_entry.grid(
             row=0, column=1, columnspan=2, sticky="we", padx=(6, 0))
-        self.single_preferred_team_label = tk.Label(
-            self.single_panel, text="")
-        self.single_preferred_team_label.grid(
-            row=1, column=0, sticky="w", pady=(6, 0))
-        self.single_preferred_team_box = self._ttk.Combobox(
-            self.single_panel, textvariable=self.preferred_team,
-            values=_PREFERRED_TEAM_CHOICES, width=10)
-        self.single_preferred_team_box.grid(
-            row=1, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
         self.single_help_label = tk.Label(
             self.single_panel, text="", anchor="w", justify="left")
         self.single_help_label.grid(
-            row=2, column=0, columnspan=3, sticky="we", pady=(8, 6))
+            row=1, column=0, columnspan=3, sticky="we", pady=(8, 6))
         self.single_start_button = tk.Button(
             self.single_panel, text="", command=self._start_single,
             height=2, font=("TkDefaultFont", 10, "bold"))
         self.single_start_button.grid(
-            row=3, column=0, columnspan=3, sticky="we")
+            row=2, column=0, columnspan=3, sticky="we")
         self.single_panel.grid_columnconfigure(1, weight=1)
 
         self.server_address_label = tk.Label(self.network_panel, text="")
@@ -416,29 +417,20 @@ class LauncherWindow(object):
         self.network_player_name_entry.grid(
             row=1, column=1, columnspan=2, sticky="we", padx=(6, 0),
             pady=(6, 0))
-        self.network_preferred_team_label = tk.Label(
-            self.network_panel, text="")
-        self.network_preferred_team_label.grid(
-            row=2, column=0, sticky="w", pady=(6, 0))
-        self.network_preferred_team_box = self._ttk.Combobox(
-            self.network_panel, textvariable=self.preferred_team,
-            values=_PREFERRED_TEAM_CHOICES, width=10)
-        self.network_preferred_team_box.grid(
-            row=2, column=1, sticky="w", padx=(6, 6), pady=(6, 0))
         self.server_button = tk.Button(
             self.network_panel, text="", command=self._toggle_lan_server)
         self.server_button.grid(
-            row=3, column=0, columnspan=3, sticky="we", pady=(8, 0))
+            row=2, column=0, columnspan=3, sticky="we", pady=(8, 0))
         self.network_help_label = tk.Label(
             self.network_panel, text="", anchor="w", justify="left",
             wraplength=620)
         self.network_help_label.grid(
-            row=4, column=0, columnspan=3, sticky="we", pady=(8, 6))
+            row=3, column=0, columnspan=3, sticky="we", pady=(8, 6))
         self.network_start_button = tk.Button(
             self.network_panel, text="", command=self._start_network,
             height=2, font=("TkDefaultFont", 10, "bold"))
         self.network_start_button.grid(
-            row=5, column=0, columnspan=3, sticky="we")
+            row=4, column=0, columnspan=3, sticky="we")
         self.network_panel.grid_columnconfigure(1, weight=1)
 
         self.tools_tabs = self._ttk.Notebook(frame)
@@ -554,10 +546,6 @@ class LauncherWindow(object):
         self.battle_tabs.tab(self.network_panel, text=self._t("Online"))
         self.single_player_name_label.config(text=self._t("Player name"))
         self.network_player_name_label.config(text=self._t("Player name"))
-        self.single_preferred_team_label.config(
-            text=self._t("Preferred team"))
-        self.network_preferred_team_label.config(
-            text=self._t("Preferred team"))
         self.single_help_label.config(text=self._t(
             "The launcher starts the private server and hidden simulation "
             "client automatically."))
@@ -659,8 +647,7 @@ class LauncherWindow(object):
         self._selected_client = status["client"]
         self._refresh_profiles(status)
         self._update_action_controls()
-        if hasattr(self, "single_preferred_team_box"):
-            self._refresh_mode()
+        self._refresh_mode()
         return status
 
     def _server_is_running(self):
@@ -806,15 +793,6 @@ class LauncherWindow(object):
             not self._maintenance_busy else "disabled")
         self.join_entry.config(state=network_state)
         self.test_button.config(state=network_state)
-        selection_available = (
-            self._selected_client == core.PORT_0_9_22 and not self._busy and
-            not self._maintenance_busy)
-        self.single_preferred_team_box.config(
-            state="readonly" if selection_available and not network
-            else "disabled")
-        self.network_preferred_team_box.config(
-            state="readonly" if selection_available and network
-            else "disabled")
         self._update_action_controls()
 
     def _test_connection(self):
@@ -1132,11 +1110,6 @@ class LauncherWindow(object):
         return True
 
     def _save_settings(self):
-        try:
-            preferred_team = core.parse_preferred_team(
-                self.preferred_team.get())
-        except core.LauncherError:
-            preferred_team = core.DEFAULT_PREFERRED_TEAM
         core.save_settings({
             "game_root": self.game_root.get().strip(),
             "folders": list(self._folders),
@@ -1145,7 +1118,6 @@ class LauncherWindow(object):
                      else core.MODE_JOIN),
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
-            "preferred_team": preferred_team,
             "vehicle_profile": self.vehicle_profile.get().strip(),
             "language": self.language_preference,
             COLLECT_CRASH_REPORTS_SETTING:
@@ -1393,8 +1365,7 @@ class LauncherWindow(object):
         try:
             session = core.plan_session(
                 status, self.mode.get(), self.join_address.get(),
-                vehicle_profile=profile_name,
-                preferred_team=self.preferred_team.get())
+                vehicle_profile=profile_name)
             session[COLLECT_CRASH_REPORTS_SETTING] = bool(
                 self.collect_crash_reports.get())
         except core.LauncherError as error:
