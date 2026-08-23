@@ -2552,6 +2552,31 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.06 * battle_runtime_module.POSE_RELAX_STRETCH, relax)
 
+    def test_same_frame_pose_changes_do_not_divide_by_zero(self):
+        battle = BattleRuntime(_runtime())
+
+        self.assertIsNone(
+            battle._bot_pose_relax({'id': 3, 'yaw': 0.0}, 'a', 10.0))
+        self.assertIsNone(
+            battle._bot_pose_relax({'id': 3, 'yaw': 0.2}, 'b', 10.0))
+
+        self.assertEqual(0.0, battle._bot_yaw_rates[3])
+        self.assertAlmostEqual(
+            0.1 * battle_runtime_module.POSE_RELAX_STRETCH,
+            battle._bot_pose_relax({'id': 3, 'yaw': 0.3}, 'c', 10.1))
+        self.assertAlmostEqual(1.0, battle._bot_yaw_rates[3])
+
+    def test_same_frame_remote_track_samples_do_not_divide_by_zero(self):
+        battle = BattleRuntime(_runtime())
+        record = {}
+
+        self.assertEqual(
+            0.0, battle._remember_remote_track_turn(record, 0.0, 10.0))
+        self.assertEqual(
+            0.0, battle._remember_remote_track_turn(record, 0.2, 10.0))
+        self.assertAlmostEqual(
+            1.0, battle._remember_remote_track_turn(record, 0.3, 10.1))
+
     def test_a_bot_pose_is_animated_without_allocating_per_pose(self):
         """OfflineEntity declares an empty <Volatile/>, so no WGVehicleFilter
         can ever interpolate for a bot; the compound animates instead, and

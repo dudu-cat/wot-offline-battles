@@ -11394,7 +11394,10 @@ class BattleRuntime(object):
         if previous is None:
             self._bot_yaw_rates[key] = 0.0
             return None
-        elapsed = max(FRAME_SECONDS, min(0.5, float(now) - float(previous[0])))
+        elapsed = min(0.5, float(now) - float(previous[0]))
+        if elapsed <= 0.0:
+            self._bot_yaw_rates[key] = 0.0
+            return None
         turned = (yaw - float(previous[1]) + math.pi) % (
             2.0 * math.pi) - math.pi
         self._bot_yaw_rates[key] = turned / elapsed
@@ -11454,11 +11457,11 @@ class BattleRuntime(object):
         previous = record.get('track_pose_sample')
         turn = 0.0
         if previous is not None:
-            elapsed = max(
-                FRAME_SECONDS, min(0.5, float(now) - float(previous[0])))
-            turned = (float(yaw) - float(previous[1]) + math.pi) % (
-                2.0 * math.pi) - math.pi
-            turn = turned / elapsed
+            elapsed = min(0.5, float(now) - float(previous[0]))
+            if elapsed > 0.0:
+                turned = (float(yaw) - float(previous[1]) + math.pi) % (
+                    2.0 * math.pi) - math.pi
+                turn = turned / elapsed
         record['track_pose_sample'] = (float(now), float(yaw))
         return turn
 
