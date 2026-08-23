@@ -57,6 +57,20 @@ def default_data_dir():
 
 OCCLUDER_FORMAT = 'offline-lan-0922-occluders'
 OCCLUDER_VERSION = 1
+_OPTIONAL_WARNING_LIMIT = 240
+
+
+def _optional_warning(label, error=None):
+    message = str(label)
+    if error is not None:
+        try:
+            detail = str(error)
+        except Exception:
+            detail = error.__class__.__name__
+        detail = ' '.join(detail.split())
+        if detail:
+            message += ': ' + detail
+    return message[:_OPTIONAL_WARNING_LIMIT]
 
 
 def load_occluders(map_name, base_dir):
@@ -85,20 +99,46 @@ def load_occluders(map_name, base_dir):
 
 def load_world(map_name, base_dir=None):
     """Return a BakedWorld for one supported map, or None when not baked."""
+    if (prebaked_navigation._short_map_name(map_name) not in
+            prebaked_navigation.SUPPORTED_MAPS):
+        return None
     base_dir = base_dir if base_dir is not None else default_data_dir()
     graph = prebaked_navigation.load_graph(map_name, base_dir=base_dir)
     if graph is None:
         return None
-    catalog = prebaked_destructibles.load_catalog(map_name, base_dir=base_dir)
-    foliage = prebaked_foliage.load_foliage(map_name, base_dir=base_dir)
+    optional_warnings = []
+    try:
+        catalog = prebaked_destructibles.load_catalog(
+            map_name, base_dir=base_dir)
+    except Exception as error:
+        catalog = None
+        optional_warnings.append(_optional_warning(
+            'destructible catalog is unavailable', error))
+    if catalog is None and not optional_warnings:
+        optional_warnings.append('destructible catalog is unavailable')
+    try:
+        foliage = prebaked_foliage.load_foliage(
+            map_name, base_dir=base_dir)
+    except Exception as error:
+        foliage = None
+        optional_warnings.append(_optional_warning(
+            'foliage data is unavailable', error))
+    if foliage is None and not any(
+            warning.startswith('foliage data')
+            for warning in optional_warnings):
+        optional_warnings.append('foliage data is unavailable')
     occluders = load_occluders(map_name, base_dir)
-    if catalog is None or foliage is None or occluders is None:
-        # Server authority is an all-or-nothing correctness mode. A partial
-        # dataset would silently turn missing collision or visibility geometry
-        # into clear space, so let the caller enter its explicit fallback.
+    if occluders is None:
+        # Navigation and static-world collision are the authority's core world
+        # boundary. Destructibles and foliage can be disabled independently,
+        # but a missing solid world cannot be simulated safely.
         return None
-    return BakedWorld(graph, catalog=catalog, foliage=foliage,
-                      occluders=occluders)
+    world = BakedWorld(graph, catalog=catalog, foliage=foliage,
+                       occluders=occluders)
+    if catalog is None:
+        world.disable_destructibles('destructible_catalog_unavailable')
+    world.optional_warnings = tuple(optional_warnings)
+    return world
 
 
 class BakedWorld(object):
@@ -119,6 +159,7 @@ class BakedWorld(object):
             self._width * self._height)
         self._instances = {}
         self._wire_index = {}
+        self._destructibles_disabled_reason = None
         self._destroyed = set()
         self._occluder_bins = {}
         self._occluders = []
@@ -468,6 +509,8 @@ class BakedWorld(object):
     def install_destructible_map(self, instances, resources,
                                  unit_vehicle_mass):
         """Install donated wire identities and native-scaled healths."""
+        if self._destructibles_disabled_reason is not None:
+            return 0
         installed = 0
         resources = resources or {}
         try:
@@ -499,18 +542,39 @@ class BakedWorld(object):
         return installed
 
     def has_destructible_identities(self):
-        return bool(self._wire_index)
+        return (self._destructibles_disabled_reason is None and
+                bool(self._wire_index))
 
     def requires_destructible_identities(self):
         """Whether this baked map needs native chunk/item wire identities."""
-        return bool(self._instances)
+        return (self._destructibles_disabled_reason is None and
+                bool(self._instances))
 
     def destructible_identities_ready(self):
         """Whether projectile/destruction results can name native instances."""
-        return all(
+        return (self._destructibles_disabled_reason is not None or all(
             instance['wire'] is not None and
             self._wire_index.get(instance['wire']) == signature
-            for signature, instance in self._instances.items())
+            for signature, instance in self._instances.items()))
+
+    def disable_destructibles(self, reason):
+        """Disable native destructible events while retaining static occlusion."""
+        if self._destructibles_disabled_reason is not None:
+            return False
+        self._destructibles_disabled_reason = str(
+            reason or 'destructible_data_unavailable')
+        self._wire_index.clear()
+        self._unit_vehicle_mass = None
+        for instance in self._instances.values():
+            instance['wire'] = None
+            instance['scaled_health'] = None
+            instance['modules'] = None
+            instance['destr_type'] = None
+            instance['kinetic_correction'] = None
+        return True
+
+    def destructibles_disabled_reason(self):
+        return self._destructibles_disabled_reason
 
     def instance(self, signature):
         return self._instances.get(signature)

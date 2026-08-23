@@ -45,28 +45,27 @@ def _manifest_entry(directory, map_name):
 			int(manifest.get('version', -1)) != FORMAT_VERSION or
 			str(manifest.get('game_version', '')) != GAME_VERSION):
 		raise ValueError('foliage manifest is incompatible')
-	records = manifest.get('maps') or ()
-	if len(records) != len(SUPPORTED_MAPS):
-		raise ValueError('foliage manifest is incomplete')
-	expected = set(SUPPORTED_MAPS)
-	seen = set()
+	records = manifest.get('maps')
+	if not isinstance(records, list):
+		raise ValueError('foliage manifest record list is invalid')
 	selected = None
 	for record in records:
-		if not isinstance(record, dict):
-			raise ValueError('foliage manifest record is invalid')
-		name = short_map_name(record.get('map'))
-		filename = str(record.get('file') or '')
-		digest = str(record.get('sha256') or '')
-		if (name not in expected or name in seen or
-				filename != name + '.json' or len(digest) != 64):
-			raise ValueError('foliage manifest record is invalid')
-		seen.add(name)
-		if not os.path.isfile(os.path.join(directory, filename)):
-			raise ValueError('foliage batch is incomplete')
-		if name == map_name:
-			selected = record
-	if seen != expected:
-		raise ValueError('foliage manifest is incomplete')
+		if (not isinstance(record, dict) or
+				short_map_name(record.get('map')) != map_name):
+			continue
+		if selected is not None:
+			raise ValueError('foliage manifest record is duplicated')
+		selected = record
+	if selected is None:
+		raise ValueError('foliage manifest has no record for this map')
+	name = short_map_name(selected.get('map'))
+	filename = str(selected.get('file') or '')
+	digest = str(selected.get('sha256') or '')
+	if (name not in SUPPORTED_MAPS or filename != name + '.json' or
+			len(digest) != 64):
+		raise ValueError('foliage manifest record is invalid')
+	if not os.path.isfile(os.path.join(directory, filename)):
+		raise ValueError('foliage data is unavailable')
 	return selected
 
 
