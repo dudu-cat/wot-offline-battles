@@ -1,4 +1,5 @@
 import ast
+import io
 import json
 import os
 import shutil
@@ -337,32 +338,228 @@ class SettingsFileTest(unittest.TestCase):
                           "0.1.0", core.MODE_SINGLE, core.LOCAL_HOST, 1)
 
 
-class ServerPayloadTest(unittest.TestCase):
-    def test_source_procdump_resolves_to_the_vendored_executable(self):
-        with mock.patch.object(core.sys, "_MEIPASS", None, create=True):
+class ProcDumpDownloadTest(unittest.TestCase):
+    EXECUTABLE = (
+        b"MZ" + b"\x00" * 58 + b"\x80\x00\x00\x00" +
+        b"\x00" * 64 + b"PE\x00\x00" + b"\x4c\x01" +
+        b"\x00" * 18 + b"\x0b\x01" + b"\x00" * 32)
+
+    class _Response(io.BytesIO):
+        def __init__(self, payload, url=None, content_length=None):
+            super().__init__(payload)
+            if content_length is None:
+                content_length = len(payload)
+            self.headers = {"Content-Length": str(content_length)}
+            self._url = url or core.PROCDUMP_DOWNLOAD_URL
+
+        def geturl(self):
+            return self._url
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.path = os.path.join(self.root, "tools", "procdump.exe")
+        signature = mock.patch(
+            "core._procdump_authenticode_is_trusted", return_value=True)
+        self.signature_is_trusted = signature.start()
+        self.addCleanup(signature.stop)
+
+    @staticmethod
+    def _archive(*entries):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, payload in entries:
+                archive.writestr(name, payload)
+        return stream.getvalue()
+
+    @staticmethod
+    def _mark_members_encrypted(payload):
+        payload = bytearray(payload)
+        for signature, flags_offset in ((b"PK\x03\x04", 6),
+                                        (b"PK\x01\x02", 8)):
+            cursor = 0
+            while True:
+                cursor = payload.find(signature, cursor)
+                if cursor < 0:
+                    break
+                offset = cursor + flags_offset
+                flags = int.from_bytes(payload[offset:offset + 2], "little")
+                payload[offset:offset + 2] = (flags | 1).to_bytes(2, "little")
+                cursor += len(signature)
+        return bytes(payload)
+
+    def _opener(self, payload):
+        return mock.Mock(return_value=self._Response(payload))
+
+    def test_default_path_lives_beside_launcher_settings_in_user_cache(self):
+        settings = os.path.join(self.root, "launcher.json")
+        with mock.patch("core.settings_path", return_value=settings):
             path = core.procdump_executable()
 
-        self.assertEqual(
-            os.path.join(os.path.dirname(core.__file__), "vendor", "procdump",
-                         "procdump.exe"),
-            path)
+        self.assertEqual(self.path, path)
 
-    def test_frozen_procdump_resolves_inside_the_onedir_bundle(self):
-        bundle = os.path.join(tempfile.gettempdir(), "launcher", "_internal")
-        with mock.patch.object(core.sys, "_MEIPASS", bundle, create=True):
+    def test_frozen_bundle_state_does_not_change_the_user_cache_path(self):
+        settings = os.path.join(self.root, "launcher.json")
+        bundle = os.path.join(self.root, "launcher", "_internal")
+        with mock.patch("core.settings_path", return_value=settings), \
+                mock.patch.object(core.sys, "_MEIPASS", bundle, create=True):
             path = core.procdump_executable()
 
-        self.assertEqual(
-            os.path.join(bundle, "tools", "procdump.exe"), path)
+        self.assertEqual(self.path, path)
+        self.assertFalse(path.startswith(bundle))
 
-    def test_explicit_procdump_base_takes_priority_over_bundle_state(self):
-        base = os.path.join(tempfile.gettempdir(), "staged-launcher")
+    def test_explicit_cache_base_takes_priority_over_bundle_state(self):
         with mock.patch.object(
                 core.sys, "_MEIPASS", "/ignored", create=True):
-            path = core.procdump_executable(base)
+            path = core.procdump_executable(self.root)
 
-        self.assertEqual(
-            os.path.join(base, "tools", "procdump.exe"), path)
+        self.assertEqual(self.path, path)
+
+    def test_download_installs_the_exact_root_32_bit_executable(self):
+        payload = self._archive(
+            ("procdump.exe", self.EXECUTABLE),
+            ("procdump64.exe", b"not-the-selected-executable"),
+            ("Eula.txt", b"license"))
+        opener = self._opener(payload)
+
+        installed = core.download_procdump(self.path, opener=opener)
+
+        self.assertEqual(self.path, installed)
+        with open(self.path, "rb") as stream:
+            self.assertEqual(self.EXECUTABLE, stream.read())
+        opener.assert_called_once_with(
+            core.PROCDUMP_DOWNLOAD_URL,
+            timeout=core.PROCDUMP_DOWNLOAD_TIMEOUT_SECONDS)
+
+    def test_valid_cached_executable_is_reused_without_a_download(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "wb") as stream:
+            stream.write(self.EXECUTABLE)
+        opener = mock.Mock(side_effect=AssertionError("must not download"))
+
+        installed = core.download_procdump(self.path, opener=opener)
+
+        self.assertEqual(self.path, installed)
+        opener.assert_not_called()
+
+    def test_untrusted_cached_executable_is_not_reused(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "wb") as stream:
+            stream.write(self.EXECUTABLE)
+        self.signature_is_trusted.return_value = False
+
+        self.assertFalse(core.procdump_is_installed(self.path))
+
+    def test_untrusted_download_is_not_installed(self):
+        payload = self._archive(("procdump.exe", self.EXECUTABLE))
+        self.signature_is_trusted.return_value = False
+
+        with self.assertRaisesRegex(core.LauncherError, "signature"):
+            core.download_procdump(self.path, opener=self._opener(payload))
+
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual([], [
+            name for name in os.listdir(os.path.dirname(self.path))
+            if name.startswith(".procdump-")])
+
+    def test_bad_zip_is_rejected(self):
+        with self.assertRaisesRegex(core.LauncherError, "valid ZIP"):
+            core.download_procdump(
+                self.path, opener=self._opener(b"not a zip"))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_duplicate_root_executable_members_are_rejected(self):
+        payload = self._archive(
+            ("procdump.exe", self.EXECUTABLE),
+            ("PROCDUMP.EXE", self.EXECUTABLE))
+
+        with self.assertRaisesRegex(core.LauncherError, "unique procdump.exe"):
+            core.download_procdump(self.path, opener=self._opener(payload))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_non_pe_executable_is_rejected(self):
+        payload = self._archive(("procdump.exe", b"not-a-pe-executable"))
+
+        with self.assertRaisesRegex(core.LauncherError, "executable is invalid"):
+            core.download_procdump(self.path, opener=self._opener(payload))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_64_bit_pe_executable_is_rejected(self):
+        executable = bytearray(self.EXECUTABLE)
+        executable[132:134] = b"\x64\x86"
+        executable[152:154] = b"\x0b\x02"
+        payload = self._archive(("procdump.exe", bytes(executable)))
+
+        with self.assertRaises(core.LauncherError):
+            core.download_procdump(self.path, opener=self._opener(payload))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_redirect_away_from_official_https_host_is_rejected(self):
+        payload = self._archive(("procdump.exe", self.EXECUTABLE))
+        response = self._Response(
+            payload, url="https://downloads.example.test/Procdump.zip")
+
+        with self.assertRaises(core.LauncherError):
+            core.download_procdump(
+                self.path, opener=mock.Mock(return_value=response))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_oversized_download_is_rejected(self):
+        with mock.patch.object(core, "PROCDUMP_ARCHIVE_MAX_BYTES", 4):
+            with self.assertRaisesRegex(
+                    core.LauncherError, "download is unexpectedly large"):
+                core.download_procdump(
+                    self.path, opener=self._opener(b"12345"))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_oversized_declared_download_is_rejected(self):
+        payload = self._archive(("procdump.exe", self.EXECUTABLE))
+        response = self._Response(
+            payload, content_length=core.PROCDUMP_ARCHIVE_MAX_BYTES + 1)
+
+        with self.assertRaises(core.LauncherError):
+            core.download_procdump(
+                self.path, opener=mock.Mock(return_value=response))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_oversized_executable_member_is_rejected_before_extraction(self):
+        payload = self._archive(("procdump.exe", self.EXECUTABLE))
+
+        with mock.patch.object(core, "PROCDUMP_EXECUTABLE_MAX_BYTES", 8):
+            with self.assertRaisesRegex(
+                    core.LauncherError, "executable has an invalid size"):
+                core.download_procdump(
+                    self.path, opener=self._opener(payload))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_encrypted_executable_member_is_rejected(self):
+        payload = self._mark_members_encrypted(
+            self._archive(("procdump.exe", self.EXECUTABLE)))
+
+        with self.assertRaises(core.LauncherError):
+            core.download_procdump(self.path, opener=self._opener(payload))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_failed_atomic_install_does_not_overwrite_existing_file(self):
+        os.makedirs(os.path.dirname(self.path))
+        original = b"existing invalid cache"
+        with open(self.path, "wb") as stream:
+            stream.write(original)
+        payload = self._archive(("procdump.exe", self.EXECUTABLE))
+
+        with mock.patch("core.os.replace", side_effect=OSError("locked")):
+            with self.assertRaises(core.LauncherError):
+                core.download_procdump(
+                    self.path, opener=self._opener(payload))
+
+        with open(self.path, "rb") as stream:
+            self.assertEqual(original, stream.read())
+        self.assertEqual([], [
+            name for name in os.listdir(os.path.dirname(self.path))
+            if name.startswith(".procdump-")])
+
+
+class ServerPayloadTest(unittest.TestCase):
 
     def test_server_log_lives_beside_the_frozen_launcher(self):
         executable = os.path.join(
@@ -1197,24 +1394,21 @@ class PayloadStagingTest(unittest.TestCase):
             "0.8.2 and Map Studio must remain outside the launcher "
             "distribution", script)
 
-    def test_windows_distribution_bundles_procdump_and_its_eula(self):
+    def test_windows_distribution_does_not_bundle_procdump(self):
         launcher_root = os.path.dirname(os.path.dirname(__file__))
         vendor_root = os.path.join(launcher_root, "vendor", "procdump")
-        self.assertTrue(os.path.isfile(os.path.join(
+        self.assertFalse(os.path.isfile(os.path.join(
             vendor_root, "procdump.exe")))
-        eula_path = os.path.join(vendor_root, "Eula.txt")
-        self.assertTrue(os.path.isfile(eula_path))
-        with open(eula_path, "r", encoding="utf-8-sig") as stream:
-            self.assertIn(
-                "sysinternals software license terms", stream.read().lower())
+        self.assertFalse(os.path.isfile(os.path.join(
+            vendor_root, "Eula.txt")))
 
         script_path = os.path.join(launcher_root, "build_launcher.ps1")
         with open(script_path, "r", encoding="utf-8") as stream:
             script = stream.read()
-        self.assertIn('--add-binary "$ProcDumpExecutable;tools"', script)
-        self.assertIn('--add-data "$ProcDumpEula;tools"', script)
-        self.assertIn('"_internal\\tools\\procdump.exe"', script)
-        self.assertIn('"_internal\\tools\\Eula.txt"', script)
+        self.assertNotIn("ProcDumpExecutable", script)
+        self.assertNotIn("ProcDumpEula", script)
+        self.assertNotIn("procdump.exe", script.lower())
+        self.assertNotIn('"_internal\\tools\\Eula.txt"', script)
 
     def test_the_0_9_22_server_finds_its_client_modules(self):
         self.assertTrue(os.path.isfile(os.path.join(

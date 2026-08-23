@@ -99,6 +99,19 @@ _CHINESE = {
         "无法在 Windows 资源管理器中选中报告：%s",
     "Could not delete the declined crash report: %s":
         "无法删除你拒绝上传的闪退报告：%s",
+    "Enable crash dumps?": "启用闪退转储？",
+    "To collect native crash dumps, the launcher will download Microsoft "
+    "Sysinternals ProcDump from Microsoft's official site and accept its "
+    "license terms at %s. Crash dumps may contain user names, passwords, file "
+    "paths, or network information. Download and enable it?":
+        "为了收集原生闪退转储，启动器会从微软官方网站下载 Microsoft "
+        "Sysinternals ProcDump，并接受此处的微软许可条款：%s。转储文件可能"
+        "包含用户名、密码、文件路径或网络信息。是否下载并启用？",
+    "Downloading ProcDump from Microsoft...":
+        "正在从微软官方下载 ProcDump…",
+    "ProcDump was downloaded and crash dumps are enabled.":
+        "ProcDump 下载完成，闪退转储已启用。",
+    "ProcDump could not be enabled: %s": "无法启用 ProcDump：%s",
     "Report game crash?": "是否汇报游戏闪退？",
     "The game closed unexpectedly. The prepared ZIP may include a process "
     "memory dump containing user names, passwords, file paths, or network "
@@ -112,6 +125,7 @@ _CHINESE = {
 
 _PREFERRED_TEAM_CHOICES = ("Auto", "1", "2")
 COLLECT_CRASH_REPORTS_SETTING = "collect_crash_reports"
+PROCDUMP_CONSENT_SETTING = "procdump_download_consent"
 PROCDUMP_PATH_ENV = "WOT_OFFLINE_PROCDUMP_PATH"
 CRASH_DUMP_PATH_ENV = "WOT_OFFLINE_CRASH_DUMP_PATH"
 
@@ -249,6 +263,8 @@ class LauncherWindow(object):
         self._active_report_session = None
         self._crash_capture_enabled = False
         self._procdump_path = None
+        self._procdump_download_consent = False
+        self._initial_crash_prompt_pending = False
         self._worker_exited_unexpectedly = False
         self._observed_crash_roles = set()
         self._forced_stop_roles = set()
@@ -314,15 +330,21 @@ class LauncherWindow(object):
         self.client_label = tk.Label(self.game_panel, text="", anchor="w")
         self.client_label.grid(
             row=1, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        saved_consent = settings.get(PROCDUMP_CONSENT_SETTING)
+        self._initial_crash_prompt_pending = not isinstance(
+            saved_consent, bool)
+        self._procdump_download_consent = saved_consent is True
         saved_crash_capture = settings.get(
-            COLLECT_CRASH_REPORTS_SETTING, True)
+            COLLECT_CRASH_REPORTS_SETTING, False)
         if not isinstance(saved_crash_capture, bool):
-            saved_crash_capture = True
+            saved_crash_capture = False
+        if not self._procdump_download_consent:
+            saved_crash_capture = False
         self.collect_crash_reports = tk.BooleanVar(
             value=saved_crash_capture)
         self.crash_report_check = tk.Checkbutton(
             self.game_panel, text="", variable=self.collect_crash_reports,
-            command=self._save_settings, anchor="w")
+            command=self._crash_collection_toggled, anchor="w")
         self.crash_report_check.grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.game_panel.grid_columnconfigure(1, weight=1)
@@ -875,17 +897,105 @@ class LauncherWindow(object):
         thread.start()
         return True
 
+    def _confirm_enable_crash_capture(self):
+        from tkinter import messagebox
+
+        return messagebox.askyesno(
+            self._t("Enable crash dumps?"),
+            self._t(
+                "To collect native crash dumps, the launcher will download "
+                "Microsoft Sysinternals ProcDump from Microsoft's official "
+                "site and accept its license terms at %s. Crash dumps may "
+                "contain user names, passwords, file paths, or network "
+                "information. Download and enable it?") %
+            core.PROCDUMP_LICENSE_URL,
+            icon="warning")
+
+    def _finish_procdump_download(self, path=None, error=None):
+        self._set_maintenance_busy(False)
+        if error is not None:
+            self.collect_crash_reports.set(False)
+            self._log(self._t("ProcDump could not be enabled: %s") % error)
+            self._save_settings()
+            return False
+        self.collect_crash_reports.set(True)
+        self._log(self._t(
+            "ProcDump was downloaded and crash dumps are enabled."))
+        self._save_settings()
+        return bool(path)
+
+    def _begin_procdump_download(self):
+        path = core.procdump_executable()
+        if core.procdump_is_installed(path):
+            self.collect_crash_reports.set(True)
+            self._save_settings()
+            return True
+        self.collect_crash_reports.set(False)
+        self._save_settings()
+        self._log(self._t("Downloading ProcDump from Microsoft..."))
+        self._set_maintenance_busy(True)
+
+        def run():
+            try:
+                installed = core.download_procdump(path)
+            except core.LauncherError as error:
+                self.root.after(
+                    0, lambda message=str(error):
+                    self._finish_procdump_download(error=message))
+            except Exception as error:
+                self.root.after(
+                    0, lambda message=str(error):
+                    self._finish_procdump_download(error=message))
+            else:
+                self.root.after(
+                    0, lambda installed_path=installed:
+                    self._finish_procdump_download(path=installed_path))
+
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        return True
+
+    def _request_crash_collection(self):
+        if not self._procdump_download_consent:
+            if not self._confirm_enable_crash_capture():
+                self.collect_crash_reports.set(False)
+                self._save_settings()
+                return False
+            self._procdump_download_consent = True
+        return self._begin_procdump_download()
+
+    def _crash_collection_toggled(self):
+        if not bool(self.collect_crash_reports.get()):
+            self._save_settings()
+            return False
+        self.collect_crash_reports.set(False)
+        return self._request_crash_collection()
+
+    def _prompt_initial_crash_collection(self):
+        if not self._initial_crash_prompt_pending:
+            return False
+        self._initial_crash_prompt_pending = False
+        return self._request_crash_collection()
+
+    def _disable_crash_collection(self):
+        self.collect_crash_reports.set(False)
+        self._save_settings()
+
     def _enable_crash_capture(self, report_session, requested):
         self._crash_capture_enabled = False
         self._procdump_path = None
-        if not requested or report_session is None:
+        if (not requested or report_session is None or
+                not self._procdump_download_consent):
             return False
         procdump_path = core.procdump_executable()
-        if not os.path.isfile(procdump_path):
-            self._log(
-                "Crash report collection is unavailable because ProcDump "
-                "is missing: %s" % procdump_path)
-            return False
+        if not core.procdump_is_installed(procdump_path):
+            try:
+                core.download_procdump(procdump_path)
+            except core.LauncherError as error:
+                self._log(self._t("ProcDump could not be enabled: %s") % error)
+                self.root.after(0, self._disable_crash_collection)
+                return False
         self._crash_capture_enabled = True
         self._procdump_path = procdump_path
         return True
@@ -1046,6 +1156,8 @@ class LauncherWindow(object):
             "language": self.language_preference,
             COLLECT_CRASH_REPORTS_SETTING:
                 bool(self.collect_crash_reports.get()),
+            PROCDUMP_CONSENT_SETTING:
+                bool(self._procdump_download_consent),
         })
 
     def _start_maintenance(self, action):
@@ -1806,6 +1918,8 @@ class LauncherWindow(object):
         return True
 
     def run(self):
+        if self._initial_crash_prompt_pending:
+            self.root.after(0, self._prompt_initial_crash_collection)
         self.root.mainloop()
 
 

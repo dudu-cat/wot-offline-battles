@@ -8,16 +8,7 @@ $WorkRoot = Join-Path $BuildRoot "pyinstaller"
 $SpecRoot = Join-Path $BuildRoot "spec"
 # PyInstaller owns its work directory, so the payload is staged beside it.
 $PayloadRoot = Join-Path $BuildRoot "payload"
-$ProcDumpRoot = Join-Path $LauncherRoot "vendor\procdump"
-$ProcDumpExecutable = Join-Path $ProcDumpRoot "procdump.exe"
-$ProcDumpEula = Join-Path $ProcDumpRoot "Eula.txt"
 $AppName = "WoT-Offline-Battles-Launcher"
-
-foreach ($entry in @($ProcDumpExecutable, $ProcDumpEula)) {
-    if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) {
-        throw "Bundled ProcDump file is missing: $entry"
-    }
-}
 
 foreach ($directory in @($DistRoot, $BuildRoot)) {
     if (Test-Path -LiteralPath $directory) {
@@ -57,8 +48,6 @@ python -m PyInstaller `
     --paths (Join-Path $RepoRoot "0.9.22\tools") `
     --add-data "$PayloadRoot\servers;servers" `
     --add-data "$PayloadRoot\client;client" `
-    --add-binary "$ProcDumpExecutable;tools" `
-    --add-data "$ProcDumpEula;tools" `
     (Join-Path $LauncherRoot "wot_launcher.py")
 
 if ($LASTEXITCODE -ne 0) {
@@ -110,9 +99,7 @@ Copy-Item -Force `
     (Join-Path $LicenseRoot "Boost-1.0.txt")
 
 foreach ($entry in @("$AppName.exe", "README.txt", "LICENSE",
-                     "THIRD_PARTY_NOTICES.md", "licenses\Boost-1.0.txt",
-                     "_internal\tools\procdump.exe",
-                     "_internal\tools\Eula.txt")) {
+                     "THIRD_PARTY_NOTICES.md", "licenses\Boost-1.0.txt")) {
     if (-not (Test-Path -LiteralPath (Join-Path $DistRoot "$AppName\$entry"))) {
         throw "Launcher distribution is incomplete: $entry"
     }

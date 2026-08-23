@@ -132,16 +132,16 @@ under MIT. The complete PyInstaller 6.21.0 licensing terms are available at:
 
 https://github.com/pyinstaller/pyinstaller/blob/v6.21.0/COPYING.txt
 
-This research launcher includes Microsoft Sysinternals ProcDump for crash
-collection. Microsoft's original license terms are retained at
-_internal\tools\Eula.txt. Sysinternals does not grant third-party redistribution
-rights through its standard download terms; remove ProcDump or obtain separate
-permission before redistributing this launcher bundle. The bundled ProcDump
-v12.01 is officially supported on Windows 11 and later; Windows 10 use is not
-validated here.
+Microsoft Sysinternals ProcDump is not included in this launcher. The first
+time the launcher asks about native crash dumps, choosing Enable downloads the
+32-bit ProcDump executable directly from Microsoft's official site to
+%LOCALAPPDATA%\WoTOfflineBattles\tools\procdump.exe. Choosing Enable also
+accepts Microsoft's license terms. If the download fails, crash-dump collection
+stays disabled and the game can still be launched normally.
 
 https://learn.microsoft.com/en-us/sysinternals/downloads/procdump
 https://learn.microsoft.com/en-us/sysinternals/license-faq
+https://learn.microsoft.com/en-us/sysinternals/license-terms
 
 World of Tanks and its assets are not included with this server. This project
 is unofficial and is not endorsed by Wargaming.

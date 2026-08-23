@@ -106,6 +106,7 @@ class _Root(_Widget):
     def __init__(self):
         _Widget.__init__(self)
         self.destroyed = False
+        self.mainloop_called = False
 
     def title(self, unused_title):
         pass
@@ -118,6 +119,9 @@ class _Root(_Widget):
 
     def destroy(self):
         self.destroyed = True
+
+    def mainloop(self):
+        self.mainloop_called = True
 
 
 class _FakeTk(object):
@@ -238,22 +242,125 @@ class WindowTest(unittest.TestCase):
         self.assertIs(
             self.window.distribution_notice_text,
             self.window.distribution_notice_entry.cget("textvariable"))
-        self.assertTrue(self.window.collect_crash_reports.get())
+        self.assertFalse(self.window.collect_crash_reports.get())
         self.assertEqual(
             "Collect a report if the game crashes",
             self.window.crash_report_check.cget("text"))
 
-    def test_crash_collection_defaults_on_and_persists_an_opt_out(self):
-        self.assertTrue(self.window.collect_crash_reports.get())
-        self.window.collect_crash_reports.set(False)
-        self.window._save_settings()
+    def test_first_run_prompts_once_when_the_launcher_starts(self):
+        with mock.patch.object(
+                self.window, "_request_crash_collection",
+                return_value=False) as request:
+            self.window.run()
+            self.window.run()
+
+        request.assert_called_once_with()
+        self.assertTrue(self.window.root.mainloop_called)
+
+    def test_crash_collection_defaults_off_and_persists_a_decline(self):
+        self.assertFalse(self.window.collect_crash_reports.get())
+        self.assertTrue(self.window._initial_crash_prompt_pending)
+        with mock.patch.object(
+                self.window, "_confirm_enable_crash_capture",
+                return_value=False) as confirm, mock.patch.object(
+                    core, "download_procdump") as download:
+            self.assertFalse(
+                self.window._prompt_initial_crash_collection())
+
+        confirm.assert_called_once_with()
+        download.assert_not_called()
+        self.assertFalse(self.window.collect_crash_reports.get())
+        self.assertFalse(self.window._procdump_download_consent)
+        settings = core.load_settings()
+        self.assertFalse(settings.get(
+            wot_launcher.COLLECT_CRASH_REPORTS_SETTING))
+        self.assertFalse(settings.get(wot_launcher.PROCDUMP_CONSENT_SETTING))
 
         reopened = wot_launcher.LauncherWindow(
             _FakeTk, _FakeTtk, self.dialog)
 
         self.assertFalse(reopened.collect_crash_reports.get())
-        self.assertFalse(core.load_settings().get(
+        self.assertFalse(reopened._initial_crash_prompt_pending)
+        with mock.patch.object(
+                reopened, "_confirm_enable_crash_capture") as confirm:
+            reopened.run()
+        confirm.assert_not_called()
+
+    def test_manual_enable_confirms_and_downloads_procdump_in_background(self):
+        installed_path = os.path.join(
+            self.settings_dir, "tools", "procdump.exe")
+        self.window.collect_crash_reports.set(True)
+        with mock.patch.object(
+                self.window, "_confirm_enable_crash_capture",
+                return_value=True) as confirm, mock.patch.object(
+                    core, "procdump_executable",
+                    return_value=installed_path), mock.patch.object(
+                    core, "procdump_is_installed",
+                    return_value=False), mock.patch.object(
+                    core, "download_procdump",
+                    return_value=installed_path) as download, mock.patch(
+                        "wot_launcher.threading.Thread") as thread:
+            self.assertTrue(self.window._crash_collection_toggled())
+            download.assert_not_called()
+            worker = thread.call_args.kwargs["target"]
+            worker()
+
+        confirm.assert_called_once_with()
+        thread.return_value.start.assert_called_once_with()
+        download.assert_called_once_with(installed_path)
+        self.assertTrue(self.window._procdump_download_consent)
+        self.assertTrue(self.window.collect_crash_reports.get())
+        self.assertFalse(self.window._maintenance_busy)
+        settings = core.load_settings()
+        self.assertTrue(settings.get(
             wot_launcher.COLLECT_CRASH_REPORTS_SETTING))
+        self.assertTrue(settings.get(wot_launcher.PROCDUMP_CONSENT_SETTING))
+        self.assertIn("ProcDump was downloaded", self._log_text())
+
+    def test_failed_procdump_download_keeps_crash_collection_disabled(self):
+        installed_path = os.path.join(
+            self.settings_dir, "tools", "procdump.exe")
+        self.window.collect_crash_reports.set(True)
+        with mock.patch.object(
+                self.window, "_confirm_enable_crash_capture",
+                return_value=True), mock.patch.object(
+                    core, "procdump_executable",
+                    return_value=installed_path), mock.patch.object(
+                    core, "procdump_is_installed",
+                    return_value=False), mock.patch.object(
+                    core, "download_procdump",
+                    side_effect=core.LauncherError(
+                        "official download unavailable")), mock.patch(
+                            "wot_launcher.threading.Thread") as thread:
+            self.assertTrue(self.window._crash_collection_toggled())
+            worker = thread.call_args.kwargs["target"]
+            worker()
+
+        self.assertTrue(self.window._procdump_download_consent)
+        self.assertFalse(self.window.collect_crash_reports.get())
+        self.assertFalse(self.window._maintenance_busy)
+        settings = core.load_settings()
+        self.assertFalse(settings.get(
+            wot_launcher.COLLECT_CRASH_REPORTS_SETTING))
+        self.assertTrue(settings.get(wot_launcher.PROCDUMP_CONSENT_SETTING))
+        self.assertIn("official download unavailable", self._log_text())
+
+    def test_missing_cache_retry_failure_disables_saved_collection(self):
+        self.window._procdump_download_consent = True
+        self.window.collect_crash_reports.set(True)
+        self.window._save_settings()
+        with mock.patch.object(
+                core, "procdump_is_installed", return_value=False), \
+                mock.patch.object(
+                    core, "download_procdump",
+                    side_effect=core.LauncherError("offline")):
+            self.assertFalse(self.window._enable_crash_capture({}, True))
+
+        self.assertFalse(self.window.collect_crash_reports.get())
+        settings = core.load_settings()
+        self.assertFalse(settings.get(
+            wot_launcher.COLLECT_CRASH_REPORTS_SETTING))
+        self.assertTrue(settings.get(wot_launcher.PROCDUMP_CONSENT_SETTING))
 
     def test_crash_collection_control_is_only_enabled_for_0_9_22(self):
         self._game("0.8.2", "")

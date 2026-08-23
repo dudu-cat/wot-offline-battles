@@ -56,14 +56,12 @@ are retained upstream in
 
 ## Microsoft Sysinternals ProcDump
 
-The research launcher bundle includes Microsoft Sysinternals ProcDump for
-process crash collection. ProcDump remains Microsoft's software and is governed
-by the original `Eula.txt` retained beside the bundled executable under
-`_internal/tools`. Microsoft's standard Sysinternals terms do not grant
-third-party redistribution rights; remove ProcDump or obtain separate
-permission before redistributing the launcher bundle. The bundled ProcDump
-v12.01 build is officially supported on Windows 11 and later; Windows 10 use
-has not been validated. Official information is available from the
+Microsoft Sysinternals ProcDump is not distributed with this project. If a user
+chooses to enable native crash dumps, the launcher downloads the 32-bit
+executable directly from Microsoft's official download host into that user's
+local application-data directory. The download and use of ProcDump are governed
+by Microsoft's [license terms](https://learn.microsoft.com/en-us/sysinternals/license-terms).
+Official information is available from the
 [ProcDump documentation](https://learn.microsoft.com/en-us/sysinternals/downloads/procdump)
 and [Sysinternals licensing FAQ](https://learn.microsoft.com/en-us/sysinternals/license-faq).
 
