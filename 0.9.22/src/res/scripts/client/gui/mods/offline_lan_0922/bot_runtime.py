@@ -31,11 +31,10 @@ PUBLICATION_SECONDS = 1.0 / 30.0
 ARTILLERY_INTENT_SECONDS = 60.0
 ARTILLERY_REPROOF_SECONDS = 60.0
 ARTILLERY_TOTAL_PROOF_SECONDS = 120.0
-# A completed exact arc is still stale if a moving target has outrun the lead
-# while the bounded native queue was proving it.  Descriptors are not present
-# on every canonical contact, so use a conservative half-width fallback.
-ARTILLERY_IMPACT_ERROR_METRES = 1.5
-ARTILLERY_RECEIPT_HOLD_SECONDS = 10.0
+# Refresh an undispersed SPG lead when target motion during the native proof
+# queue moves its intended aim point farther than a conservative half-width.
+# This gate must never inspect or compensate the random projectile endpoint.
+ARTILLERY_AIM_STALENESS_METRES = 1.5
 COVER_JOBS_PER_OBSERVATION = 3
 HUMAN_TARGET_ID_BASE = 1000000
 RAM_REPORT_CURRENT_DISTANCE = 12.5
@@ -564,14 +563,14 @@ class _BotCriticalVehicle(object):
 
 
 class _BotGunState(object):
-    """The final 0.8.2 bot reload/clip clock, kept engine-free.
+    """The final 0.8.2 bot reload/clip and #1513 dispersion clocks.
 
     Inventory and loaded-shell selection live in ``_BotAmmoState``. A clip
     starts full; rounds inside it use ``clip[1]`` and an empty clip is
     immediately reset but held for the full reload time.
     """
 
-    def __init__(self, descriptor, fire_seq=0):
+    def __init__(self, descriptor, fire_seq=0, dispersion_factor=1.0):
         gun = _value(descriptor, 'gun', {}) or {}
         raw_dispersion = _value(gun, 'shotDispersionAngle')
         try:
@@ -585,6 +584,29 @@ class _BotGunState(object):
                 self.fully_aimed_dispersion <= 0.0):
             raise ValueError(
                 'installed gun shotDispersionAngle must be positive')
+        factors = _value(gun, 'shotDispersionFactors', {}) or {}
+        self.after_shot = max(
+            0.0, _number(_value(factors, 'afterShot'), 1.5))
+        self.turret_dispersion_factor = max(
+            0.0, _number(_value(factors, 'turretRotation'), 0.0))
+        self.aiming_time = max(
+            0.1, _number(_value(gun, 'aimingTime'), 2.0))
+        chassis_factors = _value(
+            _value(descriptor, 'chassis', {}) or {},
+            'shotDispersionFactors', (0.0, 0.0)) or (0.0, 0.0)
+        try:
+            self.movement_dispersion_factor = max(
+                0.0, float(chassis_factors[0]))
+            self.rotation_dispersion_factor = max(
+                0.0, float(chassis_factors[1]))
+        except (TypeError, ValueError, IndexError, OverflowError):
+            self.movement_dispersion_factor = 0.0
+            self.rotation_dispersion_factor = 0.0
+        self.current_dispersion_factor = 1.0
+        self.aiming_start_factor = 1.0
+        self.aiming_elapsed = 0.0
+        self.dispersion = self.fully_aimed_dispersion
+        self.motion_dispersion_squared = 0.0
         self.reload_full = max(
             0.01, _number(_value(gun, 'reloadTime', 3.0), 3.0))
         self.clip_size = 1
@@ -605,9 +627,9 @@ class _BotGunState(object):
         self.elapsed = 0.0
         self.reload_duration = self.reload_full
         self.reload_factor = 1.0
-        self.restore_fire_seq(fire_seq)
+        self.restore_fire_seq(fire_seq, dispersion_factor)
 
-    def restore_fire_seq(self, fire_seq):
+    def restore_fire_seq(self, fire_seq, dispersion_factor=1.0):
         fire_seq = max(0, int(_number(fire_seq)))
         if self.clip_size > 1:
             used = fire_seq % self.clip_size
@@ -620,9 +642,60 @@ class _BotGunState(object):
         # A takeover does not know the previous authority's sub-frame clock.
         # Waiting one complete interval is safe and prevents a duplicate shot.
         self.elapsed = 0.0
+        if fire_seq > 0:
+            # The previous authority's exact aiming clock is not on the wire.
+            # Start conservatively at one post-shot ideal and let the full safe
+            # reload interval converge it instead of granting an instant aim.
+            self.motion_dispersion_squared = 0.0
+            self.commit_shot_bloom(dispersion_factor)
 
     def tick(self, dt):
         self.elapsed += max(0.0, float(dt))
+
+    def tick_dispersion(self, dt, move_speed, rotation_speed, turret_speed,
+                        dispersion_factor=1.0, aim_time_factor=1.0):
+        """Advance the exact #1513 movement bloom and aiming convergence."""
+        dt = max(0.0, float(dt))
+        move_term = (abs(float(move_speed)) *
+                     self.movement_dispersion_factor)
+        rotation_term = (abs(float(rotation_speed)) *
+                         self.rotation_dispersion_factor)
+        turret_term = (abs(float(turret_speed)) *
+                       self.turret_dispersion_factor)
+        self.motion_dispersion_squared = (
+            move_term * move_term + rotation_term * rotation_term +
+            turret_term * turret_term)
+        dispersion_factor = max(0.0, float(dispersion_factor))
+        ideal = (dispersion_factor *
+                 math.sqrt(1.0 + self.motion_dispersion_squared))
+        if (math.isnan(ideal) or math.isinf(ideal) or ideal <= 0.0):
+            raise ValueError('dynamic bot shot dispersion must be positive')
+        aiming_time = self.aiming_time * max(
+            0.0, float(aim_time_factor))
+        elapsed = self.aiming_elapsed + dt
+        candidate = self.aiming_start_factor * math.exp(
+            -elapsed / max(aiming_time, 0.1))
+        if candidate < ideal:
+            self.current_dispersion_factor = ideal
+            self.aiming_start_factor = ideal
+            self.aiming_elapsed = 0.0
+        else:
+            self.current_dispersion_factor = candidate
+            self.aiming_elapsed = elapsed
+        self.dispersion = (self.fully_aimed_dispersion *
+                           self.current_dispersion_factor)
+
+    def commit_shot_bloom(self, dispersion_factor=1.0):
+        """Apply #1513's final-shot ideal factor after physical launch."""
+        dispersion_factor = max(0.0, float(dispersion_factor))
+        ideal = dispersion_factor * math.sqrt(
+            1.0 + self.motion_dispersion_squared +
+            self.after_shot * self.after_shot)
+        if self.current_dispersion_factor < ideal:
+            self.current_dispersion_factor = ideal
+            self.aiming_start_factor = ideal
+            self.aiming_elapsed = 0.0
+            self.dispersion = self.fully_aimed_dispersion * ideal
 
     def rescale_reload(self, reload_factor):
         """Keep the completed fraction when a live reload penalty changes."""
@@ -903,9 +976,10 @@ class _BotAmmoState(object):
 
 
 def _effective_shot_dispersion(gun_state, state, descriptor):
-    """Return installed fully-aimed dispersion with current critical malus."""
-    value = (float(gun_state.fully_aimed_dispersion) *
-             _critical_factor(state, descriptor, 'dispersion'))
+    """Return the current dynamic dispersion with critical-state malus."""
+    minimum = (float(gun_state.fully_aimed_dispersion) *
+               _critical_factor(state, descriptor, 'dispersion'))
+    value = max(float(gun_state.dispersion), minimum)
     if math.isnan(value) or math.isinf(value) or value <= 0.0:
         raise ValueError('effective bot shot dispersion must be positive')
     return value
@@ -1766,7 +1840,8 @@ class BotRuntime(object):
                 bot_id, ai_driver.gun_yaw_limits(descriptor))
             if bot_id not in self._gun_states:
                 self._gun_states[bot_id] = _BotGunState(
-                    descriptor, raw.get('fire_seq', 0))
+                    descriptor, raw.get('fire_seq', 0),
+                    _critical_factor(raw, descriptor, 'dispersion'))
             self._physics_params[bot_id] = vehicle_physics.derive_params(
                 descriptor)
             self._turn_speeds[bot_id] = 0.0
@@ -1838,9 +1913,10 @@ class BotRuntime(object):
                 self._ammo_states[bot_id] = ammo_state
             elif authority_handoff:
                 ammo_state.restore(raw)
-                gun_state.restore_fire_seq(max(
-                    int(state.get('fire_seq', 0)),
-                    int(_number(raw.get('fire_seq', 0)))))
+                gun_state.restore_fire_seq(
+                    max(int(state.get('fire_seq', 0)),
+                        int(_number(raw.get('fire_seq', 0)))),
+                    _critical_factor(state, descriptor, 'dispersion'))
             ammo_state.publish(state)
             if authority_handoff:
                 self._apply_authority_takeover_motion(state, raw)
@@ -2307,8 +2383,11 @@ class BotRuntime(object):
             if incoming_fire_seq > previous_fire_seq:
                 gun_state = self._gun_states.get(state['id'])
                 if gun_state is not None:
-                    gun_state.restore_fire_seq(incoming_fire_seq)
                     descriptor = self._descriptors.get(state['id'], {})
+                    gun_state.restore_fire_seq(
+                        incoming_fire_seq,
+                        _critical_factor(
+                            state, descriptor, 'dispersion'))
                     reload_factor = _critical_factor(
                         state, descriptor, 'reload')
                     state['clip'] = gun_state.clip
@@ -3909,11 +3988,9 @@ class BotRuntime(object):
                 'shell_index': int(shell_index),
                 'fire_seq': fire_seq,
                 'physical': physical,
-                # Reproofs separately predict native-queue target motion and
-                # cancel the deterministic next-fire dispersion endpoint.
-                'compensation_offset': (0.0, 0.0, 0.0),
+                # Reproofs predict only target motion accumulated while the
+                # exact native world path is queued. Random dispersion stays.
                 'proof_latency': 0.0,
-                'held_receipt': None,
                 'attempts': 0,
                 'created': _number(now),
                 'deadline': _number(now) + ARTILLERY_INTENT_SECONDS,
@@ -3948,31 +4025,20 @@ class BotRuntime(object):
             'shot_pitch': shot_pitch,
             'created': _number(now),
             'deadline': reproof['deadline'],
-            'compensation_offset': reproof['compensation_offset'],
         }
         self._artillery_intents[bot_id] = intent
         return intent
-
-    @staticmethod
-    def _corrected_artillery_target(target, offset):
-        corrected = dict(target)
-        position = _point(target.get('position'), _position(target))
-        position = tuple(position[index] + offset[index]
-                         for index in range(3))
-        corrected['position'] = position
-        corrected['x'], corrected['y'], corrected['z'] = position
-        return corrected
 
     def _artillery_reproof_solution(
             self, state, target, descriptor, shell_index, reproof):
         """Re-lead a proved SPG arc without repeating strategic world rays.
 
-        The first strategic proof selects a clear low/high family.  A stale
-        exact endpoint does not invalidate that family: re-solve it at the
-        latest contact plus the observed exact-queue latency, then submit the
-        new immutable parabola to the full exact world probe.  Any changed
-        target motion still has to pass the final three-dimensional endpoint
-        gate, so this prediction can only save redundant strategic work.
+        The first strategic proof selects a clear low/high family. Target
+        motion while its exact path is queued does not invalidate that family:
+        re-solve it at the latest contact plus the observed queue latency, then
+        submit the new immutable parabola to the full exact world probe. Any
+        changed target motion still has to pass the undispersed aim-staleness
+        gate, so this prediction cannot select or compensate a random endpoint.
         """
         physical = _shot_ballistics(descriptor, shell_index)
         if physical is None or not isinstance(target, dict):
@@ -3988,13 +4054,9 @@ class BotRuntime(object):
             target_position[2])
         target_velocity = self._target_velocity(target)
         proof_latency = max(0.0, _number(reproof.get('proof_latency')))
-        correction = reproof.get('compensation_offset')
-        if not isinstance(correction, (list, tuple)) or len(correction) < 3:
-            return None
         predicted = tuple(
             target_position[index] +
-            target_velocity[index] * proof_latency +
-            _number(correction[index])
+            target_velocity[index] * proof_latency
             for index in range(3))
         arc = str(reproof.get('arc') or '')
         if arc not in ('low', 'high'):
@@ -4032,21 +4094,17 @@ class BotRuntime(object):
                     state, target, descriptor, shell_index, reproof)
             if not callable(self.ballistic_solution_probe):
                 return None
-            probe_target = target
-            if reproof is not None and isinstance(target, dict):
-                probe_target = self._corrected_artillery_target(
-                    target, reproof['compensation_offset'])
             if self._probe_clock is None:
                 value = self.ballistic_solution_probe(
-                    dict(state), (dict(probe_target)
-                                  if probe_target is not None else None),
+                    dict(state), (dict(target)
+                                  if target is not None else None),
                     descriptor, int(shell_index), _number(now))
             else:
                 probe_started = self._probe_started()
                 try:
                     value = self.ballistic_solution_probe(
-                        dict(state), (dict(probe_target)
-                                      if probe_target is not None else None),
+                        dict(state), (dict(target)
+                                      if target is not None else None),
                         descriptor, int(shell_index), _number(now))
                 finally:
                     self._probe_finished(1, probe_started)
@@ -4331,94 +4389,43 @@ class BotRuntime(object):
         })
         return result
 
-    @staticmethod
-    def _artillery_receipt_terminal(receipt):
-        """Return the exact proved parabolic endpoint, or ``None``."""
-        if not isinstance(receipt, dict):
-            return None
+    def _reject_stale_artillery_receipt(
+            self, state, target, descriptor, shell_index, intent,
+            receipt, now):
+        intent_solution = intent.get('solution')
+        intent_solution = (intent_solution
+                           if isinstance(intent_solution, dict) else {})
         try:
-            origin = receipt['origin']
-            velocity = receipt['velocity']
-            gravity = float(receipt['gravity'])
-            flight_time = float(receipt['flight_time'])
-            terminal = (
-                origin[0] + velocity[0] * flight_time,
-                origin[1] + velocity[1] * flight_time -
-                0.5 * gravity * flight_time * flight_time,
-                origin[2] + velocity[2] * flight_time,
-            )
-        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
-            return None
-        if any(math.isnan(value) or math.isinf(value) for value in terminal):
-            return None
-        return terminal
-
-    @staticmethod
-    def _artillery_receipt_impact_error(receipt, target):
-        """Compare the proved shell endpoint with a moving target at impact."""
-        if not isinstance(receipt, dict) or not isinstance(target, dict):
-            return None
-        terminal = BotRuntime._artillery_receipt_terminal(receipt)
-        if terminal is None:
-            return None
-        try:
+            intended_impact = _point(intent_solution['aim_position'])
             flight_time = float(receipt['flight_time'])
         except (KeyError, TypeError, ValueError, OverflowError):
-            return None
-        target_velocity = BotRuntime._target_velocity(target)
+            self._cancel_artillery_intent(state.get('id'))
+            return True
+        target_velocity = self._target_velocity(target)
         target_position = _point(
             target.get('position'), _position(target))
         target_at_impact = (
             target_position[0] + target_velocity[0] * flight_time,
-            target_position[1] + 1.0 +
-            target_velocity[1] * flight_time,
+            target_position[1] + 1.0 + target_velocity[1] * flight_time,
             target_position[2] + target_velocity[2] * flight_time,
         )
-        error = tuple(target_at_impact[index] - terminal[index]
+        error = tuple(target_at_impact[index] - intended_impact[index]
                       for index in range(3))
-        values = terminal + target_at_impact + error
-        if any(math.isnan(value) or math.isinf(value) for value in values):
-            return None
-        distance = math.sqrt(sum(value * value for value in error))
-        return distance, error
-
-    def _reject_stale_artillery_receipt(
-            self, state, target, descriptor, shell_index, intent,
-            receipt, now):
-        impact_error = self._artillery_receipt_impact_error(receipt, target)
-        if impact_error is None:
+        if any(math.isnan(value) or math.isinf(value)
+               for value in target_at_impact + intended_impact + error):
             self._cancel_artillery_intent(state.get('id'))
             return True
-        distance, error = impact_error
-        if distance <= ARTILLERY_IMPACT_ERROR_METRES + 1e-9:
+        distance = math.sqrt(sum(value * value for value in error))
+        if distance <= ARTILLERY_AIM_STALENESS_METRES + 1e-9:
             return False
         reproof = self._active_artillery_reproof(
             state, target, descriptor, shell_index, now)
         if reproof is None:
             self._cancel_artillery_intent(state.get('id'))
             return True
-        terminal = self._artillery_receipt_terminal(receipt)
-        intent_solution = intent.get('solution')
-        intent_solution = (intent_solution
-                           if isinstance(intent_solution, dict) else {})
-        try:
-            intended_impact = _point(intent_solution['aim_position'])
-        except (KeyError, TypeError, ValueError, OverflowError):
-            self._cancel_artillery_intent(state.get('id'))
-            return True
-        if terminal is None:
-            self._cancel_artillery_intent(state.get('id'))
-            return True
-        # The receipt is the dispersed physical path.  Its displacement from
-        # the undispersed strategic aim is deterministic for this reserved
-        # fire sequence, so cancel it independently from target motion.
-        new_offset = tuple(intended_impact[index] - terminal[index]
-                           for index in range(3))
-        if any(math.isnan(value) or math.isinf(value)
-               for value in new_offset):
-            self._cancel_artillery_intent(state.get('id'))
-            return True
-        reproof['compensation_offset'] = new_offset
+        # Re-lead only for target motion accumulated while the native world
+        # proof was pending.  Never feed the dispersed terminal back as an aim
+        # correction: doing so cancels this fire sequence's random offset.
         reproof['proof_latency'] = max(
             0.0, _number(now) - _number(intent.get('created')))
         reproof['attempts'] = int(reproof.get('attempts', 0)) + 1
@@ -4427,85 +4434,17 @@ class BotRuntime(object):
             _number(now) + ARTILLERY_REPROOF_SECONDS)
         reproof['last_proof_latency'] = max(
             0.0, _number(now) - _number(intent.get('created')))
-        reproof['last_impact_error'] = distance
+        reproof['last_aim_staleness'] = distance
         reproof['arc'] = str(intent_solution.get('arc') or '')
         self._cancel_artillery_intent(
             state.get('id'), preserve_reproof=True)
         return True
-
-    def _held_artillery_receipt(self, reproof, target, now):
-        """Return a pinned exact receipt when the target reaches its endpoint.
-
-        A completed native proof remains valid for its immutable parabola.  If
-        a constant-velocity contact will cross that endpoint shortly, retain
-        the receipt and wait without spending more rays.  Every frame uses the
-        current target pose and velocity; stopping, reversing or changing
-        height invalidates the hold and falls back to a fresh exact proof.
-        """
-        held = reproof.get('held_receipt')
-        if not isinstance(held, dict) or not isinstance(target, dict):
-            return None, False
-        if (self._artillery_target_identity(target) !=
-                held.get('target_identity')):
-            reproof['held_receipt'] = None
-            return None, False
-        if _number(now) > _number(held.get('deadline')) + 1e-9:
-            reproof['held_receipt'] = None
-            return None, False
-        terminal = self._artillery_receipt_terminal(held.get('receipt'))
-        if terminal is None:
-            reproof['held_receipt'] = None
-            return None, False
-        position = _point(target.get('position'), _position(target))
-        position = (position[0], position[1] + 1.0, position[2])
-        velocity = self._target_velocity(target)
-        baseline = held.get('velocity')
-        if (not isinstance(baseline, (list, tuple)) or len(baseline) < 3 or
-                any(abs(velocity[index] - _number(baseline[index])) > 1e-6
-                    for index in range(3))):
-            reproof['held_receipt'] = None
-            return None, False
-        speed_sq = sum(value * value for value in velocity)
-        if speed_sq <= 1e-9:
-            reproof['held_receipt'] = None
-            return None, False
-        delta = tuple(terminal[index] - position[index] for index in range(3))
-        time_to_closest = sum(
-            delta[index] * velocity[index] for index in range(3)) / speed_sq
-        if time_to_closest < -1e-9:
-            reproof['held_receipt'] = None
-            return None, False
-        closest = tuple(
-            position[index] + velocity[index] * max(0.0, time_to_closest)
-            for index in range(3))
-        miss = math.sqrt(sum(
-            (closest[index] - terminal[index]) ** 2 for index in range(3)))
-        if miss > ARTILLERY_IMPACT_ERROR_METRES + 1e-9:
-            reproof['held_receipt'] = None
-            return None, False
-        flight_time = _number(held['receipt'].get('flight_time'))
-        impact_position = tuple(
-            position[index] + velocity[index] * flight_time
-            for index in range(3))
-        impact_miss = math.sqrt(sum(
-            (impact_position[index] - terminal[index]) ** 2
-            for index in range(3)))
-        if impact_miss <= ARTILLERY_IMPACT_ERROR_METRES + 1e-9:
-            return held['receipt'], True
-        return None, True
 
     def _artillery_launch_receipt(
             self, state, target, descriptor, shell_index, gun_state,
             ballistic_solution, now):
         if not callable(self.artillery_launch_probe):
             return None
-        reproof = self._active_artillery_reproof(
-            state, target, descriptor, shell_index, now)
-        if reproof is not None:
-            held, waiting = self._held_artillery_receipt(
-                reproof, target, now)
-            if waiting:
-                return held
         intent = self._active_artillery_intent(
             state, target, descriptor, shell_index, now)
         if intent is None:
@@ -4537,39 +4476,9 @@ class BotRuntime(object):
             shot_yaw, shot_pitch, flight_time)
         if receipt is None:
             return None
-        impact_error = self._artillery_receipt_impact_error(receipt, target)
-        if (impact_error is not None and
-                impact_error[0] > ARTILLERY_IMPACT_ERROR_METRES + 1e-9):
-            reproof = self._active_artillery_reproof(
-                state, target, descriptor, shell_index, now)
-            velocity = self._target_velocity(target)
-            terminal = self._artillery_receipt_terminal(receipt)
-            position = _point(target.get('position'), _position(target))
-            position = (position[0], position[1] + 1.0, position[2])
-            if reproof is not None and terminal is not None:
-                speed_sq = sum(value * value for value in velocity)
-                delta = tuple(terminal[index] - position[index]
-                              for index in range(3))
-                closest_time = (sum(
-                    delta[index] * velocity[index] for index in range(3)) /
-                    speed_sq if speed_sq > 1e-9 else -1.0)
-                closest = tuple(
-                    position[index] + velocity[index] * max(0.0, closest_time)
-                    for index in range(3))
-                closest_miss = math.sqrt(sum(
-                    (closest[index] - terminal[index]) ** 2
-                    for index in range(3)))
-                if (closest_time >= 0.0 and
-                        closest_time <= ARTILLERY_RECEIPT_HOLD_SECONDS and
-                        closest_miss <= ARTILLERY_IMPACT_ERROR_METRES + 1e-9):
-                    reproof['held_receipt'] = {
-                        'receipt': receipt, 'velocity': velocity,
-                        'target_identity': self._artillery_target_identity(
-                            target),
-                        'deadline': (_number(now) +
-                                     ARTILLERY_RECEIPT_HOLD_SECONDS),
-                    }
-                    return None
+        # A valid receipt proves the frozen random parabola against the world;
+        # it does not prove a hit. Reproof may refresh only an aim solution that
+        # went stale while queued; it must never compensate the random endpoint.
         if self._reject_stale_artillery_receipt(
                 state, target, descriptor, shell_index, intent, receipt, now):
             return None
@@ -4795,6 +4704,10 @@ class BotRuntime(object):
             state['shot_max_distance'] = launch_receipt['max_distance']
             state['shot_max_time_ms'] = launch_receipt['max_time_ms']
             state['shot_proof_key'] = launch_receipt['proof_key']
+        # The committed ray used the pre-shot circle frozen above. Expand only
+        # after launch so this penalty applies to the following round.
+        gun_state.commit_shot_bloom(
+            _critical_factor(state, descriptor, 'dispersion'))
         state['clip'] = gun_state.clip
         state['reload_time'] = gun_state.remaining(reload_factor)
         state['reload_duration'] = (
@@ -5070,7 +4983,9 @@ class BotRuntime(object):
             gun_state = self._gun_states.get(state['id'])
             if gun_state is None:
                 gun_state = _BotGunState(
-                    descriptor, state.get('fire_seq', 0))
+                    descriptor, state.get('fire_seq', 0),
+                    _critical_factor(
+                        state, descriptor, 'dispersion'))
                 self._gun_states[state['id']] = gun_state
             ammo_state = self._ammo_states.get(state['id'])
             if ammo_state is None:
@@ -5362,8 +5277,18 @@ class BotRuntime(object):
             ballistic_solution = self._ballistic_solution(
                 state, target, descriptor, state['shell_index'], now)
             command['_ballistic_solution'] = ballistic_solution
+            previous_turret_yaw = _number(state.get('turret_yaw'))
             unused_desired_yaw, unused_horizontal = self._update_gun_aim(
                 state, command, target, step)
+            turret_speed = abs(_angle_delta(
+                _number(state.get('turret_yaw')), previous_turret_yaw)) / max(
+                    step, 1.0e-9)
+            gun_state.tick_dispersion(
+                step, abs(_number(state.get('speed'))),
+                abs(_number(self._turn_speeds.get(state['id'], 0.0))),
+                turret_speed,
+                _critical_factor(state, descriptor, 'dispersion'),
+                _critical_factor(state, descriptor, 'aim_time'))
             state['clip_size'] = gun_state.clip_size
             state['clip'] = gun_state.clip
             state['reload_time'] = gun_state.remaining(reload_factor)
