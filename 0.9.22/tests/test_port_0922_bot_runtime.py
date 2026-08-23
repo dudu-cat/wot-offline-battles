@@ -4001,169 +4001,80 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIsNone(runtime._validated_artillery_receipt(
             receipt, descriptor, 0, 1, 0.0, 0.0, 0.5))
 
-    def test_spg_receipt_is_rejected_when_target_stops_or_reverses(self):
-        descriptor = _combat_descriptor()
-        receipt = {
-            'origin': (0.0, 6.0, 0.0),
-            'velocity': (10.0, 0.0, 99.498743710662),
-            'gravity': 10.0, 'flight_time': 1.0,
-        }
-        stopped = {
-            'position': (0.0, 0.0, 99.498743710662),
-            'yaw': 0.0, 'speed': 0.0,
-        }
-        reversed_target = dict(
-            stopped, yaw=-math.pi * 0.5, speed=8.0)
+    def test_spg_legal_world_receipt_fires_its_natural_miss_once(self):
+        descriptor = _combat_descriptor(dispersion=0.03)
+        calls = []
 
-        runtime = self.module.BotRuntime(1)
-        stopped_error = runtime._artillery_receipt_impact_error(
-            receipt, stopped)[0]
-        reversed_error = runtime._artillery_receipt_impact_error(
-            receipt, reversed_target)[0]
-
-        self.assertAlmostEqual(10.0, stopped_error, 6)
-        self.assertAlmostEqual(18.0, reversed_error, 6)
-        self.assertGreater(
-            stopped_error, self.module.ARTILLERY_IMPACT_ERROR_METRES)
-        self.assertGreater(
-            reversed_error, self.module.ARTILLERY_IMPACT_ERROR_METRES)
-        for target in (stopped, reversed_target):
-            target = dict(
-                target, kind='human', network_id=2, alive=True)
-            state = {
-                'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
-                'yaw': 0.0, 'fire_seq': 0,
+        def final_proof(state, target, unused_descriptor, shell_index,
+                        fire_seq, shot_yaw, shot_pitch, flight_time, now):
+            calls.append((
+                fire_seq, shot_yaw, shot_pitch, flight_time,
+                target['position'], now))
+            speed = 1000.0
+            horizontal = math.cos(shot_pitch)
+            return {
+                'proof_key': ('exact-world-path', fire_seq),
+                'fire_seq': fire_seq, 'shell_index': shell_index,
+                # This origin deliberately puts the proved parabola far to the
+                # right of the target. The world proof is still legal: random
+                # dispersion may miss and must not be compensated away.
+                'origin': (25.0, 6.0, 0.0),
+                'velocity': (
+                    math.sin(shot_yaw) * horizontal * speed,
+                    math.sin(shot_pitch) * speed,
+                    math.cos(shot_yaw) * horizontal * speed),
+                'shot_yaw': shot_yaw, 'shot_pitch': shot_pitch,
+                'gravity': 10.0, 'max_distance': 5000.0,
+                'max_time_ms': 20000, 'flight_time': flight_time,
             }
-            physical = self.module._shot_ballistics(descriptor, 0)
-            reproof = {
-                'source': {'id': 11},
-                'source_pose': (0.0, 0.0, 0.0, 0.0),
-                'target_identity': ('human', 2),
-                'shell_index': 0, 'fire_seq': 1,
-                'physical': physical,
-                'compensation_offset': (0.0, 0.0, 0.0),
-                'attempts': 0, 'created': 1.0,
-                'deadline': 61.0, 'absolute_deadline': 121.0,
-            }
-            intent = {
-                'source': {'id': 11}, 'created': 1.0,
-                'solution': {
-                    'arc': 'low',
-                    'aim_position': (10.0, 1.0, 99.498743710662),
-                },
-            }
-            runtime._artillery_reproofs[11] = reproof
-            runtime._artillery_intents[11] = intent
 
-            self.assertTrue(runtime._reject_stale_artillery_receipt(
-                state, target, descriptor, 0, intent, receipt, 2.0))
-            self.assertNotIn(11, runtime._artillery_intents)
-            self.assertEqual(1, runtime._artillery_reproofs[11]['attempts'])
-            solution = runtime._artillery_reproof_solution(
-                state, target, descriptor, 0,
-                runtime._artillery_reproofs[11])
-            self.assertIsNotNone(solution)
-            if target['speed'] == 0.0:
-                self.assertAlmostEqual(0.0, solution['aim_position'][0], 6)
-            else:
-                self.assertLess(solution['aim_position'][0], -1.0)
-
-    def test_spg_receipt_is_rejected_when_target_height_changes(self):
-        receipt = {
-            'origin': (0.0, 11.0, 0.0),
-            'velocity': (0.0, 0.0, 100.0),
-            'gravity': 10.0, 'flight_time': 1.0,
+        runtime = self.module.BotRuntime(
+            1, artillery_launch_probe=final_proof)
+        runtime.round_id = 7
+        gun_state = self.module._BotGunState(descriptor)
+        gun_state.elapsed = 10.0
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'aim_yaw': 0.0, 'gun_pitch': -0.1,
+            'gun_aligned': True, 'fire_seq': 0, 'speed': 0.0,
+            'critical': {}, 'profile': {'class_tag': 'SPG'},
+            'shell_index': 0,
         }
         target = {
             'kind': 'human', 'network_id': 2, 'alive': True,
             'position': (0.0, 0.0, 100.0),
             'yaw': 0.0, 'speed': 0.0,
         }
-        descriptor = _combat_descriptor()
-        runtime = self.module.BotRuntime(1)
-        distance, error = runtime._artillery_receipt_impact_error(
-            receipt, target)
-        self.assertAlmostEqual(5.0, distance, 6)
-        self.assertEqual((0.0, -5.0, 0.0), error)
-
-        state = {
-            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
-            'yaw': 0.0, 'fire_seq': 0,
-        }
-        reproof = {
-            'source': {'id': 11},
-            'source_pose': (0.0, 0.0, 0.0, 0.0),
-            'target_identity': ('human', 2),
-            'shell_index': 0, 'fire_seq': 1,
-            'physical': self.module._shot_ballistics(descriptor, 0),
-            'compensation_offset': (0.0, 0.0, 0.0),
-            'attempts': 0, 'created': 1.0, 'deadline': 61.0,
-            'absolute_deadline': 121.0,
-        }
-        intent = {
-            'source': {'id': 11}, 'created': 1.0,
-            'solution': {
-                'arc': 'low', 'aim_position': (0.0, 6.0, 100.0),
-            },
-        }
-        runtime._artillery_reproofs[11] = reproof
-        runtime._artillery_intents[11] = intent
-
-        self.assertTrue(runtime._reject_stale_artillery_receipt(
-            state, target, descriptor, 0, intent, receipt, 2.0))
-        self.assertNotIn(11, runtime._artillery_intents)
-        self.assertEqual(1, runtime._artillery_reproofs[11]['attempts'])
-        solution = runtime._artillery_reproof_solution(
-            state, target, descriptor, 0,
-            runtime._artillery_reproofs[11])
-        self.assertIsNotNone(solution)
-        self.assertAlmostEqual(1.0, solution['aim_position'][1], 6)
-
-    def test_spg_pinned_receipt_hold_rechecks_motion_and_closest_frame(self):
-        runtime = self.module.BotRuntime(1)
-        receipt = {
-            'origin': (0.0, 6.0, 0.0),
-            'velocity': (20.0, 0.0, 100.0),
-            'gravity': 10.0, 'flight_time': 1.0,
+        solution = {
+            'aim_position': (0.0, 1.0, 100.0),
+            'yaw': 0.0, 'pitch': -0.1,
+            'flight_time': 0.5, 'arc': 'low',
         }
 
-        def reproof(velocity):
-            return {'held_receipt': {
-                'receipt': receipt, 'velocity': velocity,
-                'target_identity': ('human', 2), 'deadline': 20.0,
-            }}
+        receipt = runtime._artillery_launch_receipt(
+            state, target, descriptor, 0, gun_state, solution, 1.0)
 
-        target = {
-            'kind': 'human', 'network_id': 2,
-            'position': (10.0, 0.0, 100.0),
-            'yaw': math.pi * 0.5, 'speed': 10.0,
-        }
-        held = reproof((10.0, 0.0, 0.0))
-        value, waiting = runtime._held_artillery_receipt(held, target, 1.0)
-        self.assertIs(receipt, value)
-        self.assertTrue(waiting)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, calls[0][0])
+        self.assertEqual((receipt['shot_yaw'], receipt['shot_pitch']),
+                         calls[0][1:3])
+        terminal_x = (receipt['origin'][0] +
+                      receipt['velocity'][0] * receipt['flight_time'])
+        self.assertGreater(abs(terminal_x - target['position'][0]), 20.0)
+        self.assertNotIn('compensation_offset', receipt)
 
-        for changed in (
-                dict(target, speed=0.0),
-                dict(target, yaw=-math.pi * 0.5),
-                dict(target, velocity=(10.0, 1.0, 0.0)),
-                dict(target, network_id=3)):
-            held = reproof((10.0, 0.0, 0.0))
-            value, waiting = runtime._held_artillery_receipt(
-                held, changed, 1.0)
-            self.assertIsNone(value)
-            self.assertFalse(waiting)
-            self.assertIsNone(held['held_receipt'])
-
-        held = reproof((10.0, 0.0, 0.0))
-        before = dict(target, position=(8.0, 0.0, 100.0))
-        value, waiting = runtime._held_artillery_receipt(held, before, 1.0)
-        self.assertIsNone(value)
-        self.assertTrue(waiting)
-        after = dict(target, position=(10.0, 0.0, 100.0))
-        value, waiting = runtime._held_artillery_receipt(held, after, 1.04)
-        self.assertIs(receipt, value)
-        self.assertTrue(waiting)
+        self.assertTrue(runtime._fire(
+            state, gun_state, 1.0, descriptor, launch_receipt=receipt))
+        self.assertEqual(1, state['fire_seq'])
+        self.assertEqual(receipt['shot_yaw'], state['shot_yaw'])
+        self.assertEqual(receipt['shot_pitch'], state['shot_pitch'])
+        self.assertEqual(receipt['origin'], state['shot_origin'])
+        self.assertEqual(receipt['velocity'], state['shot_velocity'])
+        self.assertFalse(runtime._fire(
+            state, gun_state, 1.0, descriptor, launch_receipt=receipt))
+        self.assertEqual(1, state['fire_seq'])
+        self.assertEqual(1, len(calls))
 
     def test_spg_pending_intent_freezes_moving_target_angles_and_sequence(self):
         descriptor = _combat_descriptor(dispersion=0.03)
@@ -4298,8 +4209,9 @@ class BotRuntimeTests(unittest.TestCase):
     def test_spg_intent_timeout_clears_and_allows_a_fresh_restart(self):
         descriptor = _combat_descriptor(dispersion=0.03)
         cancelled = []
+        launches = []
         runtime = self.module.BotRuntime(
-            1, artillery_launch_probe=lambda *unused: None,
+            1, artillery_launch_probe=lambda *args: launches.append(args),
             artillery_launch_cancel=lambda source: cancelled.append(source))
         runtime.round_id = 12
         gun_state = self.module._BotGunState(descriptor)
@@ -4331,6 +4243,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIn(11, runtime._artillery_intents)
         self.assertGreater(
             runtime._artillery_reproofs[11]['deadline'], expired_at)
+        self.assertEqual(2, len(launches))
         self.assertEqual([{'id': 11}], cancelled)
 
     def test_spg_reproof_attempts_never_extend_absolute_lifetime(self):
@@ -4374,94 +4287,150 @@ class BotRuntimeTests(unittest.TestCase):
             state, target, descriptor, 0, absolute + 0.01))
         self.assertNotIn(11, runtime._artillery_reproofs)
 
-    def test_spg_update_rejects_a_stale_frozen_receipt_without_firing(self):
+    def test_spg_reproofs_stale_undispersed_aim_then_fires_same_sequence(self):
         descriptor = _combat_descriptor(dispersion=0.03)
-        command = {
-            'target_yaw': 0.0, 'throttle': 0.0, 'turn': 0.0,
-            'shell_index': 0, 'fire_allowed': True,
-            'target_id': self.module.HUMAN_TARGET_ID_BASE + 2,
-            'fire_range': 1000.0, 'combat_mode': 'engage',
-            'aim_position': (0.0, 1.0, 100.0),
-            'face_position': (0.0, 1.0, 100.0),
-            'move_position': (0.0, 0.0, 0.0),
-            'recovery_mode': 'arrived', 'movement_intent': False,
-        }
-        strategic_calls = []
-        launch_calls = []
-        lane_calls = []
-        muzzle = (3.0, 4.0, -2.0)
+        calls = []
 
-        def strategic(state, target, unused_descriptor,
-                      unused_shell, unused_now):
-            strategic_calls.append(target['position'])
-            yaw = math.atan2(target['position'][0], target['position'][2])
-            return {
-                'aim_position': target['position'], 'yaw': yaw,
-                'pitch': -0.1, 'flight_time': 0.5, 'arc': 'low',
-            }
-
-        def final_proof(state, target, unused_descriptor, shell_index,
-                        fire_seq, shot_yaw, shot_pitch, flight_time, now):
-            launch_calls.append((
+        def exact_world_proof(
+                state, target, unused_descriptor, shell_index, fire_seq,
+                shot_yaw, shot_pitch, flight_time, now):
+            calls.append((
                 fire_seq, shot_yaw, shot_pitch, flight_time,
                 target['position'], now))
-            if len(launch_calls) < 5:
-                return None
             speed = 1000.0
-            velocity = (
-                math.sin(shot_yaw) * math.cos(shot_pitch) * speed,
-                math.sin(shot_pitch) * speed,
-                math.cos(shot_yaw) * math.cos(shot_pitch) * speed,
-            )
+            horizontal = math.cos(shot_pitch)
             return {
-                'proof_key': ('exact', fire_seq),
+                'proof_key': ('exact-world-path', len(calls), fire_seq),
                 'fire_seq': fire_seq, 'shell_index': shell_index,
-                'origin': muzzle, 'velocity': velocity,
+                # The origin preserves a large natural random miss. Aim
+                # staleness is evaluated from the undispersed solution only.
+                'origin': (25.0, 6.0, 0.0),
+                'velocity': (
+                    math.sin(shot_yaw) * horizontal * speed,
+                    math.sin(shot_pitch) * speed,
+                    math.cos(shot_yaw) * horizontal * speed),
                 'shot_yaw': shot_yaw, 'shot_pitch': shot_pitch,
                 'gravity': 10.0, 'max_distance': 5000.0,
                 'max_time_ms': 20000, 'flight_time': flight_time,
             }
 
         runtime = self.module.BotRuntime(
-            1, descriptor_resolver=lambda unused: descriptor,
-            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
-            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
-            visibility_probe=lambda *unused: True,
-            firing_lane_probe=lambda *unused: lane_calls.append(True) or True,
-            ballistic_solution_probe=strategic,
-            artillery_launch_probe=final_proof,
-            ground_probe=lambda *unused: 0.0,
-            physics_ground_probe=lambda *unused: 0.0,
-            spawn_resolver=_spawn_resolver, baked_graph=_graph())
-        runtime.battle_start(self.start)
-        runtime._next_observation = 100.0
-        state = runtime.states[11]
-        state.update({
-            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-            'aim_yaw': 0.0, 'turret_yaw': 0.0,
-            'gun_pitch': -0.1, 'desired_gun_pitch': -0.1,
-            'profile': {'class_tag': 'SPG'},
-        })
-        runtime._gun_states[11].elapsed = 1.0
+            1, artillery_launch_probe=exact_world_proof)
+        runtime.round_id = 17
+        gun_state = self.module._BotGunState(descriptor)
+        gun_state.elapsed = 10.0
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'aim_yaw': 0.0, 'gun_pitch': -0.1,
+            'gun_aligned': True, 'fire_seq': 0, 'speed': 0.0,
+            'critical': {}, 'profile': {'class_tag': 'SPG'},
+        }
+        moved_target = {
+            'kind': 'human', 'network_id': 2, 'alive': True,
+            'position': (10.0, 0.0, 100.0),
+            'yaw': math.pi * 0.5, 'speed': 8.0,
+        }
+        stale = {
+            'aim_position': (0.0, 1.0, 100.0),
+            'yaw': 0.0, 'pitch': -0.1,
+            'flight_time': 0.5, 'arc': 'low',
+        }
 
-        publication = None
-        for frame in range(5):
-            publication = runtime.update(0.04, 1.0 + frame * 0.04, players=[{
-                'id': 2, 'team': 1, 'alive': True,
-                'x': float(frame) * 8.0, 'y': 0.0, 'z': 100.0,
-                'yaw': math.pi * 0.5, 'speed': 8.0,
-            }])[0]['bots'][0]
-
-        self.assertEqual(0, publication['fire_seq'])
-        self.assertEqual(1, len(strategic_calls))
-        self.assertEqual(1, len(lane_calls))
-        frozen = [call[0:4] for call in launch_calls]
-        self.assertTrue(all(value == frozen[0] for value in frozen))
-        self.assertNotIn('shot_origin', publication)
-        self.assertEqual(1, runtime._artillery_reproofs[11]['attempts'])
+        self.assertIsNone(runtime._artillery_launch_receipt(
+            state, moved_target, descriptor, 0, gun_state, stale, 1.0))
+        self.assertEqual(0, state['fire_seq'])
+        reproof = runtime._artillery_reproofs[11]
+        self.assertEqual(1, reproof['attempts'])
         self.assertGreater(
-            runtime._artillery_reproofs[11]['last_impact_error'],
-            self.module.ARTILLERY_IMPACT_ERROR_METRES)
+            reproof['last_aim_staleness'],
+            self.module.ARTILLERY_AIM_STALENESS_METRES)
+        self.assertNotIn('compensation_offset', reproof)
+        expected = self.module._dispersed_barrel_angles(
+            state['id'], runtime.round_id, 1,
+            stale['yaw'], stale['pitch'],
+            self.module._effective_shot_dispersion(
+                gun_state, state, descriptor))
+        self.assertEqual((1,) + expected, calls[0][:3])
+
+        refreshed = runtime._ballistic_solution(
+            state, moved_target, descriptor, 0, 1.04)
+        self.assertIsNotNone(refreshed)
+        state['aim_yaw'] = refreshed['yaw']
+        state['gun_pitch'] = refreshed['pitch']
+        receipt = runtime._artillery_launch_receipt(
+            state, moved_target, descriptor, 0, gun_state,
+            refreshed, 1.04)
+
+        self.assertIsNotNone(receipt)
+        self.assertEqual([1, 1], [call[0] for call in calls])
+        refreshed_expected = self.module._dispersed_barrel_angles(
+            state['id'], runtime.round_id, 1,
+            refreshed['yaw'], refreshed['pitch'],
+            self.module._effective_shot_dispersion(
+                gun_state, state, descriptor))
+        self.assertEqual(refreshed_expected, calls[1][1:3])
+        self.assertNotIn('compensation_offset', receipt)
+        self.assertEqual(0, state['fire_seq'])
+        self.assertTrue(runtime._fire(
+            state, gun_state, 1.0, descriptor,
+            launch_receipt=receipt))
+        self.assertEqual(1, state['fire_seq'])
+        self.assertEqual(receipt['shot_yaw'], state['shot_yaw'])
+        self.assertEqual(receipt['shot_pitch'], state['shot_pitch'])
+
+    def test_spg_motion_changes_reproof_only_the_undispersed_aim(self):
+        descriptor = _combat_descriptor(dispersion=0.03)
+        cases = (
+            ('stopped', {
+                'position': (0.0, 0.0, 100.0),
+                'yaw': 0.0, 'speed': 0.0,
+            }, (8.0, 1.0, 100.0), 8.0),
+            ('reversed', {
+                'position': (0.0, 0.0, 100.0),
+                'yaw': -math.pi * 0.5, 'speed': 8.0,
+            }, (8.0, 1.0, 100.0), 16.0),
+            ('height_changed', {
+                'position': (0.0, 5.0, 100.0),
+                'yaw': 0.0, 'speed': 0.0,
+            }, (0.0, 1.0, 100.0), 5.0),
+        )
+        for name, motion, intended_impact, expected_staleness in cases:
+            with self.subTest(name=name):
+                runtime = self.module.BotRuntime(1)
+                state = {
+                    'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                    'yaw': 0.0, 'fire_seq': 0,
+                }
+                target = dict(
+                    motion, kind='human', network_id=2, alive=True)
+                reproof = {
+                    'source': {'id': 11},
+                    'source_pose': (0.0, 0.0, 0.0, 0.0),
+                    'target_identity': ('human', 2),
+                    'shell_index': 0, 'fire_seq': 1,
+                    'physical': self.module._shot_ballistics(descriptor, 0),
+                    'proof_latency': 0.0, 'attempts': 0,
+                    'created': 1.0, 'deadline': 61.0,
+                    'absolute_deadline': 121.0,
+                }
+                intent = {
+                    'source': {'id': 11}, 'created': 1.0,
+                    'solution': {
+                        'arc': 'low', 'aim_position': intended_impact,
+                    },
+                }
+                runtime._artillery_reproofs[11] = reproof
+                runtime._artillery_intents[11] = intent
+
+                self.assertTrue(runtime._reject_stale_artillery_receipt(
+                    state, target, descriptor, 0, intent,
+                    {'flight_time': 1.0}, 2.0))
+
+                self.assertNotIn(11, runtime._artillery_intents)
+                self.assertEqual(1, reproof['attempts'])
+                self.assertAlmostEqual(
+                    expected_staleness, reproof['last_aim_staleness'])
+                self.assertNotIn('compensation_offset', reproof)
 
     def test_moving_spg_reproofs_converge_at_20_and_24_fps(self):
         from gui.mods.offline_lan_0922.artillery_controller import (
@@ -4479,6 +4448,8 @@ class BotRuntimeTests(unittest.TestCase):
                     },)
                     descriptor.gun.pitchLimits = {
                         'absolute': (-0.8, 0.15)}
+                    gun_by_id = {}
+                    proof_calls = []
 
                     def strategic(source, target, installed, shell, now):
                         return controller.solution(
@@ -4487,6 +4458,16 @@ class BotRuntimeTests(unittest.TestCase):
                     def exact_launch(
                             source, target, installed, shell, fire_seq,
                             shot_yaw, shot_pitch, flight_time, now):
+                        source_id = int(source['id'])
+                        proof_calls.append((
+                            source_id, fire_seq, shot_yaw, shot_pitch))
+                        expected = self.module._dispersed_barrel_angles(
+                            source_id, 77, fire_seq,
+                            source['aim_yaw'], source['gun_pitch'],
+                            self.module._effective_shot_dispersion(
+                                gun_by_id[source_id], source, installed))
+                        self.assertEqual(
+                            expected, (shot_yaw, shot_pitch))
                         origin = (
                             source['x'] + 0.3, source['y'] + 1.7,
                             source['z'] - 0.2)
@@ -4503,20 +4484,22 @@ class BotRuntimeTests(unittest.TestCase):
                     states = []
                     guns = []
                     for index in range(count):
-                        states.append({
+                        state = {
                             'id': 11 + index,
                             'x': float(index), 'y': 0.0, 'z': 0.0,
                             'yaw': 0.0, 'speed': 0.0, 'fire_seq': 0,
                             'aim_yaw': 0.0, 'gun_pitch': 0.0,
                             'gun_aligned': True, 'critical': {},
                             'profile': {'class_tag': 'SPG'},
-                        })
+                        }
+                        states.append(state)
                         gun = self.module._BotGunState(descriptor)
                         gun.elapsed = 100.0
                         guns.append(gun)
+                        gun_by_id[state['id']] = gun
 
                     fired = {}
-                    rejected = dict((state['id'], 0) for state in states)
+                    reproofed = dict((state['id'], 0) for state in states)
                     for frame in range(1, fps * 5 + 1):
                         now = frame / float(fps)
                         probe_calls = [0]
@@ -4554,33 +4537,47 @@ class BotRuntimeTests(unittest.TestCase):
                             after = runtime._artillery_reproofs.get(
                                 state['id'], {}).get('attempts', 0)
                             if after > before:
-                                rejected[state['id']] += 1
+                                reproofed[state['id']] += 1
+                                self.assertGreater(
+                                    runtime._artillery_reproofs[
+                                        state['id']]['last_aim_staleness'],
+                                    self.module.
+                                    ARTILLERY_AIM_STALENESS_METRES)
+                                self.assertNotIn(
+                                    'compensation_offset',
+                                    runtime._artillery_reproofs[state['id']])
                             self.assertEqual(0, state['fire_seq'])
                             if receipt is None:
                                 continue
-                            impact_error = (
-                                runtime._artillery_receipt_impact_error(
-                                    receipt, target)[0])
-                            self.assertLessEqual(
-                                impact_error,
-                                self.module.ARTILLERY_IMPACT_ERROR_METRES)
+                            self.assertEqual(1, receipt['fire_seq'])
+                            self.assertNotIn(
+                                'compensation_offset', receipt)
                             self.assertTrue(runtime._fire(
                                 state, gun, 1.0, descriptor,
                                 launch_receipt=receipt))
+                            self.assertEqual(1, state['fire_seq'])
+                            self.assertEqual(
+                                receipt['shot_yaw'], state['shot_yaw'])
+                            self.assertEqual(
+                                receipt['shot_pitch'], state['shot_pitch'])
                             self.assertEqual(
                                 receipt['origin'], state['shot_origin'])
                             self.assertEqual(
                                 receipt['velocity'], state['shot_velocity'])
-                            fired[state['id']] = (now, impact_error, after)
+                            fired[state['id']] = now
                             runtime._cancel_artillery_intent(state['id'])
                         if len(fired) == count:
                             break
 
                     self.assertEqual(count, len(fired))
                     self.assertLessEqual(now, 5.0)
+                    if count > 1:
+                        self.assertTrue(any(
+                            reproofed[state['id']] >= 1
+                            for state in states))
+                    self.assertTrue(proof_calls)
                     self.assertTrue(all(
-                        rejected[state['id']] >= 1
-                        for state in states))
+                        call[1] == 1 for call in proof_calls))
 
     def _run_catalog_max_spg_proof_case(self, fps, direction):
         from gui.mods.offline_lan_0922.artillery_controller import (
@@ -4589,11 +4586,10 @@ class BotRuntimeTests(unittest.TestCase):
         controller = ArtilleryController(maximum_step=0.12)
         descriptor = _combat_descriptor(dispersion=0.0001)
         # The pinned #1513 non-secret SPG catalog has shell speeds 265..510,
-        # gravity 125..190 and maxDistance 10000.  This FV3805/FV206 5.5-inch
-        # shell takes about 5.66 seconds on the flat high arc used here.  The
+        # gravity 125..190 and maxDistance 10000. This FV3805/FV206 5.5-inch
+        # shell takes about 5.66 seconds on the flat high arc used here. The
         # moving contact uses the catalogue's 79 km/h maximum plus the copied
-        # 1.05 downhill overspeed, about 23.04 m/s.  The old speed=100,
-        # gravity=1, 19-second fixture is not assignable by this client.
+        # 1.05 downhill overspeed, about 23.04 m/s.
         descriptor.gun.shots = ({
             'shell': {'effectsIndex': 0},
             'speed': 440.0, 'gravity': 146.0,
@@ -4603,6 +4599,8 @@ class BotRuntimeTests(unittest.TestCase):
             'absolute': (-math.radians(70.0), math.radians(5.0))}
 
         strategic_calls = {}
+        proof_calls = []
+        gun_by_id = {}
 
         def strategic(source, target, installed, shell, now):
             source_id = int(source['id'])
@@ -4614,6 +4612,15 @@ class BotRuntimeTests(unittest.TestCase):
         def exact_launch(
                 source, target, installed, shell, fire_seq,
                 shot_yaw, shot_pitch, flight_time, now):
+            source_id = int(source['id'])
+            proof_calls.append((
+                source_id, fire_seq, shot_yaw, shot_pitch))
+            expected = self.module._dispersed_barrel_angles(
+                source_id, 5, fire_seq,
+                source['aim_yaw'], source['gun_pitch'],
+                self.module._effective_shot_dispersion(
+                    gun_by_id[source_id], source, installed))
+            self.assertEqual(expected, (shot_yaw, shot_pitch))
             unused_ready, receipt = controller.request_launch(
                 source, target, installed, shell, fire_seq,
                 (source['x'], source['y'] + 1.5, source['z']),
@@ -4628,20 +4635,22 @@ class BotRuntimeTests(unittest.TestCase):
         states = []
         guns = []
         for index in range(8):
-            states.append({
+            state = {
                 'id': 11 + index,
                 'x': float(index), 'y': 0.0, 'z': 0.0,
                 'yaw': 0.0, 'speed': 0.0, 'fire_seq': 0,
                 'aim_yaw': 0.0, 'gun_pitch': 0.0,
                 'gun_aligned': True, 'critical': {},
                 'profile': {'class_tag': 'SPG'},
-            })
+            }
+            states.append(state)
             gun = self.module._BotGunState(descriptor)
             gun.elapsed = 100.0
             guns.append(gun)
+            gun_by_id[state['id']] = gun
 
         fired = {}
-        rejected = dict((state['id'], 0) for state in states)
+        reproofed = dict((state['id'], 0) for state in states)
         strategic_calls_at_first_reproof = {}
         catalog_max_speed = direction * 79.0 / 3.6 * 1.05
         for frame in range(1, fps * 20 + 1):
@@ -4655,7 +4664,8 @@ class BotRuntimeTests(unittest.TestCase):
                         abs(end[2] - start[2]) > 1e-9):
                     fraction = ((wall_z - start[2]) /
                                 (end[2] - start[2]))
-                    height = start[1] + (end[1] - start[1]) * fraction
+                    height = (
+                        start[1] + (end[1] - start[1]) * fraction)
                     if height < 300.0:
                         return (0.0, height, wall_z)
                 return None
@@ -4690,51 +4700,206 @@ class BotRuntimeTests(unittest.TestCase):
                 after = runtime._artillery_reproofs.get(
                     state['id'], {}).get('attempts', 0)
                 if after > before:
-                    rejected[state['id']] += 1
+                    reproofed[state['id']] += 1
                     if before == 0:
                         strategic_calls_at_first_reproof[state['id']] = (
                             strategic_calls[state['id']])
+                    self.assertGreater(
+                        runtime._artillery_reproofs[
+                            state['id']]['last_aim_staleness'],
+                        self.module.ARTILLERY_AIM_STALENESS_METRES)
+                    self.assertNotIn(
+                        'compensation_offset',
+                        runtime._artillery_reproofs[state['id']])
                 self.assertEqual(0, state['fire_seq'])
                 if receipt is None:
                     continue
-                impact_error = runtime._artillery_receipt_impact_error(
-                    receipt, target)[0]
-                self.assertLessEqual(
-                    impact_error,
-                    self.module.ARTILLERY_IMPACT_ERROR_METRES)
+                self.assertEqual(1, receipt['fire_seq'])
+                self.assertNotIn('compensation_offset', receipt)
                 self.assertTrue(runtime._fire(
                     state, gun, 1.0, descriptor,
                     launch_receipt=receipt))
+                self.assertEqual(1, state['fire_seq'])
+                self.assertEqual(receipt['shot_yaw'], state['shot_yaw'])
+                self.assertEqual(
+                    receipt['shot_pitch'], state['shot_pitch'])
                 self.assertEqual('exact_launch', receipt['arc'])
-                fired[state['id']] = (now, impact_error, after)
+                fired[state['id']] = (now, after)
                 runtime._cancel_artillery_intent(state['id'])
             if len(fired) == 8:
                 break
 
         self.assertEqual(8, len(fired))
         self.assertLessEqual(now, 20.0)
-        self.assertTrue(all(value >= 1 for value in rejected.values()))
+        self.assertTrue(all(
+            value >= 1 for value in reproofed.values()))
         self.assertEqual(
             strategic_calls_at_first_reproof, strategic_calls)
+        self.assertTrue(proof_calls)
+        self.assertTrue(all(call[1] == 1 for call in proof_calls))
         self.assertEqual({}, runtime._artillery_intents)
         self.assertEqual({}, runtime._artillery_reproofs)
-        return fired, rejected
+        return fired, reproofed
 
     def test_eight_catalog_max_flight_reproofs_finish_with_shared_budget(self):
-        fired, rejected = self._run_catalog_max_spg_proof_case(24, 1.0)
+        fired, reproofed = self._run_catalog_max_spg_proof_case(24, 1.0)
 
         self.assertEqual(8, len(fired))
-        self.assertTrue(all(value >= 1 for value in rejected.values()))
+        self.assertTrue(all(
+            value >= 1 for value in reproofed.values()))
 
-    def test_catalog_max_spg_pinned_receipts_converge_across_frame_rates(self):
+    def test_catalog_max_spg_reproofs_converge_across_frame_rates(self):
         for fps in (20, 30, 60):
             for direction in (-1.0, 1.0):
                 with self.subTest(fps=fps, direction=direction):
-                    fired, rejected = self._run_catalog_max_spg_proof_case(
-                        fps, direction)
+                    fired, reproofed = (
+                        self._run_catalog_max_spg_proof_case(
+                            fps, direction))
                     self.assertEqual(8, len(fired))
                     self.assertTrue(all(
-                        value >= 1 for value in rejected.values()))
+                        value >= 1 for value in reproofed.values()))
+
+    def test_bot_dispersion_expands_for_move_hull_and_turret_motion(self):
+        descriptor = _combat_descriptor(dispersion=0.01)
+        descriptor.chassis.shotDispersionFactors = (0.2, 0.4)
+        descriptor.gun.shotDispersionFactors = {
+            'afterShot': 3.0, 'afterShotInBurst': 1.5,
+            'turretRotation': 0.5,
+        }
+        descriptor.gun.aimingTime = 2.0
+        gun_state = self.module._BotGunState(descriptor)
+
+        gun_state.tick_dispersion(
+            0.04, move_speed=5.0, rotation_speed=0.25,
+            turret_speed=0.4)
+
+        self.assertAlmostEqual(
+            0.01 * math.sqrt(1.0 + 1.0 ** 2 + 0.1 ** 2 + 0.2 ** 2),
+            gun_state.dispersion)
+
+    def test_bot_first_high_fps_tick_keeps_exact_turret_angular_speed(self):
+        command = {
+            'target_yaw': 0.0, 'throttle': 0.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False,
+            'target_id': self.module.HUMAN_TARGET_ID_BASE + 2,
+            'fire_range': 1000.0, 'combat_mode': 'engage',
+            'aim_position': (0.0, 1.0, 100.0),
+            'face_position': (0.0, 1.0, 100.0),
+            'move_position': (0.0, 0.0, 0.0),
+            'recovery_mode': 'arrived', 'movement_intent': False,
+        }
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            visibility_probe=lambda *unused: True,
+            firing_lane_probe=lambda *unused: True,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        runtime._next_observation = 100.0
+        state = runtime.states[11]
+        state['turret_yaw'] = -0.001
+        state['aim_yaw'] = -0.001
+        gun_state = runtime._gun_states[11]
+        recorded = []
+        gun_state.tick_dispersion = lambda *args: recorded.append(args)
+        step = 1.0 / 240.0
+
+        runtime.update(step, 1.0, players=[{
+            'id': 2, 'team': 1, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 100.0,
+        }])
+
+        self.assertEqual(1, len(recorded))
+        turret_delta = abs(self.module._angle_delta(
+            state['turret_yaw'], -0.001))
+        self.assertGreater(turret_delta, 0.0)
+        self.assertAlmostEqual(
+            turret_delta, recorded[0][3] * step)
+
+    def test_bot_dispersion_converges_with_1513_exponential_aiming_law(self):
+        descriptor = _combat_descriptor(dispersion=0.01)
+        descriptor.chassis.shotDispersionFactors = (0.2, 0.4)
+        descriptor.gun.shotDispersionFactors = {
+            'afterShot': 3.0, 'afterShotInBurst': 1.5,
+            'turretRotation': 0.5,
+        }
+        descriptor.gun.aimingTime = 2.0
+        gun_state = self.module._BotGunState(descriptor)
+        gun_state.current_dispersion_factor = 8.0
+        gun_state.aiming_start_factor = 8.0
+        gun_state.aiming_elapsed = 0.0
+        gun_state.dispersion = 0.08
+
+        gun_state.tick_dispersion(
+            0.5, move_speed=0.0, rotation_speed=0.0,
+            turret_speed=0.0)
+
+        self.assertAlmostEqual(
+            max(0.01, 0.08 * math.exp(-0.5 / 2.0)),
+            gun_state.dispersion)
+
+    def test_bot_shot_bloom_expands_to_after_shot_ideal_without_stacking(self):
+        descriptor = _combat_descriptor(dispersion=0.01)
+        descriptor.gun.shotDispersionFactors = {
+            'afterShot': 3.0, 'afterShotInBurst': 1.5,
+            'turretRotation': 0.0,
+        }
+        descriptor.gun.aimingTime = 2.0
+        descriptor.gun.burst = (1, 0.0)
+        gun_state = self.module._BotGunState(descriptor)
+        expected = 0.01 * math.sqrt(1.0 + 3.0 ** 2)
+
+        gun_state.commit_shot_bloom()
+        self.assertAlmostEqual(expected, gun_state.dispersion)
+
+        # #1513 clamps the current aiming factor to the shot ideal. A second
+        # event before any convergence does not add another independent jump.
+        gun_state.commit_shot_bloom()
+        self.assertAlmostEqual(expected, gun_state.dispersion)
+
+    def test_bot_fire_scatters_with_the_current_dynamic_circle(self):
+        descriptor = _combat_descriptor(dispersion=0.01)
+        descriptor.gun.shotDispersionFactors = {
+            'afterShot': 3.0, 'afterShotInBurst': 1.5,
+            'turretRotation': 0.0,
+        }
+        descriptor.gun.aimingTime = 2.0
+        gun_state = self.module._BotGunState(descriptor)
+        gun_state.current_dispersion_factor = 4.0
+        gun_state.aiming_start_factor = 4.0
+        gun_state.dispersion = 0.04
+        gun_state.elapsed = 10.0
+        state = {
+            'id': 11, 'fire_seq': 0, 'aim_yaw': 0.4,
+            'gun_pitch': -0.1, 'critical': {},
+        }
+        sigmas = []
+
+        class RecordingRandom(object):
+            def __init__(self, unused_seed):
+                pass
+
+            def gauss(self, mean, sigma):
+                sigmas.append((mean, sigma))
+                return 0.0
+
+            @staticmethod
+            def uniform(minimum, unused_maximum):
+                return minimum
+
+        original_random = self.module.random.Random
+        self.module.random.Random = RecordingRandom
+        try:
+            self.assertTrue(self.module.BotRuntime(1)._fire(
+                state, gun_state, 1.0, descriptor))
+        finally:
+            self.module.random.Random = original_random
+
+        self.assertEqual([(0.0, 0.02)], sigmas)
+        self.assertEqual(1, state['fire_seq'])
 
     def test_installed_gun_dispersion_sets_bounded_two_sigma_cone(self):
         descriptor = _combat_descriptor(dispersion=0.012)
@@ -7331,7 +7496,11 @@ class BotRuntimeTests(unittest.TestCase):
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=1, y=0, z=2, yaw=0.5,
             fire_seq=7, shell_index=0, next_shell_index=0,
-            ammo_remaining=[38], ammo_reload_pending=False, critical={},
+            ammo_remaining=[38], ammo_reload_pending=False,
+            critical=_critical_payload({
+                'name': 'gunHealth', 'hp': 10.0, 'max_hp': 54.0,
+                'state': 'critical',
+            }, crew_ko=['gunner1']),
             combat_revision=0, combat_base_revision=0,
             combat_ack_seq=0, combat_fire_elapsed=0.0,
             combat_fire_timer=0.0)
@@ -7344,6 +7513,15 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(7, self.runtime.states[11]['fire_seq'])
         self.assertEqual(0, self.runtime.states[11]['shell_index'])
         self.assertEqual('bot_manifest', outgoing[0]['type'])
+        descriptor = self.runtime._descriptors[11]
+        expected_factor = self.module._critical_factor(
+            self.runtime.states[11], descriptor, 'dispersion')
+        expected_dispersion = (
+            descriptor.gun.shotDispersionAngle * expected_factor *
+            math.sqrt(1.0 + 1.5 ** 2))
+        self.assertAlmostEqual(
+            expected_dispersion,
+            self.runtime._gun_states[11].dispersion)
         self.runtime.apply_snapshot({'bots': [dict(
             snapshot_bot, fire_seq=8, shell_index=0,
             ammo_remaining=[37], ammo_reload_pending=True)]})
@@ -7352,6 +7530,9 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([37], self.runtime.states[11]['ammo_remaining'])
         self.assertTrue(
             self.runtime.states[11]['ammo_reload_pending'])
+        self.assertAlmostEqual(
+            expected_dispersion,
+            self.runtime._gun_states[11].dispersion)
 
     def test_new_round_discards_previous_bot_and_terminal_state(self):
         self.runtime.battle_start(self.start)
