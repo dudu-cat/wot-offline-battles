@@ -2,6 +2,7 @@ import json
 import math
 import socket
 import sys
+import types
 from pathlib import Path
 import unittest
 
@@ -11,6 +12,7 @@ sys.path.insert(0, str(
     ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'))
 
 from gui.mods.offline_lan_0922 import lan_client as module
+from gui.mods.offline_lan_0922 import descriptor_donation
 from gui.mods.offline_lan_0922.authority_worker import (
     AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.lan_client import LANClient
@@ -60,6 +62,29 @@ def source_shot(speed, gravity, maximum, is_he=False, radius=0.0,
 
 
 class ProjectileWireTests(unittest.TestCase):
+
+    def test_projected_he_shot_freezes_descriptor_owned_factors(self):
+        shell_type = types.SimpleNamespace(
+            name='HIGH_EXPLOSIVE', explosionRadius=4.5,
+            explosionDamageFactor=0.55,
+            explosionDamageAbsorptionFactor=1.4,
+            explosionEdgeDamageFactor=0.2)
+        shot = types.SimpleNamespace(
+            speed=720.0, gravity=9.81, maxDistance=500.0,
+            piercingPower=(53.0, 53.0),
+            shell=types.SimpleNamespace(
+                type=shell_type, caliber=122.0, damage=(450.0, 90.0)))
+
+        projected = descriptor_donation.project_shot(shot)
+
+        self.assertEqual('HIGH_EXPLOSIVE', projected['shell']['kind'])
+        self.assertEqual(4.5, projected['shell']['explosionRadius'])
+        self.assertEqual(0.55,
+                         projected['shell']['explosionDamageFactor'])
+        self.assertEqual(
+            1.4, projected['shell']['explosionDamageAbsorptionFactor'])
+        self.assertEqual(0.2,
+                         projected['shell']['explosionEdgeDamageFactor'])
 
     @staticmethod
     def gun_checkpoint(reload_time=0.0, clip=1, dispersion=0.02):
@@ -359,6 +384,26 @@ class ProjectileWireTests(unittest.TestCase):
             gravity=143.0, velocity=[0.0, 100.0, 425.0]))
         message = wire_copy(client._outbound_queue[-1][1])
         self.assertEqual(143.0, message['gravity'])
+
+    def test_launch_preserves_complete_he_factor_contract(self):
+        client = self.active_worker_client()
+        frozen = source_shot(
+            math.sqrt(11300.0), 9.81, 720.0, True, 4.5)
+        frozen['shell'].update({
+            'explosionDamageFactor': 0.55,
+            'explosionDamageAbsorptionFactor': 1.4,
+            'explosionEdgeDamageFactor': 0.2,
+        })
+
+        self.assertEqual(1, self.launch(
+            client, shot_seq=1, authority_epoch=4,
+            fire_intent_seq=1, fire_input_seq=1,
+            source_shot=frozen))
+
+        shell = client._outbound_queue[-1][1]['source_shot']['shell']
+        self.assertEqual(0.55, shell['explosionDamageFactor'])
+        self.assertEqual(1.4, shell['explosionDamageAbsorptionFactor'])
+        self.assertEqual(0.2, shell['explosionEdgeDamageFactor'])
 
     def test_send_fire_never_falls_back_to_instant_input(self):
         client = self.active_client()

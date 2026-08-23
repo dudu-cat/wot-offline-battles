@@ -1,4 +1,5 @@
 import importlib.util
+import math
 from pathlib import Path
 import unittest
 
@@ -28,6 +29,52 @@ class ProjectileRuntimeTests(unittest.TestCase):
             (0.0, -10.0, 2.0), 2.0)
 
         self.assertEqual((201.0, 2.0, -33.0), position)
+
+    def test_high_arc_range_uses_frozen_start_not_travelled_path(self):
+        state = {'start': (0.0, 0.0, 0.0), 'distance': 13.0}
+
+        distance = self.runtime.projectile_range_distance(
+            state, (6.0, 8.0, 0.0))
+
+        self.assertEqual(10.0, distance)
+        self.assertGreater(state['distance'], distance)
+
+    def test_range_origin_in_payload_takes_precedence_over_muzzle_start(self):
+        state = {
+            'start': (100.0, 100.0, 100.0),
+            'payload': {'range_origin': (1.0, 2.0, 3.0)},
+        }
+
+        distance = self.runtime.projectile_range_distance(
+            state, (4.0, 6.0, 15.0))
+
+        self.assertEqual(13.0, distance)
+
+    def test_ideal_reflection_normalizes_normal_and_preserves_speed(self):
+        incoming = (3.0, -4.0, 12.0)
+
+        reflected = self.runtime.ideal_reflection_velocity(
+            incoming, (0.0, 7.0, 0.0))
+
+        self.assertEqual((3.0, 4.0, 12.0), reflected)
+        incoming_speed = math.sqrt(sum(value * value for value in incoming))
+        reflected_speed = math.sqrt(sum(
+            value * value for value in reflected))
+        self.assertAlmostEqual(incoming_speed, reflected_speed, places=12)
+
+    def test_ideal_reflection_rejects_non_finite_or_degenerate_inputs(self):
+        invalid_pairs = (
+            ((1.0, 2.0), (0.0, 1.0, 0.0)),
+            ((1.0, 2.0, float('nan')), (0.0, 1.0, 0.0)),
+            ((1.0, 2.0, 3.0), (0.0, float('inf'), 0.0)),
+            ((1.0, 2.0, 3.0), (0.0, 0.0, 0.0)),
+            ((1.0, 2.0, 3.0), (1.0e-13, 0.0, 0.0)),
+        )
+
+        for incoming, normal in invalid_pairs:
+            with self.subTest(incoming=incoming, normal=normal):
+                self.assertIsNone(self.runtime.ideal_reflection_velocity(
+                    incoming, normal))
 
     def test_absolute_trajectory_and_substeps_are_frame_rate_invariant(self):
         final_positions = []

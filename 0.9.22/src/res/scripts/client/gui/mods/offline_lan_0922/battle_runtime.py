@@ -37,7 +37,7 @@ from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
     PROJECTILE_BROADPHASE_RADIUS, PROJECTILE_MAX_SUBSTEP_SECONDS, lerp3,
     point_in_expanded_segment_bounds, point_segment_distance_sq,
-    trajectory_position)
+    projectile_range_distance, trajectory_position)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
@@ -9391,7 +9391,7 @@ class BattleRuntime(object):
                 self._projectile_shot(meta),
                 penetration_factor=meta.get('penetration_factor'),
                 initial_piercing_loss=meta.get('piercing_loss', 0.0),
-                distance_offset=state.get('distance', 0.0))
+                projectile_state=state)
         finally:
             self._projectile_destructible_context = None
         meta['piercing_loss'] = scene['piercing_loss']
@@ -9570,11 +9570,13 @@ class BattleRuntime(object):
                     collisions, trace_start, trace_end = self._vehicle_trace(
                         shot, query[0], trace_end, tuple(extended))
         factor = terminal_data.get('penetration_factor')
-        resolved = combat_rules.resolve_hull_hit(
-            shot, state.get('distance', 0.0), collisions,
+        range_distance = projectile_range_distance(
+            state, terminal_data['impact'])
+        contact = combat_rules.resolve_armor_contact(
+            shot, range_distance, collisions,
             pierce_loss=terminal_data.get('piercing_loss', 0.0),
             penetration_factor=factor)
-        result = 1 if resolved is None else resolved[0]
+        result = 1 if contact is None else contact['result']
         armor = combat_rules.he_nominal_armor(
             collisions, getattr(target, 'typeDescriptor', None))
         damage = combat_rules.damage(shot, result, armor)
@@ -9584,13 +9586,15 @@ class BattleRuntime(object):
             source, 'id', meta.get('shooter_id', 0)))
         deadeye = bool(_field(shot, 'deadeye', False))
         layers = combat_rules.collision_layers(collisions)
-        if combat_rules.is_he(shot):
+        critical = None
+        critical_delta = {}
+        if int(result) != 0 and combat_rules.is_he(shot):
             damage, critical, critical_delta = (
                 critical_damage.propose_explosion(
                     target, layers, self._vector(terminal_data['impact']),
                     trace_end - trace_start, damage, legacy_shell,
                     attacker_id, deadeye=deadeye, with_delta=True))
-        else:
+        elif int(result) != 0:
             damage, critical, critical_delta = critical_damage.propose_direct(
                 target, layers, trace_start, trace_end, damage,
                 legacy_shell, attacker_id, penetrated=int(result) == 2,
@@ -16192,7 +16196,8 @@ class BattleRuntime(object):
     def _resolve_shot_scene(self, start, end, direction, shot,
                             penetration_factor=None,
                             initial_piercing_loss=0.0,
-                            distance_offset=0.0):
+                            distance_offset=0.0,
+                            projectile_state=None):
         """Traverse exact destructibles in order before the capped endpoint."""
         maximum = (end - start).length
         initial_piercing_loss = max(
@@ -16233,10 +16238,15 @@ class BattleRuntime(object):
                 loss_distance = result.get('continue_from')
             obstacle_distance = travelled + max(
                 0.0, _number(loss_distance, 0.0))
+            piercing_distance = distance_offset + obstacle_distance
+            if projectile_state is not None:
+                piercing_distance = projectile_range_distance(
+                    projectile_state,
+                    start + direction.scale(obstacle_distance))
             if (result.get('continue_from') is not None and
                     penetration_factor is not None and
                     combat_rules.sampled_piercing(
-                        shot, distance_offset + obstacle_distance,
+                        shot, piercing_distance,
                         penetration_factor,
                         piercing_loss) < 1.0):
                 return {
@@ -16452,12 +16462,13 @@ class BattleRuntime(object):
         index = max(0, min(int(shell_index),
                            max(0, len(shots) - 1)))
         shot = shots[index] if shots else {}
-        resolved = combat_rules.resolve_hull_hit(
+        contact = combat_rules.resolve_armor_contact(
             shot, distance, collisions, pierce_loss=pierce_loss,
             penetration_factor=penetration_factor)
-        # 0.8.2 law: a round that never reaches structure is a non-penetration,
-        # and an HE round still detonates on the part it did reach.
-        result = 1 if resolved is None else resolved[0]
+        # A trace with no terminal contact remains a non-penetration. A
+        # preserved external contact may instead carry the exact ricochet
+        # result, and HE still detonates on the part it reached.
+        result = 1 if contact is None else contact['result']
         armor = combat_rules.he_nominal_armor(collisions, target_descriptor)
         return combat_rules.damage(shot, result, armor), result
 

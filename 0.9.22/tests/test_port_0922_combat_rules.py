@@ -49,6 +49,17 @@ class CombatRulesTests(unittest.TestCase):
         self.assertEqual(0.25, combat_rules.range_piercing(shot, 899.0))
         self.assertEqual(0.0, combat_rules.range_piercing(shot, 900.0))
 
+    def test_range_law_exact_boundaries_and_early_zero(self):
+        shot = _shot(piercing=(100.0, -100.0), maximum=720.0)
+
+        self.assertEqual(
+            100.0, combat_rules.range_piercing(shot, 100.0 - 1e-6))
+        self.assertEqual(100.0, combat_rules.range_piercing(shot, 100.0))
+        self.assertLess(
+            combat_rules.range_piercing(shot, 100.0 + 1e-6), 100.0)
+        self.assertEqual(0.0, combat_rules.range_piercing(shot, 300.0))
+        self.assertEqual(0.0, combat_rules.range_piercing(shot, 500.0))
+
     def test_max_distance_is_a_hard_zero_not_the_p500_endpoint(self):
         shot = _shot(piercing=(200.0, 100.0), maximum=350.0)
 
@@ -105,6 +116,38 @@ class CombatRulesTests(unittest.TestCase):
 
         self.assertEqual(2, result[0])
         self.assertEqual(25.0, result[2])
+
+    def test_ricochet_base_multiplier_precedes_roll_and_accumulated_loss(self):
+        shot = _shot(piercing=(200.0, 200.0))
+
+        result = combat_rules.penetration(
+            shot, 50.0, 100.0, 1.0, pierce_loss=20.0,
+            penetration_factor=0.8, base_penetration_multiplier=0.75)
+
+        self.assertEqual(2, result[0])
+        self.assertEqual(100.0, result[2])
+        self.assertEqual(100.0, combat_rules.sampled_piercing(
+            shot, 50.0, 0.8, 20.0,
+            base_penetration_multiplier=0.75))
+
+    def test_first_ricochet_multiplier_is_shell_kind_specific(self):
+        self.assertEqual(
+            0.75,
+            combat_rules.first_ricochet_penetration_multiplier(
+                'ARMOR_PIERCING'))
+        self.assertEqual(
+            0.75,
+            combat_rules.first_ricochet_penetration_multiplier(
+                'ARMOR_PIERCING_CR'))
+        self.assertEqual(
+            1.0,
+            combat_rules.first_ricochet_penetration_multiplier(
+                'HOLLOW_CHARGE'))
+        for shell_kind in ('HIGH_EXPLOSIVE', 'ARMOR_PIERCING_HE', None):
+            with self.subTest(shell_kind=shell_kind):
+                self.assertIsNone(
+                    combat_rules.first_ricochet_penetration_multiplier(
+                        shell_kind))
 
     def test_hull_resolver_draws_one_factor_for_every_layer(self):
         draws = []
@@ -253,6 +296,17 @@ class CombatRulesTests(unittest.TestCase):
 
         self.assertEqual(0, result[0])
 
+    def test_exact_1513_richet_typo_wins_over_legacy_alias(self):
+        material = _material(
+            60.0, checkCaliberForRichet=False,
+            checkCaliberForRicochet=True)
+        result = combat_rules.penetration(
+            _shot(caliber=200.0, piercing=(1000.0, 1000.0)),
+            50.0, 60.0, math.cos(math.radians(75.0)),
+            penetration_factor=1.0, material=material)
+
+        self.assertEqual(0, result[0])
+
     def test_material_can_disable_two_caliber_normalization(self):
         material = _material(
             60.0, checkCaliberForHitAngleNorm=False)
@@ -265,14 +319,44 @@ class CombatRulesTests(unittest.TestCase):
         expected = 60.0 / math.cos(angle - math.radians(5.0))
         self.assertAlmostEqual(expected, result[1], places=8)
 
-    def test_he_non_penetration_uses_082_direct_blast_damage(self):
+    def test_grazing_effective_armor_uses_exact_1513_cosine_floor(self):
+        result = combat_rules.penetration(
+            _shot(kind='ARMOR_PIERCING_HE', caliber=90.0,
+                  piercing=(50000.0, 50000.0)),
+            50.0, 1.0, 0.0, penetration_factor=1.0)
+
+        self.assertEqual(1, result[0])
+        self.assertAlmostEqual(100000.0, result[1], places=5)
+        self.assertEqual(50000.0, result[2])
+
+    def test_negative_cosine_is_not_reflected_into_a_front_face(self):
+        result = combat_rules.penetration(
+            _shot(kind='ARMOR_PIERCING_HE', caliber=90.0,
+                  piercing=(1000.0, 1000.0)),
+            50.0, 60.0, -0.5, penetration_factor=1.0)
+
+        self.assertEqual(1, result[0])
+        self.assertAlmostEqual(6000000.0, result[1], places=3)
+
+    def test_ap_normalization_floors_only_the_final_cosine(self):
+        material = _material(60.0, mayRicochet=False)
+        result = combat_rules.penetration(
+            _shot(kind='ARMOR_PIERCING', caliber=90.0,
+                  piercing=(1000.0, 1000.0)),
+            50.0, 60.0, -0.5, penetration_factor=1.0,
+            material=material)
+
+        self.assertEqual(1, result[0])
+        self.assertAlmostEqual(6000000.0, result[1], places=3)
+
+    def test_he_non_penetration_uses_1513_common_factors(self):
         shot = _shot(kind='HIGH_EXPLOSIVE', damage=400.0)
 
         value = combat_rules.damage(
             shot, 1, 100.0,
             random_uniform=lambda low, high: (low + high) * 0.5)
 
-        self.assertEqual(89, value)
+        self.assertEqual(70, value)
 
     def test_ap_damage_roll_stays_within_twenty_five_percent(self):
         shot = _shot(kind='ARMOR_PIERCING_CR', damage=400.0)
@@ -335,6 +419,147 @@ class CombatRulesTests(unittest.TestCase):
             penetration_factor=1.0)
 
         self.assertIsNone(result)
+
+    def test_he_detonates_after_penetrating_spaced_armor(self):
+        screen = _material(20.0, 0.0)
+        hull = _material(1.0)
+        collisions = (
+            _collision(5.0, 1.0, screen, 'vehicleChassis'),
+            _collision(5.2, 1.0, hull),
+        )
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(kind='HIGH_EXPLOSIVE', piercing=(1000.0, 1000.0)),
+            50.0, collisions, penetration_factor=1.0)
+
+        self.assertEqual(('external', 1),
+                         (contact['layer'], contact['result']))
+        self.assertIsNone(combat_rules.resolve_hull_hit(
+            _shot(kind='HIGH_EXPLOSIVE', piercing=(1000.0, 1000.0)),
+            50.0, collisions, penetration_factor=1.0))
+
+    def test_armor_contact_preserves_external_ricochet(self):
+        screen = _material(60.0, 0.0)
+        hull = _material(10.0)
+        collisions = (
+            _collision(
+                5.0, math.cos(math.radians(75.0)), screen,
+                'vehicleChassis'),
+            _collision(5.2, 1.0, hull),
+        )
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(piercing=(1000.0, 1000.0)), 50.0, collisions,
+            pierce_loss=12.5, penetration_factor=1.0)
+
+        self.assertEqual(0, contact['result'])
+        self.assertEqual('external', contact['layer'])
+        self.assertEqual(5.0, contact['distance'])
+        self.assertIs(screen, contact['material'])
+        self.assertEqual(12.5, contact['accumulated_loss'])
+        self.assertIsNone(combat_rules.resolve_hull_hit(
+            _shot(piercing=(1000.0, 1000.0)), 50.0, collisions,
+            pierce_loss=12.5, penetration_factor=1.0))
+
+    def test_armor_contact_preserves_external_non_penetration(self):
+        screen = _material(30.0, 0.0)
+        hull = _material(10.0)
+        collisions = (
+            _collision(5.0, 1.0, screen, 'vehicleChassis'),
+            _collision(5.2, 1.0, hull),
+        )
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(piercing=(20.0, 20.0)), 50.0, collisions,
+            pierce_loss=7.0, penetration_factor=1.0)
+
+        self.assertEqual(1, contact['result'])
+        self.assertEqual('external', contact['layer'])
+        self.assertEqual(5.0, contact['distance'])
+        self.assertIs(screen, contact['material'])
+        self.assertEqual(7.0, contact['accumulated_loss'])
+
+    def test_armor_contact_keeps_structural_result_legacy_compatible(self):
+        track = _material(20.0, 0.0)
+        hull = _material(100.0)
+        collisions = (
+            _collision(5.0, 1.0, track, 'vehicleChassis'),
+            _collision(5.2, 1.0, hull),
+        )
+        shot = _shot(piercing=(120.0, 120.0))
+
+        contact = combat_rules.resolve_armor_contact(
+            shot, 50.0, collisions, pierce_loss=5.0,
+            penetration_factor=1.0)
+        legacy = combat_rules.resolve_hull_hit(
+            shot, 50.0, collisions, pierce_loss=5.0,
+            penetration_factor=1.0)
+
+        self.assertEqual(1, contact['result'])
+        self.assertEqual('structural', contact['layer'])
+        self.assertEqual(5.2, contact['distance'])
+        self.assertIs(hull, contact['material'])
+        self.assertEqual('vehicleHull', contact['component'])
+        self.assertEqual(25.0, contact['accumulated_loss'])
+        self.assertEqual(
+            (contact['result'], contact['effective_armor'],
+             contact['piercing'], contact['accumulated_loss'],
+             contact['angle_cos']),
+            legacy)
+
+    def test_armor_contact_applies_base_multiplier_before_layer_loss(self):
+        screen = _material(20.0, 0.0)
+        hull = _material(100.0)
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(piercing=(200.0, 200.0)), 50.0,
+            (_collision(5.0, 1.0, screen, 'vehicleChassis'),
+             _collision(5.2, 1.0, hull, 'vehicleHull')),
+            penetration_factor=0.8,
+            base_penetration_multiplier=0.75)
+
+        self.assertEqual(('structural', 2, 'vehicleHull'),
+                         (contact['layer'], contact['result'],
+                          contact['component']))
+        self.assertEqual(20.0, contact['accumulated_loss'])
+        self.assertEqual(100.0, contact['piercing'])
+
+    def test_zero_thickness_structural_material_is_still_a_contact(self):
+        material = _material(0.0)
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(piercing=(100.0, 100.0)), 50.0,
+            (_collision(5.0, 1.0, material),),
+            penetration_factor=1.0)
+
+        self.assertEqual('structural', contact['layer'])
+        self.assertEqual(2, contact['result'])
+        self.assertEqual(0.0, contact['effective_armor'])
+
+    def test_external_plate_exactly_exhausting_power_is_terminal(self):
+        screen = _material(100.0, 0.0)
+        hull = _material(1.0)
+        collisions = (
+            _collision(5.0, 1.0, screen, 'vehicleChassis'),
+            _collision(5.2, 1.0, hull),
+        )
+
+        below = combat_rules.resolve_armor_contact(
+            _shot(piercing=(99.999, 99.999)), 50.0, collisions,
+            penetration_factor=1.0)
+        exact = combat_rules.resolve_armor_contact(
+            _shot(piercing=(100.0, 100.0)), 50.0, collisions,
+            penetration_factor=1.0)
+        above = combat_rules.resolve_armor_contact(
+            _shot(piercing=(100.001, 100.001)), 50.0, collisions,
+            penetration_factor=1.0)
+
+        self.assertEqual(('external', 1),
+                         (below['layer'], below['result']))
+        self.assertEqual(('external', 1),
+                         (exact['layer'], exact['result']))
+        self.assertEqual(('structural', 1),
+                         (above['layer'], above['result']))
 
     def test_collide_once_only_deducts_one_copy_of_the_same_plate(self):
         once_entry = _material(
@@ -466,6 +691,57 @@ class CombatRulesTests(unittest.TestCase):
         self.assertAlmostEqual(110.0, one_metre[3], places=8)
         self.assertAlmostEqual(90.0, one_metre[2], places=8)
 
+    def test_heat_charges_gap_before_collide_once_only_deduplication(self):
+        screen_entry = _material(
+            20.0, 0.0, kind=7, collideOnceOnly=True)
+        screen_exit = _material(
+            20.0, 0.0, kind=7, collideOnceOnly=True)
+        hull = _material(80.0)
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(kind='HOLLOW_CHARGE', piercing=(200.0, 200.0)),
+            50.0,
+            (_collision(5.0, 1.0, screen_entry, 'vehicleChassis'),
+             _collision(5.5, 1.0, screen_exit, 'vehicleChassis'),
+             _collision(6.0, 1.0, hull)),
+            penetration_factor=1.0)
+
+        self.assertEqual(('structural', 1),
+                         (contact['layer'], contact['result']))
+        self.assertAlmostEqual(130.232, contact['accumulated_loss'], places=8)
+        self.assertAlmostEqual(69.768, contact['piercing'], places=8)
+
+    def test_heat_empty_material_starts_the_jet_gap(self):
+        hull = _material(110.0)
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(kind='HOLLOW_CHARGE', piercing=(200.0, 200.0)),
+            50.0,
+            (_collision(5.0, 1.0, None, 'vehicleGun'),
+             _collision(6.0, 1.0, hull)),
+            penetration_factor=1.0)
+
+        self.assertEqual(('structural', 1),
+                         (contact['layer'], contact['result']))
+        self.assertEqual(100.0, contact['accumulated_loss'])
+        self.assertEqual(100.0, contact['piercing'])
+
+    def test_heat_zero_thickness_material_starts_the_jet_gap(self):
+        screen = _material(0.0, 0.0)
+        hull = _material(110.0)
+
+        contact = combat_rules.resolve_armor_contact(
+            _shot(kind='HOLLOW_CHARGE', piercing=(200.0, 200.0)),
+            50.0,
+            (_collision(5.0, 1.0, screen, 'vehicleChassis'),
+             _collision(6.0, 1.0, hull)),
+            penetration_factor=1.0)
+
+        self.assertEqual(('structural', 1),
+                         (contact['layer'], contact['result']))
+        self.assertEqual(100.0, contact['accumulated_loss'])
+        self.assertEqual(100.0, contact['piercing'])
+
     def test_heat_jet_does_not_ricochet_after_the_external_plate(self):
         track = _material(20.0, 0.0)
         hull = _material(60.0)
@@ -495,18 +771,42 @@ class CombatRulesTests(unittest.TestCase):
 
         self.assertEqual(75.0, armor)
 
-    def test_he_splash_preserves_082_distance_and_armour_reduction(self):
+    def test_he_splash_interpolates_from_center_to_edge_factor(self):
         shot = _shot(
             kind='HIGH_EXPLOSIVE', damage=400.0,
             explosion_radius=10.0)
+
+        uniform = lambda low, high: (low + high) * 0.5
+        center = combat_rules.he_splash_damage(
+            shot, 0.0, 0.0, random_uniform=uniform)
+        middle = combat_rules.he_splash_damage(
+            shot, 50.0, 0.5, random_uniform=uniform)
+        edge = combat_rules.he_splash_damage(
+            shot, 0.0, 1.0, random_uniform=uniform)
+
+        self.assertTrue(combat_rules.is_he(shot))
+        self.assertEqual(10.0, combat_rules.he_radius(shot))
+        self.assertEqual(200, center)
+        self.assertEqual(65, middle)
+        self.assertEqual(60, edge)
+
+    def test_native_1513_shell_type_overrides_all_he_factors(self):
+        shell_type = types.SimpleNamespace(
+            name='HIGH_EXPLOSIVE', explosionRadius=10.0,
+            explosionDamageFactor=0.6,
+            explosionDamageAbsorptionFactor=1.0,
+            explosionEdgeDamageFactor=0.2)
+        shot = types.SimpleNamespace(
+            shell=types.SimpleNamespace(
+                type=shell_type, caliber=122.0, damage=(400.0, 90.0)),
+            piercingPower=(60.0, 60.0), maxDistance=720.0)
 
         value = combat_rules.he_splash_damage(
             shot, 50.0, 0.5,
             random_uniform=lambda low, high: (low + high) * 0.5)
 
-        self.assertTrue(combat_rules.is_he(shot))
-        self.assertEqual(10.0, combat_rules.he_radius(shot))
-        self.assertEqual(44, value)
+        self.assertEqual((0.6, 1.0, 0.2), combat_rules.he_factors(shot))
+        self.assertEqual(110, value)
 
     def test_he_hull_armor_reads_native_1513_component_attributes(self):
         material = types.SimpleNamespace(

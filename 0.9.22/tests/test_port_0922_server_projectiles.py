@@ -645,6 +645,22 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 self.assertEqual(0, state.players[1].fire_seq)
                 self.assertFalse(state.projectiles)
 
+    def test_he_factors_survive_server_ledger_and_snapshot(self):
+        state = _state()
+        message = _launch(is_he=True, splash_radius=4.5)
+        message['source_shot']['shell'].update({
+            'explosionDamageFactor': 0.55,
+            'explosionDamageAbsorptionFactor': 1.4,
+            'explosionEdgeDamageFactor': 0.2,
+        })
+
+        self.assertTrue(_launch_authority(state, message))
+
+        shell = state._projectile_snapshot()[0]['source_shot']['shell']
+        self.assertEqual(0.55, shell['explosionDamageFactor'])
+        self.assertEqual(1.4, shell['explosionDamageAbsorptionFactor'])
+        self.assertEqual(0.2, shell['explosionEdgeDamageFactor'])
+
     def test_retail_spg_gravity_is_admitted_and_snapshotted(self):
         state = _state()
 

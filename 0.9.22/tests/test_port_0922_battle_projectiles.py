@@ -1195,7 +1195,8 @@ class BattleProjectileTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-                combat_rules, 'resolve_hull_hit', return_value=(2,)), \
+                combat_rules, 'resolve_armor_contact',
+                return_value={'result': 2}), \
                 mock.patch.object(
                     combat_rules, 'he_nominal_armor', return_value=100.0), \
                 mock.patch.object(
@@ -1208,7 +1209,8 @@ class BattleProjectileTests(unittest.TestCase):
                     unused_attacker, **unused_kwargs: (
                         damage, None, None)) as critical:
             effect = battle._projectile_direct_effect(
-                meta, {'distance': 10.0}, terminal)
+                meta, {'start': (0.0, 1.0, 0.0), 'distance': 10.0},
+                terminal)
 
         self.assertEqual(390, effect['damage'])
         self.assertEqual(2, effect['shot_result'])
@@ -1247,7 +1249,8 @@ class BattleProjectileTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-                combat_rules, 'resolve_hull_hit', return_value=(2,)), \
+                combat_rules, 'resolve_armor_contact',
+                return_value={'result': 2}), \
                 mock.patch.object(
                     combat_rules, 'he_nominal_armor', return_value=100.0), \
                 mock.patch.object(
@@ -1256,7 +1259,8 @@ class BattleProjectileTests(unittest.TestCase):
                     critical_damage, 'propose_direct',
                     return_value=(390, None, None)) as critical:
             effect = battle._projectile_direct_effect(
-                meta, {'distance': 9.8}, terminal)
+                meta, {'start': (0.0, 0.0, 0.0), 'distance': 9.8},
+                terminal)
 
         self.assertEqual(390, effect['damage'])
         self.assertAlmostEqual(
@@ -1296,7 +1300,8 @@ class BattleProjectileTests(unittest.TestCase):
         }
 
         with mock.patch.object(
-                combat_rules, 'resolve_hull_hit', return_value=(1,)), \
+                combat_rules, 'resolve_armor_contact',
+                return_value={'result': 1}), \
                 mock.patch.object(
                     combat_rules, 'he_nominal_armor', return_value=100.0), \
                 mock.patch.object(
@@ -1312,7 +1317,8 @@ class BattleProjectileTests(unittest.TestCase):
                     unused_attacker, **unused_kwargs: (
                         damage, None, None)) as cone:
             effect = battle._projectile_direct_effect(
-                meta, {'distance': 10.0}, terminal)
+                meta, {'start': (0.0, 1.0, 0.0), 'distance': 10.0},
+                terminal)
 
         self.assertEqual(200, effect['damage'])
         self.assertEqual(1, effect['shot_result'])

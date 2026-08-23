@@ -55,7 +55,16 @@ def _copy_fields(source, names):
 
 
 _SHOT_FIELDS = ("speed", "gravity", "maxDistance", "piercingPower")
-_PROJECTILE_SHELL_FIELDS = ("kind", "caliber", "damage", "explosionRadius")
+_HE_FACTOR_DEFAULTS = (
+    ("explosionDamageFactor", 0.5),
+    ("explosionDamageAbsorptionFactor", 1.3),
+    ("explosionEdgeDamageFactor", 0.15),
+)
+_PROJECTILE_SHELL_FIELDS = (
+    "kind", "caliber", "damage", "explosionRadius",
+    "explosionDamageFactor", "explosionDamageAbsorptionFactor",
+    "explosionEdgeDamageFactor",
+)
 
 
 def _complete_shell_projection(shell, names, default_radius=False):
@@ -71,6 +80,20 @@ def _complete_shell_projection(shell, names, default_radius=False):
             projection["explosionRadius"] = radius
         elif default_radius:
             projection["explosionRadius"] = 0.0
+    if projection.get("kind") == "HIGH_EXPLOSIVE":
+        for name, default in _HE_FACTOR_DEFAULTS:
+            value = _json_safe(_value(shell, name))
+            if value is None:
+                value = _json_safe(_value(shell_type, name))
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            if (value != value or abs(value) == float('inf') or
+                    value <= 0.0 or
+                    (name == "explosionEdgeDamageFactor" and value > 1.0)):
+                value = default
+            projection[name] = value
     return projection
 
 

@@ -629,8 +629,14 @@ def _projectile_source_shot(value):
             "shell"}:
         raise ValueError("invalid source shot shape")
     shell = value.get("shell")
-    if not isinstance(shell, dict) or set(shell) != {
-            "kind", "caliber", "damage", "explosionRadius"}:
+    shell_fields = set(shell) if isinstance(shell, dict) else set()
+    base_shell_fields = {"kind", "caliber", "damage", "explosionRadius"}
+    he_factor_fields = {
+        "explosionDamageFactor", "explosionDamageAbsorptionFactor",
+        "explosionEdgeDamageFactor"}
+    if (not isinstance(shell, dict) or
+            shell_fields not in (
+                base_shell_fields, base_shell_fields | he_factor_fields)):
         raise ValueError("invalid source shell shape")
     kind = shell.get("kind")
     piercing = value.get("piercingPower")
@@ -641,7 +647,7 @@ def _projectile_source_shot(value):
             not isinstance(piercing, list) or len(piercing) != 2 or
             not isinstance(damage, list) or len(damage) != 2):
         raise ValueError("invalid source shell data")
-    return {
+    result = {
         "speed": round(_bounded_float(
             value.get("speed"), 0.000001, PROJECTILE_MAX_VELOCITY), 6),
         "gravity": round(_bounded_float(
@@ -666,6 +672,19 @@ def _projectile_source_shot(value):
                 PROJECTILE_MAX_SPLASH_RADIUS), 6),
         },
     }
+    if he_factor_fields.issubset(shell_fields):
+        result["shell"].update({
+            "explosionDamageFactor": round(_bounded_float(
+                shell.get("explosionDamageFactor"), 0.000001,
+                10000.0), 6),
+            "explosionDamageAbsorptionFactor": round(_bounded_float(
+                shell.get("explosionDamageAbsorptionFactor"),
+                0.000001, 10000.0), 6),
+            "explosionEdgeDamageFactor": round(_bounded_float(
+                shell.get("explosionEdgeDamageFactor"),
+                0.000001, 1.0), 6),
+        })
+    return result
 
 
 def _projectile_source_shot_matches_launch(

@@ -13,6 +13,52 @@ PROJECTILE_MAX_CHORD_ERROR_METERS = 0.05
 PROJECTILE_BROADPHASE_RADIUS = 15.0
 
 
+def projectile_range_distance(state, point):
+    """Return straight 3-D range from one frozen range origin.
+
+    The pinned #1513 client marker evaluates penetration falloff with a
+    Euclidean point-to-point distance. New projectile payloads freeze the
+    source vehicle position as ``range_origin``; older states fall back to the
+    muzzle in ``start``. This does not replace travelled trajectory distance.
+    """
+    payload = state.get('payload') or {}
+    origin = (payload['range_origin']
+              if 'range_origin' in payload else state['start'])
+    delta_x = float(point[0]) - float(origin[0])
+    delta_y = float(point[1]) - float(origin[1])
+    delta_z = float(point[2]) - float(origin[2])
+    return math.sqrt(
+        delta_x * delta_x + delta_y * delta_y + delta_z * delta_z)
+
+
+def ideal_reflection_velocity(incoming_velocity, surface_normal):
+    """Reflect one finite 3-D velocity around a normalized surface normal."""
+    try:
+        if len(incoming_velocity) != 3 or len(surface_normal) != 3:
+            return None
+        velocity = tuple(float(value) for value in incoming_velocity)
+        normal = tuple(float(value) for value in surface_normal)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if any(math.isnan(value) or math.isinf(value)
+           for value in velocity + normal):
+        return None
+    normal_length_sq = sum(value * value for value in normal)
+    if (math.isnan(normal_length_sq) or math.isinf(normal_length_sq) or
+            normal_length_sq <= 1.0e-24):
+        return None
+    inverse_length = 1.0 / math.sqrt(normal_length_sq)
+    unit_normal = tuple(value * inverse_length for value in normal)
+    projection = sum(
+        velocity[index] * unit_normal[index] for index in range(3))
+    reflected = tuple(
+        velocity[index] - 2.0 * projection * unit_normal[index]
+        for index in range(3))
+    if any(math.isnan(value) or math.isinf(value) for value in reflected):
+        return None
+    return reflected
+
+
 def trajectory_position(start, velocity, gravity, elapsed):
     """Return ``r0 + v0*t + 1/2*g*t^2`` as a plain three-tuple."""
     time = max(0.0, float(elapsed or 0.0))

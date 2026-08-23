@@ -78,6 +78,9 @@ CRITICAL_DELTA_CREW_NAMES = frozenset((
 PROJECTILE_SHELL_KINDS = frozenset((
     'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
     'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
+PROJECTILE_HE_FACTOR_FIELDS = frozenset((
+    'explosionDamageFactor', 'explosionDamageAbsorptionFactor',
+    'explosionEdgeDamageFactor'))
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
 MAX_VEHICLE_COMPACT_BYTES = 64 * 1024
@@ -638,8 +641,12 @@ def _strict_projectile_source_shot(value):
             'shell'}:
         return None
     shell = value.get('shell')
-    if not isinstance(shell, dict) or set(shell) != {
-            'kind', 'caliber', 'damage', 'explosionRadius'}:
+    shell_fields = set(shell) if isinstance(shell, dict) else set()
+    base_shell_fields = {'kind', 'caliber', 'damage', 'explosionRadius'}
+    if (not isinstance(shell, dict) or
+            shell_fields not in (
+                base_shell_fields,
+                base_shell_fields | PROJECTILE_HE_FACTOR_FIELDS)):
         return None
     kind = shell.get('kind')
     piercing = value.get('piercingPower')
@@ -669,12 +676,25 @@ def _strict_projectile_source_shot(value):
     radius = _projectile_float_range(
         shell.get('explosionRadius'), 0.0,
         MAX_PROJECTILE_SPLASH_RADIUS)
+    he_factors = None
+    if PROJECTILE_HE_FACTOR_FIELDS.issubset(shell_fields):
+        he_factors = {
+            'explosionDamageFactor': _projectile_float_range(
+                shell.get('explosionDamageFactor'), 0.000001, 10000.0),
+            'explosionDamageAbsorptionFactor': _projectile_float_range(
+                shell.get('explosionDamageAbsorptionFactor'),
+                0.000001, 10000.0),
+            'explosionEdgeDamageFactor': _projectile_float_range(
+                shell.get('explosionEdgeDamageFactor'), 0.000001, 1.0),
+        }
     if (speed is None or gravity is None or maximum is None or
             any(component is None for component in piercing) or
             caliber is None or any(component is None for component in damage) or
-            radius is None):
+            radius is None or
+            (he_factors is not None and
+             any(component is None for component in he_factors.values()))):
         return None
-    return {
+    result = {
         'speed': speed,
         'gravity': gravity,
         'maxDistance': maximum,
@@ -687,6 +707,9 @@ def _strict_projectile_source_shot(value):
             'explosionRadius': radius,
         },
     }
+    if he_factors is not None:
+        result['shell'].update(he_factors)
+    return result
 
 
 def _projectile_source_shot_matches_launch(
