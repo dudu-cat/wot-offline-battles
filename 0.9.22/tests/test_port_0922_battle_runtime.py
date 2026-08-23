@@ -540,6 +540,7 @@ class _Vehicle(object):
         self.appearance = types.SimpleNamespace(
             compoundModel=self.model, turretMatrix=_Matrix(),
             gunMatrix=_Matrix(),
+            waterSensor=None, isInWater=False, isUnderwater=False,
             onModelChanged=_Signal(),
             _CompoundAppearance__trackScrollCtl=_TrackScroll(),
             setupGunMatrixTargets=lambda target:
@@ -6663,12 +6664,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._server = types.SimpleNamespace(vehicle_id=10)
         entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
                           {'health': 500})
+        entity.appearance.waterSensor = object()
+        entity.appearance.isInWater = True
+        entity.appearance.isUnderwater = True
         runtime.bigworld.entities[10] = entity
         battle._records = {
             'player:1': {
                 'engine_id': 10, 'state': {'health': 500, 'alive': True},
                 'kind': 'player', 'network_id': 1, 'local': True}}
-        battle._water_depth = lambda unused: 2.0
+        battle._water_depth = mock.Mock(
+            side_effect=AssertionError('native water sensor was bypassed'))
         battle._local_last_attacker = ('player', 9)
         battle._present_critical = mock.Mock(return_value=True)
         critical = {
@@ -6696,6 +6701,54 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          battle._local_damage_report['display_health'])
         self.assertNotIn('attacker', battle._local_damage_report)
         self.assertNotIn('attacker_bot', battle._local_damage_report)
+        battle._water_depth.assert_not_called()
+
+    def test_native_drowning_sensor_resets_before_a_second_countdown(self):
+        runtime = _runtime()
+        server_time = [750.0]
+        runtime.bigworld.serverTime = lambda: server_time[0]
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._records = {
+            'player:1': {
+                'engine_id': 10, 'state': {'health': 500, 'alive': True},
+                'kind': 'player', 'network_id': 1, 'local': True}}
+        battle._water_depth = mock.Mock(return_value=0.8)
+
+        battle._tick_drowning(0.3, 1.0)
+        entity.appearance.waterSensor = object()
+        entity.appearance.isInWater = True
+        entity.appearance.isUnderwater = True
+        battle._water_depth.side_effect = AssertionError(
+            'native water sensor was bypassed')
+        battle._tick_drowning(0.3, 1.3)
+        self.assertEqual(0.3, battle._drown_time)
+
+        entity.appearance.isUnderwater = False
+        battle._tick_drowning(0.3, 1.6)
+        self.assertEqual(0.0, battle._drown_time)
+        self.assertIsNone(battle._drown_started)
+
+        server_time[0] = 760.0
+        entity.appearance.isUnderwater = True
+        battle._tick_drowning(0.3, 1.9)
+        entity.appearance.isUnderwater = False
+        entity.appearance.isInWater = False
+        battle._tick_drowning(0.3, 2.2)
+
+        self.assertEqual([
+            (10, 4, 1, (0.0, 0.0)),
+            (10, 4, 2, (750.0, 10.0)),
+            (10, 4, 1, (0.0, 0.0)),
+            (10, 4, 2, (760.0, 10.0)),
+            (10, 4, 0, (0.0, 0.0)),
+        ], battle._avatar.misc_statuses)
+        self.assertEqual(1, battle._water_depth.call_count)
 
     def test_local_overturn_warning_resets_when_the_hull_is_righted(self):
         runtime = _runtime()

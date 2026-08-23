@@ -3688,6 +3688,23 @@ class BattleRuntime(object):
             return -1.0
         return 20.0 - float(value)
 
+    def _native_drowning_level(self, entity):
+        """Read the local #1513 vehicle's assembled water sensor."""
+        appearance = getattr(entity, 'appearance', None)
+        try:
+            if (appearance is None or
+                    getattr(appearance, 'waterSensor', None) is None):
+                return None
+            if bool(appearance.isUnderwater):
+                return 2
+            if bool(appearance.isInWater):
+                return 1
+            return 0
+        except Exception:
+            # The sensor is native and can disappear during a model refresh.
+            # The point probe below remains valid while it is being rebuilt.
+            return None
+
     def _present_drowning_level(self, level, now):
         status_group = getattr(
             self._runtime.constants, 'VEHICLE_MISC_STATUS', None)
@@ -3732,26 +3749,26 @@ class BattleRuntime(object):
             return False
         elapsed = min(self._drown_check, 0.5)
         self._drown_check = 0.0
-        depth = self._water_depth(self.local_pose()[0])
-        if depth > 1.6:
+        level = self._native_drowning_level(entity)
+        if level is None:
+            depth = self._water_depth(self.local_pose()[0])
+            level = 2 if depth > 1.6 else (1 if depth > 0.5 else 0)
+        if level == 2:
             if self._drown_level != 2:
                 self._drown_started = self._server_clock()
             self._drown_time += elapsed
-            level = 2
-        elif depth > 0.5:
+        elif level == 1:
             self._drown_time = 0.0
             self._drown_started = None
-            level = 1
         else:
             self._drown_time = 0.0
             self._drown_started = None
-            level = 0
         self._avatar._offh_drowning = level == 2
         entity._offh_drowning = level == 2
         if level != self._drown_level:
             self._drown_level = level
             self._present_drowning_level(level, now)
-        if depth <= 1.6 or self._drown_time <= 10.0:
+        if level != 2 or self._drown_time <= 10.0:
             return False
         display_health = max(0, int(getattr(entity, 'health', 0) or 0))
         drowning_reason = self._attack_reason('DROWNING', 5)

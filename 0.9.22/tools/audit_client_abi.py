@@ -147,6 +147,8 @@ EXPECTED_ABI = {
             'isTurretDetached'),
         'setupTurretRotations': ('appearance',),
         'assembleRecoil': ('appearance', 'lodLink'),
+        'assembleWaterSensor': (
+            'vehicleDesc', 'appearance', 'lodStateLink'),
     },
     'scripts/client/OfflineEntity.pyc': {
         'OfflineEntity.__init__': ('self',),
@@ -991,6 +993,9 @@ EXPECTED_CODE_NAMES = {
             'compoundModel', 'node', 'turretMatrix', 'gunMatrix'),
         'assembleRecoil': (
             'compoundModel', 'node', 'gunRecoil', 'createGunAnimator'),
+        'assembleWaterSensor': (
+            'turretPositions', 'topRightCarryingPoint', 'Vehicular',
+            'WaterSensor', 'sensorPlaneLink', 'onUnderWaterSwitch'),
     },
     'scripts/client/Account.pyc': {
         'PlayerAccount.onBecomePlayer': (
@@ -1467,6 +1472,8 @@ EXPECTED_CODE_NAMES = {
         'decodeFragile': ('bool',),
     },
     'scripts/client/vehicle_systems/CompoundAppearance.pyc': {
+        'CompoundAppearance': (
+            'waterSensor', 'isInWater', 'isUnderwater'),
         'CompoundAppearance.start': ('getHitTesters', 'loadBspModel'),
         'CompoundAppearance.__linkCompound': (
             '_CompoundAppearance__vehicle',
