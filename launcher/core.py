@@ -85,9 +85,13 @@ WORKER_READY_MARKER_FILENAME_0922 = "offline-worker.ready"
 WORKER_FAILURE_LOG_FILENAME_0922 = "offline-worker-starter.log"
 SERVER_LOG_FILENAME = "server.log"
 PLAYER_ENGINE_CONFIG_0922 = "engine_config.offline-player.xml"
+PLAYER_ARGUMENT_0922 = "--player"
 WORKER_ONLY_ARGUMENT_0922 = "--worker-only"
 PAIRED_PLAYER_ARGUMENT_0922 = "--paired-player"
+STOP_STARTER_ARGUMENT_0922 = "--stop-starter"
 WORKER_READY_TIMEOUT_SECONDS_0922 = 60.0
+STARTER_CONTROL_TIMEOUT_SECONDS_0922 = 5.0
+STARTER_SHUTDOWN_TIMEOUT_SECONDS_0922 = 45.0
 
 _CLIENT_RUNTIME_FILES_0_9_22 = (
     WORKER_STARTER_FILENAME_0922,
@@ -193,15 +197,11 @@ def server_log_path(executable=None, frozen=None):
 
 def visible_client_command(game_root, port_version, paired_worker=False):
     """Build the visible client command for one supported port."""
-    if port_version == PORT_0_9_22 and paired_worker:
-        return [worker_starter_executable(game_root),
-                PAIRED_PLAYER_ARGUMENT_0922]
-    command = [game_executable(game_root)]
     if port_version == PORT_0_9_22:
-        command.extend([
-            "--config", PLAYER_ENGINE_CONFIG_0922,
-            "--logFilePrefix", "offline-player-",
-        ])
+        argument = (PAIRED_PLAYER_ARGUMENT_0922 if paired_worker
+                    else PLAYER_ARGUMENT_0922)
+        return [worker_starter_executable(game_root), argument]
+    command = [game_executable(game_root)]
     return command
 
 
@@ -229,6 +229,17 @@ def visible_client_environment(port_version, host=LOCAL_HOST,
 
 def worker_child_command(game_root):
     return [worker_starter_executable(game_root), WORKER_ONLY_ARGUMENT_0922]
+
+
+def starter_stop_command(game_root, process_id):
+    try:
+        process_id = int(process_id)
+    except (TypeError, ValueError):
+        raise LauncherError("The starter process identifier is invalid.")
+    if process_id <= 0:
+        raise LauncherError("The starter process identifier is invalid.")
+    return [worker_starter_executable(game_root),
+            STOP_STARTER_ARGUMENT_0922, str(process_id)]
 
 
 def worker_environment(game_root, host=LOCAL_HOST,
@@ -506,6 +517,9 @@ def write_settings(game_root, port_version, mode, host, port, name=None):
 
 SERVER_PAYLOAD_DIR = "servers"
 CLIENT_PAYLOAD_DIR = "client"
+PROCDUMP_FILENAME = "procdump.exe"
+PROCDUMP_RUNTIME_DIR = "tools"
+PROCDUMP_VENDOR_RELATIVE_DIR = os.path.join("vendor", "procdump")
 INSTALL_MARKER_NAME = "launcher_install.json"
 
 # Where each port keeps the files the launcher must not delete, and the
@@ -570,6 +584,20 @@ _CLIENT_INSTALL = {
 
 def repository_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def procdump_executable(base_dir=None):
+    """Resolve ProcDump in a staged bundle or the launcher source tree."""
+    if base_dir is not None:
+        return os.path.join(
+            base_dir, PROCDUMP_RUNTIME_DIR, PROCDUMP_FILENAME)
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        return os.path.join(
+            bundle_dir, PROCDUMP_RUNTIME_DIR, PROCDUMP_FILENAME)
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        PROCDUMP_VENDOR_RELATIVE_DIR, PROCDUMP_FILENAME)
 
 
 def server_root(base_dir=None):
@@ -1597,7 +1625,9 @@ def game_window_is_visible(game_root, enumerator=None):
 def wait_for_paired_player_exit(
         process, game_root, window_visible=None,
         close_grace=PAIRED_PLAYER_WINDOW_CLOSE_GRACE_SECONDS,
-        poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None):
+        poll=PAIRED_PLAYER_WINDOW_POLL_SECONDS, sleep=None, clock=None,
+        stop_process=None,
+        shutdown_timeout=GAME_SHUTDOWN_TIMEOUT_SECONDS):
     """Wait for the paired player's native starter process to exit.
 
     The starter owns the complete visible-client job and follows process
@@ -1605,9 +1635,8 @@ def wait_for_paired_player_exit(
     #1513 client destroys and recreates its top-level window while loading a
     map, so window visibility must never terminate a still-live player job.
 
-    ``game_root``, ``window_visible``, ``close_grace`` and ``clock`` remain in
-    the signature for compatibility with older launcher integrations; they no
-    longer participate in the shutdown decision.
+    The unused compatibility arguments remain for older launcher integrations;
+    they no longer participate in the shutdown decision.
     """
     import time as time_module
 

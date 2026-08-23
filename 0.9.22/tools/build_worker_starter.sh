@@ -23,6 +23,9 @@ docker run --rm \
     grep -q "Subsystem.*Windows GUI" /tmp/starter.pe
     grep -q "CreateDesktopW" /tmp/starter.pe
     grep -q "CreateProcessW" /tmp/starter.pe
+    grep -q "CheckRemoteDebuggerPresent" /tmp/starter.pe
+    grep -q "OpenEventW" /tmp/starter.pe
+    grep -q "SetEvent" /tmp/starter.pe
   '
 
 echo "Built $OUTPUT"

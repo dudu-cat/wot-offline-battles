@@ -83,11 +83,21 @@ Cancelling is nonfatal, but other PCs may remain unable to connect. Run this
 trusted-LAN server only on a network you trust.
 
 The launcher keeps its settings in
-%LOCALAPPDATA%\WoTOfflineBattles\launcher.json. "Create error report" copies
-only the exact log slices from the latest launcher game session into a ZIP in
-%LOCALAPPDATA%\WoTOfflineBattles\reports, then selects that ZIP in Windows
-Explorer. Player and hidden-worker logs are kept separate; configuration,
-vehicle profiles, saved results, and other user data are never included.
+%LOCALAPPDATA%\WoTOfflineBattles\launcher.json. For the exact 0.9.22 client,
+crash report collection is enabled by default on the launch page. It monitors
+both the visible client and the hidden simulation client. If either one closes
+unexpectedly, the launcher creates a ZIP and asks whether you want to report
+the crash. Choosing Yes only selects that ZIP in Windows Explorer; the launcher
+never uploads it. Choosing No deletes that newly created ZIP.
+
+"Create error report" and automatic crash reports copy only the exact log
+slices from the latest launcher game session into a ZIP in
+%LOCALAPPDATA%\WoTOfflineBattles\reports. A confirmed crash report can also
+contain a process memory dump from the crashing client. Process dumps may
+expose user names, passwords, file paths, network information, or other data
+that was present in the game process. Review and share the ZIP only with
+someone you trust. Configuration, vehicle profiles, and saved results are not
+copied as separate files.
 
 If the hosted server never opens port 28782, another server may already use
 that port. Close it and start the game again.
@@ -121,6 +131,17 @@ hooks are under Apache License 2.0, and the isolated helper is also available
 under MIT. The complete PyInstaller 6.21.0 licensing terms are available at:
 
 https://github.com/pyinstaller/pyinstaller/blob/v6.21.0/COPYING.txt
+
+This research launcher includes Microsoft Sysinternals ProcDump for crash
+collection. Microsoft's original license terms are retained at
+_internal\tools\Eula.txt. Sysinternals does not grant third-party redistribution
+rights through its standard download terms; remove ProcDump or obtain separate
+permission before redistributing this launcher bundle. The bundled ProcDump
+v12.01 is officially supported on Windows 11 and later; Windows 10 use is not
+validated here.
+
+https://learn.microsoft.com/en-us/sysinternals/downloads/procdump
+https://learn.microsoft.com/en-us/sysinternals/license-faq
 
 World of Tanks and its assets are not included with this server. This project
 is unofficial and is not endorsed by Wargaming.
