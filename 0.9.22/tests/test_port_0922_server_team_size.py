@@ -10,7 +10,8 @@ sys.path.insert(0, str(SERVER_ROOT))
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, PROJECTILE_CAPABILITY,
-    PLAYER_FIRE_INTENT_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+    MODERN_VISIBLE_MESSAGE_TYPES, PLAYER_FIRE_INTENT_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY,
 )
 
@@ -60,6 +61,9 @@ def _attach_worker(state):
 
 
 class ServerTeamSizeTests(unittest.TestCase):
+    def test_visible_clients_may_send_team_size_requests(self):
+        self.assertIn('set_team_size', MODERN_VISIBLE_MESSAGE_TYPES)
+
     def test_default_roster_still_has_fifteen_tanks_per_team(self):
         state = BattleState()
 

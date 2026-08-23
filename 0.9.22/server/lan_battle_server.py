@@ -164,7 +164,8 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
 MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
     "input", "fire_intent", "start_battle", "battle_ready", "leave_battle",
     "battle_receipt_ack", "descriptor_catalog", "descriptor_bundle",
-    "destructible_map", "select_vehicle", "select_team", "ping", "leave",
+    "destructible_map", "select_vehicle", "select_team", "set_team_size",
+    "ping", "leave",
 ))
 # The elected #1513 authority uses the same bounded in-process manager.  The
 # server must never admit more durable launches than a takeover client can

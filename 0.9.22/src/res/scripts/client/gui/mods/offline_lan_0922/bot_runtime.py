@@ -2515,6 +2515,12 @@ class BotRuntime(object):
                 vehicle_name = str(raw['vehicle'])
             except (KeyError, TypeError, ValueError, OverflowError):
                 raise ValueError('player collision manifest identity is invalid')
+            # The hidden simulation worker projects one synthetic vehicle into
+            # its local battle roster so the native client can enter the
+            # arena.  It is not a human participant and must never be donated
+            # as a server-side human collision body.
+            if player_id == lan_client.WORKER_AUTHORITY_ID:
+                continue
             if player_id <= 0 or player_id in seen or not vehicle_name:
                 raise ValueError('player collision manifest identity is invalid')
             seen.add(player_id)

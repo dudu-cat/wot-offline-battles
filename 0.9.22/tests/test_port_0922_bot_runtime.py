@@ -2528,6 +2528,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime.descriptor_resolver = lambda unused: descriptor
         start = dict(self.start, human_ram_timeline=True, players=[
             {'id': 2, 'vehicle': 'ussr:R11_MS-1'},
+            {'id': self.module.lan_client.WORKER_AUTHORITY_ID,
+             'vehicle': 'germany:G54_E-50'},
             {'id': 1, 'vehicle': 'ussr:R11_MS-1'},
         ])
 
