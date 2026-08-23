@@ -714,7 +714,7 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertEqual({}, outside.devices_hp)
         self.assertIsNone(outside_payload)
 
-    def test_every_successful_engine_damage_rolls_fire_before_destruction(self):
+    def test_engine_fire_roll_starts_at_minimum_device_damage(self):
         descriptor = _descriptor()
         descriptor.engine['fireStartingChance'] = 1.0
         vehicle = types.SimpleNamespace(
@@ -723,19 +723,41 @@ class CriticalDamageTests(unittest.TestCase):
 
         with mock.patch.dict(
                 sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
-                mock.patch('random.uniform', return_value=5.0), \
+                mock.patch('random.uniform', return_value=21.0), \
                 mock.patch('random.random', side_effect=(0.0, 0.0)):
             unused_damage, payload = critical_damage.apply_direct(
                 vehicle, (collision,), object(), object(), 0,
-                {'damage': (100.0, 5.0)}, attacker_id=2,
+                {'damage': (100.0, 21.0)}, attacker_id=2,
                 penetrated=False)
 
-        self.assertEqual(95.0, vehicle.devices_hp['engineHealth'])
+        self.assertEqual(79.0, vehicle.devices_hp['engineHealth'])
         self.assertEqual('normal', payload['devices'][0]['state'])
         self.assertTrue(vehicle.is_on_fire)
         self.assertIn(
             {'kind': 'fire', 'state': True, 'cause': 'shot'},
             payload['events'])
+
+    def test_engine_fire_roll_skips_below_minimum_device_damage(self):
+        descriptor = _descriptor()
+        descriptor.engine['fireStartingChance'] = 1.0
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=descriptor)
+        collision = (1.0, 1.0, _Material('engineHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=20.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, payload = critical_damage.apply_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 20.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertEqual(80.0, vehicle.devices_hp['engineHealth'])
+        self.assertEqual('normal', payload['devices'][0]['state'])
+        self.assertFalse(vehicle.is_on_fire)
+        self.assertFalse(any(
+            event['kind'] == 'fire' for event in payload['events']))
 
     def test_fuel_tank_ignites_only_when_module_hp_reaches_zero(self):
         vehicle = types.SimpleNamespace(

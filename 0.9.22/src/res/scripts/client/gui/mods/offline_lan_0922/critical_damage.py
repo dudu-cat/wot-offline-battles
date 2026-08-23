@@ -1020,14 +1020,17 @@ def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell,
 							_bwrb.damagePanel.updateModuleRepair(_module_ui_name(_name), 0, _secs0)
 					except Exception: pass
 			# The fuel tank starts a fire only when this successful hit reduces it to
-			# zero. Engine fire is independent of the yellow/red threshold: every
-			# successful engine HP loss gets one fireStartingChance roll.
+			# zero. Engine fire is independent of the yellow/red state threshold, but
+			# common/vehicle.xml still requires the rolled device damage to reach
+			# miscParams/minFireStartingDamage before fireStartingChance is rolled.
 			_hp_lost = current_hp < previous_hp
 			if (_hp_lost and current_hp <= 0 and
 					'fuel' in _name.lower() and
 					not getattr(target_mock, 'is_on_fire', False)):
 				_offh_ignite(target_mock, is_player_target, _name + ' destroyed')
-			elif (_hp_lost and 'engine' in _name.lower() and
+			elif (_hp_lost and
+					_shell_dmg >= _device_damage.MIN_FIRE_STARTING_DAMAGE and
+					'engine' in _name.lower() and
 					not getattr(target_mock, 'is_on_fire', False)):
 				_fsc = 0.15
 				try:
