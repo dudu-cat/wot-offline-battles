@@ -1179,6 +1179,7 @@ class BattleRuntime(object):
         self._bot_motion_kinds = {}
         self._crush_reports = 0
         self._next_crush_report = {}
+        self._destructible_verdict_reports = 0
         self._soft_static_recast_budget = [BOT_SOFT_RECAST_BUDGET]
         self._local_vertical_speed = 0.0
         self._local_airborne = False
@@ -1413,6 +1414,7 @@ class BattleRuntime(object):
         self._bot_motion_kinds = {}
         self._crush_reports = 0
         self._next_crush_report = {}
+        self._destructible_verdict_reports = 0
         self._soft_static_recast_budget = [BOT_SOFT_RECAST_BUDGET]
         self._local_vertical_speed = 0.0
         self._local_airborne = False
@@ -9535,6 +9537,13 @@ class BattleRuntime(object):
             actual_token = (
                 self._destructible_contact_token(proposal.get('token'))
                 if isinstance(proposal, dict) else None)
+            world_status = world_collision.check_horizontal_collision(
+                self._runtime.bigworld, self._runtime.math,
+                self._avatar.spaceID, self._vector(position), yaw, speed,
+                descriptor, False, dt, True, True, kinetic_speed,
+                commit_enabled=False)
+            if isinstance(world_status, bool):
+                world_status = 'hard' if world_status else 'clear'
             # The visible endpoint streams only the identities intersecting
             # its current hull bins.  The hidden worker can already have an
             # adjacent tile from the same fence/prop cluster registered, so
@@ -9545,8 +9554,10 @@ class BattleRuntime(object):
             accepted = bool(
                 isinstance(proposal, dict) and
                 proposal.get('status') == 'crushed' and
+                world_status in ('clear', 'kinetic') and
                 actual_token is not None and
                 set(token).issubset(set(actual_token)))
+            commit_status = None
             if accepted and bool(proposal.get('requires_commit', False)):
                 committed = self._destructibles._catalog_motion_blocked(
                     self._avatar.spaceID, self._vector(position), yaw,
@@ -9557,11 +9568,17 @@ class BattleRuntime(object):
                     self._destructible_contact_token(
                         committed.get('token'))
                     if isinstance(committed, dict) else None)
+                commit_status = (
+                    committed.get('status')
+                    if isinstance(committed, dict) else 'invalid')
                 accepted = bool(
                     isinstance(committed, dict) and
                     committed.get('status') == 'crushed' and
                     committed_token is not None and
                     set(token).issubset(set(committed_token)))
+            self._report_destructible_verdict(
+                'worker', seq, accepted, token, actual_token,
+                world_status, commit_status)
             if sender(
                     player_id, seq, accepted,
                     [list(row) for row in token]):
@@ -10388,6 +10405,7 @@ class BattleRuntime(object):
     _CRUSH_REPORT_LIMIT = 80
     _CRUSH_REPORT_SECONDS = 0.1
     _CRUSH_DIAGNOSTICS = False
+    _DESTRUCTIBLE_VERDICT_REPORT_LIMIT = 24
     _BOT_CONTACT_PATHS = {
         'clear': 'advance',
         'crushed': 'advance',
@@ -10413,6 +10431,23 @@ class BattleRuntime(object):
             '[Offline LAN 0.9.22] CRUSH who=%s kind=%s status=%s path=%s '
             'v0=%.2f v1=%.2f%s\n' % (
                 who, kinds, status, path, float(before), float(after), extra))
+        return True
+
+    def _report_destructible_verdict(self, stage, sequence, accepted,
+                                     requested=None, actual=None,
+                                     world_status=None,
+                                     commit_status=None):
+        """Keep a bounded audit trail for rare authority corrections."""
+        if (self._destructible_verdict_reports >=
+                self._DESTRUCTIBLE_VERDICT_REPORT_LIMIT):
+            return False
+        self._destructible_verdict_reports += 1
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] DESTRUCTIBLE stage=%s seq=%d '
+            'accepted=%d requested=%r actual=%r world=%s commit=%s\n' % (
+                str(stage), int(sequence), int(bool(accepted)),
+                requested, actual, str(world_status or '-'),
+                str(commit_status or '-')))
         return True
 
     def _report_local_contact_tick(self, path, before, pitch, rise):
@@ -10980,6 +11015,16 @@ class BattleRuntime(object):
                 self._local_motion_kinds = str(
                     proposal.get('kinds', '-'))
                 self._local_motion_status = 'kinetic'
+                world_status = world_collision.check_horizontal_collision(
+                    self._runtime.bigworld, self._runtime.math,
+                    self._avatar.spaceID, self._vector(position), yaw, speed,
+                    entity.typeDescriptor, self._local_airborne, dt, True,
+                    True, kinetic_speed, commit_enabled=False)
+                if isinstance(world_status, bool):
+                    world_status = 'hard' if world_status else 'clear'
+                if world_status not in ('clear', 'kinetic'):
+                    self._local_motion_status = 'hard'
+                    return False
                 previous_seq = self._local_destructible_contact_seq
                 if not self._queue_local_destructible_contact(
                         proposal, position, yaw, speed, dt):
@@ -11953,6 +11998,10 @@ class BattleRuntime(object):
         if (sequence not in self._local_destructible_contacts or
                 sequence not in self._local_destructible_safe_poses):
             return False
+        self._report_destructible_verdict(
+            'visible_rollback', sequence, False,
+            self._destructible_contact_token(
+                self._local_destructible_contacts[sequence].get('token')))
         position, yaw = self._local_destructible_safe_poses[sequence]
         if server_pose is not None:
             position, yaw = server_pose
@@ -12399,6 +12448,9 @@ class BattleRuntime(object):
                     # newly exposed backing wall still uses the hard response.
                     self._local_grind = 1
                     contact_path = 'soft_hold'
+                    self._report_destructible_verdict(
+                        'visible_soft_hold', 0, False,
+                        world_status=self._local_motion_status)
                 else:
                     deflected = False
                     for delta_yaw in (0.55, -0.55, 1.0, -1.0):

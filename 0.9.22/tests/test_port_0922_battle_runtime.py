@@ -11338,7 +11338,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'vehicle_physics.derive_params', return_value={
                     'speedFwd': 20.0, 'speedBwd': 8.0}), mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
-                'world_collision.check_horizontal_collision') as static_probe:
+                'world_collision.check_horizontal_collision',
+                return_value='kinetic') as static_probe:
             self.assertTrue(battle._motion_is_clear(
                 entity, (1.0, 2.0, 3.0), 0.25, 4.0, 0.04,
                 allow_crush_drive=True))
@@ -11356,7 +11357,46 @@ class BattleRuntimeContractTests(unittest.TestCase):
             ((1.0, 2.0, 3.0), 0.25),
             battle._local_destructible_safe_poses[1])
         battle._sender.send_current.assert_called_once_with()
-        static_probe.assert_not_called()
+        self.assertEqual(2, static_probe.call_count)
+        self.assertTrue(all(
+            call.kwargs['commit_enabled'] is False
+            for call in static_probe.call_args_list))
+
+    def test_visible_crush_proposal_keeps_a_backing_wall_hard(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._clock = lambda: 10.0
+        battle._sender = types.SimpleNamespace(
+            send_current=mock.Mock(return_value=True))
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        battle._destructibles = types.SimpleNamespace(
+            _catalog_motion_proposal=mock.Mock(return_value={
+                'status': 'crushed',
+                'token': ((22, 37, None),),
+                'accepted_now': False,
+                'used_kinetic_speed': True,
+                'kinds': 'structure',
+                'requires_commit': True,
+            }))
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.derive_params', return_value={
+                    'speedFwd': 20.0, 'speedBwd': 8.0}), mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='hard') as static_probe:
+            self.assertFalse(battle._motion_is_clear(
+                entity, (1.0, 2.0, 3.0), 0.25, 4.0, 0.04,
+                allow_crush_drive=True))
+
+        self.assertEqual([], list(battle._local_destructible_contacts))
+        self.assertEqual(0, battle._local_destructible_contact_seq)
+        battle._sender.send_current.assert_not_called()
+        self.assertEqual('hard', battle._local_motion_status)
+        self.assertFalse(static_probe.call_args.kwargs['commit_enabled'])
 
     def test_drive_sends_new_destructible_before_advancing_safe_pose(self):
         runtime = _runtime()
@@ -14892,6 +14932,49 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._destructibles._catalog_motion_blocked.assert_called_once()
         battle.client.send_player_destructible_contact_result.\
             assert_called_once_with(2, 3, True, requested)
+
+    def test_worker_rejects_crush_proposal_with_a_backing_wall(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._avatar = runtime.bigworld.avatar
+        battle.client = _Client()
+        battle.client.send_player_destructible_contact_result = mock.Mock(
+            return_value=True)
+        requested = [[22, 37, None]]
+        worker_token = ((22, 37, None),)
+        battle._destructibles = types.SimpleNamespace(
+            _catalog_motion_proposal=mock.Mock(return_value={
+                'status': 'crushed', 'token': worker_token,
+                'requires_commit': True,
+            }),
+            _catalog_motion_blocked=mock.Mock())
+        battle._resolve_player_descriptor = mock.Mock(
+            return_value=_Descriptor())
+        player = {
+            'id': 2, 'vehicle': 'ussr:R11_MS-1',
+            'vehicle_compact_descr': 'dGVzdA==',
+            'destructible_contacts': [{
+                'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+                'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
+                'forward': 1.0, 'token': requested,
+            }],
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.derive_params', return_value={
+                    'speedFwd': 20.0, 'speedBwd': 8.0}), mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='hard'):
+            self.assertEqual(
+                1, battle._resolve_player_destructible_contacts(
+                    [player], 12.5))
+
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+        battle.client.send_player_destructible_contact_result.\
+            assert_called_once_with(2, 3, False, requested)
 
     def test_worker_hard_destructible_block_still_rolls_visible_pose_back(self):
         runtime = _runtime()

@@ -3511,6 +3511,88 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             bins_before, destructibles_sensor.g_offh_destr_contact_bins)
 
+    def test_pending_shared_fence_face_recasts_into_active_neighbour(self):
+        (bigworld, math_module, area, cache, authority,
+         descriptor) = self._direction_catalog_fixture()
+        filename = next(iter(
+            destructibles_sensor._destructible_catalog['resources']))
+        record = destructibles_sensor._destructible_catalog[
+            'resources'][filename]
+        boxes = destructibles_sensor._world_catalog_boxes(
+            record, _ItemMatrix(_Vector(0.0, 0.0, 5.0)), _Vector(),
+            math_module)
+        neighbour = {
+            'filename': filename, 'descriptor_filename': filename,
+            'kind': 'fragile', 'boxes': boxes, 'item_scale': 1.0,
+        }
+        destructibles_sensor.g_offh_destr_instances[(22, 38)] = neighbour
+        destructibles_sensor._index_catalog_instance_1513(
+            destructibles_sensor.g_offh_destr_contact_bins,
+            (22, 38), neighbour)
+        authority.is_destroyed.side_effect = (
+            lambda chunk_id, item_index, mat_kind:
+            chunk_id == 22 and item_index == 37 and mat_kind is None)
+        start = _Vector(0.0, 0.7, 0.0)
+        end = _Vector(0.0, 0.7, 10.0)
+        normal = _Vector(0.0, 0.0, -1.0)
+        shared_hit = (_Vector(0.0, 0.7, 4.5), normal)
+        active_neighbour_hit = (_Vector(0.0, 0.7, 4.5002), normal)
+        bigworld.wg_collideSegment.return_value = active_neighbour_hit
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld, 'Math': math_module,
+                              'AreaDestructibles': area,
+                              'DestructiblesCache': cache}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            result = destructibles_sensor._catalog_soft_static_path(
+                1, start, end, shared_hit, 0.0, descriptor,
+                require_pending_first=True)
+
+        self.assertEqual('pending_hard', result)
+        bigworld.wg_collideSegment.assert_called_once()
+        recast_start = bigworld.wg_collideSegment.call_args[0][1]
+        self.assertAlmostEqual(
+            4.5 + destructibles_sensor._SHOT_RAY_EPSILON,
+            recast_start.z)
+        self.assertIs(end, bigworld.wg_collideSegment.call_args[0][2])
+        authority.destroy_fragile.assert_not_called()
+
+    def test_pending_face_never_skips_an_overlapping_active_piece(self):
+        (unused_bigworld, math_module, unused_area, unused_cache, authority,
+         unused_descriptor) = self._direction_catalog_fixture()
+        filename = next(iter(
+            destructibles_sensor._destructible_catalog['resources']))
+        record = destructibles_sensor._destructible_catalog[
+            'resources'][filename]
+        boxes = destructibles_sensor._world_catalog_boxes(
+            record, _ItemMatrix(_Vector(0.0, 0.0, 4.45)), _Vector(),
+            math_module)
+        neighbour = {
+            'filename': filename, 'descriptor_filename': filename,
+            'kind': 'fragile', 'boxes': boxes, 'item_scale': 1.0,
+        }
+        destructibles_sensor.g_offh_destr_instances[(22, 38)] = neighbour
+        destructibles_sensor._index_catalog_instance_1513(
+            destructibles_sensor.g_offh_destr_contact_bins,
+            (22, 38), neighbour)
+        authority.is_destroyed.side_effect = (
+            lambda chunk_id, item_index, mat_kind:
+            chunk_id == 22 and item_index == 37 and mat_kind is None)
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            candidate = (
+                destructibles_sensor._catalog_candidate_on_ray_1513(
+                    _Vector(0.0, 0.7, 4.0),
+                    _Vector(0.0, 0.7, 0.0),
+                    _Vector(0.0, 0.7, 10.0),
+                    prefer_destroyed=True))
+
+        self.assertIsNone(candidate)
+
     def test_direction_soft_path_defers_when_shared_recast_budget_is_empty(self):
         (bigworld, math_module, area, cache, authority,
          descriptor) = self._direction_catalog_fixture()

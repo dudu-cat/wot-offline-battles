@@ -1367,7 +1367,8 @@ def _synthetic_mat_info(candidate, math_module):
 		filename, item_index, chunk_id)
 
 
-def _catalog_candidate_on_ray_1513(contact_pt, segment_start, segment_end):
+def _catalog_candidate_on_ray_1513(
+		contact_pt, segment_start, segment_end, prefer_destroyed=False):
 	"""Resolve one exact registered OBB on the current native ray.
 
 	Point containment deliberately has a 7.5 cm tolerance for compiled BSP
@@ -1408,11 +1409,37 @@ def _catalog_candidate_on_ray_1513(contact_pt, segment_start, segment_end):
 			candidate = (int(chunk_id), int(item_index), mat_kind,
 				_instance_descriptor_filename_1513(instance),
 				instance['kind'], instance['item_scale'])
-			if candidate not in candidates:
-				candidates.append(candidate)
-			if len(candidates) > 1:
-				return None
-	return candidates[0] if len(candidates) == 1 else None
+			entry = (candidate, entry_distance, exit_distance)
+			if not any(value[0] == candidate for value in candidates):
+				candidates.append(entry)
+	if len(candidates) == 1:
+		return candidates[0][0]
+	if len(candidates) > 1 and prefer_destroyed:
+		# Adjacent fence/module OBBs commonly share the exact native face.
+		# Once the first member has a canonical destroy receipt, that shared
+		# point is no longer ambiguous: skip only an already-destroyed member,
+		# then recast immediately after its nearest exit.  Active neighbours and
+		# backing walls remain visible to the next native ray.
+		authority = _get_destr_authority()
+		destroyed = [value for value in candidates if authority.is_destroyed(
+			value[0][0], value[0][1], value[0][2])]
+		if destroyed:
+			destroyed.sort(key=lambda value: (
+				value[2], value[1], value[0][0], value[0][1],
+				-1 if value[0][2] is None else value[0][2]))
+			destroyed_keys = set(value[0][:3] for value in destroyed)
+			for value in destroyed:
+				# Do not jump past an active OBB that overlaps this member's
+				# interior (for example two side-by-side pieces sharing the
+				# entire ray).  A following segment whose entry merely touches
+				# this exit is safe: the recast starts just beyond the destroyed
+				# face and the native query sees that neighbour immediately.
+				if all(
+						other[0][:3] in destroyed_keys or
+						other[1] >= value[2] - _SHOT_RAY_EPSILON
+						for other in candidates):
+					return value[0]
+	return None
 
 
 def _catalog_soft_static_path(spaceID, segment_start, segment_end,
@@ -1454,7 +1481,8 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 		except (TypeError, IndexError):
 			return 'pending_hard' if pending_contact else False
 		candidate = _catalog_candidate_on_ray_1513(
-			hit_point, current_start, segment_end)
+			hit_point, current_start, segment_end,
+			prefer_destroyed=(require_pending_first and candidate_index == 0))
 		if candidate is None:
 			return 'pending_hard' if pending_contact else False
 		# #1513 ``Vehicle._isDestructibleMayBeBroken`` returns True as soon as the
@@ -1470,6 +1498,13 @@ def _catalog_soft_static_path(spaceID, segment_start, segment_end,
 		if require_pending_first and candidate_index == 0:
 			if broken:
 				pending_contact = True
+			elif allow_kinetic_first and current_crushable:
+				# The visible player asks this read-only path to prove the
+				# complete native ray before submitting an exact catalog
+				# proposal.  A prop already crushable at the current physical
+				# speed is just as valid as one admitted by the directional cap;
+				# both still require an OBB-exit recast for a backing wall.
+				kinetic_contact = True
 			elif (allow_kinetic_first and kinetic_speed is not None and
 					not current_crushable and _stock_crushable_1513(
 						mat_info, kinetic_speed, td, candidate[5])):
