@@ -524,6 +524,86 @@ class SnapshotSyncTests(unittest.TestCase):
             for unused_time, unused_pose, presentation_time,
             confirmed_time, unused_delay, unused_ideal in steady))
 
+    def test_late_200ms_gap_grows_buffer_once_then_decays_slowly(self):
+        clock = [0.0]
+        sync = self.module.SnapshotSync(1, clock=lambda: clock[0])
+
+        def bot(sample_time_us):
+            state = player(7, sample_time_us / 100000.0)
+            state.update(team=2, yaw=0.0, aim_yaw=0.0,
+                         gun_pitch=0.0)
+            return state
+
+        # Warm up on regular 50 ms authority samples, then reproduce the
+        # report's later 200 ms worker stalls three times. Regular cadence
+        # resumes afterwards so the high-water mark can recover.
+        source_times = list(range(0, 1000001, 50000))
+        source_times.extend((1200000, 1400000, 1600000))
+        while source_times[-1] < 5000000:
+            source_times.append(source_times[-1] + 50000)
+        server_times = list(range(0, 5200001, 33333))
+        render_times = list(range(0, 5000001, 10000))
+        source_set = set(source_times)
+        server_set = set(server_times)
+        render_set = set(render_times)
+        revision = 0
+        sample_time_us = 0
+        previous_target_us = None
+        received = {}
+        frames = []
+        for time_us in sorted(source_set | server_set | render_set):
+            if time_us in source_set:
+                revision += 1
+                sample_time_us = time_us
+            clock[0] = time_us / 1000000.0
+            if time_us in server_set:
+                sync.snapshot({
+                    'round_id': 1, 'server_tick': time_us,
+                    'bot_state_revision': revision,
+                    'motion_time_us': time_us,
+                    'bot_state_time_us': sample_time_us,
+                    'bots': [bot(sample_time_us)],
+                })
+                record = sync._entities['bot:7']
+                target_us = record['target_sample_time_us']
+                if target_us != previous_target_us:
+                    received[target_us] = (
+                        record['presentation_delay_us'],
+                        record['interpolation_delay_us'])
+                    previous_target_us = target_us
+            if time_us in render_set:
+                sync.advance(clock[0])
+                record = sync._entities['bot:7']
+                frames.append((time_us, record['presentation_time_us']))
+
+        baseline_delay = received[1000000][0]
+        for gap_target_us in (1200000, 1400000, 1600000):
+            presentation_delay, ideal_delay = received[gap_target_us]
+            # Growth happens in the snapshot that reveals the producer gap;
+            # it does not wait for many render frames to converge.
+            self.assertAlmostEqual(ideal_delay, presentation_delay, places=6)
+            self.assertGreater(ideal_delay, baseline_delay + 100000.0)
+
+        # Once the first stall has established the new cushion, the next
+        # equally long interval does not consume all confirmed history.
+        second_gap_frames = [presentation_time
+                             for time_us, presentation_time in frames
+                             if 1250000 <= time_us <= 1430000]
+        self.assertTrue(all(
+            second_gap_frames[index] > second_gap_frames[index - 1]
+            for index in range(1, len(second_gap_frames))))
+
+        # Returning to regular traffic must not snap the latency back down.
+        # The first normal sample leaves the output cushion above its newly
+        # decaying ideal; later samples reduce both gradually.
+        first_regular_delay, first_regular_ideal = received[1650000]
+        late_delay, late_ideal = received[5000000]
+        self.assertGreater(first_regular_delay, first_regular_ideal)
+        self.assertLess(late_delay, first_regular_delay)
+        self.assertLess(late_ideal, first_regular_ideal)
+        self.assertGreater(late_delay,
+                           self.module.MIN_TIMED_DELAY_US + 100000.0)
+
     def test_first_live_intervals_establish_jitter_high_water_immediately(self):
         clock = [0.0]
         sync = self.module.SnapshotSync(1, clock=lambda: clock[0])
@@ -916,10 +996,10 @@ class SnapshotSyncTests(unittest.TestCase):
                         record['presentation_delay_us'] -
                         record['interpolation_delay_us']))
 
-        initial_error_us = abs(delay_errors[0][1])
-        final_error_us = abs(delay_errors[-1][1])
-        self.assertLess(initial_error_us, 10000.0)
-        self.assertLess(final_error_us, initial_error_us * 0.1)
+        # Presentation follows the decaying ideal within one millisecond. The
+        # remaining sub-millisecond sawtooth is only the 10 ms render cadence
+        # versus the 68 ms source cadence, not a retained latency jump.
+        self.assertLess(max(abs(item[1]) for item in delay_errors), 1000.0)
         self.assertTrue(all(
             positions[index] + 1.0e-9 >= positions[index - 1]
             for index in range(1, len(positions))))

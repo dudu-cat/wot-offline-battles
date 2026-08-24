@@ -488,6 +488,7 @@ class OfflineCompatibility(object):
         self._original_vehicle_get_speed = None
         self._original_vehicle_marker_start = None
         self._original_vehicle_marker_stop = None
+        self._original_vehicle_enter_world = None
         self._original_vehicle_leave_world = None
         self._original_vehicle_start_wg_physics = None
         self._vehicle_start_wg_physics_code = None
@@ -531,6 +532,7 @@ class OfflineCompatibility(object):
         self._vehicle_get_speed_wrapper = None
         self._vehicle_marker_start_wrapper = None
         self._vehicle_marker_stop_wrapper = None
+        self._vehicle_enter_world_wrapper = None
         self._vehicle_leave_world_wrapper = None
         self._vehicle_start_wg_physics_wrapper = None
         self._vehicle_set_gun_angles_wrapper = None
@@ -758,6 +760,10 @@ class OfflineCompatibility(object):
                 '__setattr__', vehicle_type.__setattr__)
             self._original_vehicle_get_speed = vehicle_type.__dict__.get(
                 'getSpeed', getattr(vehicle_type, 'getSpeed', None))
+            self._original_vehicle_enter_world = (
+                vehicle_type.__dict__.get(
+                    'onEnterWorld',
+                    getattr(vehicle_type, 'onEnterWorld', None)))
             self._original_vehicle_leave_world = (
                 vehicle_type.__dict__.get(
                     'onLeaveWorld',
@@ -1202,6 +1208,44 @@ class OfflineCompatibility(object):
                         return vehicle
             return compatibility._original_avatar_getattribute(avatar, name)
 
+        def prime_initial_remote_enemy(avatar, vehicle):
+            """Mark one enemy hidden before stock starts its visual."""
+            if not compatibility._battle_active:
+                return False
+            public_info = getattr(vehicle, 'publicInfo', None)
+            try:
+                vehicle_team = int(public_info['team'])
+                avatar_team = int(
+                    compatibility._original_avatar_getattribute(
+                        avatar, 'team'))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return False
+            if vehicle_team == avatar_team:
+                return False
+            vehicle._spot_visible = False
+            vehicle._offlineNativeDrawVisible = False
+            vehicle._offlineNativeMarkerVisible = False
+            vehicle.targetCaps = []
+            return True
+
+        def hide_initial_remote_enemy(avatar, vehicle):
+            """Close the first native draw/marker window for one enemy."""
+            if not prime_initial_remote_enemy(avatar, vehicle):
+                return False
+            show = getattr(vehicle, 'show', None)
+            try:
+                provider = compatibility._original_avatar_getattribute(
+                    avatar, 'guiSessionProvider')
+            except AttributeError:
+                provider = None
+            stop_visual = getattr(provider, 'stopVehicleVisual', None)
+            if not callable(show) or not callable(stop_visual):
+                raise RuntimeError(
+                    '#1513 initial enemy visibility gate is unavailable')
+            show(False)
+            stop_visual(int(vehicle.id), False)
+            return True
+
         def avatar_vehicle_enter(avatar, vehicle):
             server = None
             if compatibility._battle_active:
@@ -1225,11 +1269,13 @@ class OfflineCompatibility(object):
             try:
                 previous_entering = compatibility._avatar_entering_vehicle
                 compatibility._avatar_entering_vehicle = vehicle
+                prime_initial_remote_enemy(avatar, vehicle)
                 if compatibility._original_avatar_vehicle_enter is not None:
                     result = compatibility._original_avatar_vehicle_enter(
                         avatar, vehicle)
                 else:
                     result = None
+                hide_initial_remote_enemy(avatar, vehicle)
             except Exception as error:
                 fail = getattr(server, 'failVehicleEnter', None)
                 if callable(fail):
@@ -1240,6 +1286,34 @@ class OfflineCompatibility(object):
             complete = getattr(server, 'completeVehicleEnter', None)
             if callable(complete):
                 complete(vehicle.id)
+            return result
+
+        def vehicle_enter_world(vehicle, prereqs):
+            """Let stock initialise every controller, then close enemy draw.
+
+            PlayerAvatar.vehicle_onEnterWorld runs from inside the stock
+            Vehicle lifecycle.  #1513 may still finish or refresh the model
+            after that callback returns, so hiding only at the Avatar boundary
+            leaves a one-frame spawn flash.  Prime the gate before the stock
+            lifecycle and enforce it once more after the complete lifecycle;
+            no stock startVisual/controller work is skipped.
+            """
+            original = compatibility._original_vehicle_enter_world
+            if not compatibility._battle_active:
+                return original(vehicle, prereqs)
+            try:
+                avatar = runtime.bigworld.player()
+            except ReferenceError:
+                avatar = None
+            if avatar is not None:
+                prime_initial_remote_enemy(avatar, vehicle)
+            result = original(vehicle, prereqs)
+            try:
+                avatar = runtime.bigworld.player()
+            except ReferenceError:
+                avatar = None
+            if avatar is not None:
+                hide_initial_remote_enemy(avatar, vehicle)
             return result
 
         def avatar_prereqs_loaded(avatar, resource_names, resource_refs):
@@ -1876,6 +1950,7 @@ class OfflineCompatibility(object):
         self._vehicle_getattribute_wrapper = vehicle_getattribute
         self._vehicle_setattr_wrapper = vehicle_setattr
         self._vehicle_get_speed_wrapper = vehicle_get_speed
+        self._vehicle_enter_world_wrapper = vehicle_enter_world
         self._vehicle_leave_world_wrapper = vehicle_leave_world
         self._vehicle_start_wg_physics_wrapper = vehicle_start_wg_physics
         self._vehicle_set_gun_angles_wrapper = vehicle_set_gun_angles
@@ -1929,6 +2004,8 @@ class OfflineCompatibility(object):
                 vehicle_type.__setattr__ = vehicle_setattr
                 if self._original_vehicle_get_speed is not None:
                     vehicle_type.getSpeed = vehicle_get_speed
+                if self._original_vehicle_enter_world is not None:
+                    vehicle_type.onEnterWorld = vehicle_enter_world
                 if self._original_vehicle_leave_world is not None:
                     vehicle_type.onLeaveWorld = vehicle_leave_world
                 if self._original_vehicle_start_wg_physics is not None:
@@ -2107,6 +2184,11 @@ class OfflineCompatibility(object):
                 self._steady_relink_sources_wrapper):
             steady_matrix_type.relinkSources = (
                 self._original_steady_relink_sources)
+        if (vehicle_type is not None and
+                self._original_vehicle_enter_world is not None and
+                vehicle_type.__dict__.get('onEnterWorld') is
+                self._vehicle_enter_world_wrapper):
+            vehicle_type.onEnterWorld = self._original_vehicle_enter_world
         if (vehicle_type is not None and
                 self._original_vehicle_start_wg_physics is not None and
                 vehicle_type.__dict__.get('_Vehicle__startWGPhysics') is

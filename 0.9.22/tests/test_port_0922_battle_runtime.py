@@ -1732,10 +1732,13 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
     def test_native_vehicle_owns_stock_appearance_and_lan_pose_overlay(self):
         runtime = _runtime()
         holder = {}
+        motion_lod_link = object()
         data_links = types.SimpleNamespace(
             createFloatLink=mock.Mock(
                 side_effect=AssertionError(
-                    'plain Python owners must not use DataLinks')))
+                    'plain Python owners must not use DataLinks')),
+            linkMatrixTranslation=mock.Mock(
+                return_value=motion_lod_link))
         binding = BigWorldVehicleBinding(
             runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
             _VehicleDescr, runtime.encode_gun_angles,
@@ -1758,6 +1761,8 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(runtime.constants.ARENA_UPDATE.VEHICLE_ADDED,
                          runtime.bigworld.avatar.arena_updates[-1][0])
         pending = runtime.bigworld.pending_entities[vehicle_id]
+        pending._offlineNativeMarkerVisible = False
+        pending._offlineNativeDrawVisible = False
         pending.filter.movementInfo = object()
         pending.filter.setTracksSpeed = mock.Mock()
         pending.appearance.filter = pending.filter
@@ -1767,14 +1772,20 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
             vehicleSpeedLink=None, rotationSpeedLink=None)
         pending.appearance.detailedEngineState = detailed_engine
         pending.appearance.engineAudition = object()
-        pending.appearance.wheelsAnimator = object()
+        wheels_animator = types.SimpleNamespace(
+            setMovementInfo=mock.Mock())
+        pending.appearance.wheelsAnimator = wheels_animator
         pending.appearance.suspension = object()
+        motion_lod = types.SimpleNamespace(setupPosition=mock.Mock())
+        pending.appearance.lodCalculator = motion_lod
         swinging = types.SimpleNamespace(worldMatrix=object())
         pending.appearance.swingingAnimator = swinging
         runtime.bigworld.enter_pending_vehicle(vehicle_id)
         self.assertTrue(factory.is_ready(vehicle_id))
         vehicle = factory.get(vehicle_id)
         self.assertTrue(vehicle._offlineNativeRemote)
+        self.assertFalse(vehicle._offlineNativeMarkerVisible)
+        self.assertFalse(vehicle._offlineNativeDrawVisible)
         self.assertIs(vehicle.model.matrix, vehicle.matrix)
         self.assertEqual(1, len(vehicle.aim_targets))
         self.assertIsNotNone(vehicle.track_scroll)
@@ -1784,9 +1795,16 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(0.0, detailed_engine.vehicleSpeedLink())
         self.assertEqual(0.0, detailed_engine.rotationSpeedLink())
         data_links.createFloatLink.assert_not_called()
+        data_links.linkMatrixTranslation.assert_called_once_with(
+            vehicle.model.matrix)
+        motion_lod.setupPosition.assert_called_once_with(motion_lod_link)
+        # Stock createWheelsAnimator already bound filter.movementInfo. The
+        # LAN pose-provider swap changes only the shared LOD position link.
+        wheels_animator.setMovementInfo.assert_not_called()
         self.assertEqual(
             {'engine_audio_motion': True, 'body_swinging': True,
-             'stock_wheels': True, 'stock_suspension': True},
+             'stock_motion_lod': True, 'stock_wheels': True,
+             'stock_suspension': True},
             dict(vehicle._offlinePresentationCapabilities))
 
         binding.set_vehicle_pose(
@@ -1808,6 +1826,14 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
             overlay['turn_speed'], detailed_engine.rotationSpeedLink())
         self.assertAlmostEqual(1.0, vehicle._aim_yaw)
         self.assertAlmostEqual(-0.1, vehicle._gun_pitch)
+        self.assertTrue(vehicle.settle_motion(now=12.0))
+        overlay = runtime.compatibility.pose_overlays[id(vehicle)]
+        self.assertEqual((0.0, 0.0, 0.0), tuple(overlay['velocity']))
+        self.assertEqual((0.0, 0.0, 0.0), tuple(overlay['acceleration']))
+        self.assertEqual(0.0, overlay['speed'])
+        self.assertEqual(0.0, overlay['turn_speed'])
+        self.assertEqual(0.0, detailed_engine.vehicleSpeedLink())
+        self.assertEqual(0.0, detailed_engine.rotationSpeedLink())
         self.assertTrue(vehicle.update_tracks(
             2.0, 3.0, (ENGINE_MODE_RUNNING, 1)))
         self.assertTrue(vehicle.update_tracks(
@@ -1826,14 +1852,29 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual([(2.0, 3.0), (2.0, 3.0)],
                          vehicle.track_scrolls)
 
+        # A controller object alone is not proof that its native filter is
+        # bound.  Do not cache a failed feed: the identical feed must reach
+        # setTracksSpeed once the stock appearance/filter link is restored.
+        pending.appearance.filter = object()
+        self.assertFalse(vehicle.update_tracks(
+            4.0, 5.0, (ENGINE_MODE_RUNNING, 1)))
+        self.assertEqual(2, vehicle.filter.setTracksSpeed.call_count)
+        pending.appearance.filter = pending.filter
+        self.assertTrue(vehicle.update_tracks(
+            4.0, 5.0, (ENGINE_MODE_RUNNING, 1)))
+        self.assertEqual(3, vehicle.filter.setTracksSpeed.call_count)
+        self.assertEqual(mock.call(4.0, True, 5.0, True),
+                         vehicle.filter.setTracksSpeed.call_args)
+
         # Never call the fatal native WGVehicleFilter method after the engine
         # table stops owning this exact PyEntity, including fallback methods
         # on the now-invalid appearance.
         runtime.bigworld.entities.pop(vehicle_id)
         self.assertFalse(vehicle.update_tracks(
             4.0, 5.0, (ENGINE_MODE_RUNNING, 1)))
-        self.assertEqual(2, vehicle.filter.setTracksSpeed.call_count)
-        self.assertEqual([(2.0, 3.0), (2.0, 3.0)],
+        self.assertEqual(3, vehicle.filter.setTracksSpeed.call_count)
+        self.assertEqual([(2.0, 3.0), (2.0, 3.0),
+                          (4.0, 5.0), (4.0, 5.0)],
                          vehicle.track_scrolls)
         self.assertFalse(
             vehicle._offlinePresentationCapabilities[
@@ -1855,6 +1896,11 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertFalse(state._rekey(0.1))
         self.assertIs(state.matrix, vehicle.model.matrix)
         self.assertIs(state.matrix, swinging.worldMatrix)
+        self.assertEqual(2, data_links.linkMatrixTranslation.call_count)
+        data_links.linkMatrixTranslation.assert_called_with(state.matrix)
+        self.assertEqual(2, motion_lod.setupPosition.call_count)
+        motion_lod.setupPosition.assert_called_with(motion_lod_link)
+        wheels_animator.setMovementInfo.assert_not_called()
 
         self.assertTrue(factory.destroy(vehicle_id))
         self.assertIsNone(runtime.bigworld.entity(vehicle_id))
@@ -1884,14 +1930,21 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
 
         self.assertEqual(
             {'engine_audio_motion': False, 'body_swinging': False,
-             'stock_wheels': False, 'stock_suspension': False},
+             'stock_motion_lod': False, 'stock_wheels': False,
+             'stock_suspension': False},
             dict(vehicle._offlinePresentationCapabilities))
-        self.assertTrue(vehicle.update_tracks(
+        # Without the engine-owned filter write the feed stays uncached and
+        # returns False, so the same values may retry; PyTrackScroll still
+        # receives every fallback feed.
+        self.assertFalse(vehicle.update_tracks(
             1.0, 1.5, (ENGINE_MODE_RUNNING, 1)))
         self.assertEqual([(1.0, 1.5)], vehicle.track_scrolls)
         self.assertFalse(
             vehicle._offlinePresentationCapabilities[
                 'engine_owned_track_motion'])
+        self.assertFalse(vehicle.update_tracks(
+            1.0, 1.5, (ENGINE_MODE_RUNNING, 1)))
+        self.assertEqual([(1.0, 1.5), (1.0, 1.5)], vehicle.track_scrolls)
         self.assertTrue(factory.destroy(vehicle_id))
 
     def test_guest_native_vehicle_uses_one_stable_pose_matrix(self):
@@ -8433,6 +8486,41 @@ class BattleRuntimeContractTests(unittest.TestCase):
             10.0, hud_only=True)
         battle._schedule.assert_called_once_with(0.0, battle._frame)
 
+    def test_worker_countdown_waits_for_server_battle_phase(self):
+        battle = BattleRuntime(_runtime())
+        battle._worker_mode = True
+        battle._prebattle_deadline = 10.0
+        battle.client = types.SimpleNamespace(combat_phase='prebattle')
+
+        self.assertFalse(battle._prebattle_transition_ready(10.1))
+        battle.client.combat_phase = 'battle'
+        self.assertTrue(battle._prebattle_transition_ready(10.1))
+
+        battle._worker_mode = False
+        battle.client.combat_phase = 'prebattle'
+        self.assertTrue(battle._prebattle_transition_ready(10.1))
+
+    def test_zero_countdown_worker_still_waits_for_server_battle_phase(self):
+        battle = BattleRuntime(_runtime())
+        battle.state = 'running'
+        battle._worker_mode = True
+        battle._battle_live = False
+        battle._config = {}
+        battle.client = types.SimpleNamespace(
+            combat_phase='prebattle', combat_deadline=None,
+            combat_duration=None)
+        battle._binding = mock.Mock()
+        battle._reset_prebattle_native_visuals = mock.Mock()
+        battle._show_prebattle_crosshair = mock.Mock()
+
+        self.assertTrue(battle.on_battle_live({
+            'countdown_seconds': 0.0,
+            'battle_duration_seconds': 900.0,
+        }))
+
+        self.assertFalse(battle._battle_live)
+        self.assertIsNotNone(battle._prebattle_deadline)
+
     def test_a_battle_hud_panel_failure_does_not_end_the_round(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -12482,6 +12570,38 @@ class BattleRuntimeContractTests(unittest.TestCase):
             1000, False)
         self.assertTrue(enemy.model.visible)
 
+    def test_full_state_update_does_not_hide_a_known_enemy_wreck(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        enemy = _Vehicle(
+            1000, _Descriptor(), _Vector(100.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0), {'health': 0})
+        enemy.model.visible = True
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: enemy if entity_id == 1000 else None)
+        record = {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'presentation_initialized': True, 'native_remote': True,
+            'arena_added': True, 'visual_started': False,
+            'spot_visible': False, 'spot_marker_visible': False,
+            'wreck_known': True,
+            '_spot_presentation_signature': (False, False, True, False),
+            'state': {'team': 2, 'health': 0, 'alive': False}}
+
+        with mock.patch.object(battle, '_apply_siege_state'), \
+                mock.patch.object(battle, '_apply_vehicle_statistics'), \
+                mock.patch.object(battle, '_drain_event_journal'), \
+                mock.patch.object(
+                    battle, '_pending_combat_for_record', return_value=False), \
+                mock.patch.object(battle, '_apply_health'):
+            self.assertTrue(battle._materialize_record(record))
+
+        self.assertTrue(enemy.model.visible)
+        self.assertEqual([], enemy.shows)
+
     def test_spotting_leaves_the_outline_alone(self):
         """PyModel.visible writes one flag at model+0xC4 and never touches the
         scene key, so a spotting update must not disturb the edge.  It runs
@@ -12525,7 +12645,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._set_record_spot_visibility(record, True)
         battle._set_record_spot_visibility(record, True)
 
-        self.assertEqual(['visibility', 'visibility'], order)
+        self.assertEqual(['visibility'], order)
         self.assertEqual(1000, battle._outlined_engine_id)
 
         battle._set_record_spot_visibility(record, False)
@@ -13353,6 +13473,39 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertIsNone(battle._local_fire_intent)
 
+    def test_worker_fire_intent_ignores_transport_receipt_time(self):
+        battle = BattleRuntime(_runtime())
+        battle._worker_mode = True
+        battle.state = 'running'
+        battle.client = _Client()
+        battle.client.authority_epoch = 4
+        battle._start_message = {'round_id': 7}
+        intent = {
+            'type': 'fire_intent', 'round_id': 7,
+            'authority_epoch': 4, 'player_id': 2, 'intent_seq': 3,
+            'shot_seq': 5, 'input_seq': 8, 'pose_time_us': 1000,
+            'shell_index': 0, 'aim_yaw': 0.2, 'gun_pitch': -0.1,
+            'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0, 'speed': 4.0,
+            'deadline_server_time_ms': 9000,
+            '_client_received_time': 10.0,
+            '_client_dispatch_delay': 0.01,
+        }
+
+        self.assertTrue(battle.on_fire_intent(intent))
+        retry = dict(
+            intent, _client_received_time=10.5,
+            _client_dispatch_delay=0.02)
+        self.assertTrue(battle.on_fire_intent(retry))
+
+        stored = battle._player_fire_intents[(2, 3)]
+        self.assertNotIn('_client_received_time', stored)
+        self.assertNotIn('_client_dispatch_delay', stored)
+        self.assertEqual(1, len(battle._player_fire_intents))
+        with self.assertRaisesRegex(
+                RuntimeError, 'worker fire intent is malformed'):
+            battle.on_fire_intent(dict(intent, unexpected='wire field'))
+
     def test_fire_intent_result_releases_worker_launch_pending(self):
         battle = BattleRuntime(_runtime())
         battle._worker_mode = True
@@ -13468,6 +13621,186 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((4.0, 0.0, 8.0), tuple(pose_call[0][1]))
         self.assertEqual((0.0, 0.0, 3.0), pose_call[0][2])
         self.assertEqual(runtime.bigworld.now, pose_call[1]['now'])
+
+    def test_render_pose_fast_path_skips_materialization_and_bounds_tracks(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        now = [10.0]
+        battle._clock = lambda: now[0]
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_Descriptor(), track_scroll=object(),
+            update_tracks=mock.Mock(return_value=True), bw_entity_id=11,
+            settle_motion=mock.Mock(return_value=True),
+            track_scroll_readback=mock.Mock(
+                return_value=(1.0, 1.0, True, True)))
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: vehicle if entity_id == 11 else None,
+            track_animation_error=None)
+        battle._report_bot_tracks = mock.Mock(return_value=True)
+        state = {'id': 17, 'health': 500, 'alive': True, 'speed': 8.0}
+        record = {
+            'engine_id': 11, 'state': state, 'kind': 'bot',
+            'network_id': 17, 'local': False, 'ready': True,
+            'native_remote': True,
+            'track_params': {'trackCenter': 1.0, 'speedFwd': 50.0}}
+        battle._records = {'bot:17': record}
+        battle._materialize_record = mock.Mock()
+
+        fps = 120
+        for frame in range(fps):
+            now[0] = 10.0 + frame / float(fps)
+            battle._update_entity({
+                'type': 'update', 'entity': 'bot:17', 'kind': 'bot',
+                'id': 17, 'remote': True, 'interpolated': True,
+                'presentation_time_us': frame * 1000000 // fps,
+                'pose': {
+                    'x': 0.0, 'y': 0.0,
+                    'z': (frame + 1) / float(fps),
+                    'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+                    'aim_yaw': 0.0, 'gun_pitch': 0.0}})
+
+        # Hull and aim remain render-rate smooth; only the native 20 Hz belt
+        # controller is rate limited, and no pose-only sample walks the full
+        # state/materialization path.
+        self.assertEqual(fps, battle._binding.set_vehicle_pose.call_count)
+        self.assertEqual(fps, battle._binding.update_vehicle_aim.call_count)
+        self.assertEqual(20, vehicle.update_tracks.call_count)
+        battle._materialize_record.assert_not_called()
+        self.assertIs(state, record['state'])
+
+        # Replaying an identical render pose still advances the receipt time
+        # and may finish one due 20 Hz belt feed, but performs no full native
+        # pose or aim write.  A confirmed-history underrun can repeat a pose
+        # while authority still says the bot is moving; that is a playback
+        # hold, not a reason to zero native body motion.
+        now[0] = 11.0
+        previous_track_calls = vehicle.update_tracks.call_count
+        battle._update_entity({
+            'type': 'update', 'entity': 'bot:17', 'kind': 'bot',
+            'id': 17, 'remote': True, 'interpolated': True,
+            'presentation_time_us': 1000000,
+            'pose': {
+                'x': 0.0, 'y': 0.0, 'z': 1.0,
+                'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+                'aim_yaw': 0.0, 'gun_pitch': 0.0}})
+        self.assertEqual(fps, battle._binding.set_vehicle_pose.call_count)
+        self.assertEqual(fps, battle._binding.update_vehicle_aim.call_count)
+        self.assertEqual(previous_track_calls + 1,
+                         vehicle.update_tracks.call_count)
+        vehicle.settle_motion.assert_not_called()
+        previous_track_calls = vehicle.update_tracks.call_count
+        self.assertEqual(1000000, record['presentation_time_us'])
+
+        # A speed edge at an unchanged pose must still stop the native belts.
+        # Pose-only duplicates remain free above, while a new snapshot state
+        # is part of the track presentation identity.
+        now[0] = 11.01
+        record['state'] = dict(state, speed=0.0)
+        battle._apply_record_pose(record, {
+            'x': 0.0, 'y': 0.0, 'z': 1.0,
+            'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0})
+        vehicle.settle_motion.assert_called_once_with(11.01)
+        self.assertEqual(fps,
+                         battle._binding.set_vehicle_pose.call_count)
+        self.assertEqual(previous_track_calls,
+                         vehicle.update_tracks.call_count)
+        now[0] = 11.05
+        battle._apply_record_pose(record, {
+            'x': 0.0, 'y': 0.0, 'z': 1.0,
+            'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0})
+        self.assertEqual(fps,
+                         battle._binding.set_vehicle_pose.call_count)
+        self.assertEqual(previous_track_calls + 1,
+                         vehicle.update_tracks.call_count)
+        vehicle.settle_motion.assert_called_once_with(11.01)
+        self.assertEqual((0.0, 0.0),
+                         vehicle.update_tracks.call_args[0][:2])
+
+    def test_remote_tracks_retry_a_failed_native_feed_without_scroll(self):
+        battle = BattleRuntime(_runtime())
+        battle._binding = mock.Mock()
+        now = [10.0]
+        battle._clock = lambda: now[0]
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_Descriptor(), track_scroll=None,
+            update_tracks=mock.Mock(side_effect=(False, True)),
+            bw_entity_id=11)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: vehicle if entity_id == 11 else None,
+            track_animation_error=None)
+        battle._report_bot_tracks = mock.Mock(return_value=True)
+        record = {
+            'engine_id': 11, 'kind': 'bot', 'network_id': 17,
+            'local': False,
+            'state': {'id': 17, 'health': 500, 'alive': True,
+                      'speed': 8.0},
+            'track_params': {'trackCenter': 1.0, 'speedFwd': 50.0}}
+        pose = {
+            'x': 0.0, 'y': 0.0, 'z': 1.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0}
+
+        battle._apply_record_pose(record, pose)
+
+        self.assertTrue(record['_remote_track_pending'])
+        self.assertNotIn('_remote_track_state_signature', record)
+        self.assertEqual(1, vehicle.update_tracks.call_count)
+
+        now[0] = 10.05
+        battle._apply_record_pose(record, pose)
+
+        self.assertFalse(record['_remote_track_pending'])
+        self.assertIn('_remote_track_state_signature', record)
+        self.assertEqual(2, vehicle.update_tracks.call_count)
+
+    def test_remote_tracks_stop_after_the_last_turning_pose(self):
+        battle = BattleRuntime(_runtime())
+        battle._binding = mock.Mock()
+        now = [10.0]
+        battle._clock = lambda: now[0]
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_Descriptor(), track_scroll=object(),
+            update_tracks=mock.Mock(return_value=True), bw_entity_id=11)
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: vehicle if entity_id == 11 else None,
+            track_animation_error=None)
+        battle._report_bot_tracks = mock.Mock(return_value=True)
+        record = {
+            'engine_id': 11, 'kind': 'bot', 'network_id': 17,
+            'local': False,
+            'state': {'id': 17, 'health': 500, 'alive': True,
+                      'speed': 0.0},
+            'track_params': {'trackCenter': 1.0, 'speedFwd': 50.0}}
+        still = {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0}
+
+        battle._apply_record_pose(record, still)
+        now[0] = 10.05
+        turning = dict(still, yaw=0.05, aim_yaw=0.05)
+        battle._apply_record_pose(record, turning)
+        self.assertEqual(2, vehicle.update_tracks.call_count)
+        self.assertEqual(
+            (ENGINE_MODE_RUNNING, _MOVEMENT_ROTATE_RIGHT),
+            vehicle.update_tracks.call_args.args[2])
+
+        # The first still frame is inside the native 20 Hz window. It must
+        # stay pending and retry at the deadline, or rotate mode sticks.
+        now[0] = 10.058
+        battle._apply_record_pose(record, turning)
+        self.assertEqual(2, vehicle.update_tracks.call_count)
+        now[0] = 10.1
+        battle._apply_record_pose(record, turning)
+        self.assertEqual(3, vehicle.update_tracks.call_count)
+        self.assertEqual((0.0, 0.0),
+                         vehicle.update_tracks.call_args.args[:2])
+        self.assertEqual((ENGINE_MODE_IDLE, 0),
+                         vehicle.update_tracks.call_args.args[2])
 
     def test_remote_update_is_coalesced_until_vehicle_materializes(self):
         runtime = _runtime()
@@ -15241,8 +15574,15 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         server.leaveArena({})
 
-        self.assertEqual('running', battle.state)
+        self.assertEqual('leaving', battle.state)
         self.assertIs(server, battle._server)
+        self.assertIsNone(battle._remote_factory)
+        self.assertIsNone(battle._callback_id)
+        self.assertIsNone(battle._ammo_callback_id)
+        previous_snapshot = battle._last_snapshot
+        battle.on_snapshot({'round_id': 1, 'server_tick': 999})
+        self.assertIs(previous_snapshot, battle._last_snapshot)
+        self.assertFalse(battle.on_events({'events': []}))
         runtime.bigworld.callbacks.pop()()
         self.assertEqual('stopped', battle.state)
         self.assertIsNone(battle._server)
@@ -15271,8 +15611,34 @@ class BattleRuntimeContractTests(unittest.TestCase):
         local_leave.assert_not_called()
         runtime.bigworld.callbacks.pop()()
         local_leave.assert_called_once_with()
-        self.assertEqual('running', battle.state)
+        self.assertEqual('leaving', battle.state)
         self.assertIs(server, battle._server)
+
+    def test_avatar_leave_still_defers_after_presentation_cleanup_failure(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        start = {
+            'round_id': 1, 'map': '01_karelia', 'bot_authority_id': 1,
+            'players': [{
+                'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
+                'vehicle': 'ussr:R11_MS-1', 'health': 500}],
+            'bots': []}
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Player'}, start, client))
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.callbacks.pop(0)()
+        server = battle._server
+        battle._quiesce_native_presentations = mock.Mock(
+            side_effect=RuntimeError('presentation cleanup failed'))
+
+        with mock.patch('sys.stdout'):
+            self.assertTrue(server.leaveArena({}))
+
+        self.assertEqual('leaving', battle.state)
+        self.assertIs(server, battle._server)
+        self.assertTrue(runtime.bigworld.callbacks)
 
     def test_same_runtime_can_cleanly_create_a_second_round(self):
         runtime = _runtime()

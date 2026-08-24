@@ -24,7 +24,12 @@
 #define HIDDEN_DESKTOP_ENV L"OFFLINE_LAN_0922_HIDDEN_DESKTOP"
 #define HIDDEN_DESKTOP_VALUE L"1"
 #define WORKER_READY_MARKER_ENV L"OFFLINE_LAN_0922_WORKER_READY_MARKER"
+#define WORKER_INTERNAL_READY_MARKER_ENV \
+	L"OFFLINE_LAN_0922_WORKER_INTERNAL_READY_MARKER"
+#define PLAYER_READY_MARKER_ENV L"OFFLINE_LAN_0922_PLAYER_READY_MARKER"
 #define WORKER_READY_MARKER_FILE L"offline-worker.ready"
+#define WORKER_INTERNAL_READY_MARKER_FILE L"offline-worker.internal-ready"
+#define PLAYER_READY_MARKER_FORMAT L"offline-player-%lu.ready"
 #define SERVER_FILENAME L"WoT-0.9.22-LAN-Server.exe"
 #define SERVER_HOST_ENV L"OFFLINE_LAN_0922_SERVER_HOST"
 #define SERVER_HOST_VALUE L"127.0.0.1"
@@ -57,6 +62,7 @@
 
 static WCHAR g_root[MAX_PATH];
 static WCHAR g_ready_marker[MAX_PATH];
+static WCHAR g_internal_ready_marker[MAX_PATH];
 
 
 typedef struct JobProcessSet {
@@ -73,6 +79,7 @@ typedef struct TrackedGameProcess {
 	DWORD exit_code;
 	FILETIME exit_time;
 	WCHAR dump_path[MAX_PATH];
+	BOOL procdump_attempted;
 	BOOL exited;
 	BOOL dump_complete;
 } TrackedGameProcess;
@@ -99,8 +106,9 @@ static void log_failure(const char *stage, DWORD error_code)
 				L"offline-worker-starter.log"))) {
 		return;
 	}
-	file = CreateFileW(log_path, GENERIC_WRITE, FILE_SHARE_READ, 0,
-		CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+	file = CreateFileW(log_path, FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+		OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
 	if (file == INVALID_HANDLE_VALUE) {
 		return;
 	}
@@ -545,14 +553,27 @@ static HANDLE create_starter_stop_event(void)
 }
 
 
-static int configure_ready_marker(void)
+static int configure_ready_markers(void)
 {
 	if (FAILED(StringCchCopyW(g_ready_marker, MAX_PATH, g_root)) ||
 			FAILED(StringCchCatW(g_ready_marker, MAX_PATH,
-				WORKER_READY_MARKER_FILE))) {
+				WORKER_READY_MARKER_FILE)) ||
+			FAILED(StringCchCopyW(
+				g_internal_ready_marker, MAX_PATH, g_root)) ||
+			FAILED(StringCchCatW(
+				g_internal_ready_marker, MAX_PATH,
+				WORKER_INTERNAL_READY_MARKER_FILE))) {
 		return 0;
 	}
 	return 1;
+}
+
+
+static int configure_player_ready_marker(WCHAR *path, size_t path_count)
+{
+	return SUCCEEDED(StringCchPrintfW(path, path_count,
+		L"%s" PLAYER_READY_MARKER_FORMAT, g_root,
+		(unsigned long)GetCurrentProcessId()));
 }
 
 
@@ -619,11 +640,11 @@ static int wait_for_local_server(HANDLE server_process, HANDLE stop_event)
 }
 
 
-static int remove_ready_marker(void)
+static int remove_marker_path(const WCHAR *marker_path)
 {
 	WCHAR temporary_path[MAX_PATH];
 	DWORD error_code;
-	if (!DeleteFileW(g_ready_marker)) {
+	if (!DeleteFileW(marker_path)) {
 		error_code = GetLastError();
 		if (error_code != ERROR_FILE_NOT_FOUND &&
 				error_code != ERROR_PATH_NOT_FOUND) {
@@ -631,8 +652,7 @@ static int remove_ready_marker(void)
 			return 0;
 		}
 	}
-	if (FAILED(StringCchCopyW(temporary_path, MAX_PATH,
-			g_ready_marker)) ||
+	if (FAILED(StringCchCopyW(temporary_path, MAX_PATH, marker_path)) ||
 			FAILED(StringCchCatW(temporary_path, MAX_PATH, L".tmp"))) {
 		SetLastError(ERROR_INSUFFICIENT_BUFFER);
 		return 0;
@@ -644,6 +664,50 @@ static int remove_ready_marker(void)
 			SetLastError(error_code);
 			return 0;
 		}
+	}
+	return 1;
+}
+
+
+static int remove_ready_markers(void)
+{
+	return remove_marker_path(g_ready_marker) &&
+		remove_marker_path(g_internal_ready_marker);
+}
+
+
+static int publish_ready_marker(const WCHAR *marker_path)
+{
+	static const char payload[] = "ready\n";
+	WCHAR temporary_path[MAX_PATH];
+	HANDLE file;
+	DWORD written = 0;
+	DWORD error_code;
+	if (FAILED(StringCchCopyW(temporary_path, MAX_PATH, marker_path)) ||
+			FAILED(StringCchCatW(temporary_path, MAX_PATH, L".tmp"))) {
+		SetLastError(ERROR_INSUFFICIENT_BUFFER);
+		return 0;
+	}
+	file = CreateFileW(temporary_path, GENERIC_WRITE, FILE_SHARE_READ, 0,
+		CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+	if (file == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+	if (!WriteFile(file, payload, sizeof(payload) - 1, &written, 0) ||
+			written != sizeof(payload) - 1 || !FlushFileBuffers(file)) {
+		error_code = GetLastError();
+		CloseHandle(file);
+		DeleteFileW(temporary_path);
+		SetLastError(error_code);
+		return 0;
+	}
+	CloseHandle(file);
+	if (!MoveFileExW(temporary_path, marker_path,
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+		error_code = GetLastError();
+		DeleteFileW(temporary_path);
+		SetLastError(error_code);
+		return 0;
 	}
 	return 1;
 }
@@ -673,7 +737,7 @@ static int wait_for_worker_ready(HANDLE worker_process, HANDLE server_process,
 				ERROR_PROCESS_ABORTED);
 			return 0;
 		}
-		marker_attributes = GetFileAttributesW(g_ready_marker);
+		marker_attributes = GetFileAttributesW(g_internal_ready_marker);
 		if (marker_attributes != INVALID_FILE_ATTRIBUTES &&
 				!(marker_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
 			/* Reject a marker published immediately before worker death. */
@@ -797,9 +861,41 @@ static int track_player_process(PlayerProcessTracker *tracker,
 			tracked->dump_path[0] = L'\0';
 		} else {
 			DeleteFileW(tracked->dump_path);
-			tracked->procdump_process = start_procdump_configured(
-				process, process_id, tracker->procdump_path,
-				tracked->dump_path);
+		}
+	}
+	return 1;
+}
+
+
+static int attach_ready_player_procdumps(PlayerProcessTracker *tracker,
+		const WCHAR *ready_marker)
+{
+	DWORD marker_attributes;
+	DWORD index;
+	if (!tracker->procdump_configured) {
+		return 1;
+	}
+	marker_attributes = GetFileAttributesW(ready_marker);
+	if (marker_attributes == INVALID_FILE_ATTRIBUTES ||
+			(marker_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+		return 1;
+	}
+	for (index = 0; index < tracker->count; ++index) {
+		TrackedGameProcess *tracked = &tracker->processes[index];
+		if (tracked->exited || tracked->process == 0 ||
+				tracked->procdump_attempted ||
+				tracked->dump_path[0] == L'\0') {
+			continue;
+		}
+		tracked->procdump_attempted = TRUE;
+		tracked->procdump_process = start_procdump_configured(
+			tracked->process, tracked->id, tracker->procdump_path,
+			tracked->dump_path);
+		/* Capture setup is diagnostic only. A ProcDump installation failure
+		 * must not close a fully initialized visible game client. */
+		if (tracked->procdump_process == 0 &&
+				WaitForSingleObject(tracked->process, 0) == WAIT_TIMEOUT) {
+			log_failure("player_procdump_unavailable", ERROR_OPEN_FAILED);
 		}
 	}
 	return 1;
@@ -977,9 +1073,16 @@ static DWORD finish_player_tracker(PlayerProcessTracker *tracker,
 	DWORD result = fallback_exit_code;
 	TrackedGameProcess *last = 0;
 	for (index = 0; index < tracker->count; ++index) {
-		tracker->processes[index].dump_complete = wait_for_procdump(
-			&tracker->processes[index].procdump_process,
-			tracker->procdump_path, tracker->processes[index].id);
+		TrackedGameProcess *tracked = &tracker->processes[index];
+		if (stopped || !tracked->exited || tracked->exit_code == 0 ||
+				tracked->exit_code == STILL_ACTIVE) {
+			cancel_procdump_now(&tracked->procdump_process,
+				tracker->procdump_path, tracked->id);
+		} else {
+			tracked->dump_complete = wait_for_procdump(
+				&tracked->procdump_process,
+				tracker->procdump_path, tracked->id);
+		}
 	}
 	if (preferred_exit_index >= 0) {
 		last = &tracker->processes[preferred_exit_index];
@@ -1015,6 +1118,7 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 		HANDLE stop_event)
 {
 	WCHAR child_command[2 * MAX_PATH];
+	WCHAR player_ready_marker[MAX_PATH];
 	STARTUPINFOW startup;
 	PROCESS_INFORMATION process;
 	JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting;
@@ -1028,6 +1132,7 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 	BOOL stopped = FALSE;
 	int preserved_crash_exit = -1;
 	int result = 1;
+	player_ready_marker[0] = L'\0';
 	if (paired_worker) {
 		if (!SetEnvironmentVariableW(MULTI_CLIENT_ENV, MULTI_CLIENT_VALUE)) {
 			log_failure("SetEnvironmentVariableW", GetLastError());
@@ -1044,6 +1149,7 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 	}
 	SetEnvironmentVariableW(HIDDEN_DESKTOP_ENV, 0);
 	SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0);
+	SetEnvironmentVariableW(WORKER_INTERNAL_READY_MARKER_ENV, 0);
 	if (FAILED(StringCchPrintfW(child_command, 2 * MAX_PATH,
 			L"\"%s\" --config engine_config.offline-player.xml "
 			L"--logFilePrefix offline-player-", game_path))) {
@@ -1062,11 +1168,21 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 		}
 		return 22;
 	}
+	if (!configure_player_ready_marker(player_ready_marker, MAX_PATH) ||
+			!remove_marker_path(player_ready_marker) ||
+			!SetEnvironmentVariableW(
+				PLAYER_READY_MARKER_ENV, player_ready_marker)) {
+		log_failure("player_ready_marker", GetLastError());
+		CloseHandle(player_job);
+		return 22;
+	}
 	if (!CreateProcessW(game_path, child_command, 0, 0, FALSE,
 			CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP, 0,
 			g_root, &startup, &process)) {
 		log_failure("CreateProcessW(player)", GetLastError());
 		CloseHandle(player_job);
+		SetEnvironmentVariableW(PLAYER_READY_MARKER_ENV, 0);
+		(void)remove_marker_path(player_ready_marker);
 		return 22;
 	}
 	if (!AssignProcessToJobObject(player_job, process.hProcess)) {
@@ -1075,14 +1191,17 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 		result = 22;
 		goto player_cleanup;
 	}
-	if (!track_player_process(&tracker, process.dwProcessId, game_path)) {
-		log_failure("track_player_process(initial)", GetLastError());
-	}
 	if (ResumeThread(process.hThread) == (DWORD)-1) {
 		log_failure("ResumeThread(player)", GetLastError());
 		TerminateJobObject(player_job, 22);
 		result = 22;
 		goto player_cleanup;
+	}
+	/* The client publishes its ready marker only after Python, Scaleform and the
+	 * Hangar are live. Track the Job now, but defer debugger attachment until
+	 * that native-startup boundary has passed. */
+	if (!track_player_process(&tracker, process.dwProcessId, game_path)) {
+		log_failure("track_player_process(initial)", GetLastError());
 	}
 	CloseHandle(process.hThread);
 	process.hThread = 0;
@@ -1091,7 +1210,9 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 	 * to this launch; scanning every same-path process can claim another game. */
 	for (;;) {
 		if (!track_player_job_processes(&tracker, player_job, game_path) ||
-				!update_tracked_player_exits(&tracker)) {
+				!update_tracked_player_exits(&tracker) ||
+				!attach_ready_player_procdumps(
+					&tracker, player_ready_marker)) {
 			TerminateJobObject(player_job, 23);
 			result = 23;
 			goto player_cleanup;
@@ -1159,6 +1280,10 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 	completed_normally = TRUE;
 
 player_cleanup:
+	SetEnvironmentVariableW(PLAYER_READY_MARKER_ENV, 0);
+	if (player_ready_marker[0] != L'\0') {
+		(void)remove_marker_path(player_ready_marker);
+	}
 	if (process.hThread != 0) {
 		CloseHandle(process.hThread);
 	}
@@ -1228,6 +1353,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 	worker_monitor_dump_path[0] = L'\0';
 	g_root[0] = L'\0';
 	g_ready_marker[0] = L'\0';
+	g_internal_ready_marker[0] = L'\0';
 	stop_command_state = parse_starter_stop_command(
 		command_line, &stop_target_process_id);
 	if (stop_command_state < 0) {
@@ -1244,7 +1370,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		log_failure("resolve_game_root", error_code);
 		return 4;
 	}
-	if (!configure_ready_marker()) {
+	if (!configure_ready_markers()) {
 		log_failure("ready_marker", ERROR_INSUFFICIENT_BUFFER);
 		return 5;
 	}
@@ -1279,7 +1405,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 	clear_failure_log();
 	/* Only the mutex owner may replace the shared ready marker.  Otherwise a
 	 * rapid second launch can erase the live worker's just-published marker. */
-	if (!remove_ready_marker()) {
+	if (!remove_ready_markers()) {
 		log_failure("remove_ready_marker", GetLastError());
 		result = 5;
 		goto worker_cleanup;
@@ -1403,8 +1529,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 				MULTI_CLIENT_VALUE) ||
 			!SetEnvironmentVariableW(HIDDEN_DESKTOP_ENV,
 				HIDDEN_DESKTOP_VALUE) ||
-			!SetEnvironmentVariableW(WORKER_READY_MARKER_ENV,
-				g_ready_marker)) {
+			!SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0) ||
+			!SetEnvironmentVariableW(WORKER_INTERNAL_READY_MARKER_ENV,
+				g_internal_ready_marker) ||
+			!SetEnvironmentVariableW(PLAYER_READY_MARKER_ENV, 0)) {
 		error_code = GetLastError();
 		log_failure("SetEnvironmentVariableW", error_code);
 		result = 7;
@@ -1453,75 +1581,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		result = 11;
 		goto worker_cleanup;
 	}
-	if (worker_procdump_configured) {
-		procdump_process = start_procdump_configured(
-			process.hProcess, process.dwProcessId,
-			worker_procdump_path, worker_monitor_dump_path);
-	}
 	if (ResumeThread(process.hThread) == (DWORD)-1) {
 		error_code = GetLastError();
 		log_failure("ResumeThread", error_code);
 		TerminateProcess(process.hProcess, 12);
 		WaitForSingleObject(process.hProcess, INFINITE);
 		result = 12;
-	} else if (worker_only) {
-		wait_handles[0] = process.hProcess;
-		wait_handles[1] = stop_event;
-		wait_state = WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
-		if (wait_state == WAIT_OBJECT_0 + 1) {
-			/* A process exit wins if it raced the stop event. */
-			if (WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0) {
-				if (!GetExitCodeProcess(process.hProcess, &child_exit_code)) {
-					child_exit_code = 13;
-					log_failure("GetExitCodeProcess", GetLastError());
-				}
-				worker_crashed = child_exit_code != 0;
-				result = (int)child_exit_code;
-			} else {
-				worker_stopped = TRUE;
-				cancel_procdump_now(&procdump_process,
-					worker_procdump_path, process.dwProcessId);
-				if (worker_procdump_configured) {
-					cleanup_monitor_dump_slots(worker_final_dump_path);
-				}
-				TerminateJobObject(job, ERROR_PROCESS_ABORTED);
-				if (WaitForSingleObject(process.hProcess,
-						TARGET_STOP_TIMEOUT_MS) == WAIT_TIMEOUT) {
-					log_failure("worker_stop_timeout", WAIT_TIMEOUT);
-				}
-				result = 0;
-			}
-		} else if (wait_state == WAIT_OBJECT_0) {
-			if (!GetExitCodeProcess(process.hProcess, &child_exit_code)) {
-				child_exit_code = 13;
-				log_failure("GetExitCodeProcess", GetLastError());
-			} else if (child_exit_code != 0) {
-				log_failure("worker_process_exit", child_exit_code);
-			}
-			worker_crashed = child_exit_code != 0;
-			result = (int)child_exit_code;
-		} else {
-			log_failure("WaitForMultipleObjects(worker)", GetLastError());
-			TerminateJobObject(job, ERROR_PROCESS_ABORTED);
-			WaitForSingleObject(process.hProcess, INFINITE);
-			result = 13;
-		}
 	} else {
+		CloseHandle(process.hThread);
+		process.hThread = 0;
+		/* #1513 can fault if a debugger attaches during its loader/native
+		 * startup. Python publishes only the private internal marker. The
+		 * starter waits for that full Hangar+LAN boundary, attaches ProcDump,
+		 * rechecks liveness, and only then publishes the marker the launcher
+		 * observes. */
 		ready_state = wait_for_worker_ready(
-			process.hProcess, server_process.hProcess, stop_event);
+			process.hProcess,
+			worker_only ? 0 : server_process.hProcess, stop_event);
 		if (ready_state <= 0) {
-			if (ready_state < 0 &&
-					WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
+			if (ready_state < 0 && WaitForSingleObject(
+					process.hProcess, 0) == WAIT_TIMEOUT) {
 				worker_stopped = TRUE;
-				cancel_procdump_now(&procdump_process,
-					worker_procdump_path, process.dwProcessId);
-				if (worker_procdump_configured) {
-					cleanup_monitor_dump_slots(worker_final_dump_path);
-				}
 				result = 0;
 			} else if (WaitForSingleObject(
 					process.hProcess, 0) == WAIT_OBJECT_0 &&
-					GetExitCodeProcess(process.hProcess, &child_exit_code)) {
+					GetExitCodeProcess(
+						process.hProcess, &child_exit_code)) {
 				worker_crashed = child_exit_code != 0;
 				result = (int)child_exit_code;
 			} else {
@@ -1529,14 +1614,90 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 			}
 			goto worker_cleanup;
 		}
-		/* Keep the hidden authority alive only for the visible host client.
-		 * Returning from launch_player means that client has closed or
-		 * crashed; terminating the worker job also retires any children on
-		 * its private desktop. */
-		result = launch_player(game_path, TRUE, stop_event);
-		if (WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
-			TerminateJobObject(job, ERROR_PROCESS_ABORTED);
-			WaitForSingleObject(process.hProcess, INFINITE);
+		if (worker_procdump_configured) {
+			procdump_process = start_procdump_configured(
+				process.hProcess, process.dwProcessId,
+				worker_procdump_path, worker_monitor_dump_path);
+			if (procdump_process == 0) {
+				result = 25;
+				goto worker_cleanup;
+			}
+		}
+		wait_state = WaitForSingleObject(process.hProcess, 0);
+		if (wait_state != WAIT_TIMEOUT) {
+			if (wait_state == WAIT_FAILED || !GetExitCodeProcess(
+					process.hProcess, &child_exit_code)) {
+				log_failure("worker_post_attach_liveness",
+					wait_state == WAIT_FAILED ? GetLastError() :
+					ERROR_PROCESS_ABORTED);
+				result = 23;
+			} else {
+				worker_crashed = child_exit_code != 0;
+				result = (int)child_exit_code;
+			}
+			goto worker_cleanup;
+		}
+		if (!publish_ready_marker(g_ready_marker)) {
+			log_failure("publish_worker_ready", GetLastError());
+			result = 25;
+			goto worker_cleanup;
+		}
+		if (worker_only) {
+			wait_handles[0] = process.hProcess;
+			wait_handles[1] = stop_event;
+			wait_state = WaitForMultipleObjects(
+				2, wait_handles, FALSE, INFINITE);
+			if (wait_state == WAIT_OBJECT_0 + 1) {
+				/* A process exit wins if it raced the stop event. */
+				if (WaitForSingleObject(
+						process.hProcess, 0) == WAIT_OBJECT_0) {
+					if (!GetExitCodeProcess(
+							process.hProcess, &child_exit_code)) {
+						child_exit_code = 13;
+						log_failure(
+							"GetExitCodeProcess", GetLastError());
+					}
+					worker_crashed = child_exit_code != 0;
+					result = (int)child_exit_code;
+				} else {
+					worker_stopped = TRUE;
+					cancel_procdump_now(&procdump_process,
+						worker_procdump_path, process.dwProcessId);
+					if (worker_procdump_configured) {
+						cleanup_monitor_dump_slots(
+							worker_final_dump_path);
+					}
+					TerminateJobObject(job, ERROR_PROCESS_ABORTED);
+					if (WaitForSingleObject(process.hProcess,
+							TARGET_STOP_TIMEOUT_MS) == WAIT_TIMEOUT) {
+						log_failure(
+							"worker_stop_timeout", WAIT_TIMEOUT);
+					}
+					result = 0;
+				}
+			} else if (wait_state == WAIT_OBJECT_0) {
+				if (!GetExitCodeProcess(process.hProcess, &child_exit_code)) {
+					child_exit_code = 13;
+					log_failure("GetExitCodeProcess", GetLastError());
+				} else if (child_exit_code != 0) {
+					log_failure("worker_process_exit", child_exit_code);
+				}
+				worker_crashed = child_exit_code != 0;
+				result = (int)child_exit_code;
+			} else {
+				log_failure(
+					"WaitForMultipleObjects(worker)", GetLastError());
+				worker_stopped = TRUE;
+				result = 13;
+			}
+		} else {
+			/* Keep the hidden authority alive only for the visible host client.
+			 * Returning from launch_player means that client has closed or
+			 * crashed. Cleanup cancels the diagnostic monitor before the Job's
+			 * intentional termination. */
+			result = launch_player(game_path, TRUE, stop_event);
+			worker_stopped = WaitForSingleObject(
+				process.hProcess, 0) == WAIT_TIMEOUT;
 		}
 	}
 
@@ -1546,13 +1707,23 @@ worker_cleanup:
 	SetEnvironmentVariableW(SERVER_DATA_ENV, 0);
 	SetEnvironmentVariableW(SERVER_HOST_ENV, 0);
 	SetEnvironmentVariableW(SERVER_PORT_ENV, 0);
+	SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0);
+	SetEnvironmentVariableW(WORKER_INTERNAL_READY_MARKER_ENV, 0);
+	SetEnvironmentVariableW(PLAYER_READY_MARKER_ENV, 0);
+	/* A live worker is about to be terminated intentionally by the Job. Cancel
+	 * its -t monitor first so normal shutdown cannot create a large dump. */
+	if (worker_procdump_configured &&
+			(worker_stopped || !worker_crashed)) {
+		cancel_procdump_now(&procdump_process,
+			worker_procdump_path, process.dwProcessId);
+	}
 	/* Closing the kill-on-close job retires any browser child still using the
 	 * private desktop before the desktop handle itself is released. */
 	if (job != 0) {
 		CloseHandle(job);
 	}
 	if (worker_procdump_configured) {
-		if (!worker_stopped) {
+		if (worker_crashed) {
 			worker_dump_complete = wait_for_procdump(
 				&procdump_process, worker_procdump_path,
 				process.dwProcessId);
@@ -1593,7 +1764,7 @@ worker_cleanup:
 	if (sockets_started) {
 		WSACleanup();
 	}
-	(void)remove_ready_marker();
+	(void)remove_ready_markers();
 	if (singleton != 0) {
 		CloseHandle(singleton);
 	}

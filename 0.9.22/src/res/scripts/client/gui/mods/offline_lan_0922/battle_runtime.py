@@ -129,6 +129,9 @@ TRACK_SCROLL_LIMITS = (-15.0, 30.0)
 VISION_PUBLISH_EPSILON = 0.5
 # Seconds between two bot-track diagnostic lines.
 TRACK_REPORT_SECONDS = 5.0
+# The stock track controller advances at 20 Hz.  Remote hull interpolation
+# remains render-rate; only the native belt feed is bounded to that cadence.
+REMOTE_TRACK_PRESENTATION_SECONDS = 1.0 / 20.0
 # Maximum vertical disagreement between the suspension probes before they are
 # treated as different terrain layers rather than one drivable plane.
 GROUND_PLANE_EPSILON = 0.35
@@ -2603,6 +2606,20 @@ class BattleRuntime(object):
             self._config.get('battleDurationSeconds', BATTLE_SECONDS),
             BATTLE_SECONDS))
 
+    def _prebattle_transition_ready(self, now):
+        """Keep worker combat behind the server's accepted live boundary."""
+        if (self._prebattle_deadline is None or
+                float(now) < float(self._prebattle_deadline)):
+            return False
+        if not self._worker_mode:
+            return True
+        # The visible client may project the countdown from receipt time for a
+        # smooth HUD.  A worker must wait for the first server snapshot whose
+        # timing phase is actually ``battle``; otherwise RTT estimation can
+        # make its first bot_state/fire/ram edge arrive one tick too early and
+        # be rejected as combat_closed.
+        return getattr(self.client, 'combat_phase', None) == 'battle'
+
     def _begin_battle(self):
         if self._battle_live:
             return False
@@ -2649,7 +2666,8 @@ class BattleRuntime(object):
         self._show_prebattle_crosshair()
         self._prebattle_deadline = self._clock() + countdown
         self._last_frame_time = self._clock()
-        if countdown <= 0.0:
+        if (countdown <= 0.0 and
+                self._prebattle_transition_ready(self._clock())):
             self._begin_battle()
         return True
 
@@ -5468,7 +5486,7 @@ class BattleRuntime(object):
         return False
 
     def on_snapshot(self, message):
-        if self.state in ('failed', 'stopped'):
+        if self.state in ('failed', 'stopped', 'leaving'):
             return
         try:
             self._last_snapshot = dict(message or {})
@@ -5676,7 +5694,7 @@ class BattleRuntime(object):
         authority is ended by the server; this client never takes the bot
         simulation over.
         """
-        if self.state in ('failed', 'stopped'):
+        if self.state in ('failed', 'stopped', 'leaving'):
             return False
         message = message if isinstance(message, dict) else {}
         round_id = message.get('round_id')
@@ -5789,7 +5807,11 @@ class BattleRuntime(object):
             'aim_yaw', 'gun_pitch', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',
             'speed',
             'deadline_server_time_ms'}
-        if not isinstance(message, dict) or set(message) != required:
+        transport_fields = {
+            '_client_received_time', '_client_dispatch_delay'}
+        if (not isinstance(message, dict) or
+                not required.issubset(message) or
+                not set(message).issubset(required | transport_fields)):
             raise RuntimeError('worker fire intent is malformed')
         try:
             player_id = int(message['player_id'])
@@ -5816,7 +5838,10 @@ class BattleRuntime(object):
                 any(math.isnan(value) or math.isinf(value)
                     for value in values)):
             raise RuntimeError('worker fire intent violates its contract')
-        frozen = dict(message)
+        # The LAN receive thread decorates every frame with its local receipt
+        # time.  That transport-only value is neither part of the server's
+        # admitted fire identity nor stable across an exact retry.
+        frozen = dict((name, message[name]) for name in required)
         key = (player_id, intent_seq)
         previous = self._player_fire_intents.get(
             key, self._player_fire_intent_history.get(key))
@@ -5895,7 +5920,7 @@ class BattleRuntime(object):
         return changed
 
     def on_events(self, message):
-        if self.state in ('failed', 'stopped'):
+        if self.state in ('failed', 'stopped', 'leaving'):
             return False
         try:
             self._observe_destructibles_disabled(message)
@@ -9402,8 +9427,7 @@ class BattleRuntime(object):
                 stages['prewarm'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
             if (not self._battle_live and
-                    self._prebattle_deadline is not None and
-                    now >= self._prebattle_deadline):
+                    self._prebattle_transition_ready(now)):
                 self._begin_battle()
                 dt = 0.0
                 transitioned = True
@@ -11491,8 +11515,27 @@ class BattleRuntime(object):
         """Drive one bot's belts from its authority speed and turn rate."""
         if self._remote_factory is None:
             return False
+        if turn_override is not None:
+            # Guest poses arrive once per rendered frame, while the stock
+            # PyTrackScroll controller itself advances at 20 Hz.  Carry the
+            # deadline instead of using ``now + interval`` so 30/40/60/120 Hz
+            # renderers all average the same feed cadence without touching
+            # the render-rate hull interpolation below.
+            now = float(now)
+            next_update = record.get('_remote_track_next_update')
+            if (next_update is not None and
+                    now + 1.0e-9 < float(next_update)):
+                return False
+            if next_update is None:
+                next_update = now
+            elapsed = max(0.0, now - float(next_update))
+            periods = max(
+                1, int(elapsed / REMOTE_TRACK_PRESENTATION_SECONDS) + 1)
+            record['_remote_track_next_update'] = (
+                float(next_update) +
+                periods * REMOTE_TRACK_PRESENTATION_SECONDS)
         vehicle = self._remote_factory.get(record['engine_id'])
-        if vehicle is None or getattr(vehicle, 'track_scroll', None) is None:
+        if vehicle is None:
             return False
         alive = bool(state.get('alive', True)) and int(
             state.get('health', 1) or 0) > 0
@@ -11504,10 +11547,11 @@ class BattleRuntime(object):
         left, right = vehicle_physics.track_scroll(
             self._bot_track_params(record, vehicle), speed, turn)
         minimum, maximum = TRACK_SCROLL_LIMITS
-        vehicle.update_tracks(max(minimum, min(maximum, left)),
-                              max(minimum, min(maximum, right)), mode)
+        updated = vehicle.update_tracks(
+            max(minimum, min(maximum, left)),
+            max(minimum, min(maximum, right)), mode)
         self._report_bot_tracks(vehicle, left, right, mode, now)
-        return True
+        return bool(updated)
 
     def _report_bot_tracks(self, vehicle, left, right, mode, now):
         """Log what the scroll controller actually holds.
@@ -12311,7 +12355,7 @@ class BattleRuntime(object):
         return sent
 
     def _apply_sync_event(self, event):
-        if self.state in ('failed', 'stopped'):
+        if self.state in ('failed', 'stopped', 'leaving'):
             return
         kind = event.get('type')
         if kind == 'create':
@@ -12483,11 +12527,29 @@ class BattleRuntime(object):
             record = self._records.get(event.get('entity'))
             if record is None:
                 return
+        pose = event.get('pose')
+        incoming_state = event.get('state') or {}
+        if event.get('interpolated') and not incoming_state:
+            # SnapshotSync emits one pose-only sample per rendered frame.
+            # Ready entities do not need state cloning, visibility, health,
+            # critical, siege or event-journal reconciliation for that sample.
+            # An authority echo whose pose was stripped above is a complete
+            # no-op; a not-yet-ready entity still falls through so its newest
+            # pose is coalesced until onEnterWorld completes.
+            if pose is None:
+                return
+            if record.get('ready'):
+                if (record.get('kind') == 'bot' and
+                        event.get('presentation_time_us') is not None):
+                    record['presented_pose'] = dict(pose)
+                    record['presentation_time_us'] = int(
+                        event.get('presentation_time_us'))
+                self._apply_record_pose(record, pose)
+                return
         state = dict(record.get('state') or {})
-        incoming = dict(event.get('state') or {})
+        incoming = dict(incoming_state)
         state.update(incoming)
         record['state'] = state
-        pose = event.get('pose')
         if pose is not None:
             record['pending_pose'] = dict(pose)
             if (record.get('kind') == 'bot' and
@@ -12531,22 +12593,30 @@ class BattleRuntime(object):
             vehicle = self._remote_factory.get(record['engine_id'])
             if vehicle is None or vehicle.model is None:
                 raise RuntimeError('remote vehicle has no ready presentation')
-            initially_visible = bool(record.get('spot_visible', True))
-            vehicle._spot_visible = initially_visible
-            if self._worker_mode:
-                # Keep the assembled compound, muzzle nodes and hit tester for
-                # authority simulation. Do not register markers, target caps,
-                # battle UI or shot/sound presentation in the hidden worker.
-                record['simulation_entity'] = True
-            elif record.get('native_remote'):
-                vehicle._offlineNativeDrawVisible = initially_visible
-                vehicle.show(initially_visible)
-                vehicle.targetCaps = [1] if initially_visible else []
-                # Stock Vehicle.startVisual registered the native marker.
-                record['visual_started'] = True
-                vehicle._offlineNativeMarkerVisible = True
-            else:
-                vehicle.appearance.changeVisibility(initially_visible)
+            if not record.get('presentation_initialized'):
+                initially_visible = bool(record.get('spot_visible', True))
+                vehicle._spot_visible = initially_visible
+                if self._worker_mode:
+                    # Keep the assembled compound, muzzle nodes and hit tester
+                    # for authority simulation. Do not register markers,
+                    # target caps, battle UI or shot/sound presentation in the
+                    # hidden worker.
+                    record['simulation_entity'] = True
+                elif record.get('native_remote'):
+                    vehicle._offlineNativeDrawVisible = initially_visible
+                    vehicle.show(initially_visible)
+                    vehicle.targetCaps = [1] if initially_visible else []
+                    # The compatibility enter-world gate may already have
+                    # stopped an enemy marker before this asynchronous ready
+                    # boundary.
+                    record['visual_started'] = bool(getattr(
+                        vehicle, '_offlineNativeMarkerVisible',
+                        initially_visible))
+                    vehicle._offlineNativeMarkerVisible = bool(
+                        record['visual_started'])
+                else:
+                    vehicle.appearance.changeVisibility(initially_visible)
+                record['presentation_initialized'] = True
         if (not self._worker_mode and record.get('presentation') and
                 not record.get('arena_added')):
             self._binding.arena_vehicle_added(record['engine_id'], {
@@ -12660,22 +12730,69 @@ class BattleRuntime(object):
             return
         else:
             now = self._clock()
+            x = _number(pose.get('x'))
+            y = _number(pose.get('y'))
+            z = _number(pose.get('z'))
+            pitch = _number(pose.get('pitch'))
+            roll = _number(pose.get('roll'))
+            aim_yaw = _number(pose.get('aim_yaw', yaw))
+            gun_pitch = _number(pose.get('gun_pitch'))
+            alive = bool(state.get('alive', True)) and int(
+                state.get('health', 1) or 0) > 0
+            signature = (x, y, z, yaw, pitch, roll, aim_yaw, gun_pitch)
+            if signature == record.get('_remote_pose_signature'):
+                motion_intended = bool(
+                    abs(_number(state.get('speed'))) > BOT_MOVING_SPEED or
+                    abs(_number(state.get('movement_dir'))) > 0.5 or
+                    abs(_number(state.get('rotation_dir'))) > 0.5)
+                if (record.get('native_remote') and not motion_intended and
+                        record.get('_remote_motion_settled_signature') !=
+                        signature):
+                    vehicle = self._remote_factory.get(record['engine_id'])
+                    settle = getattr(vehicle, 'settle_motion', None)
+                    if callable(settle):
+                        settled = self._run_optional_feature(
+                            'remote motion presentation', settle, (now,))
+                        if settled:
+                            record['_remote_motion_settled_signature'] = \
+                                signature
+                if record.get('kind') in ('bot', 'player'):
+                    # Keep the zero-turn sample fresh so the first real pivot
+                    # after a long stop is measured over one render interval,
+                    # not diluted across the whole stationary period.
+                    turn = self._remember_remote_track_turn(record, yaw, now)
+                    track_signature = (
+                        _number(state.get('speed')), alive, turn)
+                    if (record.get('_remote_track_pending') or
+                            track_signature != record.get(
+                                '_remote_track_state_signature')):
+                        updated = self._run_optional_feature(
+                            'remote track animation', self._update_bot_tracks,
+                            (record, state, now, turn))
+                        record['_remote_track_pending'] = not updated
+                        if updated:
+                            record['_remote_track_state_signature'] = \
+                                track_signature
+                return False
             self._binding.set_vehicle_pose(
-                record['engine_id'], self._vector((
-                    _number(pose.get('x')), _number(pose.get('y')),
-                    _number(pose.get('z')))), _engine_rotation(
-                        yaw, _number(pose.get('pitch')),
-                        _number(pose.get('roll'))),
+                record['engine_id'], self._vector((x, y, z)),
+                _engine_rotation(yaw, pitch, roll),
                 now=now)
             self._binding.update_vehicle_aim(
-                record['engine_id'], yaw,
-                _number(pose.get('aim_yaw', yaw)),
-                _number(pose.get('gun_pitch')))
+                record['engine_id'], yaw, aim_yaw, gun_pitch)
+            record['_remote_pose_signature'] = signature
+            record.pop('_remote_motion_settled_signature', None)
             if record.get('kind') in ('bot', 'player'):
                 turn = self._remember_remote_track_turn(record, yaw, now)
-                self._run_optional_feature(
+                track_signature = (
+                    _number(state.get('speed')), alive, turn)
+                updated = self._run_optional_feature(
                     'remote track animation', self._update_bot_tracks,
                     (record, state, now, turn))
+                record['_remote_track_pending'] = not updated
+                if updated:
+                    record['_remote_track_state_signature'] = track_signature
+            return True
 
     def _flush_pending_entities(self, now):
         for unused_key, record in list(self._records.items()):
@@ -12744,17 +12861,20 @@ class BattleRuntime(object):
         wreck_known = bool(record.get(
             'wreck_known', record.get('spot_marker_visible', visible)))
         draw_vehicle = visible or (not alive and wreck_known)
-        if record.get('native_remote'):
-            vehicle._offlineNativeDrawVisible = draw_vehicle
-            vehicle.show(draw_vehicle)
-            vehicle.targetCaps = [1] if visible else []
-        else:
-            vehicle.appearance.changeVisibility(draw_vehicle)
-        if draw_vehicle:
-            # A fire transition received while this enemy was hidden had no
-            # drawable compound.  Reconcile the durable fire state whenever
-            # the wreck/live model becomes visible again.
-            self._sync_fire_effect(vehicle)
+        signature = (visible, marker_visible, draw_vehicle, alive)
+        if signature != record.get('_spot_presentation_signature'):
+            if record.get('native_remote'):
+                vehicle._offlineNativeDrawVisible = draw_vehicle
+                vehicle.show(draw_vehicle)
+                vehicle.targetCaps = [1] if visible else []
+            else:
+                vehicle.appearance.changeVisibility(draw_vehicle)
+            if draw_vehicle:
+                # A fire transition received while this enemy was hidden had
+                # no drawable compound. Reconcile it on the presentation edge,
+                # not on every unrelated state or pose update.
+                self._sync_fire_effect(vehicle)
+            record['_spot_presentation_signature'] = signature
         if marker_visible and not record.get('visual_started'):
             self._binding.start_vehicle_visual(record['engine_id'], True)
             record['visual_started'] = True
@@ -13993,6 +14113,26 @@ class BattleRuntime(object):
         server = self._server
         on_local_leave = self._on_local_leave
 
+        # Stock starts constructing the Hangar before the next BigWorld
+        # callback runs.  Stop every battle callback and release the native
+        # Vehicle presentation while its Avatar, GUI and space are still the
+        # active owners.  Full Avatar/space retirement must remain deferred so
+        # it never destroys the mailbox which is executing leaveArena().
+        self.state = 'leaving'
+        self._battle_live = False
+        self._prebattle_deadline = None
+        self._cancel_callbacks()
+        try:
+            self._quiesce_native_presentations()
+        except Exception as error:
+            # A recoverable presentation cleanup failure must not escape the
+            # fake mailbox and cancel the deferred Avatar retirement.  Native
+            # access violations still terminate at their exact call site;
+            # Python failures remain visible in the client log.
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] leave presentation cleanup failed: '
+                '%s\n' % error)
+
         def leave_after_mailbox_returns():
             if (generation == self._generation and
                     server is self._server):
@@ -14038,60 +14178,25 @@ class BattleRuntime(object):
         self._callback_id = None
         self._ammo_callback_id = None
 
-    def _cleanup(self):
+    def _quiesce_native_presentations(self):
+        """Release battle-scoped native visuals before Hangar takes over."""
         cleanup_error = None
-        try:
-            self._stop_authority_worker_probe('battle_cleanup')
-        except Exception as error:
-            cleanup_error = error
-        try:
-            self._remove_decal_probe()
-        except Exception as error:
-            cleanup_error = error
-        if self._projectiles is not None:
-            try:
-                self._projectiles.reset(max(
-                    self._projectiles.now, self._clock()))
-            except Exception as error:
-                cleanup_error = error
-        self._projectiles = None
-        self._projectile_meta = {}
-        self._projectile_visual_meta = {}
-        self._projectile_terminal_data = {}
-        self._projectile_target_positions = {}
-        self._projectile_lineage = set()
-        if self._artillery is not None:
-            self._artillery.reset()
-        self._artillery = None
         try:
             self._release_postmortem_visibility()
         except Exception as error:
             cleanup_error = error
-        try:
-            self._runtime.compatibility.set_control_mode_listener(None)
-        except Exception as error:
-            cleanup_error = error
-        if self._sixth_sense is not None:
+        if self._local_matrix is not None or self._local_model is not None:
             try:
-                self._sixth_sense.reset()
+                self._detach_local_presentation()
             except Exception as error:
-                cleanup_error = error
-            self._sixth_sense = None
-        try:
-            self._detach_local_presentation()
-        except Exception as error:
-            if cleanup_error is None:
-                cleanup_error = error
-        # Remote presentations are separate OfflineEntity visuals and must be
-        # detached before the stock Avatar tears down the battle space.  The
-        # local stock Vehicle remains owned by Avatar/OfflineMapCreator.
+                if cleanup_error is None:
+                    cleanup_error = error
+        # Remote presentations are separate native Vehicle entities.  Their
+        # filters, track controllers and marker adaptors become unsafe as soon
+        # as the Hangar app starts replacing the battle app, so close them at
+        # the synchronous leaveArena boundary rather than during late Account
+        # reconstruction.
         if self._remote_factory is not None:
-            # Each step owns its own boundary. A failed outline clear or one
-            # failed visual must still reach destroy_all(), which releases the
-            # native models and BSP trees for the whole battle.
-            # Once the engine has reset the entity manager, removing the
-            # outline or stopping a visual would call into objects it already
-            # freed.
             engine_active = self._remote_factory.engine_active()
             if engine_active:
                 try:
@@ -14119,6 +14224,49 @@ class BattleRuntime(object):
                 if cleanup_error is None:
                     cleanup_error = error
             self._remote_factory = None
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _cleanup(self):
+        cleanup_error = None
+        try:
+            self._stop_authority_worker_probe('battle_cleanup')
+        except Exception as error:
+            cleanup_error = error
+        try:
+            self._remove_decal_probe()
+        except Exception as error:
+            cleanup_error = error
+        if self._projectiles is not None:
+            try:
+                self._projectiles.reset(max(
+                    self._projectiles.now, self._clock()))
+            except Exception as error:
+                cleanup_error = error
+        self._projectiles = None
+        self._projectile_meta = {}
+        self._projectile_visual_meta = {}
+        self._projectile_terminal_data = {}
+        self._projectile_target_positions = {}
+        self._projectile_lineage = set()
+        if self._artillery is not None:
+            self._artillery.reset()
+        self._artillery = None
+        try:
+            self._runtime.compatibility.set_control_mode_listener(None)
+        except Exception as error:
+            cleanup_error = error
+        if self._sixth_sense is not None:
+            try:
+                self._sixth_sense.reset()
+            except Exception as error:
+                cleanup_error = error
+            self._sixth_sense = None
+        try:
+            self._quiesce_native_presentations()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
         self._descriptor_cache = {}
         self._prepared_vehicle_names = []
         self._unusable_vehicles_reported = set()

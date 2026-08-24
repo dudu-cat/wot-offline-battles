@@ -238,7 +238,7 @@ class LanClientQueueTests(unittest.TestCase):
         queued_bots = queued[1]['bots']
         expected = {
             'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',
-            'aim_yaw', 'gun_pitch',
+            'aim_yaw', 'gun_pitch', 'speed',
             'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
             'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
             'health', 'alive', 'critical', 'combat_base_revision',

@@ -3090,11 +3090,11 @@ class BotRuntimeTests(unittest.TestCase):
             for projected, state in zip(publication['bots'], internal)))
         self.assertTrue(all(
             projected['pitch'] == state['pitch'] and
-            projected['roll'] == state['roll']
+            projected['roll'] == state['roll'] and
+            projected['speed'] == state['speed']
             for projected, state in zip(publication['bots'], internal)))
         self.assertTrue(all(
-            'profile' not in state and 'speed' not in state and
-            'reload_duration' not in state
+            'profile' not in state and 'reload_duration' not in state
             for state in publication['bots']))
 
     def test_contact_resolution_uses_the_banked_global_simulation_step(self):

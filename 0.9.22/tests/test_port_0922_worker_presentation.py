@@ -168,6 +168,20 @@ class WorkerPresentationTests(unittest.TestCase):
                 self.module.WorkerPresentationError, 'marker'):
             self.module.signal_worker_ready({})
 
+    def test_player_ready_marker_uses_its_own_environment_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'offline-player.ready'
+
+            self.assertTrue(self.module.signal_player_ready({
+                self.module.PLAYER_READY_MARKER_ENV: str(marker)}))
+
+            self.assertEqual(b'ready\n', marker.read_bytes())
+
+    def test_player_ready_marker_path_is_required(self):
+        with self.assertRaisesRegex(
+                self.module.WorkerPresentationError, 'visible player'):
+            self.module.signal_player_ready({})
+
 
 if __name__ == '__main__':
     unittest.main()

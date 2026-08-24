@@ -12,16 +12,27 @@ PREDICTION_SECONDS = 0.05
 MAX_TIMED_PREDICTION_SECONDS = 0.2
 MAX_INITIAL_TIMED_INTERVAL_US = int(
     MAX_TIMED_PREDICTION_SECONDS * 1000000.0)
-# With the QPC worker clock fixed, measured authority gaps are normally
-# 40-50 ms and top out around 66 ms.  Start with 90 ms of confirmed history;
+# With the QPC worker clock fixed, unloaded authority gaps are normally
+# 40-50 ms and top out around 66 ms. Start with 90 ms of confirmed history;
 # the adaptive observed-delay term can still rise to roughly 99 ms for that
-# worst gap plus one 30 Hz snapshot exposure.  Regular traffic then settles
-# near 60-90 ms instead of retaining the old 110-170 ms startup cushion.
+# worst gap plus one 30 Hz snapshot exposure. A fully engaged 22-bot worker
+# can later produce isolated 100-200 ms gaps, which the material-growth gate
+# below absorbs when observed. Regular traffic still settles near 60-90 ms
+# instead of retaining the old 110-170 ms startup cushion.
 # Authority, hit resolution, local-player input and the confirmed-only
 # presentation cursor are unchanged.
 INITIAL_TIMED_DELAY_US = 90000.0
 MIN_TIMED_DELAY_US = 60000.0
 TIMED_DELAY_DECAY_RATIO = 0.005
+# Ignore sub-frame changes in the measured target after warm-up.  Expanding a
+# confirmed-only cursor cannot rewind it, so a tiny increase would itself add
+# one visible hold.  Material producer stalls still grow the buffer on the
+# first packet that proves the old high-water mark was insufficient.
+TIMED_DELAY_GROW_DEADBAND_US = 15000.0
+# A producer interval above 100 ms is a real authority stall, not ordinary
+# 30 Hz snapshot exposure.  Grow even when the hold that just occurred has
+# already raised the measured output latency close to the new ideal value.
+TIMED_DELAY_GROW_STALL_US = 100000.0
 # Build the confirmed-history high-water mark from the first few live source
 # intervals before playback has consumed the initial cushion.  This avoids a
 # series of early buffer underruns while preserving the steady-state latency
@@ -278,13 +289,33 @@ class SnapshotSync(object):
                     if record.get('presentation_delay_us') is None:
                         record['presentation_delay_us'] = \
                             record['interpolation_delay_us']
-                    elif (record.get('timed_warmup_active') and
-                          record['timed_warmup_intervals'] <=
-                          TIMED_WARMUP_INTERVALS and
-                          record['interpolation_delay_us'] >
-                          record['presentation_delay_us']):
-                        record['presentation_delay_us'] = \
-                            record['interpolation_delay_us']
+                    else:
+                        delay_growth_us = (
+                            record['interpolation_delay_us'] -
+                            record['presentation_delay_us'])
+                        warmup_growth = bool(
+                            record.get('timed_warmup_active') and
+                            record['timed_warmup_intervals'] <=
+                            TIMED_WARMUP_INTERVALS)
+                        material_growth = (
+                            delay_growth_us >=
+                            TIMED_DELAY_GROW_DEADBAND_US or
+                            source_interval_us >=
+                            TIMED_DELAY_GROW_STALL_US)
+                        if (delay_growth_us > 0.0 and
+                                (warmup_growth or material_growth)):
+                            # A jitter buffer has to grow on the packet which
+                            # proves its old high-water mark was too small. The
+                            # former stock-style convergence was appropriate
+                            # for shrinking latency, but when a loaded worker
+                            # began producing 100-200 ms gaps it let confirmed
+                            # playback exhaust the buffer on every later gap:
+                            # stop, catch up, stop again. Growing immediately
+                            # costs latency once; the existing decay path below
+                            # still sheds that excess gradually after regular
+                            # samples resume.
+                            record['presentation_delay_us'] = \
+                                record['interpolation_delay_us']
             else:
                 record['interpolation_delay_us'] = None
             record['timed_samples'].append({

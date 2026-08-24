@@ -863,6 +863,59 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         self.assertLess(state.bot_states[bot_id]['health'], before[1])
         self.assertEqual([], list(player.ram_contacts))
 
+    def test_human_ram_keeps_pre_separation_body_from_contact_receipt(self):
+        state = self._live_state()
+        authority = state.server_authority
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        runtime_bot = authority._bots.states[bot_id]
+        runtime_bot.update(
+            x=0.0, y=0.0, z=6.5, yaw=math.pi, speed=0.0,
+            push_x=0.0, push_z=0.0, health=1000, alive=True)
+        state.bot_states[bot_id].update(
+            x=0.0, y=0.0, z=6.5, yaw=math.pi,
+            health=1000, alive=True)
+
+        for server_tick, revision, sample_time_us in (
+                (20, 20, 200000), (22, 22, 220000)):
+            bot = dict(state.bot_states[bot_id])
+            authority.apply_snapshot({
+                'server_tick': server_tick,
+                'bot_state_revision': revision,
+                'bot_state_time_us': sample_time_us,
+                'server_time_ms': sample_time_us // 1000,
+                'bots': [bot], 'projectiles': [],
+            })
+        state.bot_state_revision = 22
+        state.bot_state_time_us = 220000
+        state.update_input(1, {
+            'round_id': state.round_id,
+            # The local collision response has already moved this ordinary
+            # input pose outside the two 3.5 m half-lengths.
+            'x': 0.0, 'y': 0.0, 'z': -0.75, 'yaw': 0.0,
+            'speed': 8.0,
+            'ram_contacts': [{
+                'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 21,
+                'presentation_time_us': 210000,
+                # The receipt freezes the pre-separation overlap and speed.
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'vx': 0.0, 'vz': 16.0,
+            }],
+        })
+
+        admitted = state.players[1].ram_contacts[1]
+        self.assertEqual((0.0, 16.0), (
+            admitted['z'], admitted['vz']))
+        reports = authority._bots._resolve_human_ram_receipts(
+            authority._players_payload(), 1.0,
+            step=1.0 / TICK_HZ, processed_pairs=set())
+
+        self.assertEqual(1, len(reports))
+        self.assertGreater(reports[0]['damage_to_target'], 0)
+        self.assertGreater(reports[0]['damage_to_bot'], 0)
+
     def test_bots_publish_states_and_move_on_server_ticks(self):
         state = self._live_state()
         self.assertTrue(state.bot_states)
@@ -908,8 +961,9 @@ class ServerAuthorityBattleTest(unittest.TestCase):
                 'presentation_time_us')})
         self.assertEqual((1.25, 0.0, -2.5, 0.25), tuple(
             accepted[key] for key in ('x', 'y', 'z', 'yaw')))
-        self.assertAlmostEqual(math.sin(0.25) * 16.5, accepted['vx'], 4)
-        self.assertAlmostEqual(math.cos(0.25) * 16.5, accepted['vz'], 4)
+        self.assertEqual((0.0, 16.5), (
+            accepted['vx'], accepted['vz']))
+        self.assertEqual(0, accepted['input_seq'])
         for rejected in (
                 dict(valid, seq=2, bot_state_revision=301),
                 dict(valid, seq=3, bot_state_revision=44),

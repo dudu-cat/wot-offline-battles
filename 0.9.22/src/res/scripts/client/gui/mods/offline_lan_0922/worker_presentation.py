@@ -5,7 +5,9 @@ from __future__ import print_function
 import os
 
 
-WORKER_READY_MARKER_ENV = 'OFFLINE_LAN_0922_WORKER_READY_MARKER'
+WORKER_READY_MARKER_ENV = \
+    'OFFLINE_LAN_0922_WORKER_INTERNAL_READY_MARKER'
+PLAYER_READY_MARKER_ENV = 'OFFLINE_LAN_0922_PLAYER_READY_MARKER'
 HIDDEN_DESKTOP_ENV = 'OFFLINE_LAN_0922_HIDDEN_DESKTOP'
 
 try:
@@ -18,13 +20,13 @@ class WorkerPresentationError(RuntimeError):
     pass
 
 
-def signal_worker_ready(environ=None):
-    """Atomically publish full worker Hangar and LAN readiness."""
+def _signal_ready_marker(variable, description, environ=None):
+    """Atomically publish one native-starter readiness boundary."""
     environ = os.environ if environ is None else environ
-    marker_path = environ.get(WORKER_READY_MARKER_ENV, '')
+    marker_path = environ.get(variable, '')
     if not marker_path:
         raise WorkerPresentationError(
-            'simulation worker ready marker is unavailable')
+            '%s ready marker is unavailable' % description)
     temporary_path = marker_path + '.tmp'
     try:
         os.remove(temporary_path)
@@ -50,6 +52,18 @@ def signal_worker_ready(environ=None):
             pass
         raise
     return True
+
+
+def signal_worker_ready(environ=None):
+    """Publish full worker Hangar and LAN readiness to its starter."""
+    return _signal_ready_marker(
+        WORKER_READY_MARKER_ENV, 'simulation worker', environ)
+
+
+def signal_player_ready(environ=None):
+    """Publish the visible client's post-loader Hangar boundary."""
+    return _signal_ready_marker(
+        PLAYER_READY_MARKER_ENV, 'visible player', environ)
 
 
 def _load_runtime():

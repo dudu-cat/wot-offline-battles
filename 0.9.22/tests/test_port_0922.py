@@ -1660,6 +1660,128 @@ class OfflineCompatibilityTests(unittest.TestCase):
                         names.index('complete_vehicle_enter'))
         compatibility.fini()
 
+    def test_enemy_is_hidden_before_vehicle_enter_barrier_completes(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle(player_team=1)
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.playerVehicleID = 10
+
+        class Server(object):
+            def acceptVehicleEnter(self, vehicle_id):
+                operations.append(('accept_vehicle_enter', vehicle_id))
+
+            def completeVehicleEnter(self, vehicle_id):
+                operations.append(('complete_vehicle_enter', vehicle_id))
+
+        class Provider(object):
+            def stopVehicleVisual(self, vehicle_id, is_player):
+                operations.append(
+                    ('stop_vehicle_visual', vehicle_id, is_player))
+
+        enemy = types.SimpleNamespace(
+            id=11, publicInfo={'team': 2}, targetCaps=[1],
+            model=types.SimpleNamespace(visible=True))
+
+        def show(visible):
+            operations.append(('vehicle_show', visible))
+            enemy.model.visible = bool(visible)
+
+        enemy.show = show
+        avatar.fakeServer = Server()
+        avatar.guiSessionProvider = Provider()
+
+        avatar.vehicle_onEnterWorld(enemy)
+
+        names = [item[0] for item in operations]
+        self.assertLess(names.index('original_avatar_vehicle_enter'),
+                        names.index('vehicle_show'))
+        self.assertLess(names.index('vehicle_show'),
+                        names.index('stop_vehicle_visual'))
+        self.assertLess(names.index('stop_vehicle_visual'),
+                        names.index('complete_vehicle_enter'))
+        self.assertFalse(enemy.model.visible)
+        self.assertEqual([], enemy.targetCaps)
+        self.assertFalse(enemy._spot_visible)
+        self.assertFalse(enemy._offlineNativeDrawVisible)
+        self.assertFalse(enemy._offlineNativeMarkerVisible)
+        compatibility.fini()
+
+    def test_enemy_stays_hidden_after_full_stock_vehicle_enter_lifecycle(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+
+        def stock_vehicle_enter(vehicle, prereqs):
+            operations.append(('stock_vehicle_enter_before', prereqs))
+            runtime.bigworld.player().vehicle_onEnterWorld(vehicle)
+            # Exact #1513 may finish startVisual/model refresh after the
+            # nested PlayerAvatar callback has returned. Simulate that late
+            # stock edge explicitly; the compatibility layer must not skip it.
+            operations.append(('stock_vehicle_controllers_started',))
+            vehicle.show(True)
+            vehicle.targetCaps = [1]
+            vehicle._offlineNativeMarkerVisible = True
+            operations.append(('stock_vehicle_enter_after',))
+            return 'stock-entered'
+
+        vehicle_type = runtime.vehicle_module.Vehicle
+        vehicle_type.onEnterWorld = stock_vehicle_enter
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle(player_team=1)
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.playerVehicleID = 10
+
+        class Server(object):
+            def acceptVehicleEnter(self, vehicle_id):
+                operations.append(('accept_vehicle_enter', vehicle_id))
+
+            def completeVehicleEnter(self, vehicle_id):
+                operations.append(('complete_vehicle_enter', vehicle_id))
+
+        class Provider(object):
+            def stopVehicleVisual(self, vehicle_id, is_player):
+                operations.append(
+                    ('stop_vehicle_visual', vehicle_id, is_player))
+
+        enemy = vehicle_type()
+        enemy.id = 11
+        enemy.publicInfo = {'team': 2}
+        enemy.targetCaps = [1]
+        enemy.model = types.SimpleNamespace(visible=True)
+
+        def show(visible):
+            operations.append(('vehicle_show', visible))
+            enemy.model.visible = bool(visible)
+
+        enemy.show = show
+        avatar.fakeServer = Server()
+        avatar.guiSessionProvider = Provider()
+        runtime.bigworld._player = avatar
+
+        result = enemy.onEnterWorld('prereqs')
+
+        self.assertEqual('stock-entered', result)
+        self.assertIn(('stock_vehicle_controllers_started',), operations)
+        show_values = [item[1] for item in operations
+                       if item[0] == 'vehicle_show']
+        self.assertEqual([False, True, False], show_values)
+        names = [item[0] for item in operations]
+        self.assertLess(names.index('stock_vehicle_enter_after'),
+                        len(names) - 1)
+        self.assertEqual('stop_vehicle_visual', names[-1])
+        self.assertFalse(enemy.model.visible)
+        self.assertEqual([], enemy.targetCaps)
+        self.assertFalse(enemy._spot_visible)
+        self.assertFalse(enemy._offlineNativeDrawVisible)
+        self.assertFalse(enemy._offlineNativeMarkerVisible)
+
+        compatibility.fini()
+        self.assertIs(stock_vehicle_enter,
+                      vehicle_type.__dict__['onEnterWorld'])
+
     def test_compatibility_does_not_replace_stock_vehicle_filters(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()
@@ -5409,6 +5531,7 @@ class BootstrapContractTests(unittest.TestCase):
             module._selected_vehicle = lambda value: {
                 'id': 1, 'compDescr': 12345}
             module._signal_worker_ready = mock.Mock(return_value=True)
+            module._signal_player_ready = mock.Mock(return_value=True)
             module.init()
             module.init()
             instance_guard.release_if_requested.assert_called_once_with()
@@ -5472,6 +5595,7 @@ class BootstrapContractTests(unittest.TestCase):
                 bigworld.run_next()
             module.fini()
             self.assertFalse(module._started)
+            module._signal_player_ready.assert_called_once_with()
 
             # A lobby-stage timeout must fully undo the connection adapter
             # and listener, then allow a clean init.  Keep the hangar not

@@ -3848,6 +3848,8 @@ class BattleState:
             "roll": round(_clamp(_finite_float(raw.get("roll")), -0.61, 0.61), 5),
             "aim_yaw": round(_finite_float(raw.get("aim_yaw"), yaw), 5),
             "gun_pitch": round(_clamp(_finite_float(raw.get("gun_pitch")), -1.2, 1.2), 5),
+            "speed": round(_clamp(
+                _finite_float(raw.get("speed")), -80.0, 80.0), 4),
             "movement_dir": (1 if movement > 0.01 else
                              (-1 if movement < -0.01 else 0)),
             "rotation_dir": (1 if rotation > 0.01 else
@@ -6653,22 +6655,18 @@ class BattleState:
                             player.ram_contact_seq = seq
                             continue
                         if self.client_build == CLIENT_BUILD_0922:
-                            # The visible modern endpoint reports only contact
-                            # identity. Freeze its body from this admitted input
-                            # so a second unbound pose cannot become a verdict.
-                            contact.update({
-                                "input_seq": int(player.input_seq),
-                                "x": round(float(player.x), 4),
-                                "y": round(float(player.y), 4),
-                                "z": round(float(player.z), 4),
-                                "yaw": round(float(player.yaw), 5),
-                                "vx": round(
-                                    math.sin(float(player.yaw)) *
-                                    float(player.speed), 4),
-                                "vz": round(
-                                    math.cos(float(player.yaw)) *
-                                    float(player.speed), 4),
-                            })
+                            # The contact body is sampled before local
+                            # separation, while this input's ordinary pose is
+                            # sampled after the reciprocal impulse/correction.
+                            # Replacing the former with the latter therefore
+                            # removes the overlap that the authority must
+                            # independently re-check and turns every player-
+                            # bot ram into a terminal zero-damage receipt.
+                            # Bind the validated pre-separation body to this
+                            # ordered input transaction without rewriting it;
+                            # the worker still derives damage from the frozen
+                            # bot history and owns the canonical HP commit.
+                            contact["input_seq"] = int(player.input_seq)
                         player.ram_contact_seq = seq
                         player.ram_contacts[seq] = contact
                         player.ram_contact = dict(contact)

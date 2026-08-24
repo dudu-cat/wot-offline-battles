@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -12,9 +13,10 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 
 from gui.mods.offline_lan_0922.lan_client import (
     HUMAN_RAM_TIMELINE_CAPABILITY, LANClient,
-    LEAN_SNAPSHOT_MANIFEST_CAPABILITY)
+    LEAN_SNAPSHOT_MANIFEST_CAPABILITY, project_bot_state)
 from gui.mods.offline_lan_0922.authority_worker import (
     AuthorityWorkerLANClient)
+from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from lan_battle_server import (
     BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, Player,
     _bot_combat_log_message, _server_event_log_message, _server_log)
@@ -224,6 +226,46 @@ class LanProtocolTests(unittest.TestCase):
             team=1, slot=0, health=90, max_health=90,
             vehicle_compact_descr='dGVzdA==')
         return state
+
+    def test_bot_speed_survives_worker_server_and_snapshot_projection(self):
+        source = {
+            'id': 3, 'x': 1.0, 'y': 0.0, 'z': 2.0, 'yaw': 0.1,
+            'pitch': 0.0, 'roll': 0.0, 'aim_yaw': 0.1,
+            'gun_pitch': 0.0, 'speed': 6.25,
+            'movement_dir': 1, 'rotation_dir': 0,
+            'fire_seq': 0, 'health': 500, 'alive': True,
+        }
+        identity = {
+            'id': 3, 'team': 1, 'slot': 1, 'name': 'Ally',
+            'vehicle': 'ussr:R11_MS-1', 'max_health': 500,
+        }
+
+        projected = project_bot_state(source)
+        self.assertEqual(6.25, projected['speed'])
+        sanitized = BattleState._sanitize_bot_state(
+            projected, identity, None)
+        self.assertEqual(6.25, sanitized['speed'])
+
+        events = SnapshotSync(
+            local_player_id=1, clock=lambda: 10.0).snapshot({
+                'round_id': 7, 'server_tick': 1,
+                'bot_state_revision': 1,
+                'motion_time_us': 100000,
+                'bot_state_time_us': 100000,
+                'players': [], 'bots': [sanitized],
+            })
+        update = next(event for event in events
+                      if event['type'] == 'update')
+        self.assertEqual(6.25, update['state']['speed'])
+
+        for raw, expected in (
+                (81.0, 80.0), (-81.0, -80.0),
+                (float('nan'), 0.0), (float('inf'), 0.0),
+                (float('-inf'), 0.0)):
+            bounded = BattleState._sanitize_bot_state(
+                dict(projected, speed=raw), identity, None)['speed']
+            self.assertTrue(math.isfinite(bounded))
+            self.assertEqual(expected, bounded)
 
     def test_server_applies_a_waiting_room_vehicle_change(self):
         state = self._room_with_one_player()

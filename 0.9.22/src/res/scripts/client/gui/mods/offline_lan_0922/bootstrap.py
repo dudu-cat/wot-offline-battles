@@ -28,6 +28,7 @@ _lobby_view_loaded = False
 _lobby_listener_installed = False
 _client_guard_released = False
 _worker_ready_signaled = False
+_player_ready_signaled = False
 
 # Enough of every artefact that the garage never blocks a mount on stock.
 OFFLINE_ARTEFACT_STOCK = 200
@@ -722,6 +723,7 @@ def _cleanup_runtime():
     global _lobby_listener_installed, _lobby_view_loaded
     global _announcement_ui, _intro_skip, _login_space_seen, _session, _started
     global _worker_presentation, _worker_ready_signaled
+    global _player_ready_signaled
     global _client_guard_released
     errors = []
 
@@ -791,6 +793,7 @@ def _cleanup_runtime():
     _lobby_view_loaded = False
     _client_guard_released = False
     _worker_ready_signaled = False
+    _player_ready_signaled = False
     _started = False
     if errors:
         return errors[0]
@@ -931,6 +934,13 @@ def _signal_worker_ready():
     return signal_worker_ready()
 
 
+def _signal_player_ready():
+    """Publish readiness after the visible client's Hangar is stable."""
+    from gui.mods.offline_lan_0922.worker_presentation import \
+        signal_player_ready
+    return signal_player_ready()
+
+
 def _install_intro_skip():
     """Skip the startup video so the client reaches the login screen."""
     global _intro_skip
@@ -1007,7 +1017,7 @@ def _wait_for_login_space():
 
 
 def _wait_for_lobby():
-    global _callback_id, _deadline
+    global _callback_id, _deadline, _player_ready_signaled
     _callback_id = None
     try:
         if _lobby_view_loaded and _deadline <= 0.0:
@@ -1030,6 +1040,11 @@ def _wait_for_lobby():
                     _config.get('startupTimeoutSeconds', 30.0))
                 _schedule(0.10, _wait_for_worker_connection)
             else:
+                if not _player_ready_signaled:
+                    if not _signal_player_ready():
+                        raise RuntimeError(
+                            'visible player ready marker was not published')
+                    _player_ready_signaled = True
                 sys.stdout.write(
                     '[Offline LAN 0.9.22] lobby ready; click Battle to join '
                     '%s:%s\n' % (

@@ -273,6 +273,33 @@ class _NativeRemoteState(object):
                 'body_swinging', False,
                 'stock SwingingAnimator is unavailable')
 
+        # CompoundAppearance.activate binds the stock LodCalculator after it
+        # links the compound to the entity filter.  We replace that compound
+        # matrix with the copied LAN provider after stock activation, so the
+        # old position link would otherwise remain at the filter's spawn pose.
+        # WheelsAnimator, suspension and other stock components share this LOD
+        # state; belts can keep scrolling through PyTrackScroll while the
+        # wheels themselves stop updating once the camera leaves that stale
+        # position.  Repeat #1513's exact public binding for our provider.
+        lod = getattr(appearance, 'lodCalculator', None)
+        link_translation = getattr(
+            self._data_links, 'linkMatrixTranslation', None)
+        setup_position = getattr(lod, 'setupPosition', None)
+        lod_ready = False
+        if callable(link_translation) and callable(setup_position):
+            try:
+                setup_position(link_translation(self.provider))
+                lod_ready = True
+            except Exception as error:
+                self._record_capability(
+                    'stock_motion_lod', False, error)
+        if lod_ready:
+            self._record_capability('stock_motion_lod', True)
+        elif 'stock_motion_lod' not in self.presentation_errors:
+            self._record_capability(
+                'stock_motion_lod', False,
+                'stock LodCalculator/DataLinks are unavailable')
+
         wheels = getattr(appearance, 'wheelsAnimator', None)
         suspension = getattr(appearance, 'suspension', None)
         if suspension is None:
@@ -323,11 +350,25 @@ class _NativeRemoteState(object):
         self.speed = float(speed)
         self.turn_speed = float(turn_speed)
 
+    def settle_motion(self, now=None):
+        """Clear pose-derived motion after the rendered pose stops changing."""
+        if now is not None:
+            self._last_pose_time = float(now)
+        self.velocity = self._math.Vector3(0.0, 0.0, 0.0)
+        self.acceleration = self._math.Vector3(0.0, 0.0, 0.0)
+        self.speed = 0.0
+        self.turn_speed = 0.0
+        if self.entity is not None:
+            self._publish_pose()
+        return True
+
     def attach(self, entity):
         self.entity = entity
         entity._offlineNativeRemote = True
-        entity._offlineNativeMarkerVisible = True
-        entity._offlineNativeDrawVisible = True
+        entity._offlineNativeMarkerVisible = bool(getattr(
+            entity, '_offlineNativeMarkerVisible', True))
+        entity._offlineNativeDrawVisible = bool(getattr(
+            entity, '_offlineNativeDrawVisible', True))
         entity._offlineNativeMotionState = self
         entity._aim_yaw = self.yaw
         entity._gun_pitch = 0.0
@@ -335,6 +376,7 @@ class _NativeRemoteState(object):
         entity.bw_entity_id = int(entity.id)
         entity.set_pose = self.set_pose
         entity.set_aim = self.set_aim
+        entity.settle_motion = self.settle_motion
         entity.update_tracks = self.update_tracks
         entity.track_scroll_readback = self.track_scroll_readback
         entity.model.matrix = self.provider
@@ -354,6 +396,15 @@ class _NativeRemoteState(object):
             if self.entity is not None and self.entity.appearance is not None:
                 self._rebind_provider()
                 self.entity.appearance.setupGunMatrixTargets(self.aim)
+                # Stock may replace the scroll controller together with the
+                # chassis fashion.  Re-read it at that lifecycle boundary and
+                # make the next 20 Hz feed replay both engine mode and speed.
+                self.track_scroll = getattr(
+                    self.entity.appearance,
+                    '_CompoundAppearance__trackScrollCtl', None)
+                self.entity.track_scroll = self.track_scroll
+                self.track_mode = None
+                self._track_feed = None
                 # CompoundAppearance may replace the model after damage or a
                 # streaming refresh.  Stock startVisual makes that replacement
                 # visible again, so restore the runtime-owned spotting gates
@@ -428,7 +479,7 @@ class _NativeRemoteState(object):
                 left_contact, right_contact)
         if feed == self._track_feed:
             return bool(self.presentation_capabilities.get(
-                'engine_owned_track_motion') or self.track_scroll is not None)
+                'engine_owned_track_motion'))
         native_updated = False
         vehicle_filter = getattr(entity, 'filter', None)
         appearance_filter = getattr(appearance, 'filter', None)
@@ -457,8 +508,13 @@ class _NativeRemoteState(object):
         # PyTrackScroll remains the safe belt/audio fallback when the exact
         # native wheel input is absent.  It never calls WGVehicleFilter APIs.
         appearance.updateTracksScroll(left, right)
-        self._track_feed = feed
-        return bool(native_updated or self.track_scroll is not None)
+        # Merely finding the controller does not prove stock activated and
+        # bound it.  Commit the cache only after the engine-owned filter has
+        # accepted the #1513 native write; otherwise the same feed must be
+        # allowed to retry instead of becoming a permanent false success.
+        if native_updated:
+            self._track_feed = feed
+        return bool(native_updated)
 
     def track_scroll_readback(self):
         if self.track_scroll is None:

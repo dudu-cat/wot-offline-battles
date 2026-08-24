@@ -90,7 +90,7 @@ LEAVE_SEND_TIMEOUT = 0.05
 LEAVE_PAYLOAD = b'{"type":"leave"}\n'
 _BOT_STATE_WIRE_FIELDS = (
     'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
-    'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
+    'speed', 'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
     'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',

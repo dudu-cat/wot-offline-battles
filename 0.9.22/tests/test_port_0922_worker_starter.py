@@ -38,8 +38,9 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('CreateMutexW(0, TRUE, WORKER_MUTEX_NAME)', source)
         self.assertIn('OFFLINE_LAN_0922_WORKER_READY_MARKER', source)
         self.assertIn(
-            'wait_for_worker_ready(\n\t\t\tprocess.hProcess, '
-            'server_process.hProcess, stop_event)', source)
+            'wait_for_worker_ready(\n\t\t\tprocess.hProcess,\n'
+            '\t\t\tworker_only ? 0 : server_process.hProcess, stop_event)',
+            source)
         wait_body = source.split(
             'static int wait_for_worker_ready', 1)[1].split(
                 'static int launch_player', 1)[0]
@@ -118,7 +119,7 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertLess(launch.index('AssignProcessToJobObject'),
                         launch.index('ResumeThread'))
 
-    def test_optional_procdump_attaches_before_clients_are_resumed(self):
+    def test_optional_procdump_attaches_only_after_client_ready_boundaries(self):
         source = SOURCE.read_text(encoding='utf-8')
         capture = source.split(
             'static HANDLE start_procdump_configured', 1)[1].split(
@@ -139,22 +140,50 @@ class WorkerStarterTests(unittest.TestCase):
 
         player_assign = launch.index(
             'AssignProcessToJobObject(player_job, process.hProcess)')
-        player_capture = launch.index(
-            'track_player_process(&tracker, process.dwProcessId, game_path)',
-            player_assign)
         player_resume = launch.index(
-            'ResumeThread(process.hThread)', player_capture)
-        self.assertLess(player_assign, player_capture)
-        self.assertLess(player_capture, player_resume)
+            'ResumeThread(process.hThread)', player_assign)
+        player_track = launch.index(
+            'track_player_process(&tracker, process.dwProcessId, game_path)',
+            player_resume)
+        player_ready_attach = launch.index(
+            'attach_ready_player_procdumps(', player_track)
+        self.assertLess(player_assign, player_resume)
+        self.assertLess(player_resume, player_track)
+        self.assertLess(player_track, player_ready_attach)
+        attach = source.split(
+            'static int attach_ready_player_procdumps', 1)[1].split(
+                'static int track_player_job_processes', 1)[0]
+        self.assertLess(
+            attach.index('GetFileAttributesW(ready_marker)'),
+            attach.index('start_procdump_configured('))
 
         worker_assign = main.index(
             'AssignProcessToJobObject(job, process.hProcess)')
-        worker_capture = main.index(
-            'procdump_process = start_procdump_configured(', worker_assign)
         worker_resume = main.index(
-            'ResumeThread(process.hThread)', worker_capture)
-        self.assertLess(worker_assign, worker_capture)
-        self.assertLess(worker_capture, worker_resume)
+            'ResumeThread(process.hThread)', worker_assign)
+        worker_ready = main.index(
+            'ready_state = wait_for_worker_ready(', worker_resume)
+        worker_capture = main.index(
+            'procdump_process = start_procdump_configured(', worker_ready)
+        worker_publish = main.index(
+            'publish_ready_marker(g_ready_marker)', worker_capture)
+        self.assertLess(worker_assign, worker_resume)
+        self.assertLess(worker_resume, worker_ready)
+        self.assertLess(worker_ready, worker_capture)
+        self.assertLess(worker_capture, worker_publish)
+        self.assertIn('OFFLINE_LAN_0922_WORKER_INTERNAL_READY_MARKER', source)
+        self.assertIn('OFFLINE_LAN_0922_PLAYER_READY_MARKER', source)
+
+    def test_starter_failure_log_preserves_the_root_procdump_error(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        log = source.split(
+            'static void log_failure', 1)[1].split(
+                'static void clear_failure_log', 1)[0]
+
+        self.assertIn('FILE_APPEND_DATA', log)
+        self.assertIn('OPEN_ALWAYS', log)
+        self.assertIn('FILE_SHARE_READ | FILE_SHARE_WRITE', log)
+        self.assertNotIn('CREATE_ALWAYS', log)
 
     def test_starter_bounds_procdump_completion_and_cancels_on_timeout(self):
         source = SOURCE.read_text(encoding='utf-8')
@@ -251,11 +280,16 @@ class WorkerStarterTests(unittest.TestCase):
             player_cancel)
         worker_stop = main.index('wait_state == WAIT_OBJECT_0 + 1')
         worker_recheck = main.index(
-            'WaitForSingleObject(process.hProcess, 0)', worker_stop)
+            'WaitForSingleObject(\n\t\t\t\t\t\tprocess.hProcess, 0)',
+            worker_stop)
         worker_cancel = main.index(
             'cancel_procdump_now(&procdump_process,', worker_recheck)
         worker_terminate = main.index(
             'TerminateJobObject(job, ERROR_PROCESS_ABORTED);', worker_cancel)
+        worker_cleanup = main.index('worker_cleanup:')
+        cleanup_cancel = main.index(
+            'cancel_procdump_now(&procdump_process,', worker_cleanup)
+        cleanup_job_close = main.index('CloseHandle(job);', cleanup_cancel)
 
         self.assertIn('--stop-starter ', source)
         self.assertIn('OpenEventW(EVENT_MODIFY_STATE', source)
@@ -263,6 +297,7 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertLess(player_cancel, player_terminate)
         self.assertLess(worker_recheck, worker_cancel)
         self.assertLess(worker_cancel, worker_terminate)
+        self.assertLess(cleanup_cancel, cleanup_job_close)
         self.assertIn('return stopped ? 0 : result;', source)
 
     def test_player_stop_always_retires_job_and_preserves_observed_crash(self):
@@ -294,7 +329,7 @@ class WorkerStarterTests(unittest.TestCase):
             'singleton = CreateMutexW(0, TRUE, WORKER_MUTEX_NAME);')
         duplicate = main.index(
             'if (GetLastError() == ERROR_ALREADY_EXISTS)', mutex)
-        clear_marker = main.index('if (!remove_ready_marker())', duplicate)
+        clear_marker = main.index('if (!remove_ready_markers())', duplicate)
         self.assertLess(mutex, duplicate)
         self.assertLess(duplicate, clear_marker)
         self.assertIn('goto worker_cleanup;', main[clear_marker:])
@@ -308,7 +343,7 @@ class WorkerStarterTests(unittest.TestCase):
         first_process_check = wait_body.index(
             'WaitForSingleObject(worker_process, 0)')
         marker_check = wait_body.index(
-            'GetFileAttributesW(g_ready_marker)')
+            'GetFileAttributesW(g_internal_ready_marker)')
         second_process_check = wait_body.index(
             'WaitForSingleObject(worker_process, 0)',
             first_process_check + 1)
@@ -382,6 +417,10 @@ class WorkerStarterTests(unittest.TestCase):
             'engine_config.offline-worker.xml'.encode('utf-16le'), payload)
         self.assertNotIn('--preferences'.encode('utf-16le'), payload)
         self.assertIn('offline-worker.ready'.encode('utf-16le'), payload)
+        self.assertIn(
+            'offline-worker.internal-ready'.encode('utf-16le'), payload)
+        self.assertIn(
+            'offline-player-%lu.ready'.encode('utf-16le'), payload)
         self.assertIn(
             'WoT-0.9.22-LAN-Server.exe'.encode('utf-16le'), payload)
         self.assertIn('WOT_0922_LOOPBACK_ONLY'.encode('utf-16le'), payload)
