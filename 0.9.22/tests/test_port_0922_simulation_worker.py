@@ -1292,6 +1292,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                     'target_id': target.player_id,
                     'target_team': target.team,
                     'visible': False,
+                    'visible_by_player_ids': [],
                     'shootable_by_bot_ids': [],
                     'x': target.x, 'y': target.y, 'z': target.z,
                     'health': target.health,
