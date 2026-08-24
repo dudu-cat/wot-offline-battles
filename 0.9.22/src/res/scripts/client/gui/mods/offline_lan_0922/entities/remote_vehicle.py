@@ -207,9 +207,10 @@ class _RemoteAppearance(object):
     def detach(self):
         self.engineAudition.detach()
         effects = self._bound_effects
-        self._bound_effects = None
         if effects is not None:
             effects.destroy()
+            if self._bound_effects is effects:
+                self._bound_effects = None
         self.compoundModel = None
         self.models = []
         self.isLoaded = False
@@ -259,13 +260,15 @@ class _RemoteShotPresenter(object):
     #1513 adaptation of the mature 0.8.2 remote-shot presentation path.
     """
 
-    def __init__(self, bigworld, math_module, model_assembler):
+    def __init__(self, bigworld, math_module, model_assembler, space_id):
         self._bigworld = bigworld
         self._math = math_module
         self._model_assembler = model_assembler
+        self._space_id = int(space_id)
         self._mover = None
         self._next_shot_id = 1000000
         self._projectile_shots = {}
+        self._failure_stages = set()
         self._closed = False
 
     def setup_recoil(self, vehicle):
@@ -363,6 +366,7 @@ class _RemoteShotPresenter(object):
             attacker_id = int(attacker_id)
         except (TypeError, ValueError, OverflowError):
             return False
+        existing = None
         if projectile_id is not None:
             try:
                 projectile_id = str(projectile_id)
@@ -371,9 +375,7 @@ class _RemoteShotPresenter(object):
             if not projectile_id or len(projectile_id) > 128:
                 return False
             existing = self._projectile_shots.get(projectile_id)
-            if existing is not None:
-                return existing
-            if len(self._projectile_shots) >= 128:
+            if existing is None and len(self._projectile_shots) >= 128:
                 return False
         if (visual_start is None or reference_start is None or
                 reference_velocity is None or gravity is None or
@@ -385,9 +387,26 @@ class _RemoteShotPresenter(object):
             effects_descr = vehicles.g_cache.shotEffects[effects_index]
             if effects_descr is None:
                 return False
+            try:
+                artillery = effects_descr.get('artilleryID') is not None
+            except AttributeError:
+                return False
             mover = self._projectile_mover()
             if mover is None:
                 return False
+            if existing is not None:
+                existing_id, existing_artillery = existing
+                if existing_artillery:
+                    return existing_id
+                active = getattr(
+                    mover, '_ProjectileMover__projectiles', None)
+                if (isinstance(active, dict) and
+                        existing_id in active):
+                    return existing_id
+                # The native simulator discarded or retired the projectile
+                # without an authoritative terminal.  Drop only our stale
+                # dedupe entry so the active snapshot can recreate it.
+                self._projectile_shots.pop(projectile_id, None)
             camera = getattr(self._bigworld, 'camera', None)
             camera = camera() if callable(camera) else None
             camera_position = self._finite_vector(
@@ -403,10 +422,24 @@ class _RemoteShotPresenter(object):
                 shot_id, effects_descr, gravity, reference_start,
                 reference_velocity, visual_start, maximum, attacker_id,
                 camera_position)
+            # ``ProjectileMover.add`` has no return-value contract.  In
+            # #1513 it silently returns without creating a projectile during
+            # replay time-warp and when the native ballistics simulator
+            # rejects the launch.  Do not turn that failure into a permanent
+            # projectile-id dedupe entry: a later authoritative snapshot must
+            # be allowed to retry it.
+            active = getattr(
+                mover, '_ProjectileMover__projectiles', None)
+            if (not artillery and
+                    (not isinstance(active, dict) or shot_id not in active)):
+                self._report_failure('native add rejected')
+                return False
             if projectile_id is not None:
-                self._projectile_shots[projectile_id] = shot_id
+                self._projectile_shots[projectile_id] = (
+                    shot_id, artillery)
             return shot_id
-        except Exception:
+        except Exception as error:
+            self._report_failure('launch exception', error)
             return False
 
     def stop_canonical(self, projectile_id, end_position,
@@ -427,23 +460,26 @@ class _RemoteShotPresenter(object):
             projectile_id = str(projectile_id)
         except Exception:
             return False
-        shot_id = self._projectile_shots.get(projectile_id)
+        entry = self._projectile_shots.get(projectile_id)
         end = self._finite_vector(end_position)
-        if shot_id is None or end is None:
+        if entry is None or end is None:
             return False
-        self._projectile_shots.pop(projectile_id, None)
+        shot_id, unused_artillery = entry
         mover = self._mover
         if mover is None:
             return False
         if self._explode_canonical(mover, shot_id, end, explosion):
+            self._projectile_shots.pop(projectile_id, None)
             return True
         callback = getattr(mover, 'hide', None) if mover is not None else None
         if not callable(callback):
             return False
         try:
             callback(shot_id, end)
-        except Exception:
+        except Exception as error:
+            self._report_failure('terminal hide exception', error)
             return False
+        self._projectile_shots.pop(projectile_id, None)
         return True
 
     def _explode_canonical(self, mover, shot_id, end, explosion):
@@ -468,9 +504,9 @@ class _RemoteShotPresenter(object):
         # An artillery-strike descriptor makes ProjectileMover.explode return
         # before it plays anything; never pretend that produced an effect.
         try:
-            if 'artilleryID' in effects_descr:
+            if effects_descr.get('artilleryID') is not None:
                 return False
-        except TypeError:
+        except AttributeError:
             return False
         direction = self._finite_vector(velocity)
         if direction is None:
@@ -515,12 +551,42 @@ class _RemoteShotPresenter(object):
 
     def _projectile_mover(self):
         if self._mover is None and not self._closed:
+            mover = None
             try:
                 from ProjectileMover import ProjectileMover
-                self._mover = ProjectileMover()
-            except Exception:
+                mover = ProjectileMover()
+                set_space_id = getattr(mover, 'setSpaceID', None)
+                if not callable(set_space_id):
+                    raise RuntimeError(
+                        '#1513 ProjectileMover has no setSpaceID')
+                # Stock PlayerAvatar binds the ballistics simulator to the
+                # current space before its first addProjectile call.  A mover
+                # without this binding can fail silently or trace against the
+                # wrong collision scene.
+                set_space_id(self._space_id)
+                self._mover = mover
+            except Exception as error:
+                destroy = getattr(mover, 'destroy', None)
+                if callable(destroy):
+                    try:
+                        destroy()
+                    except Exception:
+                        pass
+                self._report_failure('mover setup', error)
                 return None
         return self._mover
+
+    def _report_failure(self, stage, error=None):
+        """Log each native tracer failure stage once per battle."""
+        stage = str(stage)
+        if stage in self._failure_stages:
+            return False
+        self._failure_stages.add(stage)
+        detail = '' if error is None else ': %s' % error
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] projectile visual %s%s\n' % (
+                stage, detail))
+        return True
 
     def _muzzle_position(self, vehicle):
         try:
@@ -582,13 +648,18 @@ class _RemoteShotPresenter(object):
 
     def destroy(self):
         self._closed = True
-        self._projectile_shots = {}
         mover = self._mover
-        self._mover = None
         if mover is not None:
             callback = getattr(mover, 'destroy', None)
-            if callable(callback):
-                callback()
+            if not callable(callback):
+                raise RuntimeError(
+                    '#1513 ProjectileMover has no destroy lifecycle')
+            callback()
+        # Keep the mover and its projectile ownership intact when native
+        # teardown raises.  ``destroy_all`` may then retry the same object
+        # instead of leaking a callback subscription with no Python owner.
+        self._mover = None
+        self._projectile_shots = {}
 
 
 class _RemoteFilter(object):
@@ -871,9 +942,10 @@ class RemoteVehicle(object):
 
     def _release_stickers(self, engine_alive=True):
         stickers = self._vehicle_stickers
-        self._vehicle_stickers = None
         if stickers is not None and engine_alive:
             stickers.detach()
+        if self._vehicle_stickers is stickers:
+            self._vehicle_stickers = None
         return stickers is not None
 
     def update_tracks(self, left, right, mode):
@@ -951,12 +1023,14 @@ class RemoteVehicle(object):
         self._stop_extras()
         self.appearance.engineAudition.detach()
         effects = self.appearance._bound_effects
-        self.appearance._bound_effects = None
         if effects is not None:
             try:
                 effects.destroy()
             except Exception:
                 pass
+            else:
+                if self.appearance._bound_effects is effects:
+                    self.appearance._bound_effects = None
         self.engineMode = (0, 0)
         self.appearance.gear = 0
         self.filter.update(
@@ -1003,37 +1077,23 @@ class RemoteVehicle(object):
         self._stop_extras()
         self._release_stickers()
         self._release_track_animation()
+        model = self.model
+        entity = self.bw_entity
+        if entity is not None:
+            entity.model = None
+        if model is not None:
+            # Match CompoundAppearance.deactivate(): the compound leaves
+            # the entity first, and only then loses the live provider.
+            model.matrix = self._math.Matrix()
+        self.appearance.detach()
         self._collision_obstacle = None
         self.isStarted = False
         self.inWorld = False
-        model = self.model
-        entity = self.bw_entity
-        first_error = None
-        try:
-            if entity is not None:
-                entity.model = None
-        except Exception as error:
-            first_error = error
-        try:
-            if model is not None:
-                # Match CompoundAppearance.deactivate(): the compound leaves
-                # the entity first, and only then loses the live provider.
-                model.matrix = self._math.Matrix()
-        except Exception as error:
-            if first_error is None:
-                first_error = error
-        try:
-            self.appearance.detach()
-        except Exception as error:
-            if first_error is None:
-                first_error = error
         self.appearance.gunRecoil = None
         self.bw_entity = None
         self.bw_entity_id = None
         self.model = None
         self._gun_recoil = None
-        if first_error is not None:
-            raise first_error
 
     def abandon_visual(self):
         """Forget every native object without touching one of them.
@@ -1440,7 +1500,7 @@ class RemoteVehicleFactory(object):
         self._wreck_loading_entities = set()
         self._wreck_loading_started = {}
         self._shot_presenter = _RemoteShotPresenter(
-            bigworld, math_module, model_assembler)
+            bigworld, math_module, model_assembler, self._space_id)
         self.install()
 
     def install(self):
@@ -1719,6 +1779,7 @@ class RemoteVehicleFactory(object):
             self._report_track_animation('disabled', None)
             return False
         step = 'prepareFashions'
+        scroll = None
         try:
             fashions = camouflages.prepareFashions(False)
             step = 'setupVehicleFashion'
@@ -1752,6 +1813,18 @@ class RemoteVehicleFactory(object):
             step = 'movementInfo'
             fashions[0].movementInfo = vehicle_filter.movementInfo
         except Exception as error:
+            if scroll is not None:
+                # ``activate`` registers a native 20 Hz callback and
+                # ``setData`` keeps a raw filter pointer.  Unwind both sides
+                # when any later initialization step fails.
+                try:
+                    scroll.deactivate()
+                except Exception:
+                    pass
+                try:
+                    scroll.setData(None)
+                except Exception:
+                    pass
             if self.track_animation_error is None:
                 self.track_animation_error = '%s: %s' % (step, error)
             self._report_track_animation(step, error)
@@ -1994,45 +2067,42 @@ class RemoteVehicleFactory(object):
         return lookup(int(entity_id)) is not None
 
     def engine_active(self):
-        """Whether the engine still holds the presentations we created."""
-        for vehicle in self._vehicles.values():
-            if vehicle.bw_entity_id is None:
-                continue
-            if self.engine_owns(vehicle.bw_entity_id):
-                return True
-            return False
-        return True
+        """Whether the engine still holds any presentation we created."""
+        return any(
+            vehicle.bw_entity_id is not None and
+            self.engine_owns(vehicle.bw_entity_id)
+            for vehicle in self._vehicles.values())
 
     def destroy(self, entity_id):
-        vehicle = self._vehicles.pop(entity_id, None)
+        vehicle = self._vehicles.get(entity_id)
         if vehicle is None:
             return False
+        visual_id = vehicle.bw_entity_id
+        if visual_id is not None and not self.engine_owns(visual_id):
+            vehicle.abandon_visual()
+        else:
+            try:
+                vehicle.detach_visual()
+            except Exception as error:
+                # Do not destroy the native entity while one of its attached
+                # subresources still needs an exact retry.
+                vehicle.bw_entity_id = visual_id
+                raise
+            if visual_id is not None:
+                try:
+                    self._bigworld.destroyEntity(visual_id)
+                except Exception as error:
+                    # ``detach_visual`` intentionally severs the compound
+                    # before destroyEntity.  Retain the stable native id on
+                    # failure so a later destroy() can finish that exact
+                    # teardown.
+                    vehicle.bw_entity_id = visual_id
+                    raise
+        self._vehicles.pop(entity_id, None)
         self._wreck_requested_entities.discard(entity_id)
         self._wreck_waiting_entities.discard(entity_id)
         self._wreck_loading_entities.discard(entity_id)
         self._wreck_loading_started.pop(entity_id, None)
-        visual_id = vehicle.bw_entity_id
-        if visual_id is not None and not self.engine_owns(visual_id):
-            vehicle.abandon_visual()
-            return True
-        first_error = None
-        try:
-            vehicle.detach_visual()
-        except Exception as error:
-            first_error = error
-            vehicle.bw_entity = None
-            vehicle.bw_entity_id = None
-            vehicle.model = None
-            vehicle.isStarted = False
-            vehicle.inWorld = False
-        if visual_id is not None:
-            try:
-                self._bigworld.destroyEntity(visual_id)
-            except Exception as error:
-                if first_error is None:
-                    first_error = error
-        if first_error is not None:
-            raise first_error
         return True
 
     def destroy_all(self):
@@ -2043,20 +2113,27 @@ class RemoteVehicleFactory(object):
             except Exception as error:
                 if first_error is None:
                     first_error = error
-        for descriptor in tuple(self._descriptors.values()):
+        # A failed entity remains in ``_vehicles`` with its native id.  Shared
+        # BSPs, tracer resources and entity-table wrappers must stay alive
+        # until a retry has retired every such owner.
+        if first_error is not None:
+            raise first_error
+        for key, descriptor in tuple(self._descriptors.items()):
             try:
                 tank_collision.forget_chassis_shape(descriptor)
             except Exception as error:
                 if first_error is None:
                     first_error = error
-        self._descriptors = {}
-        for tester in tuple(self._hit_testers.values()):
+            else:
+                self._descriptors.pop(key, None)
+        for key, tester in tuple(self._hit_testers.items()):
             try:
                 tester.releaseBspModel()
             except Exception as error:
                 if first_error is None:
                     first_error = error
-        self._hit_testers = {}
+            else:
+                self._hit_testers.pop(key, None)
         self._wreck_descriptor_paths = {}
         self._wreck_requested_paths = set()
         self._wreck_pending_paths = set()

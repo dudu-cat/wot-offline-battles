@@ -159,6 +159,7 @@ EXPECTED_ABI = {
             'self', 'startPoint', 'endPoint', 'skipGun'),
     },
     'scripts/client/ProjectileMover.pyc': {
+        'ProjectileMover.__init__': ('self',),
         'ProjectileMover.add': (
             'self', 'shotID', 'effectsDescr', 'gravity', 'refStartPoint',
             'refVelocity', 'startPoint', 'maxDistance', 'attackerID',
@@ -167,6 +168,8 @@ EXPECTED_ABI = {
         'ProjectileMover.explode': (
             'self', 'shotID', 'effectsDescr', 'effectMaterial', 'endPoint',
             'velocityDir'),
+        'ProjectileMover.setSpaceID': ('self', 'spaceID'),
+        'ProjectileMover.destroy': ('self',),
         'segmentMayHitEntity': ('entity', 'startPoint', 'endPoint'),
         'collideEntities': (
             'startPoint', 'endPoint', 'entities', 'skipGun'),

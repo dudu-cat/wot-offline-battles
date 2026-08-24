@@ -10,6 +10,10 @@ MAX_SPOT_DISTANCE = 445.0
 # keep its ten-second memory beyond this boundary, but the local client must not
 # draw the remote vehicle there.
 VEHICLE_AOI_RADIUS = 565.0
+# Exact #1513 ``constants.AOI.CIRCULAR_AOI_MARGIN``.  Native AOI keeps an
+# already-present vehicle for this extra distance so movement along the
+# boundary does not repeatedly add and remove its world presentation.
+VEHICLE_AOI_HYSTERESIS_MARGIN = 5.0
 # Retail #1513 varied the post-detection hold within a 5-10 second window.
 # Use its no-skill guaranteed-disappearance bound so deterministic LAN peers
 # never hide a target earlier than the retail rule allowed.

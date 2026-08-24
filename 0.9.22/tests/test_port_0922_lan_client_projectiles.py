@@ -91,6 +91,7 @@ class ProjectileWireTests(unittest.TestCase):
             module.RAM_CONTACT_LEDGER_CAPABILITY,
             module.HUMAN_RAM_TIMELINE_CAPABILITY,
             module.PLAYER_FIRE_INTENT_CAPABILITY,
+            module.PLAYER_ENVIRONMENT_CAPABILITY,
             module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
             module.PROJECTILE_WRECK_HIT_CAPABILITY,
             module.RANDOM_MAP_CAPABILITY,
@@ -117,6 +118,7 @@ class ProjectileWireTests(unittest.TestCase):
             module.RAM_CONTACT_LEDGER_CAPABILITY,
             module.HUMAN_RAM_TIMELINE_CAPABILITY,
             module.PLAYER_FIRE_INTENT_CAPABILITY,
+            module.PLAYER_ENVIRONMENT_CAPABILITY,
             module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
             module.PROJECTILE_WRECK_HIT_CAPABILITY,
             module.RANDOM_MAP_CAPABILITY,
@@ -237,6 +239,24 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual([1.0, 2.0, 3.0], message['shot_origin'])
         self.assertEqual([1.0, 0.0, 0.0], message['shot_direction'])
         self.assertEqual(0.02, message['dispersion_angle'])
+
+    def test_player_input_carries_one_atomic_queued_shell_selection(self):
+        client = self.active_client()
+
+        self.assertTrue(client.send_input(
+            0.0, 0.0, position=[1.0, 2.0, 3.0], yaw=0.0,
+            shell_index=0, next_shell_index=1,
+            shell_change_pending=True, pose_time_us=1000))
+
+        message = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual(0, message['shell_index'])
+        self.assertEqual(1, message['next_shell_index'])
+        self.assertTrue(message['shell_change_pending'])
+        self.assertFalse(client.send_input(
+            0.0, 0.0, shell_index=0, next_shell_index=1))
+        self.assertFalse(client.send_input(
+            0.0, 0.0, shell_index=0, next_shell_index=0,
+            shell_change_pending=1))
 
     def test_visible_client_cannot_publish_player_projectile_launch(self):
         client = self.active_client()
@@ -510,6 +530,7 @@ class ProjectileWireTests(unittest.TestCase):
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
+                module.PLAYER_ENVIRONMENT_CAPABILITY,
                 module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 module.RANDOM_MAP_CAPABILITY,
             ] if server_capabilities is None else server_capabilities),

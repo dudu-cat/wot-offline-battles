@@ -19,7 +19,7 @@ import sys
 import BigWorld
 import Math
 
-_state = {'spaceID': None, 'chunks': {}, 'entities': set()}
+_state = {'spaceID': None, 'chunks': {}, 'entities': {}}
 
 _APPLY_REPORT_LIMIT = 24
 _applies_reported = [0]
@@ -57,7 +57,7 @@ def reset(spaceID=None):
 	raises KeyError, killing destructibles for the whole battle."""
 	_state['spaceID'] = spaceID
 	_state['chunks'] = {}
-	_state['entities'] = set()
+	_state['entities'] = {}
 	_applies_reported[0] = 0
 	_chunks_reported[0] = 0
 
@@ -80,8 +80,8 @@ def _ensure_shape():
 		_state['spaceID'] = None
 	if 'chunks' not in _state:
 		_state['chunks'] = {}
-	if 'entities' not in _state:
-		_state['entities'] = set()
+	if not isinstance(_state.get('entities'), dict):
+		_state['entities'] = {}
 
 
 def _reset_if_new_space(spaceID):
@@ -139,7 +139,38 @@ def _ensure_chunk(spaceID, chunkID, pos):
 		_report_chunk('startSpace', spaceID, chunkID, pos,
 			' was=%s now=%s dropped_streamed_chunks=%s' % (
 				_mgr_sid, mgr.getSpaceID(), streamed))
-	if chunkID not in _state['entities']:
+	entities = _state['entities']
+	controller = mgr.getController(chunkID)
+	entry = entities.get(chunkID)
+	if controller is not None:
+		# A controller that the stock stream already owns needs no duplicate
+		# client entity.  Only advance lifecycle state for a request created here.
+		if entry is not None:
+			entry['state'] = 'ready'
+		return controller
+	if entry is not None:
+		# A positive createEntity id is only a pending request.  Once the
+		# PyEntity is visible, AreaDestructibles.onEnterWorld must already have
+		# registered its controller.  A visible entity without that controller is
+		# a failed enter lifecycle and can be destroyed safely before retrying.
+		lookup = getattr(BigWorld, 'entity', None)
+		entity = None
+		if callable(lookup):
+			try:
+				entity = lookup(int(entry['entityID']))
+			except (KeyError, ReferenceError, TypeError, ValueError):
+				entity = None
+		if entity is None:
+			return None
+		destroy = getattr(BigWorld, 'destroyEntity', None)
+		if not callable(destroy):
+			raise RuntimeError(
+				'AreaDestructibles failed entity cannot be destroyed')
+		destroy(int(entry['entityID']))
+		entities.pop(chunkID, None)
+		_report_chunk('controller-retry', spaceID, chunkID, pos,
+			' failed_entity=%s' % entry['entityID'])
+	if chunkID not in entities:
 		c = _chunk(chunkID)
 		entityID = BigWorld.createEntity('AreaDestructibles', spaceID, 0, Math.Vector3(pos[0], pos[1], pos[2]), (0.0, 0.0, 0.0), {
 			'fallenTrees': list(c['fallenTrees']),
@@ -151,9 +182,11 @@ def _ensure_chunk(spaceID, chunkID, pos):
 			raise RuntimeError(
 				'AreaDestructibles entity was not created for chunk %s' %
 				chunkID)
-		# createEntity may complete asynchronously, but a failed call must remain
-		# retryable instead of permanently poisoning this chunk.
-		_state['entities'].add(chunkID)
+		# createEntity may complete asynchronously.  Keep the returned id pending
+		# until onEnterWorld registers the controller; never treat the request id
+		# itself as proof that the native object is usable.
+		entry = {'entityID': int(entityID), 'state': 'pending'}
+		entities[chunkID] = entry
 		# AreaDestructibles.onEnterWorld ignores the caller's chunk and derives
 		# its own from the entity position, so report both.
 		reader = getattr(AreaDestructibles, 'chunkIDFromPosition', None)
@@ -161,6 +194,9 @@ def _ensure_chunk(spaceID, chunkID, pos):
 			derived = reader(Math.Vector3(pos[0], pos[1], pos[2]))
 		except Exception as error:
 			derived = 'unavailable:%s' % (error,)
+		controller = mgr.getController(chunkID)
+		if controller is not None:
+			entry['state'] = 'ready'
 		_report_chunk('controller', spaceID, chunkID, pos,
 			' entity=%s derived_chunk=%s' % (entityID, derived))
 	# ``game.wg_onChunkLoad`` owns the manager's exact native slot count. The
@@ -168,7 +204,7 @@ def _ensure_chunk(spaceID, chunkID, pos):
 	# onChunkLoad from its length truncates later fragile/structure/falling slots
 	# and permanently poisons the manager for this streamed chunk.  If the native
 	# callback has not arrived, the manager safely queues direct orders itself.
-	return mgr.getController(chunkID)
+	return controller
 
 
 def _report_apply(spaceID, chunkID, pos, kind, destrData, ctrl,

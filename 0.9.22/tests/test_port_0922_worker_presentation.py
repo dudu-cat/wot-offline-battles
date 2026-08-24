@@ -20,9 +20,10 @@ def _load():
 
 
 class _Native(object):
-    def __init__(self, hidden=1, hide_error=None):
+    def __init__(self, hidden=1, hide_error=None, show_error=None):
         self.hidden = hidden
         self.hide_error = hide_error
+        self.show_error = show_error
         self.hide_calls = 0
         self.show_calls = 0
 
@@ -34,6 +35,8 @@ class _Native(object):
 
     def show_process_windows(self):
         self.show_calls += 1
+        if self.show_error is not None:
+            raise self.show_error
         return self.hidden
 
 
@@ -81,6 +84,20 @@ class WorkerPresentationTests(unittest.TestCase):
         self.assertIs(self.original_set_master,
                       self.wwise.WW_setMasterVolume)
         self.assertEqual([0.0, 0.65], self.wwise.volumes)
+
+    def test_failed_window_restore_retains_owner_for_exact_retry(self):
+        self.presentation.activate()
+        self.native.show_error = RuntimeError('window restore failed')
+
+        with self.assertRaisesRegex(RuntimeError, 'window restore failed'):
+            self.presentation.deactivate()
+
+        self.assertTrue(self.presentation.active)
+        self.assertIs(self.native, self.presentation._native)
+        self.native.show_error = None
+        self.assertTrue(self.presentation.deactivate())
+        self.assertFalse(self.presentation.active)
+        self.assertEqual(2, self.native.show_calls)
 
     def test_missing_window_keeps_audio_muted_for_fail_closed_exit(self):
         self.native.hidden = 0

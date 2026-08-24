@@ -169,11 +169,24 @@ class NativeSurface(object):
         Activating it is still what makes ``mcursor.position`` track.
         """
         import BigWorld
+        if self._saved_cursor is not None:
+            return True
         cursor = self._gui.mcursor()
-        self._saved_cursor = (bool(getattr(cursor, 'active', False)),
-                              getattr(cursor, 'visible', False))
-        cursor.visible = False
-        BigWorld.setCursor(cursor)
+        saved = (bool(getattr(cursor, 'active', False)),
+                 getattr(cursor, 'visible', False))
+        try:
+            cursor.visible = False
+            BigWorld.setCursor(cursor)
+        except Exception:
+            # A failed takeover is not ownership. Restore the two values which
+            # were sampled before the attempt and leave no committed token.
+            try:
+                cursor.visible = saved[1]
+                BigWorld.setCursor(cursor if saved[0] else None)
+            except Exception:
+                pass
+            raise
+        self._saved_cursor = saved
         return True
 
     def cursor_state(self):
@@ -208,10 +221,15 @@ class NativeSurface(object):
         """
         import BigWorld
         cursor = self._gui.mcursor()
-        active, visible = self._saved_cursor or (True, False)
-        self._saved_cursor = None
+        saved = self._saved_cursor
+        if saved is None:
+            return False
+        active, visible = saved
         cursor.visible = visible
         BigWorld.setCursor(cursor if active else None)
+        # Keep the token when either native restore call raises so a repeated
+        # close can retry the exact lobby state instead of guessing defaults.
+        self._saved_cursor = None
         return True
 
     def tick(self, delay, function):
@@ -294,6 +312,7 @@ class WaitingRoomUI(object):
         self._pointer_moves = 0
         self._pointer_ticks = 0
         self._open = False
+        self._root_attached = False
         self._hovered = None
         self._selected_map = initial_map
         self._message = ''
@@ -306,8 +325,9 @@ class WaitingRoomUI(object):
         surface = self._surface
         if surface is None:
             surface = NativeSurface()
-            self._surface = surface
         panel = surface.window()
+        controls = {}
+        labels = {}
         self._set(panel, 'horizontalPositionMode', 'CLIP')
         self._set(panel, 'verticalPositionMode', 'CLIP')
         self._set(panel, 'widthMode', 'PIXEL')
@@ -331,67 +351,77 @@ class WaitingRoomUI(object):
         # wg_inputKeyMode belongs to FlashGUIComponent in this build, so a
         # GUI.Window can never accept it.  Setting it only logged a skip.
         self._set(panel, 'visible', False)
-        self._panel = panel
-        self._apply_layout()
-        self._make_control('previous', (-0.72, 0.16, CONTROL_Z), 0.20, 0.20)
-        self._make_control('map', (0.0, 0.16, CONTROL_Z), 1.15, 0.20)
-        self._make_control('next', (0.72, 0.16, CONTROL_Z), 0.20, 0.20)
-        self._make_control('team1_down', (-0.82, -0.08, CONTROL_Z),
-                           0.12, 0.16)
-        self._make_control('team1', (-0.52, -0.08, CONTROL_Z), 0.42, 0.16)
-        self._make_control('team1_up', (-0.22, -0.08, CONTROL_Z),
-                           0.12, 0.16)
-        self._make_control('team2_down', (0.22, -0.08, CONTROL_Z),
-                           0.12, 0.16)
-        self._make_control('team2', (0.52, -0.08, CONTROL_Z), 0.42, 0.16)
-        self._make_control('team2_up', (0.82, -0.08, CONTROL_Z),
-                           0.12, 0.16)
-        self._make_control('start', (0.0, -0.40, CONTROL_Z), 1.20, 0.22)
-        self._make_control('close', (0.0, -0.78, CONTROL_Z), 0.50, 0.18)
-        self._make_label('title', 'LAN WAITING ROOM', (-0.86, 0.82, 0.0), 1.72,
-                         0.12, colour=(232, 244, 255, 255))
-        self._make_label('room', '', (-0.86, 0.62, 0.0), 1.72, 0.11)
-        self._make_label('players', '', (-0.86, 0.44, 0.0), 1.72, 0.11)
+        self._apply_layout(panel=panel, surface=surface)
+        make_control = lambda role, position, width, height: self._make_control(
+            role, position, width, height, panel=panel, controls=controls,
+            surface=surface)
+        make_label = lambda role, text, position, width, height, **kwargs: \
+            self._make_label(
+                role, text, position, width, height, panel=panel, labels=labels,
+                surface=surface, **kwargs)
+        make_control('previous', (-0.72, 0.16, CONTROL_Z), 0.20, 0.20)
+        make_control('map', (0.0, 0.16, CONTROL_Z), 1.15, 0.20)
+        make_control('next', (0.72, 0.16, CONTROL_Z), 0.20, 0.20)
+        make_control('team1_down', (-0.82, -0.08, CONTROL_Z), 0.12, 0.16)
+        make_control('team1', (-0.52, -0.08, CONTROL_Z), 0.42, 0.16)
+        make_control('team1_up', (-0.22, -0.08, CONTROL_Z), 0.12, 0.16)
+        make_control('team2_down', (0.22, -0.08, CONTROL_Z), 0.12, 0.16)
+        make_control('team2', (0.52, -0.08, CONTROL_Z), 0.42, 0.16)
+        make_control('team2_up', (0.82, -0.08, CONTROL_Z), 0.12, 0.16)
+        make_control('start', (0.0, -0.40, CONTROL_Z), 1.20, 0.22)
+        make_control('close', (0.0, -0.78, CONTROL_Z), 0.50, 0.18)
+        make_label('title', 'LAN WAITING ROOM', (-0.86, 0.82, 0.0), 1.72,
+                   0.12, colour=(232, 244, 255, 255))
+        make_label('room', '', (-0.86, 0.62, 0.0), 1.72, 0.11)
+        make_label('players', '', (-0.86, 0.44, 0.0), 1.72, 0.11)
         # These labels sit on textured buttons, which render white until a
         # tint is proved, so their text has to be dark to stay readable.
-        self._make_label('previous', '<', (-0.72, 0.16, 0.0), 0.18, 0.12,
-                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('map', '', (0.0, 0.16, 0.0), 1.10, 0.12,
-                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('next', '>', (0.72, 0.16, 0.0), 0.18, 0.12,
-                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team1_down', '-', (-0.82, -0.08, 0.0), 0.10,
-                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team1', 'TEAM 1', (-0.52, -0.08, 0.0), 0.40,
-                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team1_up', '+', (-0.22, -0.08, 0.0), 0.10,
-                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team2_down', '-', (0.22, -0.08, 0.0), 0.10,
-                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team2', 'TEAM 2', (0.52, -0.08, 0.0), 0.40,
-                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('team2_up', '+', (0.82, -0.08, 0.0), 0.10,
-                         0.10, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16,
-                         0.12, anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('close', 'LEAVE', (0.0, -0.78, 0.0), 0.46, 0.12,
-                         anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        self._make_label('message', '', (-0.86, -0.60, 0.0), 1.72, 0.11,
-                         colour=(184, 205, 222, 255))
+        make_label('previous', '<', (-0.72, 0.16, 0.0), 0.18, 0.12,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('map', '', (0.0, 0.16, 0.0), 1.10, 0.12,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('next', '>', (0.72, 0.16, 0.0), 0.18, 0.12,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('team1_down', '-', (-0.82, -0.08, 0.0), 0.10, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('team1', 'TEAM 1', (-0.52, -0.08, 0.0), 0.40, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('team1_up', '+', (-0.22, -0.08, 0.0), 0.10, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('team2_down', '-', (0.22, -0.08, 0.0), 0.10, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('team2', 'TEAM 2', (0.52, -0.08, 0.0), 0.40, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('team2_up', '+', (0.82, -0.08, 0.0), 0.10, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16, 0.12,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('close', 'LEAVE', (0.0, -0.78, 0.0), 0.46, 0.12,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('message', '', (-0.86, -0.60, 0.0), 1.72, 0.11,
+                   colour=(184, 205, 222, 255))
+        # Component construction is fallible on the native client. Commit the
+        # installed state only after the complete graph exists.
+        self._surface = surface
+        self._panel = panel
+        self._controls = controls
+        self._labels = labels
         return True
 
-    def _apply_layout(self):
-        if self._panel is None:
+    def _apply_layout(self, panel=None, surface=None):
+        panel = self._panel if panel is None else panel
+        surface = self._surface if surface is None else surface
+        if panel is None or surface is None:
             return False
-        reader = getattr(self._surface, 'screen_size', None)
+        reader = getattr(surface, 'screen_size', None)
         try:
             screen_size = reader() if callable(reader) else None
         except Exception:
             screen_size = None
         width, height, y = panel_geometry(screen_size)
-        self._set(self._panel, 'width', width)
-        self._set(self._panel, 'height', height)
-        self._set(self._panel, 'position', (0.0, y, OVERLAY_Z))
+        self._set(panel, 'width', width)
+        self._set(panel, 'height', height)
+        self._set(panel, 'position', (0.0, y, OVERLAY_Z))
         return True
 
     @staticmethod
@@ -405,8 +435,12 @@ class WaitingRoomUI(object):
         except (AttributeError, TypeError, ValueError):
             _log('LAN waiting room skipped the %s property' % name)
 
-    def _make_control(self, role, position, width, height):
-        component = self._surface.simple(CONTROL_TEXTURE)
+    def _make_control(self, role, position, width, height, panel=None,
+                      controls=None, surface=None):
+        panel = self._panel if panel is None else panel
+        controls = self._controls if controls is None else controls
+        surface = self._surface if surface is None else surface
+        component = surface.simple(CONTROL_TEXTURE)
         for name, value in (
                 ('horizontalPositionMode', 'CLIP'),
                 ('verticalPositionMode', 'CLIP'),
@@ -419,13 +453,17 @@ class WaitingRoomUI(object):
                 ('visible', False)):
             self._set(component, name, value)
         self._set(component, 'script', _ControlScript(self, role))
-        self._panel.addChild(component)
-        self._controls[role] = component
+        panel.addChild(component)
+        controls[role] = component
         return component
 
     def _make_label(self, role, text, position, width, height, anchor='LEFT',
-                    colour=(255, 255, 255, 255)):
-        component = self._surface.text()
+                    colour=(255, 255, 255, 255), panel=None, labels=None,
+                    surface=None):
+        panel = self._panel if panel is None else panel
+        labels = self._labels if labels is None else labels
+        surface = self._surface if surface is None else surface
+        component = surface.text()
         for name, value in (
                 ('text', text),
                 ('horizontalPositionMode', 'CLIP'),
@@ -438,8 +476,8 @@ class WaitingRoomUI(object):
                 ('crossFocus', False), ('moveFocus', False),
                 ('visible', False)):
             self._set(component, name, value)
-        self._panel.addChild(component)
-        self._labels[role] = component
+        panel.addChild(component)
+        labels[role] = component
         return component
 
     def _options(self):
@@ -471,23 +509,78 @@ class WaitingRoomUI(object):
         if self._open:
             self.refresh()
             return True
-        if self._panel is None:
-            self.install()
-        self._sync_selection()
-        self._message = ''
+        if self._has_open_resources() and not self._cleanup_open_resources():
+            _log('LAN waiting room could not retire a previous failed open')
+            return False
+        try:
+            if self._panel is None:
+                self.install()
+            self._sync_selection()
+            self._message = ''
+            self._surface.add_root(self._panel)
+            self._root_attached = True
+            self._surface.resort()
+            show_cursor = getattr(self._surface, 'show_cursor', None)
+            if callable(show_cursor) and not self._acquire_cursor():
+                raise RuntimeError('native cursor takeover failed')
+            self._pointer_logged = None
+            self._pointer_moves = 0
+            self._pointer_ticks = 0
+            if not self._build_pointer():
+                raise RuntimeError('native pointer roots were not built')
+            self._move_pointer()
+            tick = getattr(self._surface, 'tick', None)
+            if callable(tick) and not self._start_pointer_tick():
+                raise RuntimeError('native pointer callback was not scheduled')
+            if not self._refresh_contents():
+                raise RuntimeError('native waiting room did not refresh')
+        except Exception as error:
+            self._open = False
+            self._cleanup_open_resources()
+            _log('LAN waiting room open failed: %s' % error)
+            return False
+        # No mouse callback can observe a half-built room. The public flag is
+        # committed only after every native acquisition and the first paint.
         self._open = True
-        self._surface.add_root(self._panel)
-        self._surface.resort()
-        self._acquire_cursor()
-        self._pointer_logged = None
-        self._pointer_moves = 0
-        self._pointer_ticks = 0
-        self._build_pointer()
-        self._move_pointer()
-        self._start_pointer_tick()
-        self.refresh()
         _log('LAN waiting room opened')
         return True
+
+    def _has_open_resources(self):
+        return bool(
+            self._root_attached or self._cursor_acquired or
+            self._pointer_parts or self._pointer_tick is not None)
+
+    def _detach_panel_root(self):
+        if not self._root_attached:
+            return False
+        try:
+            self._surface.remove_root(self._panel)
+        except Exception as error:
+            _log('LAN waiting room root not removed: %s' % error)
+            return False
+        self._root_attached = False
+        return True
+
+    def _cleanup_open_resources(self):
+        """Undo a completed or partial open in strict reverse order."""
+        complete = True
+        if self._pointer_tick is not None and not self._stop_pointer_tick():
+            complete = False
+        if self._panel is not None:
+            try:
+                self._set(self._panel, 'visible', False)
+            except Exception as error:
+                _log('LAN waiting room panel not hidden: %s' % error)
+        # Removal below is the actual ownership release. A visibility setter
+        # failure must not leave cleanup pending after its root is gone.
+        self._hide_pointer()
+        if self._pointer_parts and not self._remove_pointer():
+            complete = False
+        if self._cursor_acquired and not self._release_cursor():
+            complete = False
+        if self._root_attached and not self._detach_panel_root():
+            complete = False
+        return complete and not self._has_open_resources()
 
     # Vertex colour is ignored on this client, so the arrow is white.  Each
     # entry is one row of the staircase: (left offset, top offset, width,
@@ -530,46 +623,63 @@ class WaitingRoomUI(object):
             return False
         step_x, step_y = self._pixel_step()
         parts = []
-        for texture, grow, depth in (
-                (OUTLINE_TEXTURE, 1.0, CONTROL_Z - CONTROL_FRAME_OFFSET),
-                (CONTROL_TEXTURE, 0.0, CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)):
-            for left, top, width, height in self.POINTER_ROWS:
-                part = self._surface.simple(texture)
-                for name, value in (
-                        ('horizontalPositionMode', 'CLIP'),
-                        ('verticalPositionMode', 'CLIP'),
-                        ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
-                        ('horizontalAnchor', 'CENTER'),
-                        ('verticalAnchor', 'CENTER'),
-                        ('position', (0.0, 0.0, depth)),
-                        ('width', float(width) + 2.0 * grow),
-                        ('height', float(height) + 2.0 * grow),
-                        ('materialFX', 'SOLID'),
-                        ('focus', False), ('mouseButtonFocus', False),
-                        ('crossFocus', False), ('moveFocus', False),
-                        ('visible', False)):
-                    self._set(part, name, value)
-                self._surface.add_root(part)
-                # A CENTER anchor puts the component's middle on its position.
-                parts.append((part, (left + width * 0.5) * step_x,
-                              -(top + height * 0.5) * step_y, depth))
+        try:
+            for texture, grow, depth in (
+                    (OUTLINE_TEXTURE, 1.0,
+                     CONTROL_Z - CONTROL_FRAME_OFFSET),
+                    (CONTROL_TEXTURE, 0.0,
+                     CONTROL_Z - 2 * CONTROL_FRAME_OFFSET)):
+                for left, top, width, height in self.POINTER_ROWS:
+                    part = self._surface.simple(texture)
+                    for name, value in (
+                            ('horizontalPositionMode', 'CLIP'),
+                            ('verticalPositionMode', 'CLIP'),
+                            ('widthMode', 'PIXEL'), ('heightMode', 'PIXEL'),
+                            ('horizontalAnchor', 'CENTER'),
+                            ('verticalAnchor', 'CENTER'),
+                            ('position', (0.0, 0.0, depth)),
+                            ('width', float(width) + 2.0 * grow),
+                            ('height', float(height) + 2.0 * grow),
+                            ('materialFX', 'SOLID'),
+                            ('focus', False), ('mouseButtonFocus', False),
+                            ('crossFocus', False), ('moveFocus', False),
+                            ('visible', False)):
+                        self._set(part, name, value)
+                    self._surface.add_root(part)
+                    # A CENTER anchor puts the component's middle on its
+                    # position. Add the rollback token only after addRoot.
+                    parts.append((
+                        part, (left + width * 0.5) * step_x,
+                        -(top + height * 0.5) * step_y, depth))
+            resort = getattr(self._surface, 'resort', None)
+            if callable(resort):
+                resort()
+        except Exception:
+            self._pointer_parts = self._remove_pointer_entries(parts)
+            raise
         self._pointer_parts = parts
-        resort = getattr(self._surface, 'resort', None)
-        if callable(resort):
-            resort()
         _log('LAN room pointer built parts=%d rows=%d' % (
             len(parts), len(self.POINTER_ROWS)))
         return True
 
     def _remove_pointer(self):
         """Drop the arrow roots so a reopen rebuilds them."""
-        for part, unused_x, unused_y, unused_z in self._pointer_parts:
+        self._pointer_parts = self._remove_pointer_entries(
+            self._pointer_parts)
+        return not self._pointer_parts
+
+    def _remove_pointer_entries(self, entries):
+        """Remove committed roots in reverse order and retain failed tokens."""
+        remaining = []
+        for entry in reversed(list(entries)):
+            part = entry[0]
             try:
                 self._surface.remove_root(part)
             except Exception as error:
                 _log('LAN room pointer root not removed: %s' % error)
-        self._pointer_parts = []
-        return True
+                remaining.append(entry)
+        remaining.reverse()
+        return remaining
 
     def _move_pointer(self):
         """Follow ``mcursor.position`` with the drawn arrow."""
@@ -645,7 +755,10 @@ class WaitingRoomUI(object):
         tick = getattr(self._surface, 'tick', None)
         if self._pointer_tick is not None or not callable(tick):
             return False
-        self._pointer_tick = tick(POINTER_TICK_SECONDS, self._pointer_step)
+        handle = tick(POINTER_TICK_SECONDS, self._pointer_step)
+        if handle is None:
+            return False
+        self._pointer_tick = handle
         return True
 
     def _pointer_step(self):
@@ -658,7 +771,6 @@ class WaitingRoomUI(object):
 
     def _stop_pointer_tick(self):
         handle = self._pointer_tick
-        self._pointer_tick = None
         cancel = getattr(self._surface, 'cancel_tick', None)
         if handle is None or not callable(cancel):
             return False
@@ -666,12 +778,18 @@ class WaitingRoomUI(object):
             cancel(handle)
         except Exception:
             return False
+        self._pointer_tick = None
         return True
 
     def _hide_pointer(self):
+        complete = True
         for part, unused_x, unused_y, unused_z in self._pointer_parts:
-            self._set(part, 'visible', False)
-        return True
+            try:
+                self._set(part, 'visible', False)
+            except Exception as error:
+                _log('LAN room pointer not hidden: %s' % error)
+                complete = False
+        return complete
 
     def _acquire_cursor(self):
         """Activate the native cursor while this room owns the screen.
@@ -689,9 +807,11 @@ class WaitingRoomUI(object):
             return False
         self._log_cursor('before acquire')
         try:
-            show()
+            acquired = show()
         except Exception as error:
             _log('LAN waiting room could not show the cursor: %s' % error)
+            return False
+        if acquired is False:
             return False
         self._cursor_acquired = True
         self._log_cursor('after acquire')
@@ -712,21 +832,26 @@ class WaitingRoomUI(object):
     def _release_cursor(self):
         if not self._cursor_acquired:
             return False
-        self._cursor_acquired = False
         hide = getattr(self._surface, 'hide_cursor', None)
         if not callable(hide):
             return False
         try:
-            hide()
+            released = hide()
         except Exception as error:
             _log('LAN waiting room could not release the cursor: %s' % error)
             return False
+        if released is False:
+            return False
+        self._cursor_acquired = False
         self._log_cursor('after release')
         return True
 
     def refresh(self):
         if not self._open:
             return False
+        return self._refresh_contents()
+
+    def _refresh_contents(self):
         self._apply_layout()
         options = self._sync_selection()
         is_host = bool(self._host())
@@ -908,23 +1033,24 @@ class WaitingRoomUI(object):
         return True
 
     def close(self):
-        if not self._open:
+        had_resources = self._has_open_resources()
+        if not self._open and not had_resources:
             return False
         self._open = False
         self._hovered = None
-        self._release_cursor()
-        self._stop_pointer_tick()
-        self._hide_pointer()
-        self._set(self._panel, 'visible', False)
-        self._surface.remove_root(self._panel)
-        self._remove_pointer()
+        if not self._cleanup_open_resources():
+            _log('LAN waiting room close is pending native cleanup')
+            return False
         _log('LAN waiting room closed')
         return True
 
     def uninstall(self):
-        self.close()
+        if ((self._open or self._has_open_resources()) and
+                not self.close()):
+            return False
         self._panel = None
         self._controls = {}
         self._labels = {}
         self._pointer_parts = []
+        self._root_attached = False
         return True

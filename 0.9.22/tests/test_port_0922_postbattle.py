@@ -18,7 +18,8 @@ from gui.mods.offline_lan_0922.account_rpc import postbattle_store
 from lan_battle_server import (
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, MAX_RESULT_RECEIPTS,
-    PLAYER_FIRE_INTENT_CAPABILITY, PROJECTILE_CAPABILITY,
+    PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+    PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY, Player)
 import lan_battle_server as lan_server_module
 from offline_rewards import compute_offline_rewards
@@ -787,7 +788,8 @@ class PostBattleContractTests(unittest.TestCase):
                     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
                     RAM_CONTACT_LEDGER_CAPABILITY,
                     HUMAN_RAM_TIMELINE_CAPABILITY,
-                    PLAYER_FIRE_INTENT_CAPABILITY],
+                    PLAYER_FIRE_INTENT_CAPABILITY,
+                    PLAYER_ENVIRONMENT_CAPABILITY],
                 'account_key': first.account_key,
                 'name': 'A', 'vehicle': first.vehicle,
                 'max_health': first.max_health, 'outfits': {},
@@ -807,7 +809,8 @@ class PostBattleContractTests(unittest.TestCase):
                 DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
                 HUMAN_RAM_TIMELINE_CAPABILITY,
-                PLAYER_FIRE_INTENT_CAPABILITY],
+                PLAYER_FIRE_INTENT_CAPABILITY,
+                PLAYER_ENVIRONMENT_CAPABILITY],
             'account_key': account_key,
             'name': 'A', 'vehicle': 'ussr:R11_MS-1',
             'max_health': 100, 'outfits': {},

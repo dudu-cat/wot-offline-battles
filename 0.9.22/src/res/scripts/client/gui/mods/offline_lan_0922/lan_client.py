@@ -22,7 +22,8 @@ DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
 RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v1'
 HUMAN_RAM_TIMELINE_CAPABILITY = 'human_ram_timeline_v1'
-PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v2'
+PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v3'
+PLAYER_ENVIRONMENT_CAPABILITY = 'player_environment_v1'
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
     PROJECTILE_LEDGER_CAPABILITY,
@@ -31,6 +32,7 @@ CLIENT_CAPABILITIES = (
     RAM_CONTACT_LEDGER_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY,
+    PLAYER_ENVIRONMENT_CAPABILITY,
 )
 WORKER_AUTHORITY_ID = -1
 SERVER_AUTHORITY_ID = 0
@@ -1316,8 +1318,11 @@ class LANClient(object):
                    position=None, yaw=None, fire_seq=0,
                    speed=None,
                    shell_index=None,
+                   next_shell_index=None,
+                   shell_change_pending=None,
                    pose_time_us=None,
                    ram_contacts=None,
+                   destructible_contacts=None,
                    siege_enabled=None,
                    pitch=None, roll=None):
         if not self.ready or self.phase != 'battle':
@@ -1365,9 +1370,25 @@ class LANClient(object):
             if parsed_shell is None:
                 return False
             message['shell_index'] = parsed_shell
+        has_next_shell = next_shell_index is not None
+        has_shell_pending = shell_change_pending is not None
+        if has_next_shell != has_shell_pending:
+            return False
+        if has_next_shell:
+            parsed_next_shell = _projectile_int_range(
+                next_shell_index, 0, 9)
+            if (parsed_next_shell is None or
+                    not isinstance(shell_change_pending, bool)):
+                return False
+            message['next_shell_index'] = parsed_next_shell
+            message['shell_change_pending'] = shell_change_pending
         if isinstance(ram_contacts, list):
             message['ram_contacts'] = [
                 dict(value) for value in ram_contacts[:16]
+                if isinstance(value, dict)]
+        if isinstance(destructible_contacts, list):
+            message['destructible_contacts'] = [
+                dict(value) for value in destructible_contacts[:16]
                 if isinstance(value, dict)]
         if siege_enabled is not None:
             if not isinstance(siege_enabled, bool):
@@ -1377,6 +1398,49 @@ class LANClient(object):
             return False
         self._input_seq = next_input_seq
         return True
+
+    def send_player_environment(self, observations, sample_seq):
+        """Publish bounded water observations from the hidden worker only."""
+        sequence = _projectile_int_range(
+            sample_seq, 1, MAX_PROJECTILE_ID)
+        epoch = _projectile_int_range(
+            self.authority_epoch, 0, MAX_PROJECTILE_ID)
+        if (self.phase != 'battle' or not self.is_bot_authority() or
+                self.player_id != WORKER_AUTHORITY_ID or
+                sequence is None or epoch is None or
+                PLAYER_ENVIRONMENT_CAPABILITY not in self.capabilities or
+                PLAYER_ENVIRONMENT_CAPABILITY not in
+                self.server_capabilities or
+                not isinstance(observations, (list, tuple)) or
+                len(observations) > 30):
+            return False
+        rows = []
+        seen = set()
+        for raw in observations:
+            if (not isinstance(raw, dict) or
+                    set(raw) != {'player_id', 'input_seq', 'level'}):
+                return False
+            player_id = _projectile_int_range(
+                raw.get('player_id'), 1, MAX_PROJECTILE_ID)
+            input_seq = _projectile_int_range(
+                raw.get('input_seq'), 0, MAX_PROJECTILE_ID)
+            level = _projectile_int_range(raw.get('level'), 0, 2)
+            if (player_id is None or input_seq is None or level is None or
+                    player_id in seen):
+                return False
+            seen.add(player_id)
+            rows.append({
+                'player_id': player_id,
+                'input_seq': input_seq,
+                'level': level,
+            })
+        return self._send({
+            'type': 'player_environment',
+            'round_id': self.round_id,
+            'authority_epoch': epoch,
+            'sample_seq': sequence,
+            'observations': rows,
+        })
 
     def send_battle_ready(self, bases=None):
         """Join the server-owned #1513 load barrier exactly once per round."""
@@ -1791,6 +1855,42 @@ class LANClient(object):
                 return False
             message['mat_kind'] = mat_kind
         return self._send(message)
+
+    def send_player_destructible_contact_result(
+            self, player_id, contact_seq, accepted, token):
+        """Finish one server-bound player hull proposal as native authority."""
+        if (not self.ready or self.phase != 'battle' or
+                not self.is_bot_authority() or
+                not isinstance(accepted, bool) or
+                not isinstance(token, (list, tuple)) or
+                not 1 <= len(token) <= 16):
+            return False
+        parsed_player = _projectile_int_range(
+            player_id, 1, MAX_PROJECTILE_ID)
+        parsed_seq = _projectile_int_range(
+            contact_seq, 1, MAX_PROJECTILE_ID)
+        parsed_token = []
+        for raw in token:
+            if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+                return False
+            chunk_id = _exact_int(raw[0])
+            item_index = _exact_int(raw[1])
+            mat_kind = None if raw[2] is None else _exact_int(raw[2])
+            if (chunk_id is None or chunk_id < 0 or
+                    item_index is None or item_index < 0 or
+                    (raw[2] is not None and mat_kind is None)):
+                return False
+            parsed_token.append([chunk_id, item_index, mat_kind])
+        if parsed_player is None or parsed_seq is None:
+            return False
+        return self._send({
+            'type': 'player_destructible_contact_result',
+            'round_id': self.round_id,
+            'player_id': parsed_player,
+            'contact_seq': parsed_seq,
+            'accepted': accepted,
+            'token': parsed_token,
+        })
 
     def is_bot_authority(self):
         """Visible #1513 clients never own authoritative bot messages."""
@@ -2532,6 +2632,7 @@ class LANClient(object):
                     RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
                     HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                     PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
+                    PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
                     server_capabilities is None or
                     DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
                     server_capabilities or
@@ -2540,6 +2641,8 @@ class LANClient(object):
                     HUMAN_RAM_TIMELINE_CAPABILITY not in
                     server_capabilities or
                     PLAYER_FIRE_INTENT_CAPABILITY not in
+                    server_capabilities or
+                    PLAYER_ENVIRONMENT_CAPABILITY not in
                     server_capabilities):
                 self.last_error = 'required LAN capability mismatch'
                 self.stop()

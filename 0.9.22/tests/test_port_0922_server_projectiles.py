@@ -14,7 +14,8 @@ from lan_battle_server import (  # noqa: E402
     MAX_LINE_BYTES,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PREBATTLE_SECONDS,
     HUMAN_RAM_TIMELINE_CAPABILITY,
-    PLAYER_FIRE_INTENT_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
+    PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY,
     PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
     Player, SimulationWorker, SIMULATION_WORKER_AUTHORITY_ID,
     SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
@@ -34,7 +35,8 @@ def _player(player_id, team=1, x=0.0):
         capabilities=(
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
-            PLAYER_FIRE_INTENT_CAPABILITY))
+            PLAYER_FIRE_INTENT_CAPABILITY,
+            PLAYER_ENVIRONMENT_CAPABILITY))
 
 
 def _state(players=2):
@@ -56,7 +58,8 @@ def _attach_worker_authority(state):
         _Socket(), ('127.0.0.1', 28782), capabilities=(
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
-            PLAYER_FIRE_INTENT_CAPABILITY))
+            PLAYER_FIRE_INTENT_CAPABILITY,
+            PLAYER_ENVIRONMENT_CAPABILITY))
     state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
     state.simulation_worker.offer_reliable = lambda unused_message: True
     return state.simulation_worker
@@ -73,6 +76,8 @@ def _update_player_input(state, player_id, **changes):
         'x': player.x, 'y': player.y, 'z': player.z,
         'yaw': player.yaw, 'pitch': player.pitch, 'roll': player.roll,
         'fire_seq': player.fire_seq, 'shell_index': player.shell_index,
+        'next_shell_index': player.next_shell_index,
+        'shell_change_pending': player.shell_change_pending,
     }
     message.update(changes)
     return state.update_input(player_id, message)
@@ -355,6 +360,8 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual([3.25, 2.5, -4.75], relay['shot_origin'])
         self.assertEqual([0.0, 0.0, 1.0], relay['shot_direction'])
         self.assertEqual(0.01, relay['dispersion_angle'])
+        self.assertEqual(0, relay['next_shell_index'])
+        self.assertFalse(relay['shell_change_pending'])
         self.assertGreaterEqual(
             relay['deadline_server_time_ms'], state._server_time_ms())
 
@@ -374,6 +381,32 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             fire_input_seq=relay['input_seq'])
         self.assertFalse(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID, launch))
+
+    def test_player_queued_shell_is_promoted_by_the_canonical_shot(self):
+        state = _state()
+        player = state.players[1]
+        self.assertTrue(_update_player_input(
+            state, 1, shell_index=0, next_shell_index=1,
+            shell_change_pending=True))
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(
+            state, shot_direction=[1.0, 0.0, 0.0])))
+        relay = player.pending_fire_intents[1]
+        self.assertEqual(1, relay['next_shell_index'])
+        self.assertTrue(relay['shell_change_pending'])
+
+        self.assertTrue(state.launch_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, _launch(
+                authority_epoch=state.authority_epoch,
+                fire_intent_seq=relay['intent_seq'],
+                fire_input_seq=relay['input_seq'])))
+
+        self.assertEqual(1, player.shell_index)
+        self.assertEqual(1, player.next_shell_index)
+        self.assertFalse(player.shell_change_pending)
+        public = state._public_player(player)
+        self.assertEqual(1, public['shell_index'])
+        self.assertEqual(1, public['next_shell_index'])
+        self.assertFalse(public['shell_change_pending'])
 
     def test_player_fire_intent_rejects_untrusted_trigger_rays(self):
         state = _state()
@@ -601,6 +634,41 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID, dict(message, cursors=[dict(
                 cursor, base_checked_ms=200, checked_through_ms=200,
                 penetration_factor=0.999999)])))
+
+    def test_terminal_overtaking_exact_progress_retry_does_not_poison_batch(self):
+        state = _state(players=3)
+        self.assertTrue(_launch_authority(state, _launch()))
+        self.assertTrue(_launch_authority(
+            state, _launch(shooter_id=2, shot_seq=1)))
+        retired = {
+            'projectile_id': '1:p:1:1', 'base_checked_ms': 0,
+            'checked_through_ms': 100, 'checked_distance': 10.0,
+            'piercing_loss': 1.0, 'penetration_factor': 1.0,
+            'destructibles': [],
+        }
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'projectile_progress', 'round_id': 1,
+                'authority_epoch': 1, 'cursors': [retired]}))
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, _resolve(
+                '1:p:1:1', base_checked_ms=100,
+                resolved_time_ms=100, checked_distance=10.0,
+                piercing_loss=1.0)))
+        active = {
+            'projectile_id': '1:p:2:1', 'base_checked_ms': 0,
+            'checked_through_ms': 120, 'checked_distance': 12.0,
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'destructibles': [],
+        }
+
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'projectile_progress', 'round_id': 1,
+                'authority_epoch': 1, 'cursors': [retired, active]}))
+
+        self.assertEqual(
+            120, state.projectiles['1:p:2:1']['checked_through_ms'])
 
     def test_progress_destructibles_are_atomic_and_idempotent(self):
         state = _state()
@@ -984,7 +1052,8 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
-                PLAYER_FIRE_INTENT_CAPABILITY],
+                PLAYER_FIRE_INTENT_CAPABILITY,
+                PLAYER_ENVIRONMENT_CAPABILITY],
             'vehicle_compact_descr': 'dGVzdA=='})
         self.assertIsNotNone(player)
         self.assertIsNone(error)

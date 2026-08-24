@@ -371,6 +371,7 @@ class ServerBattleAuthority(object):
         self._ram_bot_history = {}
         self._ram_bot_history_order = []
         self._ram_bot_history_times = {}
+        self._player_environment_seq = 0
 
     def started(self):
         return self._started
@@ -471,6 +472,7 @@ class ServerBattleAuthority(object):
         self._ram_bot_history = {}
         self._ram_bot_history_order = []
         self._ram_bot_history_times = {}
+        self._player_environment_seq = 0
         self._bots = BotRuntime(
             SERVER_AUTHORITY_ID,
             descriptor_resolver=self._resolve_descriptor,
@@ -769,6 +771,7 @@ class ServerBattleAuthority(object):
             self._artillery.advance(
                 now, ARTILLERY_ARC_RAYS_PER_TICK, self.world.arc_probe)
             if self._live:
+                self._publish_player_environment()
                 outgoing = self._bots.update(
                     dt, now, players=self._players_payload())
                 for message in outgoing:
@@ -788,6 +791,30 @@ class ServerBattleAuthority(object):
                 self._flush_progress(now)
             self._flush_pending_resolutions()
         return tuple(observation_relays)
+
+    def _publish_player_environment(self):
+        """Sample player water state from the server's baked world."""
+        observations = []
+        for player in self.state.players.values():
+            if (not player.connected or not player.participating or
+                    not player.alive):
+                continue
+            descriptor = self.descriptors.get(player.vehicle)
+            depth = self.world.water_depth((player.x, player.y, player.z))
+            observations.append({
+                'player_id': int(player.player_id),
+                'input_seq': int(player.input_seq),
+                'level': drowning_level(descriptor, depth),
+            })
+        self._player_environment_seq += 1
+        return self.state.update_player_environment(
+            SERVER_AUTHORITY_ID, {
+                'type': 'player_environment',
+                'round_id': int(self._round_id),
+                'authority_epoch': int(self.state.authority_epoch),
+                'sample_seq': int(self._player_environment_seq),
+                'observations': observations,
+            })
 
     def _players_payload(self):
         rows = []
@@ -1728,6 +1755,57 @@ def _number(value, default=0.0):
     except (TypeError, ValueError):
         return float(default)
     return value if math.isfinite(value) else float(default)
+
+
+def _vector_y(value, default=0.0):
+    try:
+        if isinstance(value, dict):
+            return _number(value.get('y'), default)
+        if hasattr(value, 'y'):
+            return _number(value.y, default)
+        return _number(value[1], default)
+    except (TypeError, IndexError, KeyError):
+        return float(default)
+
+
+def drowning_sensor_thresholds(descriptor):
+    """Return the exact #1513 WaterSensor caution and danger heights."""
+    chassis = _field(descriptor, 'chassis', None)
+    hull = _field(descriptor, 'hull', None)
+    carrying = _vector_y(
+        _field(chassis, 'topRightCarryingPoint', None), 0.5)
+    hull_height = _vector_y(
+        _field(chassis, 'hullPosition', None), 0.6)
+    turret_positions = _field(hull, 'turretPositions', ()) or ()
+    turret_height = _vector_y(
+        turret_positions[0] if turret_positions else None, 1.0)
+    caution = max(0.0, carrying)
+    danger = max(caution, hull_height + turret_height)
+    return caution, danger
+
+
+def drowning_level(descriptor, depth):
+    """Classify water depth against the descriptor's native sensor plane."""
+    depth = _number(depth, -1.0)
+    caution, danger = drowning_sensor_thresholds(descriptor)
+    if depth > danger:
+        return 2
+    if depth > caution:
+        return 1
+    return 0
+
+
+def propose_player_drowning(player, descriptor):
+    """Compute the copied terminal critical state on detached server data."""
+    if descriptor is None:
+        return None
+    mock = _TargetMock(
+        int(player.player_id), int(player.health), descriptor,
+        (float(player.x), float(player.y), float(player.z)),
+        float(player.yaw), {'critical': player.critical},
+        float(player.aim_yaw), float(player.gun_pitch),
+        float(player.pitch), float(player.roll))
+    return critical_damage.propose_drowning(mock)
 
 
 _PROJECTILE_SHELL_KINDS = frozenset((

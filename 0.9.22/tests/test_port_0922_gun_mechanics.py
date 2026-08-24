@@ -352,6 +352,7 @@ class GunMechanicsParityTests(unittest.TestCase):
         state.reload_time = 0.0
         state.clip = 1
         state.request_shell_index(1)
+        self.assertIsNone(state.pending_index)
 
         state.commit_fire()
 

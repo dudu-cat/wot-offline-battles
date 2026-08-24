@@ -728,15 +728,16 @@ def _cleanup_runtime():
     errors = []
 
     callback_id = _callback_id
-    _callback_id = None
     if callback_id is not None:
         try:
             BigWorld.cancelCallback(callback_id)
         except Exception as error:
             errors.append(error)
+        else:
+            if _callback_id == callback_id:
+                _callback_id = None
 
     session = _session
-    _session = None
     if session is not None:
         try:
             # Global mod shutdown is followed by compatibility.disconnect().
@@ -746,9 +747,11 @@ def _cleanup_runtime():
                          release_join=True)
         except Exception as error:
             errors.append(error)
+        else:
+            if _session is session:
+                _session = None
 
     worker_presentation = _worker_presentation
-    _worker_presentation = None
     if worker_presentation is not None:
         try:
             # This cleanup runs only during worker failure or process exit.
@@ -757,28 +760,34 @@ def _cleanup_runtime():
             worker_presentation.deactivate(restore=False)
         except Exception as error:
             errors.append(error)
+        else:
+            if _worker_presentation is worker_presentation:
+                _worker_presentation = None
 
     intro_skip = _intro_skip
-    _intro_skip = None
     if intro_skip is not None:
         try:
             intro_skip.uninstall()
         except Exception as error:
             errors.append(error)
+        else:
+            if _intro_skip is intro_skip:
+                _intro_skip = None
 
     announcement_ui = _announcement_ui
-    _announcement_ui = None
     if announcement_ui is not None:
         try:
             announcement_ui.uninstall()
         except Exception as error:
             errors.append(error)
+        else:
+            if _announcement_ui is announcement_ui:
+                _announcement_ui = None
 
     try:
         _remove_lobby_listener()
     except Exception as error:
         errors.append(error)
-        _lobby_listener_installed = False
 
     try:
         g_compatibility.fini()

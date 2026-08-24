@@ -130,7 +130,7 @@ def _solid_contact_cleared(spaceID, segment_start, segment_end, vel, td):
 
 def _destroy_and_recast(spaceID, segment_start, segment_end, collision,
 		yaw, vel, td, crush_state=None, allow_kinetic=False,
-		kinetic_speed=None):
+		kinetic_speed=None, commit_enabled=True):
 	if crush_state is not None and crush_state[0]:
 		# Another hull lane already obtained native authority for this copied-pose
 		# step.  Classify this lane read-only so the delayed skin cannot cause a
@@ -162,6 +162,11 @@ def _destroy_and_recast(spaceID, segment_start, segment_end, collision,
 		# use the directional speed cap.
 		_diagnostic_static_recast_1513(False)
 		return 'kinetic'
+	if not commit_enabled:
+		# A visible player may classify its native ray and submit a hull-sweep
+		# proposal, but only the hidden worker may mutate native map state.
+		_diagnostic_static_recast_1513(False)
+		return False
 	if not _try_destroy_solid_hit(
 			spaceID, segment_start, collision[0], collision[1], yaw, vel, td):
 		# A previously accepted fragile/module may remain in the native static
@@ -184,7 +189,7 @@ def _destroy_and_recast(spaceID, segment_start, segment_end, collision,
 	return cleared is True
 
 
-def check_horizontal_collision(bigworld, math_module, *args):
+def check_horizontal_collision(bigworld, math_module, *args, **kwargs):
 	"""Supply the engine modules formerly captured by the 0.8.2 closure."""
 	import sys
 	missing = object()
@@ -193,7 +198,7 @@ def check_horizontal_collision(bigworld, math_module, *args):
 	sys.modules['BigWorld'] = bigworld
 	sys.modules['Math'] = math_module
 	try:
-		return _check_horizontal_collision(*args)
+		return _check_horizontal_collision(*args, **kwargs)
 	finally:
 		if old_bigworld is missing:
 			sys.modules.pop('BigWorld', None)
@@ -207,7 +212,7 @@ def check_horizontal_collision(bigworld, math_module, *args):
 
 def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
 		airborne=False, dt=0.04, return_status=False,
-		allow_kinetic=False, kinetic_speed=None):
+		allow_kinetic=False, kinetic_speed=None, commit_enabled=True):
 	import math, BigWorld, Math
 	try:
 		hw = 1.5
@@ -318,10 +323,13 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
 								_ray_end, _ray_hit))
 					_lane_hits.sort(key=lambda value: value[0])
 					for _unused_distance, _ray_start, _ray_end, _ray_hit in _lane_hits:
-						_resolved = _destroy_and_recast(
-								spaceID, _ray_start, _ray_end, _ray_hit,
-								yaw, vel, td, _crush_state, allow_kinetic,
-								kinetic_speed)
+						_resolve_args = (
+							spaceID, _ray_start, _ray_end, _ray_hit,
+							yaw, vel, td, _crush_state, allow_kinetic,
+							kinetic_speed)
+						_resolved = (_destroy_and_recast(*_resolve_args)
+							if commit_enabled else
+							_destroy_and_recast(*(_resolve_args + (False,))))
 						if _resolved == 'kinetic':
 							_kinetic_contact = True
 						elif _resolved is not True:
@@ -344,10 +352,13 @@ def _check_horizontal_collision(spaceID, pos, yaw, vel, td=None,
 							_ray_end, _ray_hit))
 				_upper_hits.sort(key=lambda value: value[0])
 				for _unused_distance, _ray_start, _ray_end, _ray_hit in _upper_hits:
-					_resolved = _destroy_and_recast(
-							spaceID, _ray_start, _ray_end, _ray_hit,
-							yaw, vel, td, _crush_state, allow_kinetic,
-							kinetic_speed)
+					_resolve_args = (
+						spaceID, _ray_start, _ray_end, _ray_hit,
+						yaw, vel, td, _crush_state, allow_kinetic,
+						kinetic_speed)
+					_resolved = (_destroy_and_recast(*_resolve_args)
+						if commit_enabled else
+						_destroy_and_recast(*(_resolve_args + (False,))))
 					if _resolved == 'kinetic':
 						_kinetic_contact = True
 					elif _resolved is not True:

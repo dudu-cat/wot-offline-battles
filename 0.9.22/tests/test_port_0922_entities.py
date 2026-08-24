@@ -1023,6 +1023,38 @@ class AvatarServerBridgeTests(unittest.TestCase):
             ['create', 'added', 'select', 'removed', 'destroy'],
             [event[0] for event in binding.events])
 
+    def test_destroy_retains_vehicle_owner_until_engine_retry_succeeds(self):
+        module = _avatar_bridge_module()
+        binding = _BridgeBinding()
+        destroy_attempts = []
+
+        def destroy_entity(vehicle_id):
+            destroy_attempts.append(vehicle_id)
+            binding.events.append(('destroy', vehicle_id))
+            if len(destroy_attempts) == 1:
+                raise RuntimeError('native entity destroy failed')
+
+        binding.destroy_entity = destroy_entity
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), binding,
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            _Sender())
+        self.assertEqual(91, bridge.addVehicleToArena(_snapshot()))
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'native entity destroy failed'):
+            bridge.destroy()
+
+        self.assertEqual(91, bridge.vehicle_id)
+        self.assertFalse(bridge.acceptVehicleEnter(91))
+        self.assertTrue(bridge.destroy())
+        self.assertIsNone(bridge.vehicle_id)
+        self.assertFalse(bridge.destroy())
+        self.assertEqual(1, [event[0] for event in binding.events].count(
+            'removed'))
+        self.assertEqual([91, 91], destroy_attempts)
+
     def test_duplicate_leave_mailbox_is_delivered_once(self):
         module = _avatar_bridge_module()
         leaves = []

@@ -82,8 +82,8 @@ class ServerAnnouncementUI(object):
     def uninstall(self):
         if not self._installed:
             return
-        self._installed = False
         self._restore()
+        self._installed = False
 
 
 def _no_startup_video():
@@ -130,8 +130,9 @@ class IntroVideoSkip(object):
 
     def uninstall(self):
         while self._replaced:
-            module, original = self._replaced.pop()
+            module, original = self._replaced[-1]
             if getattr(module, 'isShowStartupVideo',
                        None) is _no_startup_video:
                 setattr(module, 'isShowStartupVideo', original)
+            self._replaced.pop()
         return True

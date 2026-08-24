@@ -245,6 +245,8 @@ class GunState(object):
         except (TypeError, ValueError):
             return False
         index = max(0, min(index, len(self.shots) - 1))
+        if index >= len(self.ammo) or self.ammo[index] <= 0:
+            return False
         if self.shot_index < len(self.ammo) and self.ammo[self.shot_index] <= 0:
             # An empty shell type is never fired, so nothing would ever
             # promote the queued round.

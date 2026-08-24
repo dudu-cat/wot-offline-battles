@@ -92,7 +92,7 @@ class _NativeRemoteState(object):
                 (max(float(relax_time), _MINIMUM_KEYFRAME_SECONDS),
                  self._key_to))
             self.animation.time = 0.0
-        except Exception:
+        except Exception as error:
             self.animation = None
             self.provider = self.matrix
             self._rebind_provider()
@@ -529,7 +529,6 @@ class _NativeRemoteState(object):
     def detach(self):
         entity = self.entity
         engine_owned = self._engine_owns_entity()
-        self.entity = None
         if entity is None:
             return False
         if engine_owned:
@@ -540,8 +539,12 @@ class _NativeRemoteState(object):
                     changed -= self.model_changed
                 except Exception:
                     pass
-        self.model_changed = None
         self._compatibility.clear_vehicle_pose_overlay(entity)
+        # The overlay clear is the last native-facing operation.  Preserve the
+        # entity and callback owners if it raises so factory teardown can retry
+        # rather than forgetting a still-linked presentation.
+        self.model_changed = None
+        self.entity = None
         return True
 
 
@@ -553,7 +556,7 @@ class NativeRemoteVehicleFactory(object):
     def __init__(self, bigworld, math_module, model_assembler, space_id,
                  binding, compatibility, data_links=None,
                  interpolate_motion=True, **unused_kwargs):
-        unused_space_id = space_id
+        self._space_id = int(space_id)
         self._bigworld = bigworld
         self._math = math_module
         self._binding = binding
@@ -562,11 +565,12 @@ class NativeRemoteVehicleFactory(object):
         self._interpolate_motion = bool(interpolate_motion)
         self._states = {}
         self._vehicles = {}
+        self._failed_creates = set()
         self._descriptors = {}
         self._hit_testers = {}
         self.track_animation_error = None
         self._shot_presenter = _RemoteShotPresenter(
-            bigworld, math_module, model_assembler)
+            bigworld, math_module, model_assembler, self._space_id)
 
     def prepare_descriptor(self, descriptor):
         # Stock Vehicle.prerequisites/CompoundAppearance own BSP references.
@@ -574,6 +578,7 @@ class NativeRemoteVehicleFactory(object):
         return descriptor
 
     def create(self, descriptor, properties, position, rotation):
+        self._retire_failed_creates()
         self.prepare_descriptor(descriptor)
         entity_id = self._binding.create_vehicle(
             properties, position, rotation)
@@ -591,8 +596,25 @@ class NativeRemoteVehicleFactory(object):
             self._data_links, position, rotation,
             interpolate_motion=self._interpolate_motion)
         self._vehicles[int(entity_id)] = None
-        self._binding.arena_vehicle_added(entity_id, {
-            'properties': properties, 'team_killer': False})
+        try:
+            self._binding.arena_vehicle_added(entity_id, {
+                'properties': properties, 'team_killer': False})
+        except Exception as error:
+            # The caller never receives this id, so remove it from the ordinary
+            # factory registries immediately.  A client-created Vehicle enters
+            # asynchronously in #1513 and destroyEntity is unsafe until the id
+            # becomes visible; retain a tombstone and retire it exactly once at
+            # the next safe lifecycle poll.
+            self._states.pop(int(entity_id), None)
+            self._vehicles.pop(int(entity_id), None)
+            self._failed_creates.add(int(entity_id))
+            try:
+                self._retire_failed_creates()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    'native remote arena registration failed: %s; '
+                    'entity cleanup failed: %s' % (error, cleanup_error))
+            raise
         return int(entity_id)
 
     def get(self, entity_id):
@@ -654,28 +676,56 @@ class NativeRemoteVehicleFactory(object):
         return bool(callable(lookup) and lookup(int(entity_id)) is not None)
 
     def engine_active(self):
-        return any(self.engine_owns(entity_id)
-                   for entity_id in self._states)
+        return (any(self.engine_owns(entity_id)
+                    for entity_id in self._states) or
+                any(self.engine_owns(entity_id)
+                    for entity_id in self._failed_creates))
+
+    def _retire_failed_creates(self):
+        """Destroy failed create requests only after BigWorld owns their ids."""
+        first_error = None
+        for entity_id in tuple(self._failed_creates):
+            if not self.engine_owns(entity_id):
+                continue
+            try:
+                self._binding.destroy_entity(entity_id)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            self._failed_creates.discard(entity_id)
+        if first_error is not None:
+            raise first_error
+        return not self._failed_creates
 
     def destroy(self, entity_id):
         entity_id = int(entity_id)
-        state = self._states.pop(entity_id, None)
-        self._vehicles.pop(entity_id, None)
+        state = self._states.get(entity_id)
         if state is None:
             return False
         state.detach()
         if self.engine_owns(entity_id):
             self._binding.destroy_entity(entity_id)
+        # Native entity destruction is the ownership commit boundary.  A
+        # failure above leaves both registries intact for an exact retry.
+        self._states.pop(entity_id, None)
+        self._vehicles.pop(entity_id, None)
         return True
 
     def destroy_all(self):
         first_error = None
+        try:
+            self._retire_failed_creates()
+        except Exception as error:
+            first_error = error
         for entity_id in tuple(self._states):
             try:
                 self.destroy(entity_id)
             except Exception as error:
                 if first_error is None:
                     first_error = error
+        if first_error is not None:
+            raise first_error
         self._descriptors = {}
         try:
             self._shot_presenter.destroy()

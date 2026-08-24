@@ -1462,14 +1462,21 @@ def tick_fire(vehicle, dt, now=None, module_test_mode=False):
 
 
 def apply_drowning(vehicle):
-    """Apply the copied all-module/all-crew drowning knockout law."""
-    if vehicle is None:
-        return None
-    before = _state(vehicle)
-    _offh_knock_out_everything(vehicle, False)
-    after = _state(vehicle)
-    return _payload(
-        before, after, getattr(vehicle, 'typeDescriptor', None), 'drowning')
+	"""Apply the copied all-module/all-crew drowning knockout law."""
+	if vehicle is None:
+		return None
+	before = _state(vehicle)
+	_offh_knock_out_everything(vehicle, False)
+	after = _state(vehicle)
+	return _payload(
+		before, after, getattr(vehicle, 'typeDescriptor', None), 'drowning')
+
+
+def propose_drowning(vehicle):
+	"""Return the drowning terminal state without mutating a live Vehicle."""
+	if vehicle is None:
+		raise ValueError('critical proposal requires a vehicle')
+	return apply_drowning(_CriticalProposalVehicle(vehicle))
 
 
 def apply_death(vehicle, cause='shot'):

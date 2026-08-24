@@ -87,6 +87,77 @@ class _Surface(object):
         self.resorts += 1
 
 
+class _TransactionalSurface(_Surface):
+    """Failure-injection surface with observable native ownership tokens."""
+
+    def __init__(self):
+        _Surface.__init__(self)
+        self.events = []
+        self.cursor_owned = False
+        self.fail_show_once = False
+        self.fail_hide_once = False
+        self.fail_pointer_add_at = None
+        self.fail_cancel_once = False
+        self.fail_remove_kinds_once = set()
+        self._pointer_adds = 0
+        self._next_tick = 1
+        self.callbacks = {}
+
+    def add_root(self, component):
+        self.events.append(('add_root', component.kind))
+        if component.kind == 'simple':
+            self._pointer_adds += 1
+            if self.fail_pointer_add_at == self._pointer_adds:
+                self.fail_pointer_add_at = None
+                raise RuntimeError('injected pointer root failure')
+        _Surface.add_root(self, component)
+
+    def remove_root(self, component):
+        self.events.append(('remove_root', component.kind))
+        if component.kind in self.fail_remove_kinds_once:
+            self.fail_remove_kinds_once.remove(component.kind)
+            raise RuntimeError('injected %s root removal failure' %
+                               component.kind)
+        _Surface.remove_root(self, component)
+
+    def resort(self):
+        self.events.append(('resort',))
+        _Surface.resort(self)
+
+    def cursor_position(self):
+        return (0.0, 0.0)
+
+    def show_cursor(self):
+        self.events.append(('show_cursor',))
+        if self.fail_show_once:
+            self.fail_show_once = False
+            raise RuntimeError('injected cursor takeover failure')
+        self.cursor_owned = True
+        return True
+
+    def hide_cursor(self):
+        self.events.append(('hide_cursor',))
+        if self.fail_hide_once:
+            self.fail_hide_once = False
+            raise RuntimeError('injected cursor restore failure')
+        self.cursor_owned = False
+        return True
+
+    def tick(self, delay, function):
+        handle = self._next_tick
+        self._next_tick += 1
+        self.events.append(('tick', handle, delay))
+        self.callbacks[handle] = function
+        return handle
+
+    def cancel_tick(self, handle):
+        self.events.append(('cancel_tick', handle))
+        if self.fail_cancel_once:
+            self.fail_cancel_once = False
+            raise RuntimeError('injected callback cancellation failure')
+        self.callbacks.pop(handle, None)
+
+
 class WaitingRoomTests(unittest.TestCase):
     def setUp(self):
         self.module = _load('waiting_room_ui')
@@ -302,6 +373,163 @@ class WaitingRoomTests(unittest.TestCase):
             self.assertGreaterEqual(bottom_margin,
                                     self.module.PANEL_SAFE_MARGIN)
             self.assertGreater(y, 0.0)
+
+    def test_failed_install_does_not_commit_a_partial_component_graph(self):
+        class _InstallFailureSurface(_Surface):
+            def __init__(self):
+                _Surface.__init__(self)
+                self.fail_once = True
+                self.simple_calls = 0
+
+            def simple(self, texture=''):
+                self.simple_calls += 1
+                if self.fail_once and self.simple_calls == 4:
+                    self.fail_once = False
+                    raise RuntimeError('injected component construction failure')
+                return _Surface.simple(self, texture)
+
+        surface = _InstallFailureSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True)
+
+        with mock.patch.object(self.module, 'NativeSurface',
+                               return_value=surface):
+            with self.assertRaises(RuntimeError):
+                room.install()
+
+            self.assertIsNone(room._surface)
+            self.assertIsNone(room._panel)
+            self.assertEqual({}, room._controls)
+            self.assertEqual({}, room._labels)
+            self.assertFalse(room._root_attached)
+            self.assertEqual([], surface.roots)
+            self.assertTrue(room.install())
+        self.assertTrue(room.open())
+        self.assertTrue(room.close())
+
+    def test_failed_cursor_takeover_detaches_the_panel_and_can_reopen(self):
+        surface = _TransactionalSurface()
+        surface.fail_show_once = True
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+
+        self.assertFalse(room.open())
+        self.assertFalse(room._open)
+        self.assertFalse(room._root_attached)
+        self.assertFalse(room._cursor_acquired)
+        self.assertEqual([], room._pointer_parts)
+        self.assertEqual([], surface.roots)
+
+        self.assertTrue(room.open())
+        self.assertTrue(room._open)
+        self.assertTrue(surface.cursor_owned)
+        self.assertTrue(room.close())
+
+    def test_failed_pointer_root_add_rolls_back_and_can_reopen(self):
+        surface = _TransactionalSurface()
+        surface.fail_pointer_add_at = 3
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+
+        self.assertFalse(room.open())
+        self.assertEqual([], surface.roots)
+        self.assertFalse(surface.cursor_owned)
+        self.assertEqual([], room._pointer_parts)
+        self.assertFalse(room._root_attached)
+        self.assertFalse(room._cursor_acquired)
+
+        self.assertTrue(room.open())
+        self.assertTrue(room.close())
+
+    def test_failed_final_paint_cleans_up_in_reverse_and_can_reopen(self):
+        surface = _TransactionalSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+        room.install()
+        surface.events[:] = []
+
+        with mock.patch.object(
+                room, '_refresh_contents',
+                side_effect=RuntimeError('injected first paint failure')):
+            self.assertFalse(room.open())
+
+        self.assertFalse(room._open)
+        self.assertEqual([], surface.roots)
+        self.assertEqual({}, surface.callbacks)
+        self.assertFalse(surface.cursor_owned)
+        self.assertFalse(room._root_attached)
+        self.assertFalse(room._cursor_acquired)
+        self.assertIsNone(room._pointer_tick)
+        self.assertEqual([], room._pointer_parts)
+
+        cancel_index = next(
+            index for index, event in enumerate(surface.events)
+            if event[0] == 'cancel_tick')
+        pointer_remove_indices = [
+            index for index, event in enumerate(surface.events)
+            if event == ('remove_root', 'simple')]
+        hide_index = surface.events.index(('hide_cursor',))
+        panel_remove_index = surface.events.index(('remove_root', 'window'))
+        self.assertTrue(pointer_remove_indices)
+        self.assertLess(cancel_index, min(pointer_remove_indices))
+        self.assertLess(max(pointer_remove_indices), hide_index)
+        self.assertLess(hide_index, panel_remove_index)
+
+        self.assertTrue(room.open())
+        self.assertTrue(room.close())
+        self.assertFalse(room.close())
+
+    def test_failed_cursor_restore_is_retried_by_repeated_close(self):
+        surface = _TransactionalSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+        self.assertTrue(room.open())
+        surface.fail_hide_once = True
+
+        self.assertFalse(room.close())
+        self.assertFalse(room._open)
+        self.assertTrue(room._cursor_acquired)
+        self.assertTrue(surface.cursor_owned)
+        self.assertEqual([], surface.roots)
+
+        self.assertTrue(room.close())
+        self.assertFalse(room._cursor_acquired)
+        self.assertFalse(surface.cursor_owned)
+        self.assertFalse(room.close())
+
+    def test_failed_callback_and_root_cleanup_are_retried_by_close(self):
+        surface = _TransactionalSurface()
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True, surface=surface)
+        self.assertTrue(room.open())
+        callback = room._pointer_tick
+        surface.fail_cancel_once = True
+        surface.fail_remove_kinds_once.update(('simple', 'window'))
+
+        self.assertFalse(room.close())
+        self.assertFalse(room._open)
+        self.assertEqual(callback, room._pointer_tick)
+        self.assertIn(callback, surface.callbacks)
+        self.assertTrue(room._root_attached)
+        self.assertIs(room._panel, surface.roots[0])
+        self.assertEqual(1, len(room._pointer_parts))
+        self.assertIn(room._pointer_parts[0][0], surface.roots)
+        self.assertFalse(room._cursor_acquired)
+        self.assertFalse(surface.cursor_owned)
+
+        self.assertTrue(room.close())
+        self.assertIsNone(room._pointer_tick)
+        self.assertEqual({}, surface.callbacks)
+        self.assertFalse(room._root_attached)
+        self.assertEqual([], room._pointer_parts)
+        self.assertEqual([], surface.roots)
+        self.assertFalse(room.close())
 
     def test_the_room_takes_and_releases_the_native_cursor(self):
         class _CursorSurface(_Surface):
@@ -602,10 +830,6 @@ class NativeSurfaceTests(unittest.TestCase):
         self.assertRaises(ImportError, self.module.NativeSurface)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class NativeCursorSurfaceTests(unittest.TestCase):
     def setUp(self):
         self.module = _load('waiting_room_ui')
@@ -660,6 +884,50 @@ class NativeCursorSurfaceTests(unittest.TestCase):
 
         self.assertEqual([('setCursor', None)], calls)
 
+    def test_failed_cursor_restore_keeps_the_exact_token_for_retry(self):
+        surface, cursor, calls, modules = self._surface()
+        cursor.active, cursor.visible = True, True
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(surface.show_cursor())
+            saved = surface._saved_cursor
+            attempts = []
+
+            def fail_once(value):
+                attempts.append(value)
+                if len(attempts) == 1:
+                    raise RuntimeError('injected native restore failure')
+
+            modules['BigWorld'].setCursor = fail_once
+            with self.assertRaises(RuntimeError):
+                surface.hide_cursor()
+            self.assertEqual(saved, surface._saved_cursor)
+            self.assertTrue(surface.hide_cursor())
+
+        self.assertIsNone(surface._saved_cursor)
+        self.assertTrue(cursor.visible)
+        self.assertEqual([cursor, cursor], attempts)
+
+    def test_failed_cursor_takeover_does_not_commit_a_restore_token(self):
+        surface, cursor, unused_calls, modules = self._surface()
+        cursor.active, cursor.visible = False, True
+        attempts = []
+
+        def fail_once(value):
+            attempts.append(value)
+            if len(attempts) == 1:
+                raise RuntimeError('injected native takeover failure')
+
+        modules['BigWorld'].setCursor = fail_once
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaises(RuntimeError):
+                surface.show_cursor()
+
+        self.assertIsNone(surface._saved_cursor)
+        self.assertTrue(cursor.visible)
+        # The rollback restores the originally detached cursor state.
+        self.assertEqual([cursor, None], attempts)
+
     def test_cursor_state_reports_what_the_player_should_see(self):
         surface, cursor, unused_calls, modules = self._surface()
         cursor.active = True
@@ -701,3 +969,7 @@ class RoomTextureTests(unittest.TestCase):
         # The free-floating labels stay light: they sit over the garage.
         self.assertNotEqual(
             colour, self.room._labels['title'].properties['colour'])
+
+
+if __name__ == '__main__':
+    unittest.main()

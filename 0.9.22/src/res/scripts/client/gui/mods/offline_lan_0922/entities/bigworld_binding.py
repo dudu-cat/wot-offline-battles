@@ -219,15 +219,8 @@ class BigWorldVehicleBinding(object):
         self._need(provider, 'stopVehicleVisual')
         provider.stopVehicleVisual(int(entity_id), bool(is_player))
 
-    def refresh_vehicle_minimap(self, entity_id):
-        """Rebind one stock minimap entry to its current Vehicle matrix.
-
-        Native ``Vehicle.startVisual`` runs before the LAN pose overlay can be
-        attached.  Its first minimap entry therefore captures the inert spawn
-        matrix.  Replaying only the minimap-added signal after attach makes
-        #1513 rebuild that matrix provider without removing the 2D marker or
-        changing the feedback adaptor's visible-vehicle set.
-        """
+    def _vehicle_feedback_context(self, entity_id):
+        """Return the exact arguments used by #1513's two visual signals."""
         entity = self._authority_entity_or_fail(entity_id)
         self._need(entity, 'proxy')
         provider = self._need(self._avatar, 'guiSessionProvider')
@@ -240,11 +233,46 @@ class BigWorldVehicleBinding(object):
         get_gui_props = self._need(arena_dp, 'getPlayerGuiProps')
         if not callable(get_vehicle_info) or not callable(get_gui_props):
             raise CapabilityError(
-                'required #1513 minimap arena capabilities are not callable')
+                'required #1513 visual arena capabilities are not callable')
         vehicle_info = get_vehicle_info(int(entity_id))
         gui_props = get_gui_props(int(entity_id), vehicle_info.team)
         shared = self._need(provider, 'shared')
         feedback = self._need(shared, 'feedback')
+        return entity, vehicle_info, gui_props, feedback
+
+    def start_vehicle_marker(self, entity_id):
+        """Add only the 3D marker, leaving the minimap entry unchanged."""
+        entity, vehicle_info, gui_props, feedback = \
+            self._vehicle_feedback_context(entity_id)
+        added = self._need(feedback, 'onVehicleMarkerAdded')
+        if not callable(added):
+            raise CapabilityError(
+                'required #1513 capability is not callable: '
+                'onVehicleMarkerAdded')
+        added(entity.proxy, vehicle_info, gui_props)
+        return True
+
+    def stop_vehicle_marker(self, entity_id):
+        """Remove only the 3D marker, retaining team minimap knowledge."""
+        provider = self._need(self._avatar, 'guiSessionProvider')
+        shared = self._need(provider, 'shared')
+        feedback = self._need(shared, 'feedback')
+        removed = self._need(feedback, 'onVehicleMarkerRemoved')
+        if not callable(removed):
+            raise CapabilityError(
+                'required #1513 capability is not callable: '
+                'onVehicleMarkerRemoved')
+        removed(int(entity_id))
+        return True
+
+    def start_vehicle_minimap(self, entity_id):
+        """Add only the minimap entry for a team-known remote vehicle."""
+        entity, vehicle_info, gui_props, feedback = \
+            self._vehicle_feedback_context(entity_id)
+        visible = self._need(
+            feedback, '_BattleFeedbackAdaptor__visible')
+        self._need(visible, 'add')
+        visible.add(int(entity_id))
         added = self._need(feedback, 'onMinimapVehicleAdded')
         if not callable(added):
             raise CapabilityError(
@@ -252,6 +280,34 @@ class BigWorldVehicleBinding(object):
                 'onMinimapVehicleAdded')
         added(entity.proxy, vehicle_info, gui_props)
         return True
+
+    def stop_vehicle_minimap(self, entity_id):
+        """Remove only the minimap entry for a forgotten remote vehicle."""
+        provider = self._need(self._avatar, 'guiSessionProvider')
+        shared = self._need(provider, 'shared')
+        feedback = self._need(shared, 'feedback')
+        visible = self._need(
+            feedback, '_BattleFeedbackAdaptor__visible')
+        self._need(visible, 'discard')
+        visible.discard(int(entity_id))
+        removed = self._need(feedback, 'onMinimapVehicleRemoved')
+        if not callable(removed):
+            raise CapabilityError(
+                'required #1513 capability is not callable: '
+                'onMinimapVehicleRemoved')
+        removed(int(entity_id))
+        return True
+
+    def refresh_vehicle_minimap(self, entity_id):
+        """Rebind one stock minimap entry to its current Vehicle matrix.
+
+        Native ``Vehicle.startVisual`` runs before the LAN pose overlay can be
+        attached.  Its first minimap entry therefore captures the inert spawn
+        matrix.  Replaying only the minimap-added signal after attach makes
+        #1513 rebuild that matrix provider without removing the 2D marker or
+        changing the feedback adaptor's visible-vehicle set.
+        """
+        return self.start_vehicle_minimap(entity_id)
 
     def arena_vehicle_killed(self, entity_id, attacker_id=0, reason=0):
         """Publish the exact uncompressed #1513 ClientArena kill tuple."""

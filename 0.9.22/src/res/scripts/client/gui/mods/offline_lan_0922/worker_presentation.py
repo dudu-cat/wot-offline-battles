@@ -158,8 +158,11 @@ class WorkerPresentation(object):
         if (wwise is None or original is None or
                 getattr(wwise, 'WW_setMasterVolume', None) is not wrapper):
             return False
-        wwise.WW_setMasterVolume = original
+        # Restore native volume while our exact wrapper is still the owned
+        # hook.  If the native call fails, a later deactivate() can retry the
+        # same operation instead of observing an already-released hook.
         original(self._original_master_volume)
+        wwise.WW_setMasterVolume = original
         return True
 
     def _restore_window(self):
@@ -195,9 +198,9 @@ class WorkerPresentation(object):
             self._restore_audio()
         except Exception as error:
             errors.append(error)
-        self._clear()
         if errors:
             raise errors[0]
+        self._clear()
         return True
 
     def deactivate(self, restore=True):

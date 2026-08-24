@@ -11,10 +11,11 @@ PORT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import (  # noqa: E402
-    BattleState, CLIENT_BUILD_0922, ClientHandler,
+    BattleState, CLIENT_BUILD_0922, ClientHandler, CRITICAL_DEVICE_NAMES,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, Player, PREBATTLE_SECONDS,
-    PLAYER_FIRE_INTENT_CAPABILITY, PROJECTILE_CAPABILITY,
+    PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+    PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY, TICK_HZ,
     SIMULATION_WORKER_AUTHORITY_ID, SimulationWorker, _critical_payload,
@@ -42,7 +43,8 @@ def _player(player_id, team=1, x=398.0, z=402.0):
         client_position=True, health=1000, max_health=1000,
         capabilities=(
             PROJECTILE_CAPABILITY, HUMAN_RAM_TIMELINE_CAPABILITY,
-            RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY),
+            RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+            PLAYER_ENVIRONMENT_CAPABILITY),
     )
 
 
@@ -258,6 +260,103 @@ class ServerCriticalProposalStateTest(unittest.TestCase):
         self.assertAlmostEqual(0.0, turret_point.z)
 
 
+class PlayerDrowningAuthorityTest(unittest.TestCase):
+    def _worker_state(self):
+        state = BattleState(
+            map_name='01_karelia', authority_mode='worker')
+        state.client_build = CLIENT_BUILD_0922
+        state.descriptor_store.add('ussr:R11_MS-1', _projection())
+        player = _player(1)
+        player.input_seq = 7
+        state.players[1] = player
+        state.simulation_worker = SimulationWorker(
+            _Socket(), ('127.0.0.1', 1000), capabilities=(
+                PROJECTILE_CAPABILITY,
+                DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                SIMULATION_WORKER_CAPABILITY,
+                HUMAN_RAM_TIMELINE_CAPABILITY,
+                RAM_CONTACT_LEDGER_CAPABILITY,
+                PLAYER_FIRE_INTENT_CAPABILITY,
+                PLAYER_ENVIRONMENT_CAPABILITY))
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.authority_epoch = 3
+        state.phase = 'battle'
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        return state, player
+
+    @staticmethod
+    def _environment(state, sample_seq, level, input_seq=7):
+        return {
+            'type': 'player_environment',
+            'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+            'sample_seq': sample_seq,
+            'observations': [{
+                'player_id': 1, 'input_seq': input_seq, 'level': level,
+            }],
+        }
+
+    def test_worker_observation_drives_server_owned_drowning_death(self):
+        state, player = self._worker_state()
+
+        for sample_seq in range(1, 102):
+            state.tick += 3
+            self.assertTrue(state.update_player_environment(
+                SIMULATION_WORKER_AUTHORITY_ID,
+                self._environment(state, sample_seq, 2)))
+            state._tick_player_drowning(0.1)
+
+        self.assertFalse(player.alive)
+        self.assertEqual(0, player.health)
+        self.assertEqual(1000, player.display_health)
+        self.assertEqual(5, player.death_reason)
+        self.assertEqual(1, player.critical_revision)
+        self.assertEqual(
+            set(CRITICAL_DEVICE_NAMES), set(player.critical['destroyed']))
+        event = next(
+            event for event in state.pending_events
+            if event.get('source') == 'environment')
+        self.assertEqual('health', event['kind'])
+        self.assertEqual(5, event['death_reason'])
+        self.assertNotIn('attacker', event)
+        self.assertTrue(state._validate_combat_event_for_wire(event))
+
+    def test_surfacing_resets_server_drowning_countdown(self):
+        state, player = self._worker_state()
+        for sample_seq in range(1, 51):
+            state.tick += 3
+            self.assertTrue(state.update_player_environment(
+                SIMULATION_WORKER_AUTHORITY_ID,
+                self._environment(state, sample_seq, 2)))
+            state._tick_player_drowning(0.1)
+        self.assertAlmostEqual(5.0, state.player_drowning_seconds[1])
+
+        state.tick += 3
+        self.assertTrue(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._environment(state, 51, 1)))
+        state._tick_player_drowning(0.1)
+        self.assertNotIn(1, state.player_drowning_seconds)
+
+        for sample_seq in range(52, 112):
+            state.tick += 3
+            self.assertTrue(state.update_player_environment(
+                SIMULATION_WORKER_AUTHORITY_ID,
+                self._environment(state, sample_seq, 2)))
+            state._tick_player_drowning(0.1)
+        self.assertTrue(player.alive)
+        self.assertEqual(1000, player.health)
+
+    def test_visible_or_future_input_observation_is_rejected(self):
+        state, player = self._worker_state()
+        message = self._environment(state, 1, 2)
+        self.assertFalse(state.update_player_environment(1, message))
+        message['observations'][0]['input_seq'] = player.input_seq + 1
+        self.assertFalse(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertTrue(player.alive)
+
+
 class ServerAuthorityElectionTest(unittest.TestCase):
     @staticmethod
     def _install_worker(state):
@@ -268,7 +367,8 @@ class ServerAuthorityElectionTest(unittest.TestCase):
                 SIMULATION_WORKER_CAPABILITY,
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
-                PLAYER_FIRE_INTENT_CAPABILITY))
+                PLAYER_FIRE_INTENT_CAPABILITY,
+                PLAYER_ENVIRONMENT_CAPABILITY))
         state.simulation_worker = worker
         state._elect_bot_authority()
         return worker
@@ -451,7 +551,8 @@ class HumanRamTimelineTest(unittest.TestCase):
         state.client_build = CLIENT_BUILD_0922
         capabilities = (
             PROJECTILE_CAPABILITY, HUMAN_RAM_TIMELINE_CAPABILITY,
-            RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY)
+            RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+            PLAYER_ENVIRONMENT_CAPABILITY)
         first = _player(1, team=1, x=0.0, z=-1.6)
         second = _player(2, team=2, x=0.0, z=6.5)
         first.capabilities = capabilities
@@ -466,7 +567,8 @@ class HumanRamTimelineTest(unittest.TestCase):
                 SIMULATION_WORKER_CAPABILITY,
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
-                PLAYER_FIRE_INTENT_CAPABILITY))
+                PLAYER_FIRE_INTENT_CAPABILITY,
+                PLAYER_ENVIRONMENT_CAPABILITY))
         state.simulation_worker = worker
         state._elect_room_host()
         state._elect_bot_authority()
@@ -585,6 +687,98 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertFalse(state.update_input(
             1, dict(message, input_seq=3, pose_time_us=200000)))
         self.assertEqual(1, state.players[1].input_seq)
+
+    def test_player_destructible_contact_is_bound_to_an_admitted_pose(self):
+        state, clock = self._state()
+        clock[0] = 0.2
+        contact = {
+            'seq': 1, 'x': 0.0, 'y': 0.0, 'z': -1.6,
+            'yaw': 0.0, 'speed': 16.0, 'dt': 0.04,
+            'token': [[22, 3, None]],
+        }
+
+        self.assertTrue(state.update_input(1, {
+            'round_id': state.round_id, 'input_seq': 1,
+            'pose_time_us': 100000,
+            'x': 0.0, 'y': 0.0, 'z': -1.6, 'yaw': 0.0,
+            'forward': 1.0, 'speed': 16.0,
+            'destructible_contacts': [contact],
+        }))
+
+        player = state.players[1]
+        self.assertEqual([1], list(player.destructible_contacts))
+        admitted = player.destructible_contacts[1]
+        self.assertEqual(1, admitted['input_seq'])
+        self.assertEqual(100000, admitted['pose_time_us'])
+        self.assertEqual(
+            [1], [row['seq'] for row in
+                  state._public_player(player)['destructible_contacts']])
+        self.assertEqual({}, state.destructibles)
+
+        self.assertTrue(state.report_player_destructible_contact_result(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'player_destructible_contact_result',
+                'round_id': state.round_id, 'player_id': 1,
+                'contact_seq': 1, 'accepted': False,
+                'token': [[22, 3, None]],
+            }))
+
+        # A contact body that does not match an admitted pose is terminally
+        # rejected instead of being relayed to the hidden worker.
+        self.assertTrue(state.update_input(1, {
+            'round_id': state.round_id, 'input_seq': 2,
+            'pose_time_us': 200000,
+            'x': 0.0, 'y': 0.0, 'z': -1.6, 'yaw': 0.0,
+            'forward': 1.0, 'speed': 16.0,
+            'destructible_contacts': [dict(contact, seq=2, x=5.0)],
+        }))
+        self.assertEqual([], list(player.destructible_contacts))
+        self.assertEqual(2, player.destructible_contact_seq)
+        self.assertEqual(2, player.destructible_contact_resolved_seq)
+
+    def test_only_hidden_worker_can_resolve_player_destructible_contact(self):
+        state, clock = self._state()
+        clock[0] = 0.2
+        token = [[22, 3, None]]
+        self.assertTrue(state.update_input(1, {
+            'round_id': state.round_id, 'input_seq': 1,
+            'pose_time_us': 100000,
+            'x': 0.0, 'y': 0.0, 'z': -1.6, 'yaw': 0.0,
+            'forward': 1.0, 'speed': 16.0,
+            'destructible_contacts': [{
+                'seq': 1, 'x': 0.0, 'y': 0.0, 'z': -1.6,
+                'yaw': 0.0, 'speed': 16.0, 'dt': 0.04,
+                'token': token,
+            }],
+        }))
+        message = {
+            'type': 'player_destructible_contact_result',
+            'round_id': state.round_id, 'player_id': 1,
+            'contact_seq': 1, 'accepted': True, 'token': token,
+        }
+
+        self.assertFalse(state.report_player_destructible_contact_result(
+            1, message))
+        self.assertFalse(state.report_player_destructible_contact_result(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            dict(message, token=[[22, 4, None]])))
+        self.assertFalse(state.report_player_destructible_contact_result(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertEqual([1], list(
+            state.players[1].destructible_contacts))
+
+        state.destructibles[('fragile', 22, 3, None)] = {
+            'kind': 'destructible', 'destructible_kind': 'fragile',
+            'chunk_id': 22, 'item_index': 3,
+        }
+        self.assertTrue(state.report_player_destructible_contact_result(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertEqual([], list(
+            state.players[1].destructible_contacts))
+        self.assertEqual(
+            1, state.players[1].destructible_contact_resolved_seq)
+        self.assertTrue(state.report_player_destructible_contact_result(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
 
     def test_visible_input_cannot_submit_health_or_critical_verdicts(self):
         state, unused_clock = self._state()

@@ -12,6 +12,8 @@ _STATUS_OPERATIONS = {
     108: 'mapping mask rollback',
 }
 
+_RESTORE_ATTEMPTS = 2
+
 
 class NativeMappingMaskError(RuntimeError):
     pass
@@ -76,14 +78,28 @@ class _StandardGameplayMaskPatch(object):
     def restore(self):
         if not self._applied:
             return False
-        try:
-            status = _native_status(
-                self._bridge, 'restore_standard_gameplay_mask')
-        finally:
-            self._applied = False
-        if status != 0:
-            _raise_status(status)
-        return True
+        last_error = None
+        for unused_attempt in range(_RESTORE_ATTEMPTS):
+            try:
+                status = _native_status(
+                    self._bridge, 'restore_standard_gameplay_mask')
+            except Exception as error:
+                last_error = error
+                continue
+            # A previous native attempt may have completed the restoration but
+            # lost its return value.  In that case NOT_ACTIVE is the same
+            # confirmed terminal state as an ordinary successful restore.
+            if status in (0, 102):
+                self._applied = False
+                return True
+            try:
+                _raise_status(status)
+            except NativeMappingMaskError as error:
+                last_error = error
+        # Keep ownership on every unresolved failure.  Clearing this flag while
+        # the native bridge still reports its patch active makes all later
+        # apply calls fail with ALREADY_ACTIVE and poisons the process.
+        raise last_error
 
 
 def call_with_standard_gameplay_mask(callback, args=(), kwargs=None,

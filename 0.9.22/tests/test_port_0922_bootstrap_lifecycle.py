@@ -595,6 +595,49 @@ class BootstrapLifecycleTests(unittest.TestCase):
             self.assertIsNone(bootstrap._cleanup_runtime())
         self.assertEqual('uninstall_announcement_router', events[-1])
 
+    def test_cleanup_retains_session_until_stop_can_be_retried(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events,
+         modules) = self._load()
+        attempts = []
+
+        def stop(**unused_kwargs):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise RuntimeError('native session stop failed')
+
+        session = types.SimpleNamespace(stop=stop)
+        bootstrap._session = session
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertRegex(
+                str(bootstrap._cleanup_runtime()),
+                'native session stop failed')
+            self.assertIs(session, bootstrap._session)
+            self.assertIsNone(bootstrap._cleanup_runtime())
+
+        self.assertIsNone(bootstrap._session)
+        self.assertEqual([True, True], attempts)
+
+    def test_cleanup_retains_callback_id_until_cancel_succeeds(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events,
+         modules) = self._load()
+        cancel = mock.Mock(side_effect=(
+            RuntimeError('callback cancel failed'), None))
+        bootstrap.BigWorld.cancelCallback = cancel
+        bootstrap._callback_id = 17
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertRegex(
+                str(bootstrap._cleanup_runtime()),
+                'callback cancel failed')
+            self.assertEqual(17, bootstrap._callback_id)
+            self.assertIsNone(bootstrap._cleanup_runtime())
+
+        self.assertIsNone(bootstrap._callback_id)
+        self.assertEqual([mock.call(17), mock.call(17)], cancel.call_args_list)
+
     def test_login_space_must_remain_stable_for_the_deferred_tick(self):
         (bootstrap, callbacks, compatibility, app_loader,
          spaces, unused_events, modules) = self._load()

@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +90,22 @@ class ServerAnnouncementUITests(unittest.TestCase):
 
         self.assertIs(original, _ChinaController.__dict__['onLobbyInited'])
 
+    def test_failed_uninstall_retains_hook_owner_for_retry(self):
+        self.adapter.install()
+        restore = self.adapter._restore
+        self.adapter._restore = mock.Mock(
+            side_effect=RuntimeError('hook restore failed'))
+
+        with self.assertRaisesRegex(RuntimeError, 'hook restore failed'):
+            self.adapter.uninstall()
+
+        self.assertTrue(self.adapter._installed)
+        self.adapter._restore = restore
+        self.adapter.uninstall()
+        self.assertFalse(self.adapter._installed)
+        self.assertIs(_ORIGINAL_LOBBY_INITED,
+                      _ChinaController.__dict__['onLobbyInited'])
+
     def test_uninstall_does_not_clobber_later_wrapper(self):
         self.adapter.install()
 
@@ -105,6 +122,20 @@ class ServerAnnouncementUITests(unittest.TestCase):
 class _Module(object):
     def __init__(self, value):
         self.isShowStartupVideo = value
+
+
+class _FailingRestoreModule(_Module):
+    def __init__(self, value):
+        object.__setattr__(self, '_restore_value', value)
+        object.__setattr__(self, 'fail_restore', False)
+        _Module.__init__(self, value)
+
+    def __setattr__(self, name, value):
+        if (name == 'isShowStartupVideo' and self.fail_restore and
+                value is self._restore_value):
+            object.__setattr__(self, 'fail_restore', False)
+            raise RuntimeError('startup hook restore failed')
+        object.__setattr__(self, name, value)
 
 
 class IntroVideoSkipTests(unittest.TestCase):
@@ -135,6 +166,21 @@ class IntroVideoSkipTests(unittest.TestCase):
 
         self.assertIs(self._stock, helpers.isShowStartupVideo)
         self.assertIs(self._stock, states.isShowStartupVideo)
+
+    def test_failed_hook_restore_retains_entry_for_retry(self):
+        helpers = _FailingRestoreModule(self._stock)
+        skip = self.module.IntroVideoSkip(runtime=(helpers,))
+        skip.install()
+        helpers.fail_restore = True
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'startup hook restore failed'):
+            skip.uninstall()
+
+        self.assertEqual(1, len(skip._replaced))
+        self.assertTrue(skip.uninstall())
+        self.assertEqual([], skip._replaced)
+        self.assertIs(self._stock, helpers.isShowStartupVideo)
 
     def test_a_module_without_the_check_is_left_alone(self):
         helpers = _Module(self._stock)

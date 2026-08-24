@@ -240,6 +240,41 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'name', 'vehicle', 'max_health', 'account_key', 'outfits',
             'player_id', 'spawn'}))
 
+    def test_worker_publishes_bounded_player_environment_batch(self):
+        client = self._active_client()
+        client.authority_epoch = 4
+        client.capabilities = tuple(CLIENT_CAPABILITIES) + (
+            SIMULATION_WORKER_CAPABILITY,)
+        client.server_capabilities = tuple(CLIENT_CAPABILITIES)
+        client._send = mock.Mock(return_value=True)
+
+        self.assertTrue(client.send_player_environment([{
+            'player_id': 2, 'input_seq': 17, 'level': 2,
+        }], 9))
+
+        client._send.assert_called_once_with({
+            'type': 'player_environment', 'round_id': 7,
+            'authority_epoch': 4, 'sample_seq': 9,
+            'observations': [{
+                'player_id': 2, 'input_seq': 17, 'level': 2,
+            }],
+        })
+
+    def test_visible_client_cannot_publish_player_environment(self):
+        client = LANClient(
+            '127.0.0.1', 28782, 'Player', 'ussr:R11_MS-1')
+        client.ready = True
+        client.phase = 'battle'
+        client.player_id = 1
+        client.bot_authority_id = WORKER_AUTHORITY_ID
+        client.authority_epoch = 1
+        client.capabilities = tuple(CLIENT_CAPABILITIES)
+        client.server_capabilities = tuple(CLIENT_CAPABILITIES)
+        client._send = mock.Mock(return_value=True)
+
+        self.assertFalse(client.send_player_environment([], 1))
+        client._send.assert_not_called()
+
     def test_worker_bot_state_is_encoded_once_and_frozen_as_queue_bytes(self):
         client = self._active_client()
         state = _projected_bot_state()
@@ -369,6 +404,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
                 lan_client_module.LEAN_SNAPSHOT_MANIFEST_CAPABILITY,
                 lan_client_module.RAM_CONTACT_LEDGER_CAPABILITY,
                 lan_client_module.PLAYER_FIRE_INTENT_CAPABILITY,
+                lan_client_module.PLAYER_ENVIRONMENT_CAPABILITY,
                 lan_client_module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 lan_client_module.RANDOM_MAP_CAPABILITY],
             'map': '01_karelia', 'map_pool': ['01_karelia'],
@@ -697,6 +733,14 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             [('runtime_stop', None, False, False, False)], calls)
         self.assertTrue(world.enabled)
         self.assertTrue(client.stopped)
+        self.assertIs(runtime, session.runtime)
+        self.assertIsNone(session.client)
+
+        runtime.fail_stop = False
+        session.stop()
+
+        self.assertIsNone(session.runtime)
+        self.assertEqual(2, len(calls))
 
     def test_native_cleanup_failure_fences_worker_without_retry(self):
         world = _DrawWorld()
@@ -718,8 +762,15 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual('failed', session.state)
         self.assertTrue(session._stopped)
         self.assertTrue(client.stopped)
+        self.assertIs(runtime, session.runtime)
+        self.assertIsNone(session.client)
         self.assertIsNone(session._retry_callback_id)
         session._callback.assert_not_called()
+
+        runtime.fail_stop = False
+        session.stop()
+
+        self.assertIsNone(session.runtime)
 
     def test_busy_worker_rechecks_at_fixed_delay_and_welcome_resets_it(self):
         world = _DrawWorld()

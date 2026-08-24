@@ -577,16 +577,22 @@ class AvatarServerBridge(object):
         self._ack_command(request_id, command, result_id, error)
 
     def destroy(self):
-        if self._destroyed:
+        # ``_destroyed`` fences late native callbacks immediately, while the
+        # vehicle id remains the retry token until both arena and entity
+        # teardown have completed.
+        if self._destroyed and self._vehicle_id is None:
             return False
         self._destroyed = True
         if self._vehicle_id is None:
             self._vehicle_enter_states = {}
             return False
         vehicle_id = self._vehicle_id
+        if self._arena_vehicle_added:
+            self._binding.arena_vehicle_removed(vehicle_id)
+            self._arena_vehicle_added = False
+        self._binding.destroy_entity(vehicle_id)
         self._vehicle_id = None
         self._bound_vehicle_id = None
-        self._arena_vehicle_added = False
         self._vehicle_enter_started = False
         self._vehicle_enter_completed = False
         self._vehicle_enter_error = None
@@ -595,10 +601,6 @@ class AvatarServerBridge(object):
         self._client_ready = False
         self._ready_publish_started = False
         self._ready_publish_error = None
-        try:
-            self._binding.arena_vehicle_removed(vehicle_id)
-        finally:
-            self._binding.destroy_entity(vehicle_id)
         return True
 
     def _ack_command(self, request_id, command, result_id=0, error=''):

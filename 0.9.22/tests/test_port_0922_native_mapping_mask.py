@@ -13,9 +13,11 @@ from gui.mods.offline_lan_0922 import native_mapping_mask
 
 
 class _Bridge(object):
-    def __init__(self, apply_status=0, restore_status=0):
+    def __init__(self, apply_status=0, restore_status=0,
+                 restore_statuses=None):
         self.apply_status = apply_status
         self.restore_status = restore_status
+        self.restore_statuses = list(restore_statuses or ())
         self.events = []
         self.active = False
 
@@ -27,11 +29,13 @@ class _Bridge(object):
 
     def restore_standard_gameplay_mask(self):
         self.events.append('restore')
-        if not self.active and self.restore_status == 0:
+        status = (self.restore_statuses.pop(0)
+                  if self.restore_statuses else self.restore_status)
+        if not self.active and status == 0:
             return 102
-        if self.restore_status == 0:
+        if status == 0:
             self.active = False
-        return self.restore_status
+        return status
 
 
 class NativeMappingMaskTests(unittest.TestCase):
@@ -96,7 +100,35 @@ class NativeMappingMaskTests(unittest.TestCase):
             native_mapping_mask.call_with_standard_gameplay_mask(
                 lambda: 37, native_bridge=bridge)
 
-        self.assertEqual(['apply', 'restore'], bridge.events)
+        self.assertEqual(['apply', 'restore', 'restore'], bridge.events)
+        self.assertTrue(bridge.active)
+
+    def test_restore_retries_before_committing_the_python_lease(self):
+        bridge = _Bridge(restore_statuses=(106, 0))
+        patch = native_mapping_mask._StandardGameplayMaskPatch(bridge)
+        patch.apply()
+
+        self.assertTrue(patch.restore())
+
+        self.assertEqual(['apply', 'restore', 'restore'], bridge.events)
+        self.assertFalse(bridge.active)
+        self.assertFalse(patch._applied)
+
+    def test_unresolved_restore_failure_keeps_the_lease_retryable(self):
+        bridge = _Bridge(restore_status=106)
+        patch = native_mapping_mask._StandardGameplayMaskPatch(bridge)
+        patch.apply()
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'protection restore.*status 106'):
+            patch.restore()
+
+        self.assertTrue(bridge.active)
+        self.assertTrue(patch._applied)
+        bridge.restore_status = 0
+        self.assertTrue(patch.restore())
+        self.assertFalse(bridge.active)
+        self.assertFalse(patch._applied)
 
     def test_missing_native_method_fails_closed(self):
         bridge = object()

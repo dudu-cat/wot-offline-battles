@@ -901,6 +901,39 @@ def _instance_descriptor_filename_1513(instance):
 	return record['filename'] if record is not None else instance['filename']
 
 
+def _validate_native_effect_categories_1513(
+		bigworld, area_destructibles, record, spaceID, chunk_id, item_index):
+	"""Validate the live native kind using the exact #1513 material token.
+
+	Structures address their modules by BSP ``matKind`` (the same 71--130
+	token carried by ``destructibleModuleDestroyed``), not by a zero-based box
+	ordinal.  Passing ``0`` makes valid structures such as Malinovka's
+	``mil203_MilitaryDefences01`` report ``-1`` and isolates the whole item.
+	"""
+	expected_kind = record['kind']
+	module_tokens = (-1,)
+	if expected_kind == 'structure':
+		module_tokens = tuple(sorted(set(
+			int(box[6]) for box in record['boxes'])))
+	for module_token in module_tokens:
+		try:
+			native_type = bigworld.wg_getDestructibleEffectCategory(
+				spaceID, chunk_id, item_index, module_token)
+		except Exception as error:
+			_isolate_destructible_1513(
+				'effect_query', chunk_id, item_index,
+				detail='module=%s error=%s' % (module_token, error))
+			return False
+		if _catalog_kind_for_type_1513(
+				area_destructibles, native_type) != expected_kind:
+			_isolate_destructible_1513(
+				'effect_category', chunk_id, item_index,
+				detail='module=%s expected=%s native=%r' % (
+					module_token, expected_kind, native_type))
+			return False
+	return True
+
+
 def _stream_baked_shot_instance_1513(spaceID, identity):
 	"""Validate and register one baked wire when its chunk is streamed.
 
@@ -1001,20 +1034,9 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 		AreaDestructibles, desc.get('type'))
 	if expected_kind != record['kind']:
 		return None
-	module_index = 0 if expected_kind == 'structure' else -1
-	try:
-		native_type = BigWorld.wg_getDestructibleEffectCategory(
-			spaceID, chunk_id, item_index, module_index)
-	except Exception as error:
-		_isolate_destructible_1513(
-			'effect_query', chunk_id, item_index,
-			detail='module=%s error=%s' % (module_index, error))
-		return None
-	if _catalog_kind_for_type_1513(
-			AreaDestructibles, native_type) != expected_kind:
-		_isolate_destructible_1513(
-			'effect_category', chunk_id, item_index,
-			detail='expected=%s native=%r' % (expected_kind, native_type))
+	if not _validate_native_effect_categories_1513(
+			BigWorld, AreaDestructibles, record,
+			spaceID, chunk_id, item_index):
 		return None
 	try:
 		world_boxes = _world_catalog_boxes(
@@ -1147,6 +1169,22 @@ def _catalog_shot_intersection(spaceID, start, end, maximum_distance=None):
 		'candidate': candidate, 'distance': distance,
 		'exit_distance': exit_distance, 'ambiguous': False,
 	}
+
+
+def _stream_baked_motion_instances_1513(spaceID, vehicle_box):
+	"""Live-validate catalog wires covering one exact vehicle sweep."""
+	catalog = _destructible_catalog or {}
+	if not catalog.get('has_instance_index'):
+		return
+	identities = set()
+	for bin_key in _baked_bin_keys_for_bounds_1513(
+			*_box_xz_bounds(vehicle_box)):
+		identities.update(
+			catalog.get('baked_shot_bins', {}).get(bin_key, ()))
+	instances = globals().get('g_offh_destr_instances', {})
+	for identity in sorted(identities):
+		if identity not in instances:
+			_stream_baked_shot_instance_1513(spaceID, identity)
 
 
 def _vehicle_swept_box(pos, yaw, vel, bbox, travel_reach=None):
@@ -1570,16 +1608,19 @@ def _catalog_hull_contact(pos, yaw, vel, td, dt=0.04):
 
 def _catalog_motion_result(status, token=None, accepted_now=False,
 		used_kinetic_speed=False, return_status=False, return_detail=False,
-		kinds=None):
+		kinds=None, requires_commit=None):
 	"""Keep the legacy status seam while exposing an exact commit receipt."""
 	if return_detail:
-		return {
+		result = {
 			'status': status,
 			'token': tuple(sorted(token or ())) or None,
 			'accepted_now': bool(accepted_now),
 			'used_kinetic_speed': bool(used_kinetic_speed),
 			'kinds': ','.join(sorted(kinds or ())) or '-',
 		}
+		if requires_commit is not None:
+			result['requires_commit'] = bool(requires_commit)
+		return result
 	# ``approach`` is meaningful only to the combined world+catalog resolver.
 	# Older callers must continue to fail closed on a non-contact lookahead.
 	legacy_status = 'hard' if status == 'approach' else status
@@ -1588,8 +1629,12 @@ def _catalog_motion_result(status, token=None, accepted_now=False,
 
 def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		return_status=False, dt=0.04, kinetic_speed=None,
-		return_detail=False, kinetic_commit=False, commit_enabled=True):
+		return_detail=False, kinetic_commit=False, commit_enabled=True,
+		proposal_only=False):
 	"""Resolve exact streamed OBB contact before committing local movement."""
+	if proposal_only and (not return_detail or not kinetic_commit):
+		raise ValueError(
+			'catalog motion proposals require detail and kinetic classification')
 	_diagnostic_flush_1513(now)
 	if _destructible_catalog is None:
 		return _catalog_motion_result(
@@ -1605,6 +1650,10 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 	_refresh_destroyed_falling_instances_1513(spaceID, auth, now)
 	vehicle_box = _vehicle_swept_box(
 		pos, yaw, vel, bbox, _motion_travel_reach(vel, dt))
+	# The visible player does not run the authority Bot scan that normally
+	# populates the live item registry.  Admit only checksum-pinned wires in the
+	# current hull bins through the same read-only native validation as shells.
+	_stream_baked_motion_instances_1513(spaceID, vehicle_box)
 	candidates = _catalog_contact_candidates(vehicle_box)
 	if not candidates:
 		return _catalog_motion_result(
@@ -1706,11 +1755,18 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 
 	accepted_now = False
 	used_kinetic_speed = False
+	requires_commit = False
 	if not blocked and not kinetic:
 		for candidate, gate_speed, used_cap in commit_candidates:
 			chunk_id, item_index, mat_kind, unused_filename, kind = (
 				candidate[:5])
 			if _destructible_isolated_1513(chunk_id, item_index):
+				continue
+			if proposal_only:
+				exact_token.add((chunk_id, item_index, mat_kind))
+				requires_commit = True
+				used_kinetic_speed = used_kinetic_speed or used_cap
+				crushed = True
 				continue
 			mat_info = _synthetic_mat_info(candidate, Math)
 			point = mat_info[1]
@@ -1752,7 +1808,17 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		'approach' if approach else 'clear')
 	return _catalog_motion_result(
 		status, None if blocked else exact_token, accepted_now,
-		used_kinetic_speed, return_status, return_detail, contact_kinds)
+		used_kinetic_speed, return_status, return_detail, contact_kinds,
+		requires_commit if proposal_only else None)
+
+
+def _catalog_motion_proposal(spaceID, pos, yaw, vel, td, now,
+		dt=0.04, kinetic_speed=None):
+	"""Return a mutation-free exact hull-sweep proposal for worker review."""
+	return _catalog_motion_blocked(
+		spaceID, pos, yaw, vel, td, now, dt=dt,
+		kinetic_speed=kinetic_speed, return_detail=True,
+		kinetic_commit=True, commit_enabled=True, proposal_only=True)
 
 
 def _catalog_instance_boxes(chunkID, itemIndex, filename, kind,
@@ -2535,29 +2601,12 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 								_slot_diag['result'] = 'kind_mismatch'
 								continue
 							if _located is not None:
-								_module_index = (0 if _expected_kind ==
-									'structure' else -1)
-								try:
-									_native_type = (
-										BigWorld.wg_getDestructibleEffectCategory(
-											spaceID, cid, _ti, _module_index))
-								except Exception as error:
-									_isolate_destructible_1513(
-										'effect_query', cid, _ti,
-										detail='module=%s error=%s' %
-											(_module_index, error))
-									_slot_diag['result'] = 'isolated'
-									continue
-								if _catalog_kind_for_type_1513(
-										AreaDestructibles, _native_type) != _expected_kind:
-									_slot_diag['effect_category'] = _native_type
+								if not _validate_native_effect_categories_1513(
+										BigWorld, AreaDestructibles, _catalog_record,
+										spaceID, cid, _ti):
 									_slot_diag['result'] = 'effect_mismatch'
-									_isolate_destructible_1513(
-										'effect_category', cid, _ti,
-										detail='expected=%s native=%r' %
-											(_expected_kind, _native_type))
 									continue
-								_slot_diag['effect_category'] = _native_type
+								_slot_diag['effect_category'] = _expected_kind
 						elif typ not in (
 								AreaDestructibles.DESTR_TYPE_TREE,
 								AreaDestructibles.DESTR_TYPE_FALLING_ATOM):

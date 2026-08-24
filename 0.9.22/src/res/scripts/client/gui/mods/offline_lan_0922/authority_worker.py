@@ -17,8 +17,9 @@ from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_BUILD, CLIENT_CAPABILITIES, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, MAX_MOTION_TIME_US,
     MAX_PROJECTILE_ID, PROTOCOL_VERSION, PROJECTILE_LEDGER_CAPABILITY,
-    PLAYER_FIRE_INTENT_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
-    SIMULATION_WORKER_CAPABILITY, WORKER_AUTHORITY_ID, LANClient,
+    PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY, SIMULATION_WORKER_CAPABILITY,
+    WORKER_AUTHORITY_ID, LANClient,
     _BOT_STATE_WIRE_FIELDS,
     _canonical_vehicle_compact_descr, _canonical_wire_outfits,
     _exact_int, _projectile_int_range, _safe_text,
@@ -174,9 +175,12 @@ class AuthorityWorkerLANClient(LANClient):
                 RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
                 HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                 PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
+                PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
                 RAM_CONTACT_LEDGER_CAPABILITY not in server_capabilities or
                 HUMAN_RAM_TIMELINE_CAPABILITY not in server_capabilities or
                 PLAYER_FIRE_INTENT_CAPABILITY not in
+                server_capabilities or
+                PLAYER_ENVIRONMENT_CAPABILITY not in
                 server_capabilities or
                 state_revision is None or state_revision < 0 or
                 round_id is None or round_id < 0 or
@@ -767,15 +771,9 @@ class WorkerSession(object):
         if reason != 'round_complete' and self.client is not None:
             # Fence every authority publisher before touching native objects.
             self.client.bot_authority_id = None
-        self.runtime = None
-        self._active_round_id = None
-        self._last_progress_frame = 0
-        self._next_progress_time = 0.0
-        if round_id is not None and reason not in ('round_complete',):
-            self._retired_rounds.add(round_id)
         errors = []
         try:
-            if runtime is not None and runtime.state != 'failed':
+            if runtime is not None:
                 runtime.stop(show_login=False, restore_account=True)
         except Exception as error:
             errors.append(error)
@@ -787,10 +785,20 @@ class WorkerSession(object):
             except Exception as error:
                 errors.append(error)
         self._reset_probe_window()
-        self.state = 'waiting' if reason == 'round_complete' else 'standby'
-        self._write_status(force=True)
         if errors:
             raise errors[0]
+        # Keep the exact BattleRuntime owner and round id while native stop or
+        # draw restoration is unresolved.  Both operations are idempotent and
+        # a later stop can therefore retry instead of abandoning a live map.
+        if self.runtime is runtime:
+            self.runtime = None
+        self._active_round_id = None
+        self._last_progress_frame = 0
+        self._next_progress_time = 0.0
+        if round_id is not None and reason not in ('round_complete',):
+            self._retired_rounds.add(round_id)
+        self.state = 'waiting' if reason == 'round_complete' else 'standby'
+        self._write_status(force=True)
         return runtime is not None
 
     def _retire_or_fail(self, reason):
@@ -825,14 +833,19 @@ class WorkerSession(object):
                 '[Offline LAN 0.9.22] worker cleanup failed: %s\n' %
                 cleanup_error)
         client = self.client
-        self.client = None
         self._generation += 1
         if client is not None:
             try:
                 client.on_event = None
                 client.stop()
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                cleanup_failed = True
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] worker transport cleanup failed: '
+                    '%s\n' % cleanup_error)
+            else:
+                if self.client is client:
+                    self.client = None
         self.state = 'failed' if cleanup_failed else 'retrying'
         if cleanup_failed:
             self._stopped = True
@@ -1018,7 +1031,9 @@ class WorkerSession(object):
     def stop(self, show_login=False, restore_account=False,
              release_join=False):
         del show_login, release_join
-        if self._stopped:
+        if (self._stopped and self.runtime is None and
+                self.client is None and
+                (self._draw is None or not self._draw.active)):
             return
         self._stopped = True
         self._generation += 1
@@ -1031,23 +1046,22 @@ class WorkerSession(object):
                 except Exception:
                     pass
         client = self.client
-        self.client = None
         if client is not None:
             client.bot_authority_id = None
         cleanup_error = None
         try:
             if self.runtime is not None:
                 runtime = self.runtime
-                self.runtime = None
                 try:
-                    if runtime.state != 'failed':
-                        runtime.stop(
-                            show_login=False,
-                            restore_account=bool(restore_account))
+                    runtime.stop(
+                        show_login=False,
+                        restore_account=bool(restore_account))
                 finally:
                     # Do not reveal still-live models during native teardown.
                     if self._draw is not None:
                         self._draw.restore()
+                if self.runtime is runtime:
+                    self.runtime = None
             elif self._draw is not None:
                 self._draw.restore()
         except Exception as error:
@@ -1057,8 +1071,12 @@ class WorkerSession(object):
                 try:
                     client.on_event = None
                     client.stop()
-                except Exception:
-                    pass
+                except Exception as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                else:
+                    if self.client is client:
+                        self.client = None
         self._active_round_id = None
         self._pending_start = None
         self._pending_start_deadline = None
