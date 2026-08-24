@@ -9,6 +9,11 @@ $SpecRoot = Join-Path $BuildRoot "spec"
 # PyInstaller owns its work directory, so the payload is staged beside it.
 $PayloadRoot = Join-Path $BuildRoot "payload"
 $AppName = "WoT-Offline-Battles-Launcher"
+$PackedXmlModule = Join-Path $RepoRoot "0.9.22\tools\packed_xml.py"
+
+if (-not (Test-Path -LiteralPath $PackedXmlModule)) {
+    throw "Launcher build dependency is missing: $PackedXmlModule"
+}
 
 foreach ($directory in @($DistRoot, $BuildRoot)) {
     if (Test-Path -LiteralPath $directory) {
@@ -46,6 +51,7 @@ python -m PyInstaller `
     --workpath $WorkRoot `
     --specpath $SpecRoot `
     --paths (Join-Path $RepoRoot "0.9.22\tools") `
+    --hidden-import packed_xml `
     --add-data "$PayloadRoot\servers;servers" `
     --add-data "$PayloadRoot\client;client" `
     (Join-Path $LauncherRoot "wot_launcher.py")

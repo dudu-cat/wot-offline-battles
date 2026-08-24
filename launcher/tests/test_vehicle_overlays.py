@@ -1433,6 +1433,8 @@ class VehicleOverlayTest(unittest.TestCase):
             content = stream.read()
         self.assertIn('0.9.22\\tools', content)
         self.assertIn('--paths', content)
+        self.assertIn('--hidden-import packed_xml', content)
+        self.assertIn('Launcher build dependency is missing', content)
 
 
 if __name__ == "__main__":
