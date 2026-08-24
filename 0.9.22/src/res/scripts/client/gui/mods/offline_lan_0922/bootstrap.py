@@ -52,19 +52,61 @@ def _default_vehicle_settings():
             VEHICLE_SETTINGS_FLAG.AUTO_EQUIP)
 
 
-def _new_skill_xp(tankmen, descriptor, trained):
-    """Return the free XP that leaves NEW_SKILL_SLOTS skills to pick.
+def _new_skill_xp(tankmen, descriptor, trained,
+                  choices=NEW_SKILL_SLOTS):
+    """Return the free XP that leaves ``choices`` skills to pick.
 
     #1513's ``Tankman.newSkillCount`` offers one more skill for every skill the
     stored free XP can train to ``tankmen.MAX_SKILL_LEVEL``, plus the one it
     starts.  The cost depends only on how many skills the crewman already has.
     """
-    if trained not in _NEW_SKILL_XP:
-        _NEW_SKILL_XP[trained] = sum(
+    key = (trained, choices)
+    if key not in _NEW_SKILL_XP:
+        _NEW_SKILL_XP[key] = sum(
             descriptor.levelUpXpCost(level, trained + step)
-            for step in range(1, NEW_SKILL_SLOTS)
+            for step in range(1, choices)
             for level in range(tankmen.MAX_SKILL_LEVEL))
-    return _NEW_SKILL_XP[trained]
+    return _NEW_SKILL_XP[key]
+
+
+def _top_up_new_skill_slots(tankmen, descriptor):
+    """Give one parsed crewman NEW_SKILL_SLOTS total skill choices.
+
+    Learned skills stay selected.  XP is added only when the learned and still
+    selectable skills would otherwise total less than the offline minimum.
+    """
+    maximum = int(tankmen.MAX_SKILL_LEVEL)
+    selected = int(descriptor.lastSkillNumber)
+    missing = NEW_SKILL_SLOTS - selected
+    if missing <= 0:
+        return False
+    trained = max(0, selected - int(descriptor.freeSkillsNumber))
+
+    role_level = int(getattr(descriptor, 'roleLevel', maximum))
+    if role_level != maximum:
+        # Offline crew is generated at 100%.  Do not silently retrain a saved
+        # descriptor from another source just to make secondary slots appear.
+        return False
+    last_skill_level = int(getattr(
+        descriptor, 'lastSkillLevel', maximum))
+    required = 0
+    incomplete = False
+    if trained and last_skill_level < maximum:
+        required += sum(
+            descriptor.levelUpXpCost(level, trained)
+            for level in range(max(0, last_skill_level), maximum))
+        incomplete = True
+    required += _new_skill_xp(
+        tankmen, descriptor, trained, choices=missing)
+
+    current = max(0, int(descriptor.freeXP))
+    if current >= required and not incomplete:
+        return False
+    delta = max(0, required - current)
+    # addXP consumes the budget into the current skill first.  Merely assigning
+    # freeXP would leave #1513's newSkillCount blocked below 100%.
+    descriptor.addXP(delta)
+    return True
 
 
 def _with_new_skill_slots(tankmen, descriptor):
@@ -73,10 +115,33 @@ def _with_new_skill_slots(tankmen, descriptor):
     No skill is chosen here; the player picks all of them.  The caller already
     unpacked this descriptor to validate the crew slot, so it is reused.
     """
-    descriptor.freeXP = _new_skill_xp(
-        tankmen, descriptor,
-        descriptor.lastSkillNumber - descriptor.freeSkillsNumber)
+    _top_up_new_skill_slots(tankmen, descriptor)
     return descriptor.makeCompactDescr()
+
+
+def _migrate_saved_crew_skill_slots(snapshot, tankmen):
+    """Top up restored crew without replacing any learned skill."""
+    records = snapshot.get('vehicles') if isinstance(snapshot, dict) else None
+    if not isinstance(records, (list, tuple)):
+        records = [snapshot]
+    migrated = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        crew = list(record.get('crew') or ())
+        tankman_rows = record.get('tankmen')
+        if not isinstance(tankman_rows, dict):
+            continue
+        for tankman_id in crew:
+            compact_descr = tankman_rows.get(tankman_id)
+            if compact_descr is None:
+                continue
+            descriptor = tankmen.TankmanDescr(compact_descr)
+            if not _top_up_new_skill_slots(tankmen, descriptor):
+                continue
+            tankman_rows[tankman_id] = descriptor.makeCompactDescr()
+            migrated += 1
+    return migrated
 
 
 def _schedule(delay, function):
@@ -158,14 +223,27 @@ def _restore_garage(snapshot):
     store = _garage_store()
     if store is None:
         return False
+    migrated = [0]
+
+    def validate(staged):
+        from items import tankmen
+        migrated[0] = _migrate_saved_crew_skill_slots(staged, tankmen)
+        return _validate_restored_garage(staged)
+
     try:
-        return bool(store.apply(
-            snapshot, validator=_validate_restored_garage))
+        restored = bool(store.apply(snapshot, validator=validate))
     except Exception as error:
         sys.stdout.write(
             '[Offline LAN 0.9.22] the saved garage could not be restored: '
             '%s\n' % error)
         return False
+    if restored and migrated[0]:
+        store.mark_dirty()
+        if store.flush(snapshot):
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] upgraded saved skill choices for %d '
+                'crew member(s)\n' % migrated[0])
+    return restored
 
 
 def _validate_restored_garage(snapshot):

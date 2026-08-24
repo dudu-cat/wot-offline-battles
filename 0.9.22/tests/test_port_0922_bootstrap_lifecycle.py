@@ -57,17 +57,68 @@ class _TankmanDescr(object):
             SKILL_XP_COSTS[from_skill_level + 1] -
             SKILL_XP_COSTS[from_skill_level])
 
+    def addXP(self, amount):
+        self.freeXP += int(amount)
+
     def makeCompactDescr(self):
         return b'%s|%s|%d' % (self._passport,
                               ','.join(self.skills).encode('ascii'),
                               self.freeXP)
 
 
+class _ProgressTankmanDescr(object):
+    """A compact fake that also retains #1513's current skill progress."""
+
+    def __init__(self, compact_descr):
+        fields = compact_descr.split(b'|')
+        self._passport = fields[0]
+        self.skills = [name for name in fields[1].decode('ascii').split(',')
+                       if name]
+        self.freeXP = int(fields[2])
+        self.lastSkillLevel = int(fields[3])
+        self.freeSkillsNumber = int(fields[4])
+        self.roleLevel = int(fields[5])
+
+    @property
+    def lastSkillNumber(self):
+        return len(self.skills)
+
+    @staticmethod
+    def levelUpXpCost(from_skill_level, skill_sequence_number):
+        return _TankmanDescr.levelUpXpCost(
+            from_skill_level, skill_sequence_number)
+
+    def addXP(self, amount):
+        self.freeXP += int(amount)
+        while self.roleLevel < MAX_SKILL_LEVEL:
+            cost = self.levelUpXpCost(self.roleLevel, 0)
+            if cost > self.freeXP:
+                return
+            self.freeXP -= cost
+            self.roleLevel += 1
+        paid_skills = self.lastSkillNumber - self.freeSkillsNumber
+        while paid_skills and self.lastSkillLevel < MAX_SKILL_LEVEL:
+            cost = self.levelUpXpCost(self.lastSkillLevel, paid_skills)
+            if cost > self.freeXP:
+                return
+            self.freeXP -= cost
+            self.lastSkillLevel += 1
+
+    def makeCompactDescr(self):
+        return b'%s|%s|%d|%d|%d|%d' % (
+            self._passport, ','.join(self.skills).encode('ascii'),
+            self.freeXP, self.lastSkillLevel, self.freeSkillsNumber,
+            self.roleLevel)
+
+
 def new_skill_count(descriptor, active_skills):
     """The exact #1513 Tankman.newSkillCount loop, as a pure simulation."""
+    if getattr(descriptor, 'roleLevel', MAX_SKILL_LEVEL) != MAX_SKILL_LEVEL:
+        return 0
     available = list(active_skills)
     count = 0
-    last_skill_level = MAX_SKILL_LEVEL
+    last_skill_level = getattr(
+        descriptor, 'lastSkillLevel', MAX_SKILL_LEVEL)
     free_xp = descriptor.freeXP
     skills = list(descriptor.skills)
     while last_skill_level == MAX_SKILL_LEVEL or not skills:
@@ -402,7 +453,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 modules)
 
     ACTIVE_SKILLS = ('repair', 'camouflage', 'brotherhood', 'firefighting',
-                     'commander_sixthSense', 'driver_virtuoso',
+                     'commander_sixthSense', 'commander_eagleEye',
+                     'driver_virtuoso', 'driver_smoothDriving',
                      'gunner_smoothTurret', 'loader_intuition')
 
     def test_a_fresh_garage_vehicle_starts_with_the_refill_switches_on(self):
@@ -441,6 +493,179 @@ class BootstrapLifecycleTests(unittest.TestCase):
             for compact_descr in record['tankmen'].values():
                 skills = _TankmanDescr(compact_descr).skills
                 self.assertEqual([], skills)
+
+    def test_saved_unselected_crew_with_two_choices_is_migrated_to_eight(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+        tankmen = modules['items'].tankmen
+        descriptor = _TankmanDescr(b'0:11:commander||0')
+        descriptor.freeXP = sum(
+            descriptor.levelUpXpCost(level, 1)
+            for level in range(MAX_SKILL_LEVEL))
+        snapshot = {
+            'vehicles': [{
+                'crew': [100001],
+                'tankmen': {100001: descriptor.makeCompactDescr()},
+            }],
+        }
+        before = _TankmanDescr(snapshot['vehicles'][0]['tankmen'][100001])
+        self.assertEqual(2, new_skill_count(before, self.ACTIVE_SKILLS))
+
+        migrated = bootstrap._migrate_saved_crew_skill_slots(
+            snapshot, tankmen)
+
+        after = _TankmanDescr(snapshot['vehicles'][0]['tankmen'][100001])
+        self.assertEqual(1, migrated)
+        self.assertEqual([], after.skills)
+        self.assertEqual(8, new_skill_count(after, self.ACTIVE_SKILLS))
+
+    def test_saved_crew_with_enough_xp_is_left_byte_for_byte_unchanged(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+        tankmen = modules['items'].tankmen
+        descriptor = _TankmanDescr(
+            b'0:11:commander|repair,camouflage|0')
+        descriptor.freeXP = bootstrap._new_skill_xp(
+            tankmen, descriptor, 2, choices=6) + 1
+        compact_descr = descriptor.makeCompactDescr()
+        snapshot = {
+            'vehicles': [{
+                'crew': [100001],
+                'tankmen': {100001: compact_descr},
+            }],
+        }
+
+        migrated = bootstrap._migrate_saved_crew_skill_slots(
+            snapshot, tankmen)
+
+        self.assertEqual(0, migrated)
+        self.assertEqual(
+            compact_descr, snapshot['vehicles'][0]['tankmen'][100001])
+
+    def test_partial_learned_skill_is_kept_and_completed_to_open_slots(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, unused_modules) = (
+             self._load())
+        tankmen = types.SimpleNamespace(
+            MAX_SKILL_LEVEL=MAX_SKILL_LEVEL,
+            TankmanDescr=_ProgressTankmanDescr)
+        descriptor = _ProgressTankmanDescr(
+            b'0:11:commander|repair,camouflage|17|42|0|100')
+        original_skills = list(descriptor.skills)
+        snapshot = {
+            'vehicles': [{
+                'crew': [100001],
+                'tankmen': {100001: descriptor.makeCompactDescr()},
+            }],
+        }
+        self.assertEqual(0, new_skill_count(descriptor, self.ACTIVE_SKILLS))
+
+        migrated = bootstrap._migrate_saved_crew_skill_slots(
+            snapshot, tankmen)
+
+        after = _ProgressTankmanDescr(
+            snapshot['vehicles'][0]['tankmen'][100001])
+        self.assertEqual(1, migrated)
+        self.assertEqual(original_skills, after.skills)
+        self.assertEqual(MAX_SKILL_LEVEL, after.lastSkillLevel)
+        self.assertEqual(6, new_skill_count(after, self.ACTIVE_SKILLS))
+        self.assertGreaterEqual(after.freeXP, 17)
+        migrated_descr = snapshot['vehicles'][0]['tankmen'][100001]
+        self.assertEqual(
+            0, bootstrap._migrate_saved_crew_skill_slots(snapshot, tankmen))
+        self.assertEqual(
+            migrated_descr, snapshot['vehicles'][0]['tankmen'][100001])
+
+    def test_eight_selected_skills_are_not_expanded_or_rewritten(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+        tankmen = modules['items'].tankmen
+        compact_descr = (
+            b'0:11:commander|repair,camouflage,brotherhood,firefighting,'
+            b'commander_sixthSense,commander_eagleEye,driver_virtuoso,'
+            b'driver_smoothDriving|0')
+        snapshot = {
+            'vehicles': [{
+                'crew': [100001],
+                'tankmen': {100001: compact_descr},
+            }],
+        }
+
+        migrated = bootstrap._migrate_saved_crew_skill_slots(
+            snapshot, tankmen)
+
+        self.assertEqual(0, migrated)
+        self.assertEqual(
+            compact_descr, snapshot['vehicles'][0]['tankmen'][100001])
+
+    def test_free_skill_prefix_is_preserved_and_excluded_from_xp_sequence(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, unused_modules) = (
+             self._load())
+        tankmen = types.SimpleNamespace(
+            MAX_SKILL_LEVEL=MAX_SKILL_LEVEL,
+            TankmanDescr=_ProgressTankmanDescr)
+        descriptor = _ProgressTankmanDescr(
+            b'0:11:commander|commander_sixthSense,repair|0|100|1|100')
+        snapshot = {
+            'vehicles': [{
+                'crew': [100001],
+                'tankmen': {100001: descriptor.makeCompactDescr()},
+            }],
+        }
+
+        self.assertEqual(
+            1, bootstrap._migrate_saved_crew_skill_slots(snapshot, tankmen))
+
+        after = _ProgressTankmanDescr(
+            snapshot['vehicles'][0]['tankmen'][100001])
+        self.assertEqual(
+            ['commander_sixthSense', 'repair'], after.skills)
+        self.assertEqual(1, after.freeSkillsNumber)
+        self.assertEqual(6, new_skill_count(after, self.ACTIVE_SKILLS))
+
+    def test_saved_crew_migration_is_flushed_during_restore(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+        descriptor = _TankmanDescr(
+            b'0:11:commander|repair,camouflage|0')
+        descriptor.freeXP = sum(
+            descriptor.levelUpXpCost(level, 3)
+            for level in range(MAX_SKILL_LEVEL))
+        snapshot = {
+            'vehicles': [{
+                'crew': [100001],
+                'tankmen': {100001: descriptor.makeCompactDescr()},
+            }],
+        }
+
+        class _Store(object):
+            def __init__(self):
+                self.dirty = False
+                self.flushed = None
+
+            def apply(self, candidate, validator=None):
+                validator(candidate)
+                return True
+
+            def mark_dirty(self):
+                self.dirty = True
+
+            def flush(self, candidate):
+                self.flushed = candidate
+                return True
+
+        store = _Store()
+        bootstrap._store = store
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(
+                bootstrap, '_validate_restored_garage', return_value=True):
+            self.assertTrue(bootstrap._restore_garage(snapshot))
+
+        after = _TankmanDescr(snapshot['vehicles'][0]['tankmen'][100001])
+        self.assertTrue(store.dirty)
+        self.assertIs(snapshot, store.flushed)
+        self.assertEqual(['repair', 'camouflage'], after.skills)
+        self.assertEqual(6, new_skill_count(after, self.ACTIVE_SKILLS))
 
     def test_the_ammunition_layout_mirrors_the_loaded_shells(self):
         (bootstrap, unused_callbacks, unused_compatibility,
