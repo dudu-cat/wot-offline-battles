@@ -134,9 +134,15 @@ jobs:
               'type': 'hello',
               'protocol': 5,
               'client_build': 'wot-0.9.22.0.1-cn-1513',
-              'capabilities': ['projectile_ledger_v1'],
+              'capabilities': ['projectile_ledger_v2',
+                               'destructible_catalog_v5',
+                               'lean_snapshot_manifest_v1',
+                               'ram_contact_ledger_v1',
+                               'human_ram_timeline_v1',
+                               'player_fire_intent_v1'],
               'name': 'CI-Smoke',
               'vehicle': 'ussr:R11_MS-1',
+              'vehicle_compact_descr': 'AA==',
               'max_health': 90,
           }
           sock = socket.create_connection(('127.0.0.1', 28782), 5.0)
@@ -149,7 +155,7 @@ jobs:
           assert reply['type'] == 'welcome', reply
           assert reply['protocol'] == 5, reply
           assert reply['client_build'] == hello['client_build'], reply
-          assert 'projectile_ledger_v1' in reply['capabilities'], reply
+          assert 'projectile_ledger_v2' in reply['capabilities'], reply
           '@
 
           $process = Start-Process `
