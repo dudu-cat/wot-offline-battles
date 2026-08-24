@@ -10,17 +10,22 @@ from pathlib import Path
 PORT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
+import lan_battle_server  # noqa: E402
 from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, ClientHandler, CRITICAL_DEVICE_NAMES,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, Player, PREBATTLE_SECONDS,
     MAX_PLAYER_DESTRUCTIBLE_REJECTIONS,
-    PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+    PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_ENVIRONMENT_STALE_TICKS,
+    PLAYER_FIRE_INTENT_CAPABILITY,
     PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY, TICK_HZ,
     SIMULATION_WORKER_AUTHORITY_ID, SimulationWorker, _critical_payload,
+    _run_tick_loop,
 )
+from effective_params_fixture import effective_params  # noqa: E402
 import server_battle_authority  # noqa: E402
 from server_battle_authority import (  # noqa: E402
     SERVER_AUTHORITY_ID, ServerBattleAuthority, _segment_hull_entry,
@@ -37,6 +42,39 @@ class _Socket(object):
         self.payloads.append(unused_payload)
 
 
+class TickLoopTimeTest(unittest.TestCase):
+
+    def test_one_second_scheduler_stall_runs_all_thirty_due_steps(self):
+        clock = [0.0]
+
+        class State(object):
+            running = True
+
+            def __init__(self):
+                self.steps = []
+
+            def tick_once(self, dt):
+                self.steps.append(dt)
+
+        state = State()
+        sleeps = []
+
+        def sleep(delay):
+            sleeps.append(delay)
+            if len(sleeps) == 1:
+                clock[0] = 1.0
+            else:
+                state.running = False
+
+        _run_tick_loop(state, lambda: clock[0], sleep)
+
+        self.assertEqual(30, len(state.steps))
+        self.assertAlmostEqual(1.0, sum(state.steps))
+        self.assertTrue(all(
+            abs(step - 1.0 / TICK_HZ) < 1e-12
+            for step in state.steps))
+
+
 def _player(player_id, team=1, x=398.0, z=402.0):
     return Player(
         player_id, _Socket(), ('127.0.0.1', player_id),
@@ -45,8 +83,16 @@ def _player(player_id, team=1, x=398.0, z=402.0):
         capabilities=(
             PROJECTILE_CAPABILITY, HUMAN_RAM_TIMELINE_CAPABILITY,
             RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY),
+            PLAYER_ENVIRONMENT_CAPABILITY, EFFECTIVE_PARAMS_CAPABILITY),
+        effective_params=effective_params(),
     )
+
+
+def _gun_checkpoint(reload_time=0.0, clip=1):
+    return {
+        'reload_time': float(reload_time), 'reload_duration': 5.0,
+        'clip': int(clip), 'clip_size': 1, 'dispersion': 0.02,
+    }
 
 
 def _projection():
@@ -140,7 +186,6 @@ def _launch_player_as_authority(state, authority_id, message):
         'shot_direction': [
             float(component) / speed for component in message['velocity']],
         'dispersion_angle': 0.0,
-        'deadline_server_time_ms': state._server_time_ms() + 5000,
     }
     message.update({
         'authority_epoch': state.authority_epoch,
@@ -309,7 +354,8 @@ class PlayerDrowningAuthorityTest(unittest.TestCase):
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
-                PLAYER_ENVIRONMENT_CAPABILITY))
+                PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY))
         state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
         state.authority_epoch = 3
         state.phase = 'battle'
@@ -379,6 +425,28 @@ class PlayerDrowningAuthorityTest(unittest.TestCase):
         self.assertTrue(player.alive)
         self.assertEqual(1000, player.health)
 
+    def test_stale_environment_pauses_without_discarding_drowning_time(self):
+        state, player = self._worker_state()
+        for sample_seq in range(1, 51):
+            state.tick += 3
+            self.assertTrue(state.update_player_environment(
+                SIMULATION_WORKER_AUTHORITY_ID,
+                self._environment(state, sample_seq, 2)))
+            state._tick_player_drowning(0.1)
+        self.assertAlmostEqual(5.0, state.player_drowning_seconds[1])
+
+        state.tick += PLAYER_ENVIRONMENT_STALE_TICKS + 1
+        state._tick_player_drowning(1.0)
+        self.assertAlmostEqual(5.0, state.player_drowning_seconds[1])
+        self.assertTrue(player.alive)
+
+        state.tick += 1
+        self.assertTrue(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._environment(state, 51, 1)))
+        state._tick_player_drowning(0.1)
+        self.assertNotIn(1, state.player_drowning_seconds)
+
     def test_visible_or_future_input_observation_is_rejected(self):
         state, player = self._worker_state()
         message = self._environment(state, 1, 2)
@@ -400,7 +468,8 @@ class ServerAuthorityElectionTest(unittest.TestCase):
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
-                PLAYER_ENVIRONMENT_CAPABILITY))
+                PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY))
         state.simulation_worker = worker
         state._elect_bot_authority()
         return worker
@@ -426,7 +495,8 @@ class ServerAuthorityElectionTest(unittest.TestCase):
 
         manifest = [dict(entry, vehicle='ussr:R11_MS-1', health=350,
                          max_health=350, x=float(index), y=0.0,
-                         z=0.0, yaw=0.0)
+                         z=0.0, yaw=0.0, reload_time=0.0,
+                         reload_duration=1.5)
                     for index, entry in enumerate(state.bot_roster)]
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID, {
@@ -434,10 +504,14 @@ class ServerAuthorityElectionTest(unittest.TestCase):
             'player_collision_profiles': [{
                 'id': participant.player_id,
                 'vehicle': participant.vehicle,
-                'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+                'mass': participant.effective_params[
+                    'physics']['mass'],
+                'shape': [1.5, 3.5, -0.8, 2.0],
                 'ram_profile': {
-                    'spall_coefficient': 1.0,
-                    'ramming_bonus': 0.0,
+                    'spall_coefficient': participant.effective_params[
+                        'ramming']['spall_coefficient'],
+                    'ramming_bonus': participant.effective_params[
+                        'ramming']['ramming_bonus'],
                 },
             } for participant in state.players.values()
              if participant.connected and participant.participating]}))
@@ -517,8 +591,17 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
         state.pending_live_message = None
         player = state.players[1]
-        player.input_seq = 1
-        player.pose_time_us = 1
+        self.assertTrue(state.update_input(1, {
+            'type': 'input', 'round_id': state.round_id,
+            'input_seq': 1,
+            'pose_time_us': state._logical_motion_time_us(),
+            'forward': 0.0, 'turn': 0.0, 'speed': 0.0,
+            'x': player.x, 'y': player.y, 'z': player.z,
+            'yaw': player.yaw, 'pitch': player.pitch,
+            'roll': player.roll, 'shell_index': 0,
+            'next_shell_index': 0, 'shell_change_pending': False,
+            'gun_checkpoint': _gun_checkpoint(),
+        }))
 
         self.assertTrue(state.submit_fire_intent(1, {
             'type': 'fire_intent', 'round_id': state.round_id,
@@ -1017,14 +1100,54 @@ class HumanRamTimelineTest(unittest.TestCase):
         first_health = state.players[1].health
         self.assertNotIn((1, 2), state.human_ram_contacts)
 
-        # A 400 ms source-time hole clears both histories. The pair remains
-        # armed until a later common frontier proves separation.
+        # A 400 ms source-time hole is fully replayed, but missing native
+        # contact armour still fails closed and cannot mint damage.
         self.assertEqual(0, pair(600000, 0.0, 16.0))
         self.assertEqual(0, pair(800000, 0.0, 16.0))
         self.assertEqual(first_health, state.players[1].health)
         self.assertNotIn((1, 2), state.human_ram_contacts)
         self.assertEqual(0, pair(1000000, -5.0, 0.0))
         self.assertNotIn((1, 2), state.human_ram_contacts)
+
+    def test_one_second_gap_resolves_intermediate_contact_before_frontier(self):
+        state, clock = self._state(health=100000)
+        for player_id, z, speed, yaw in (
+                (1, -10.0, 16.0, 0.0),
+                (2, 0.0, 0.0, math.pi)):
+            self._input(state, clock, player_id, 1, 100000, z, speed, yaw)
+        self.assertEqual(0, state._resolve_human_rams())
+
+        real_resolve = lan_battle_server.tank_collision.resolve_tank
+        resolved_times = []
+
+        def resolve_with_proved_armor(tank, others, **kwargs):
+            resolved_times.append(float(kwargs['now']))
+            tank = dict(tank, contact_armor=0.0)
+            others = tuple(
+                dict(other, contact_armor=0.0) for other in others)
+            return real_resolve(tank, others, **kwargs)
+
+        with mock.patch.object(
+                lan_battle_server.tank_collision, 'resolve_tank',
+                side_effect=resolve_with_proved_armor):
+            for player_id, z, speed, yaw in (
+                    (1, 10.0, 16.0, 0.0),
+                    (2, 0.0, 0.0, math.pi)):
+                self._input(
+                    state, clock, player_id, 2, 1100000, z, speed, yaw)
+            self.assertEqual(1, state._resolve_human_rams())
+
+        self.assertEqual(1100000, state.human_ram_pair_frontiers[(1, 2)])
+        self.assertEqual(11, len(resolved_times))
+        self.assertAlmostEqual(1.0, resolved_times[-1] - resolved_times[0])
+        self.assertTrue(all(
+            later - earlier <= 0.1000001
+            for earlier, later in zip(resolved_times, resolved_times[1:])))
+        self.assertLess(state.players[1].health, 100000)
+        self.assertLess(state.players[2].health, 100000)
+        self.assertNotIn((1, 2), state.human_ram_contacts)
+        self.assertEqual(2, len(state.players[1].pose_history))
+        self.assertEqual(2, len(state.players[2].pose_history))
 
     def test_low_health_humans_survive_without_contact_armor(self):
         state, clock = self._state(health=100)
@@ -1954,23 +2077,15 @@ class ServerAuthorityProjectileTest(unittest.TestCase):
         self.assertEqual(
             'impact', state.projectile_tombstones[projectile_id]['outcome'])
 
-    def test_chord_debt_is_not_preempted_by_canonical_expiry(self):
+    def test_canonical_expiry_advances_every_due_chord_in_the_same_tick(self):
         state, authority = self._live_state()
         state.players[2].x = 100.0
         state.players[2].z = 100.0
         first = self._launch_human(state, max_time_ms=34, shot_seq=1)
         second = self._launch_human(state, max_time_ms=34, shot_seq=2)
 
-        with mock.patch.object(
-                server_battle_authority, 'PROJECTILE_CHORDS_PER_TICK', 1):
-            state.tick_once(1.0 / TICK_HZ)
-            state.tick_once(1.0 / TICK_HZ)
-            self.assertEqual(1, len(state.projectiles))
-            self.assertEqual(1, len(state.projectile_tombstones))
-            self.assertEqual(
-                'expired', next(iter(
-                    state.projectile_tombstones.values()))['outcome'])
-            state.tick_once(1.0 / TICK_HZ)
+        state.tick_once(1.0 / TICK_HZ)
+        state.tick_once(1.0 / TICK_HZ)
 
         self.assertNotIn(first, state.projectiles)
         self.assertNotIn(second, state.projectiles)

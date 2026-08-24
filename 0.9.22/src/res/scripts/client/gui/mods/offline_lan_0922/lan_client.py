@@ -8,6 +8,8 @@ import threading
 import time
 import uuid
 
+from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
+
 
 PROTOCOL_VERSION = 5
 CLIENT_BUILD = 'wot-0.9.22.0.1-cn-1513'
@@ -22,8 +24,9 @@ DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
 RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v2'
 HUMAN_RAM_TIMELINE_CAPABILITY = 'human_ram_timeline_v1'
-PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v3'
+PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v4'
 PLAYER_ENVIRONMENT_CAPABILITY = 'player_environment_v1'
+EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
     PROJECTILE_LEDGER_CAPABILITY,
@@ -33,6 +36,7 @@ CLIENT_CAPABILITIES = (
     HUMAN_RAM_TIMELINE_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
 )
 WORKER_AUTHORITY_ID = -1
 SERVER_AUTHORITY_ID = 0
@@ -60,6 +64,8 @@ MAX_PROJECTILE_DISTANCE = 10000.0
 MAX_PROJECTILE_TIME_MS = 20000
 MAX_PROJECTILE_SPLASH_RADIUS = 100.0
 MAX_PLAYER_DISPERSION_ANGLE = 0.5
+MAX_PLAYER_CLIP_SIZE = 255
+MAX_PLAYER_RELOAD_SECONDS = 3600.0
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
 PROJECTILE_SHELL_KINDS = frozenset((
     'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
@@ -95,6 +101,7 @@ _BOT_STATE_WIRE_FIELDS = (
     'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
     'speed', 'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
     'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
+    'reload_time', 'reload_duration',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',
     'death_reason', 'display_health', 'world_pose')
@@ -317,6 +324,57 @@ def _exact_finite_float(value, default=None):
         return default
 
 
+def _canonical_human_gun_checkpoint(value):
+    """Validate one visible-client gun state at an ordered input edge."""
+    required = frozenset((
+        'reload_time', 'reload_duration', 'clip', 'clip_size',
+        'dispersion'))
+    if not isinstance(value, dict) or set(value) != required:
+        return None
+    reload_time = _exact_finite_float(value.get('reload_time'))
+    reload_duration = _exact_finite_float(value.get('reload_duration'))
+    dispersion = _exact_finite_float(value.get('dispersion'))
+    clip = _exact_int(value.get('clip'))
+    clip_size = _exact_int(value.get('clip_size'))
+    if (reload_time is None or reload_duration is None or
+            reload_duration <= 0.0 or reload_time < 0.0 or
+            reload_duration > MAX_PLAYER_RELOAD_SECONDS or
+            reload_time > reload_duration or clip is None or
+            clip_size is None or not 1 <= clip_size <= MAX_PLAYER_CLIP_SIZE or
+            not 0 <= clip <= clip_size or dispersion is None or
+            not 0.0 <= dispersion <= MAX_PLAYER_DISPERSION_ANGLE):
+        return None
+    return {
+        'reload_time': reload_time,
+        'reload_duration': reload_duration,
+        'clip': clip,
+        'clip_size': clip_size,
+        'dispersion': dispersion,
+    }
+
+
+def _valid_player_gun_checkpoint_contract(player):
+    """Require one checkpoint for every admitted modern player input."""
+    if not isinstance(player, dict):
+        return False
+    input_seq = _exact_int(player.get('input_seq'))
+    has_seq = 'gun_checkpoint_seq' in player
+    has_checkpoint = 'gun_checkpoint' in player
+    if not has_seq and not has_checkpoint:
+        # Waiting/start rosters and compact compatibility fixtures may not
+        # have admitted an input yet. Once either field appears, the pair is
+        # strict and must identify the current ordered input below.
+        return True
+    if not has_seq or not has_checkpoint:
+        return False
+    checkpoint_seq = _exact_int(player.get('gun_checkpoint_seq'))
+    return bool(
+        input_seq is not None and input_seq > 0 and
+        checkpoint_seq == input_seq and
+        _canonical_human_gun_checkpoint(
+            player.get('gun_checkpoint')) is not None)
+
+
 def _attach_critical_proposal(message, critical, base_revision, ack_seq,
                               hull_damage):
     """Attach one strict #1513 compare-and-swap critical proposal."""
@@ -391,6 +449,15 @@ def project_bot_state(state):
         return None
     if (all(present) and
             not isinstance(state.get('ammo_reload_pending'), bool)):
+        return None
+    reload_fields = ('reload_time', 'reload_duration')
+    if not all(name in state for name in reload_fields):
+        return None
+    reload_time = _exact_finite_float(state.get('reload_time'))
+    reload_duration = _exact_finite_float(state.get('reload_duration'))
+    if (reload_time is None or reload_duration is None or
+            reload_duration <= 0.0 or reload_time < 0.0 or
+            reload_time > reload_duration):
         return None
     return projected
 
@@ -971,6 +1038,10 @@ def _canonical_vehicle_compact_descr(value):
     return canonical
 
 
+def _canonical_effective_params(value):
+    return effective_params_wire.canonical(value)
+
+
 def _load_bigworld():
     import BigWorld
     return BigWorld
@@ -981,7 +1052,7 @@ class LANClient(object):
     def __init__(self, host, port, name, vehicle, max_health=100,
                  on_event=None, bigworld=None, account_key=None,
                  outfits=None, requested_team=0,
-                 vehicle_compact_descr=None):
+                 vehicle_compact_descr=None, effective_params=None):
         self.host = _safe_text(host, '127.0.0.1', 255)
         self.port = int(port or 28782)
         self.name = _safe_text(name, 'Player')
@@ -992,8 +1063,10 @@ class LANClient(object):
         self.outfits = _canonical_wire_outfits(outfits or {}) or {}
         self.vehicle_compact_descr = (
             _canonical_vehicle_compact_descr(vehicle_compact_descr) or '')
+        self.effective_params = _canonical_effective_params(effective_params)
         self.requested_team = _team_choice(requested_team)
         self._published_player_outfits = {}
+        self._published_player_effective_params = {}
         self.on_event = on_event
         self.bigworld = bigworld
         self.sock = None
@@ -1095,6 +1168,9 @@ class LANClient(object):
         player identity fields.  Capability negotiation separately fences the
         schema-5 destructible and optional projectile/map wire extensions.
         """
+        effective_params = _canonical_effective_params(self.effective_params)
+        if effective_params is None:
+            raise ValueError('effective vehicle parameters are unavailable')
         payload = {
             'type': 'hello',
             'protocol': PROTOCOL_VERSION,
@@ -1106,6 +1182,7 @@ class LANClient(object):
             'account_key': self.account_key,
             'outfits': dict(self.outfits),
             'vehicle_compact_descr': self.vehicle_compact_descr,
+            'effective_params': effective_params,
         }
         if self.requested_team in (1, 2):
             payload['requested_team'] = self.requested_team
@@ -1207,7 +1284,7 @@ class LANClient(object):
         return self._send(message)
 
     def select_vehicle(self, vehicle, max_health, outfits=None,
-                       vehicle_compact_descr=None):
+                       vehicle_compact_descr=None, effective_params=None):
         """Publish one waiting-room garage change for the next round."""
         if not self.ready or self.phase != 'waiting':
             return False
@@ -1221,20 +1298,26 @@ class LANClient(object):
         compact = _canonical_vehicle_compact_descr(
             self.vehicle_compact_descr if vehicle_compact_descr is None
             else vehicle_compact_descr)
-        if outfits is None or compact is None:
+        params = _canonical_effective_params(
+            self.effective_params if effective_params is None
+            else effective_params)
+        if outfits is None or compact is None or params is None:
             return False
         if (vehicle == self.vehicle and max_health == self.max_health and
                 outfits == self.outfits and
-                compact == self.vehicle_compact_descr):
+                compact == self.vehicle_compact_descr and
+                params == self.effective_params):
             return False
         message = {'type': 'select_vehicle', 'vehicle': vehicle,
                    'max_health': max_health,
-                   'vehicle_compact_descr': compact}
+                   'vehicle_compact_descr': compact,
+                   'effective_params': params}
         if publishes_outfits:
             message['outfits'] = outfits
         if not self._send(message):
             return False
         self.vehicle_compact_descr = compact
+        self.effective_params = params
         return True
 
     def select_team(self, team):
@@ -1283,10 +1366,14 @@ class LANClient(object):
                 entry.get('vehicle_compact_descr'))
             if compact is not None:
                 self.vehicle_compact_descr = compact
+            params = _canonical_effective_params(
+                entry.get('effective_params'))
+            if params is not None:
+                self.effective_params = params
             return
 
     def _remember_player_outfits(self, players):
-        """Canonicalize static outfits and inherit them on lean snapshots."""
+        """Canonicalize static player inputs and inherit lean snapshots."""
         result = []
         for raw in players or ():
             entry = dict(raw)
@@ -1299,6 +1386,15 @@ class LANClient(object):
             elif player_id in self._published_player_outfits:
                 entry['outfits'] = dict(
                     self._published_player_outfits[player_id])
+            if 'effective_params' in entry:
+                params = _canonical_effective_params(
+                    entry.get('effective_params'))
+                if params is not None and player_id is not None:
+                    self._published_player_effective_params[player_id] = params
+                    entry['effective_params'] = params
+            elif player_id in self._published_player_effective_params:
+                entry['effective_params'] = _canonical_effective_params(
+                    self._published_player_effective_params[player_id])
             result.append(entry)
         return result
 
@@ -1326,7 +1422,8 @@ class LANClient(object):
                    ram_contacts=None,
                    destructible_contacts=None,
                    siege_enabled=None,
-                   pitch=None, roll=None):
+                   pitch=None, roll=None,
+                   gun_checkpoint=None):
         if not self.ready or self.phase != 'battle':
             return False
         if self._input_seq_round != self.round_id:
@@ -1384,6 +1481,21 @@ class LANClient(object):
                 return False
             message['next_shell_index'] = parsed_next_shell
             message['shell_change_pending'] = shell_change_pending
+        checkpoint_required = bool(
+            PLAYER_FIRE_INTENT_CAPABILITY in self.capabilities and
+            PLAYER_FIRE_INTENT_CAPABILITY in self.server_capabilities)
+        parsed_checkpoint = _canonical_human_gun_checkpoint(
+            gun_checkpoint)
+        if checkpoint_required and parsed_checkpoint is None:
+            return False
+        if gun_checkpoint is not None:
+            if parsed_checkpoint is None:
+                return False
+            if (not timeline_enabled or 'shell_index' not in message or
+                    'next_shell_index' not in message or
+                    'shell_change_pending' not in message):
+                return False
+            message['gun_checkpoint'] = parsed_checkpoint
         if isinstance(ram_contacts, list):
             message['ram_contacts'] = [
                 dict(value) for value in ram_contacts[:16]
@@ -2680,6 +2792,7 @@ class LANClient(object):
                     HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                     PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                     PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
+                    EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
                     server_capabilities is None or
                     DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
                     server_capabilities or
@@ -2690,6 +2803,8 @@ class LANClient(object):
                     PLAYER_FIRE_INTENT_CAPABILITY not in
                     server_capabilities or
                     PLAYER_ENVIRONMENT_CAPABILITY not in
+                    server_capabilities or
+                    EFFECTIVE_PARAMS_CAPABILITY not in
                     server_capabilities):
                 self.last_error = 'required LAN capability mismatch'
                 self.stop()
@@ -2713,6 +2828,8 @@ class LANClient(object):
             outfits = _canonical_wire_outfits(message.get('outfits'))
             vehicle_compact_descr = _canonical_vehicle_compact_descr(
                 message.get('vehicle_compact_descr'))
+            effective_params = _canonical_effective_params(
+                message.get('effective_params'))
             team_sizes = _team_sizes(
                 message.get('team_sizes'), message.get('team_size'),
                 self.team_sizes)
@@ -2726,6 +2843,7 @@ class LANClient(object):
                      welcome_server_time is None) or
                     not _valid_visible_authority_message(message) or
                     phase != 'waiting' or not map_name or outfits is None or
+                    effective_params is None or
                     team_sizes is None or
                     not isinstance(spawn, dict) or
                     not all(axis in spawn for axis in ('x', 'y', 'z'))):
@@ -2748,6 +2866,9 @@ class LANClient(object):
             self.outfits = outfits
             if vehicle_compact_descr is not None:
                 self.vehicle_compact_descr = vehicle_compact_descr
+            self.effective_params = effective_params
+            self._published_player_effective_params[player_id] = \
+                effective_params
             self._published_player_outfits[player_id] = dict(outfits)
             self.map_name = map_name
             self.map_pool = self._map_names(message.get('map_pool'))
@@ -2802,13 +2923,22 @@ class LANClient(object):
             player_outfits_valid = all(
                 _canonical_wire_outfits(value.get('outfits')) is not None
                 for value in players or ())
+            player_effective_params_valid = all(
+                _canonical_effective_params(
+                    value.get('effective_params')) is not None
+                for value in players or ())
             player_siege_contract = all(
                 _valid_player_siege_contract(value)
+                for value in players or ())
+            player_gun_checkpoint_contract = all(
+                _valid_player_gun_checkpoint_contract(value)
                 for value in players or ())
             ledger_required = self.has_projectile_ledger()
             if (phase not in ('waiting', 'loading', 'battle') or not map_name or
                     players is None or not player_outfits_valid or
+                    not player_effective_params_valid or
                     not player_siege_contract or
+                    not player_gun_checkpoint_contract or
                     team_sizes is None or
                     host_player_id not in player_ids or
                     not _valid_visible_authority_message(message) or
@@ -2904,8 +3034,15 @@ class LANClient(object):
             player_outfits_valid = all(
                 _canonical_wire_outfits(value.get('outfits')) is not None
                 for value in players or ())
+            player_effective_params_valid = all(
+                _canonical_effective_params(
+                    value.get('effective_params')) is not None
+                for value in players or ())
             player_siege_contract = all(
                 _valid_player_siege_contract(value)
+                for value in players or ())
+            player_gun_checkpoint_contract = all(
+                _valid_player_gun_checkpoint_contract(value)
                 for value in players or ())
             local_ids = set(_exact_int(value.get('id')) for value in players or ())
             host_player_id = _exact_int(message.get('host_player_id'))
@@ -2921,7 +3058,9 @@ class LANClient(object):
             ledger_required = self.has_projectile_ledger()
             if (phase != 'loading' or
                     not map_name or not players or not player_outfits_valid or
+                    not player_effective_params_valid or
                     not player_siege_contract or
+                    not player_gun_checkpoint_contract or
                     team_sizes is None or
                     self.player_id not in local_ids or
                     host_player_id not in local_ids or
@@ -3066,6 +3205,13 @@ class LANClient(object):
                 ('outfits' not in value or
                  _canonical_wire_outfits(value.get('outfits')) is not None)
                 for value in players or ())
+            player_effective_params_valid = all(
+                (_canonical_effective_params(
+                    value.get('effective_params')) is not None
+                 if 'effective_params' in value else
+                 _exact_int(value.get('id')) in
+                 self._published_player_effective_params)
+                for value in players or ())
             bots = _strict_mapping_list(message.get('bots'), 30)
             manifest = None
             if 'bot_manifest' in message:
@@ -3094,6 +3240,9 @@ class LANClient(object):
                 for player in players or ())
             player_siege_contract = all(
                 _valid_player_siege_contract(player)
+                for player in players or ())
+            player_gun_checkpoint_contract = all(
+                _valid_player_gun_checkpoint_contract(player)
                 for player in players or ())
             bot_combat_contract = all(
                 _valid_bot_combat_contract(bot) for bot in bots or ())
@@ -3175,12 +3324,16 @@ class LANClient(object):
                 invalid_reasons.append('players')
             if not player_outfits_valid:
                 invalid_reasons.append('player_outfits')
+            if not player_effective_params_valid:
+                invalid_reasons.append('player_effective_params')
             if bots is None:
                 invalid_reasons.append('bots')
             if not player_critical_contract:
                 invalid_reasons.append('player_critical')
             if not player_siege_contract:
                 invalid_reasons.append('player_siege')
+            if not player_gun_checkpoint_contract:
+                invalid_reasons.append('player_gun_checkpoint')
             if not bot_combat_contract:
                 invalid_reasons.append('bot_combat')
             if 'bot_manifest' in message and manifest is None:

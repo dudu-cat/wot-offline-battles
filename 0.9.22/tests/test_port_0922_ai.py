@@ -539,6 +539,17 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual(1.0, order['throttle'])
         self.assertGreater(order['turn'], 0.9)
 
+    def test_slow_callback_advances_the_complete_planner_interval(self):
+        driver = LocalDriver()
+
+        driver.drive(
+            3, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+
+        state = driver.states[3]
+        self.assertAlmostEqual(1.0, state['last_step'])
+        self.assertAlmostEqual(1.0, state['clock'])
+
     def test_deliberate_pivot_in_place_never_reverses(self):
         # A target far behind the bow commands a stationary pivot (throttle
         # 0, full turn). The rotating hull is progress, not a stall; the old

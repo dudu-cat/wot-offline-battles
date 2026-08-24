@@ -820,7 +820,7 @@ class BattleProjectileTests(unittest.TestCase):
             {'target_kind': 'bot', 'target_id': 8},
             kwargs['wreck_hit'])
 
-    def test_stock_max_29_projectile_debt_bounds_frame_and_reduces_scans(self):
+    def test_slow_frame_fully_advances_all_29_projectiles_before_return(self):
         battle, bigworld = _battle()
         source = battle._server_entity(41)
         entities = {41: source}
@@ -850,23 +850,11 @@ class BattleProjectileTests(unittest.TestCase):
             self.assertTrue(battle._accept_projectile_event(event))
 
         bigworld.now = 1.0
-        totals = {'chords': 0, 'scans': 0}
-        invocations = 0
-        while True:
-            self.assertTrue(battle._advance_projectiles(1.0))
-            perf = battle._projectile_perf
-            totals['chords'] += perf['chords']
-            totals['scans'] += perf['scans']
-            invocations += 1
-            if perf['debt'] <= 1e-9:
-                break
-            self.assertLess(invocations, 11)
+        self.assertTrue(battle._advance_projectiles(1.0))
 
-        self.assertEqual(11, invocations)
-        self.assertEqual(638, totals['chords'])
-        self.assertEqual(19140, totals['scans'])
-        self.assertEqual(58, battle._projectile_perf['chords'])
-        self.assertEqual(1740, battle._projectile_perf['scans'])
+        self.assertEqual(638, battle._projectile_perf['chords'])
+        self.assertEqual(19140, battle._projectile_perf['scans'])
+        self.assertAlmostEqual(0.0, battle._projectile_perf['debt'])
         self.assertEqual(0, battle._projectile_perf['candidates'])
         for entity_id, entity in entities.items():
             if entity_id != 41:
@@ -896,19 +884,10 @@ class BattleProjectileTests(unittest.TestCase):
             {'player:7': (0.0, 0.0, 0.0), 'bot:8': (20.0, 0.0, 0.0)},
         ])
         self.assertTrue(battle._accept_projectile_event(_event()))
-        module = sys.modules[BattleRuntime.__module__]
-        old_budget = module.PROJECTILE_CHORDS_PER_FRAME
-        old_maximum = module.PROJECTILE_MAX_CHORDS_PER_FRAME
-        module.PROJECTILE_CHORDS_PER_FRAME = 1
-        module.PROJECTILE_MAX_CHORDS_PER_FRAME = 1
-        try:
-            bigworld.now = 1.0
-            battle._advance_projectiles(1.0)
-            bigworld.now = 1.1
-            battle._advance_projectiles(1.1)
-        finally:
-            module.PROJECTILE_CHORDS_PER_FRAME = old_budget
-            module.PROJECTILE_MAX_CHORDS_PER_FRAME = old_maximum
+        bigworld.now = 1.0
+        battle._advance_projectiles(1.0)
+        bigworld.now = 1.1
+        battle._advance_projectiles(1.1)
 
         self.assertGreaterEqual(len(observed), 2)
         # The second delayed chord still belongs near launch time.  Its query

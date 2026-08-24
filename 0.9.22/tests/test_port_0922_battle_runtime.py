@@ -751,6 +751,7 @@ class _Avatar(object):
         self.battle_events = []
         self.responses = []
         self.misc_statuses = []
+        self.cancelWaitingForShot = mock.Mock()
         self.filter = object()
         self.base_points = []
         self.base_captured = []
@@ -1530,6 +1531,87 @@ class _Client(object):
         return self._fire_intent_seq
 
 
+def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
+                               ammo=None, deadeye=False):
+    ammo_rows = [[101, 40]] if ammo is None else list(ammo)
+    return {
+        'version': 1,
+        'loadout': {
+            'crew_level': 100.0, 'commander_level': 100.0,
+            'effective_crew_level': 100.0, 'crew_multiplier': 1.0,
+            'crew_factor': 1.0, 'gun_rotation_factor': 1.0,
+            'reload_factor': float(reload_factor),
+            'aim_time_factor': 1.0, 'dispersion_factor': 1.0,
+            'repair_factor': 1.0, 'vehicle_rotation_factor': 1.0,
+            'radio_factor': 1.0,
+            'bloom_move_factor': 1.0, 'bloom_rotation_factor': 1.0,
+            'bloom_turret_factor': 1.0,
+            'terrain_resistance_factors': [1.0, 1.0, 1.0],
+            'has_big_kit': False, 'from_client_factors': True,
+            'has_rammer': False, 'has_aim_drives': False,
+            'has_ventilation': False, 'has_stabiliser': False,
+            'has_rations': False, 'has_brotherhood': False,
+            'has_snap_shot': False, 'has_smooth_ride': False,
+            'has_sixth_sense': False,
+        },
+        'physics': {
+            'mass': float(mass), 'powerW': 500000.0,
+            'speedFwd': 14.0, 'speedBwd': 7.0, 'rotSpd': 0.75,
+            'terrainResist': [1.0, 1.0, 1.0],
+            'specificFriction': 1.0, 'brakeDecel': 4.0,
+            'trackCenter': 2.0, 'minPlaneNormalY': 0.2,
+            'nativePowerRatio': 1.0,
+        },
+        'spotting': {
+            'commander_level': 100.0, 'recon_level': 0.0,
+            'situational_level': 0.0, 'camouflage_level': 0.0,
+            'binocular_factor': 1.0, 'binocular_delay': 3.0,
+            'camouflage_net_bonus': 0.0, 'camouflage_net_delay': 3.0,
+            'has_binoculars': False, 'has_camouflage_net': False,
+            'vision_factor': 1.0, 'camouflage_factor': 0.57,
+            'invisibility_moving': [0.0, 1.0],
+            'invisibility_still': [0.0, 1.0],
+            'from_client_factors': True,
+        },
+        'ramming': {'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        'ammo': ammo_rows,
+        'camouflage': {
+            'camouflage_id': None, 'base_moving': 0.171,
+            'base_still': 0.228, 'shot_factor': 0.1,
+        },
+        'skills': {
+            'deadeye': bool(deadeye), 'intuition_chances': 0,
+        },
+        'gun': {
+            'clip_size': 1,
+            'shots': [{
+                'compact_descr': int(row[0]),
+                'source_shot': {
+                    'speed': 800.0, 'gravity': 9.81,
+                    'maxDistance': 500.0,
+                    'piercingPower': [1000.0, 800.0],
+                    'deadeye': bool(deadeye),
+                    'shell': {
+                        'kind': 'ARMOR_PIERCING', 'caliber': 37.0,
+                        'damage': [100.0, 50.0],
+                        'explosionRadius': 0.0,
+                    },
+                },
+            } for row in ammo_rows],
+        },
+    }
+
+
+def _human_gun_checkpoint(reload_time=0.0, clip=1, clip_size=1,
+                          dispersion=0.02, reload_duration=5.0):
+    return {
+        'reload_time': float(reload_time),
+        'reload_duration': float(reload_duration),
+        'clip': int(clip), 'clip_size': int(clip_size),
+        'dispersion': float(dispersion),
+    }
+
+
 def _minimal_start(round_id=1, map_name='01_karelia'):
     return {
         'round_id': round_id, 'map': map_name, 'bot_authority_id': -1,
@@ -1537,10 +1619,24 @@ def _minimal_start(round_id=1, map_name='01_karelia'):
             'id': 1, 'team': 1, 'slot': 0, 'name': 'Player',
             'vehicle': 'ussr:R11_MS-1',
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': _effective_params_snapshot(),
             'health': 500, 'max_health': 500, 'alive': True,
         }],
         'bots': [],
     }
+
+
+def _mounted_current_vehicle_module():
+    """Return the normal garage fixture used by visible-client starts."""
+    current_vehicle = types.ModuleType('CurrentVehicle')
+    current_vehicle.g_currentVehicle = types.SimpleNamespace(
+        isPresent=lambda: True,
+        item=types.SimpleNamespace(
+            descriptor=_Descriptor('ussr:R11_MS-1'),
+            shells=[types.SimpleNamespace(intCD=101, count=40)],
+            equipment=None,
+            crew=()))
+    return current_vehicle
 
 
 def _runtime():
@@ -4350,6 +4446,13 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
 
 
 class BattleRuntimeContractTests(unittest.TestCase):
+    def setUp(self):
+        self._current_vehicle_patch = mock.patch.dict(
+            sys.modules,
+            {'CurrentVehicle': _mounted_current_vehicle_module()})
+        self._current_vehicle_patch.start()
+        self.addCleanup(self._current_vehicle_patch.stop)
+
     def test_local_state_falls_back_before_roster_publishes_the_player(self):
         battle = BattleRuntime(_runtime())
         battle.client = _Client()
@@ -4528,7 +4631,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'engine_id': 11, 'network_id': 2, 'kind': 'player',
             'local': False, 'ready': True, 'tombstone': False,
             'state': {'x': 0.0, 'y': 0.0, 'z': 6.5, 'yaw': 0.0,
-                      'speed': 0.0, 'alive': True}}}
+                      'speed': 0.0, 'alive': True,
+                      'effective_params': _effective_params_snapshot()}}}
         battle._local_physics = {'mass': 25000.0}
         battle._local_speed = 5.0
         battle._motion_is_clear = mock.Mock(return_value=True)
@@ -5343,7 +5447,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'engine_id': 11, 'network_id': 2, 'kind': 'player',
             'local': False, 'ready': True, 'tombstone': False,
             'state': {'x': 0.0, 'y': 0.0, 'z': 6.5, 'yaw': 0.0,
-                      'speed': 0.0, 'alive': True}}}
+                      'speed': 0.0, 'alive': True,
+                      'effective_params': _effective_params_snapshot()}}}
         battle._local_physics = {'mass': 25000.0}
         battle._local_speed = 5.0
         battle._motion_is_clear = mock.Mock(return_value=False)
@@ -5429,6 +5534,17 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'CurrentVehicle': current_vehicle}):
             self.assertIsNone(battle._local_ammo_layout())
             self.assertIsNone(battle._local_mounted_equipments())
+
+    def test_battle_ammo_preserves_an_explicit_empty_garage_layout(self):
+        battle = BattleRuntime(_runtime())
+        current_vehicle = types.ModuleType('CurrentVehicle')
+        current_vehicle.g_currentVehicle = types.SimpleNamespace(
+            isPresent=lambda: True,
+            item=types.SimpleNamespace(shells=[], equipment=None))
+
+        with mock.patch.dict(sys.modules, {
+                'CurrentVehicle': current_vehicle}):
+            self.assertEqual({}, battle._local_ammo_layout())
 
     def test_mounted_rations_are_published_without_an_activation_action(self):
         runtime = _runtime()
@@ -8041,8 +8157,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.entities[10] = _Vehicle(
             10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 450})
         battle._sender = _LANInputSender(battle)
-        battle._gun_state = types.SimpleNamespace(
-            shot_index=0, pending_index=1)
+        gun_state = types.SimpleNamespace(
+            shot_index=0, pending_index=1,
+            reload_time=0.0, reload_duration=5.0,
+            clip=1, clip_size=1, dispersion=0.02)
+        battle._gun_state = gun_state
+        battle._gun_last_tick = runtime.bigworld.now
+        battle._advance_local_gun_to = mock.Mock(return_value=gun_state)
         battle._local_damage_report = {
             'critical': {'events': []}, 'reason': 2,
             'critical_base_revision': 0, 'critical_seq': 1}
@@ -8056,6 +8177,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0, kwargs['shell_index'])
         self.assertEqual(1, kwargs['next_shell_index'])
         self.assertTrue(kwargs['shell_change_pending'])
+        battle._advance_local_gun_to.assert_called_once_with(
+            runtime.bigworld.entities[10])
         self.assertTrue(battle.acknowledge_local_damage_report(0, 1, 1))
         self.assertIsNone(battle._local_damage_report)
 
@@ -10485,7 +10608,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertLessEqual(len(lines[0]), 320)
         self.assertIn('first line', lines[0])
 
-    def test_frame_diagnostics_keep_raw_delta_while_motion_uses_cap(self):
+    def test_frame_consumes_full_elapsed_time_without_truncation(self):
         runtime = _runtime()
         runtime.bigworld.now = 1.0
         battle = BattleRuntime(runtime)
@@ -10512,12 +10635,73 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._frame_diagnostics.begin.assert_called_once()
         self.assertAlmostEqual(
             0.15, battle._frame_diagnostics.begin.call_args[0][1])
-        battle._tick_critical_states.assert_called_once_with(0.1)
-        battle._drive_local.assert_called_once_with(0.1)
+        self.assertAlmostEqual(
+            0.15, battle._tick_critical_states.call_args[0][0])
+        self.assertAlmostEqual(0.15, battle._drive_local.call_args[0][0])
         finish = battle._frame_diagnostics.finish.call_args[0]
         self.assertEqual(19, finish[0])
-        self.assertAlmostEqual(0.1, finish[2])
-        self.assertAlmostEqual(0.1, finish[3])
+        self.assertAlmostEqual(0.15, finish[2])
+        self.assertAlmostEqual(0.15, finish[3])
+
+    def test_countdown_transition_consumes_the_live_suffix_of_a_slow_frame(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._battle_live = False
+        battle._prebattle_deadline = 0.95
+        battle._last_frame_time = 0.90
+        battle._avatar = runtime.bigworld.avatar
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._tick_critical_states = mock.Mock()
+        battle._tick_drowning = mock.Mock()
+        battle._tick_overturn = mock.Mock()
+        battle._prebattle_transition_ready = mock.Mock(return_value=True)
+
+        def begin_battle():
+            battle._battle_live = True
+            battle._prebattle_deadline = None
+            return True
+
+        battle._begin_battle = mock.Mock(side_effect=begin_battle)
+        battle._drive_local = mock.Mock()
+        battle._update_target_outline = mock.Mock()
+        battle._report_local_compound = mock.Mock()
+        battle._update_spotting = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        battle._begin_battle.assert_called_once_with()
+        battle._tick_critical_states.assert_called_once_with(
+            mock.ANY)
+        self.assertAlmostEqual(
+            0.05, battle._tick_critical_states.call_args[0][0])
+        battle._tick_drowning.assert_called_once_with(mock.ANY, 1.0)
+        self.assertAlmostEqual(
+            0.05, battle._tick_drowning.call_args[0][0])
+        battle._tick_overturn.assert_called_once_with(mock.ANY, 1.0)
+        self.assertAlmostEqual(
+            0.05, battle._tick_overturn.call_args[0][0])
+        self.assertAlmostEqual(0.05, battle._drive_local.call_args[0][0])
+
+    def test_local_physics_substeps_consume_full_slow_frame_before_return(self):
+        battle = BattleRuntime(_runtime())
+        battle._sender = types.SimpleNamespace(send_current=mock.Mock())
+        battle._server = object()
+        battle._drive_local_step = mock.Mock(return_value=False)
+
+        battle._drive_local(0.25)
+
+        steps = [call[0][0]
+                 for call in battle._drive_local_step.call_args_list]
+        self.assertEqual(3, len(steps))
+        self.assertAlmostEqual(0.25, sum(steps))
+        self.assertLessEqual(max(steps), 0.1)
+        battle._sender.send_current.assert_called_once_with()
 
     def test_authority_pose_is_presented_without_a_network_publication(self):
         runtime = _runtime()
@@ -11320,6 +11504,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._clock = lambda: 10.0
         battle._sender = types.SimpleNamespace(
             send_current=mock.Mock(return_value=True))
+        battle._local_physics = _effective_params_snapshot()['physics']
         entity = _Vehicle(
             10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
         proposal = {
@@ -11334,9 +11519,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             _catalog_motion_proposal=mock.Mock(return_value=proposal))
 
         with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'vehicle_physics.derive_params', return_value={
-                    'speedFwd': 20.0, 'speedBwd': 8.0}), mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
                 'world_collision.check_horizontal_collision',
                 return_value='kinetic') as static_probe:
@@ -11369,6 +11551,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._clock = lambda: 10.0
         battle._sender = types.SimpleNamespace(
             send_current=mock.Mock(return_value=True))
+        battle._local_physics = _effective_params_snapshot()['physics']
         entity = _Vehicle(
             10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
         battle._destructibles = types.SimpleNamespace(
@@ -11382,9 +11565,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }))
 
         with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'vehicle_physics.derive_params', return_value={
-                    'speedFwd': 20.0, 'speedBwd': 8.0}), mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
                 'world_collision.check_horizontal_collision',
                 return_value='hard') as static_probe:
@@ -11469,6 +11649,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._avatar = runtime.bigworld.avatar
         battle._sender = types.SimpleNamespace(
             send_current=mock.Mock(return_value=False))
+        battle._local_physics = _effective_params_snapshot()['physics']
         entity = _Vehicle(
             10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
         battle._destructibles = types.SimpleNamespace(
@@ -11644,6 +11825,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._destructibles = None
+        battle._local_physics = _effective_params_snapshot()['physics']
         entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
                           {'health': 500})
 
@@ -14804,8 +14986,68 @@ class BattleRuntimeContractTests(unittest.TestCase):
         client.send_fire_intent.assert_called_once_with(
             0, [0.0, 2.0, 0.0], [0.0, 0.0, 1.0], 0.25)
 
+    def test_trigger_advances_gun_through_hud_ready_edge_before_validation(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 10.0
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(0, 0, 0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle.client = client
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = _LANInputSender(battle)
+        battle._gun_state = gun_mechanics.GunState(descriptor)
+        battle._gun_state.reload_time = 0.05
+        battle._gun_state.clip = 0
+        battle._gun_last_tick = 9.94
+
+        self.assertTrue(battle.shoot(0.0, 0.0))
+
+        self.assertEqual(0.0, battle._gun_state.reload_time)
+        self.assertEqual(1, battle._gun_state.clip)
+        self.assertEqual(1, battle._local_fire_intent['intent_seq'])
+
+    def test_delayed_input_consumes_full_reload_gap_in_same_checkpoint(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 10.0
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(0, 0, 0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle.client = client
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = _LANInputSender(battle)
+        battle._gun_state = gun_mechanics.GunState(descriptor)
+        battle._gun_state.reload_time = 1.25
+        battle._gun_state.reload_duration = 1.5
+        battle._gun_state.clip = 0
+        battle._gun_last_tick = 8.75
+
+        self.assertTrue(battle._sender.send_current())
+
+        self.assertEqual(10.0, battle._gun_last_tick)
+        self.assertEqual(0.0, battle._gun_state.reload_time)
+        self.assertEqual(1, battle._gun_state.clip)
+        checkpoint = client.sent[-1][2]['gun_checkpoint']
+        self.assertEqual(0.0, checkpoint['reload_time'])
+        self.assertEqual(1, checkpoint['clip'])
+
     def test_fire_intent_result_releases_visible_pending_trigger(self):
-        battle = BattleRuntime(_runtime())
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
         battle._start_message = {'round_id': 7}
         battle._local_fire_intent = {
             'intent_seq': 3, 'input_seq': 4, 'sent_at': 1.0}
@@ -14817,6 +15059,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         }))
 
         self.assertIsNone(battle._local_fire_intent)
+        battle._avatar.cancelWaitingForShot.assert_called_once_with()
 
     def test_worker_fire_intent_ignores_transport_receipt_time(self):
         battle = BattleRuntime(_runtime())
@@ -14831,13 +15074,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'shot_seq': 5, 'input_seq': 8, 'pose_time_us': 1000,
             'shell_index': 0, 'next_shell_index': 0,
             'shell_change_pending': False,
+            'gun_checkpoint_seq': 8,
+            'gun_checkpoint': _human_gun_checkpoint(),
             'aim_yaw': 0.2, 'gun_pitch': -0.1,
             'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.0,
             'pitch': 0.0, 'roll': 0.0, 'speed': 4.0,
             'shot_origin': [1.0, 3.0, 3.0],
             'shot_direction': [0.0, 0.0, 1.0],
             'dispersion_angle': 0.02,
-            'deadline_server_time_ms': 9000,
             '_client_received_time': 10.0,
             '_client_dispatch_delay': 0.01,
         }
@@ -14869,6 +15113,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         player = {
             'id': 2, 'vehicle': 'ussr:R11_MS-1',
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': _effective_params_snapshot(),
             'destructible_contacts': [{
                 'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
                 'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
@@ -14914,6 +15159,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         player = {
             'id': 2, 'vehicle': 'ussr:R11_MS-1',
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': _effective_params_snapshot(),
             'destructible_contacts': [{
                 'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
                 'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
@@ -14921,13 +15167,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }
 
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'vehicle_physics.derive_params', return_value={
-                    'speedFwd': 20.0, 'speedBwd': 8.0}):
-            self.assertEqual(
-                1, battle._resolve_player_destructible_contacts(
-                    [player], 12.5))
+        self.assertEqual(
+            1, battle._resolve_player_destructible_contacts(
+                [player], 12.5))
 
         battle._destructibles._catalog_motion_blocked.assert_called_once()
         battle.client.send_player_destructible_contact_result.\
@@ -14954,6 +15196,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         player = {
             'id': 2, 'vehicle': 'ussr:R11_MS-1',
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': _effective_params_snapshot(),
             'destructible_contacts': [{
                 'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
                 'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
@@ -14962,9 +15205,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
         }
 
         with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'vehicle_physics.derive_params', return_value={
-                    'speedFwd': 20.0, 'speedBwd': 8.0}), mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
                 'world_collision.check_horizontal_collision',
                 return_value='hard'):
@@ -14997,6 +15237,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         player = {
             'id': 2, 'vehicle': 'ussr:R11_MS-1',
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': _effective_params_snapshot(),
             'destructible_contacts': [{
                 'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
                 'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
@@ -15004,13 +15245,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }
 
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'vehicle_physics.derive_params', return_value={
-                    'speedFwd': 20.0, 'speedBwd': 8.0}):
-            self.assertEqual(
-                1, worker._resolve_player_destructible_contacts(
-                    [player], 12.5))
+        self.assertEqual(
+            1, worker._resolve_player_destructible_contacts(
+                [player], 12.5))
 
         worker._destructibles._catalog_motion_blocked.assert_not_called()
         worker.client.send_player_destructible_contact_result.\
@@ -15050,17 +15287,29 @@ class BattleRuntimeContractTests(unittest.TestCase):
             11, _Descriptor(), _Vector(50.0, 0.0, 50.0), (0, 0, 0),
             {'health': 500})
         runtime.bigworld.entities[11] = entity
+        effective = _effective_params_snapshot(ammo=[[101, 40]])
+        donated_shot = effective['gun']['shots'][0]['source_shot']
+        donated_shot['speed'] = 625.0
+        donated_shot['gravity'] = 17.0
+        donated_shot['maxDistance'] = 777.0
+        donated_shot['piercingPower'] = [321.0, 222.0]
+        donated_shot['shell']['damage'] = [390.0, 165.0]
         battle._records = {'player:2': {
             'engine_id': 11, 'network_id': 2, 'kind': 'player',
             'local': False, 'ready': True, 'tombstone': False,
             'state': {
                 'alive': True, 'shell_index': 0, 'speed': 0.0,
-                'turn': 0.0,
+                'turn': 0.0, 'effective_params': effective,
             },
         }}
-        gun = gun_mechanics.GunState(entity.typeDescriptor)
-        gun.reload_time = 0.0
-        gun.clip = 1
+        gun = gun_mechanics.GunState(
+            entity.typeDescriptor, effective['loadout'])
+        gun.bind_client_contract(effective['gun'], {101: 40})
+        # The worker's independently advanced copy is deliberately stale.
+        # The input-bound visible checkpoint below is the final fire edge.
+        gun.reload_time = 4.0
+        gun.clip = 0
+        gun._effective_params = effective
         battle._player_authority_guns = {2: gun}
         intent = {
             'type': 'fire_intent', 'round_id': 7,
@@ -15068,13 +15317,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'shot_seq': 5, 'input_seq': 8, 'pose_time_us': 1000,
             'shell_index': 0, 'next_shell_index': 0,
             'shell_change_pending': False,
+            'gun_checkpoint_seq': 8,
+            'gun_checkpoint': _human_gun_checkpoint(),
             'aim_yaw': 0.2, 'gun_pitch': -0.1,
             'x': 50.0, 'y': 0.0, 'z': 50.0, 'yaw': 0.0,
             'pitch': 0.0, 'roll': 0.0, 'speed': 0.0,
             'shot_origin': [4.0, 2.0, 8.0],
             'shot_direction': [0.6, 0.0, 0.8],
             'dispersion_angle': 0.02,
-            'deadline_server_time_ms': 9000,
         }
 
         with mock.patch.object(
@@ -15089,7 +15339,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         call = client.send_projectile_launch.call_args
         self.assertEqual(['player', 2, 5, 0], list(call.args[:4]))
         self.assertEqual([4.0, 2.0, 8.0], call.args[4])
-        self.assertEqual([480.0, 0.0, 640.0], call.args[5])
+        self.assertEqual([375.0, 0.0, 500.0], call.args[5])
+        self.assertEqual((17.0, 777.0), call.args[6:8])
+        self.assertEqual([321.0, 222.0],
+                         call.kwargs['source_shot']['piercingPower'])
+        self.assertEqual([390.0, 165.0],
+                         call.kwargs['source_shot']['shell']['damage'])
 
     def test_worker_promotes_the_queued_shell_at_the_shot_boundary(self):
         runtime = _runtime()
@@ -15114,6 +15369,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             11, descriptor, _Vector(50.0, 0.0, 50.0), (0, 0, 0),
             {'health': 500})
         runtime.bigworld.entities[11] = entity
+        effective = _effective_params_snapshot(
+            ammo=[[101, 20], [102, 20]])
         record = {
             'engine_id': 11, 'network_id': 2, 'kind': 'player',
             'local': False, 'ready': True, 'tombstone': False,
@@ -15121,12 +15378,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'alive': True, 'shell_index': 0,
                 'next_shell_index': 1, 'shell_change_pending': True,
                 'speed': 0.0, 'turn': 0.0,
+                'effective_params': effective,
             },
         }
         battle._records = {'player:2': record}
-        gun = gun_mechanics.GunState(descriptor)
+        gun = gun_mechanics.GunState(
+            descriptor, effective['loadout'],
+            ammo_layout={101: 20, 102: 20})
         gun.reload_time = 0.0
         gun.clip = 1
+        gun._effective_params = effective
         battle._player_authority_guns = {2: gun}
         intent = {
             'type': 'fire_intent', 'round_id': 7,
@@ -15134,13 +15395,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'shot_seq': 5, 'input_seq': 8, 'pose_time_us': 1000,
             'shell_index': 0, 'next_shell_index': 1,
             'shell_change_pending': True,
+            'gun_checkpoint_seq': 8,
+            'gun_checkpoint': _human_gun_checkpoint(),
             'aim_yaw': 0.2, 'gun_pitch': -0.1,
             'x': 50.0, 'y': 0.0, 'z': 50.0, 'yaw': 0.0,
             'pitch': 0.0, 'roll': 0.0, 'speed': 0.0,
             'shot_origin': [4.0, 2.0, 8.0],
             'shot_direction': [0.0, 0.0, 1.0],
             'dispersion_angle': 0.02,
-            'deadline_server_time_ms': 9000,
         }
 
         self.assertTrue(battle.on_fire_intent(intent))
@@ -15154,7 +15416,47 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, gun.shot_index)
         self.assertIsNone(gun.pending_index)
 
-    def test_fire_intent_result_releases_worker_launch_pending(self):
+    def test_worker_applies_intuition_ready_shell_without_restarting_reload(self):
+        descriptor = _Descriptor()
+        second_shot = copy.copy(descriptor.gun.shots[0])
+        second_shot.shell = copy.copy(second_shot.shell)
+        second_shot.shell.compactDescr = 102
+        descriptor.gun.shots = tuple(descriptor.gun.shots) + (second_shot,)
+        gun = gun_mechanics.GunState(
+            descriptor, ammo_layout={101: 20, 102: 20})
+        gun.reload_time = 4.0
+        gun.clip = 0
+        intent = {
+            'input_seq': 9, 'gun_checkpoint_seq': 9,
+            'shell_index': 1, 'next_shell_index': 1,
+            'shell_change_pending': False,
+            'gun_checkpoint': _human_gun_checkpoint(),
+        }
+
+        self.assertTrue(BattleRuntime._apply_player_gun_checkpoint(
+            gun, intent))
+        self.assertEqual(1, gun.shot_index)
+        self.assertEqual(0.0, gun.reload_time)
+        self.assertEqual(1, gun.clip)
+        self.assertEqual([20, 20], gun.ammo)
+
+    def test_worker_rejects_stale_or_not_ready_human_gun_checkpoint(self):
+        gun = gun_mechanics.GunState(
+            _Descriptor(), ammo_layout={101: 20})
+        not_ready = {
+            'input_seq': 9, 'gun_checkpoint_seq': 9,
+            'shell_index': 0, 'next_shell_index': 0,
+            'shell_change_pending': False,
+            'gun_checkpoint': _human_gun_checkpoint(
+                reload_time=1.0, clip=0),
+        }
+
+        self.assertFalse(BattleRuntime._apply_player_gun_checkpoint(
+            gun, not_ready))
+        with self.assertRaisesRegex(RuntimeError, 'checkpoint is invalid'):
+            BattleRuntime._apply_player_gun_checkpoint(gun, not_ready)
+
+    def test_worker_launch_pending_survives_stall_until_result(self):
         battle = BattleRuntime(_runtime())
         battle._worker_mode = True
         battle._start_message = {'round_id': 7}
@@ -15162,13 +15464,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'intent_seq': 3, 'input_seq': 4, 'shot_seq': 5,
             'sent_at': 1.0,
         }}
+        battle._projectile_is_authority = lambda: True
+
+        self.assertTrue(battle._advance_player_fire_authority(0.1, 10.0))
+        self.assertIn(2, battle._player_fire_launch_pending)
 
         self.assertTrue(battle.on_fire_intent_result({
             'type': 'fire_intent_result', 'round_id': 7,
             'player_id': 2, 'intent_seq': 3, 'accepted': False,
             'reason': 'projectile_launch_rejected',
         }))
-        battle._projectile_is_authority = lambda: True
 
         self.assertEqual({}, battle._player_fire_launch_pending)
         self.assertTrue(battle._advance_player_fire_authority(0.1, 10.0))
@@ -15638,6 +15943,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                           {'health': 500})
         runtime.bigworld.entities[10] = entity
         battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._garage_loadout_snapshot()
+        battle._garage_loadout['shells'] = {101: 999999}
 
         battle._ammo_tick()
 
@@ -18405,7 +18712,7 @@ class UnusableVehicleTests(unittest.TestCase):
 class LocalBattleDescriptorTests(unittest.TestCase):
     """The battle measures the tank the garage panel measured."""
 
-    def _runtime(self, fitting):
+    def _runtime(self, fitting, worker=False):
         def VehicleDescr(typeName=None, compactDescr=None):
             if compactDescr is not None:
                 return types.SimpleNamespace(source='fitted:%s' % compactDescr)
@@ -18415,6 +18722,7 @@ class LocalBattleDescriptorTests(unittest.TestCase):
         runtime._runtime = types.SimpleNamespace(
             vehicles=types.SimpleNamespace(VehicleDescr=VehicleDescr))
         runtime._garage_loadout = {'fitting': fitting}
+        runtime._worker_mode = bool(worker)
         return runtime
 
     def test_the_mounted_compact_descriptor_wins(self):
@@ -18424,16 +18732,30 @@ class LocalBattleDescriptorTests(unittest.TestCase):
 
         self.assertEqual('fitted:CD', descriptor.source)
 
-    def test_another_vehicle_falls_back_to_the_stock_fitting(self):
-        runtime = self._runtime(('CD', 'ussr:T-34'))
+    def test_worker_another_vehicle_falls_back_to_the_stock_fitting(self):
+        runtime = self._runtime(('CD', 'ussr:T-34'), worker=True)
 
         descriptor = runtime._local_battle_descriptor('germany:PzVI')
 
         self.assertEqual('stock:germany:PzVI', descriptor.source)
 
-    def test_no_garage_falls_back_to_the_stock_fitting(self):
-        runtime = self._runtime(None)
+    def test_worker_without_garage_falls_back_to_the_stock_fitting(self):
+        runtime = self._runtime(None, worker=True)
 
         descriptor = runtime._local_battle_descriptor('ussr:T-34')
 
         self.assertEqual('stock:ussr:T-34', descriptor.source)
+
+    def test_visible_client_rejects_a_mismatched_garage_vehicle(self):
+        runtime = self._runtime(('CD', 'ussr:T-34'))
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'does not match germany:PzVI'):
+            runtime._local_battle_descriptor('germany:PzVI')
+
+    def test_visible_client_rejects_a_missing_garage_descriptor(self):
+        runtime = self._runtime(None)
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'does not match ussr:T-34'):
+            runtime._local_battle_descriptor('ussr:T-34')

@@ -869,6 +869,41 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertEqual('critical', payload['events'][0]['state'])
         self.assertEqual('fire', payload['events'][1]['kind'])
 
+    def test_fire_consumes_every_whole_second_in_one_slow_frame(self):
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500, maxHealth=500,
+            devices_hp={'fuelTankHealth': 0.0},
+            _destroyed_devices=set(['fuelTankHealth']), _crew_ko=set(),
+            is_on_fire=True, _fire_started=0.0, _fire_timer=0.4)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}):
+            damage, payload = critical_damage.tick_fire(
+                vehicle, 3.2, now=3.2)
+
+        self.assertEqual(75, damage)
+        self.assertAlmostEqual(0.6, vehicle._fire_timer)
+        self.assertTrue(vehicle.is_on_fire)
+        self.assertIsNone(payload)
+
+    def test_fire_slow_frame_stops_exactly_at_burnout_boundary(self):
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500, maxHealth=500,
+            devices_hp={'fuelTankHealth': 0.0},
+            _destroyed_devices=set(['fuelTankHealth']), _crew_ko=set(),
+            is_on_fire=True, _fire_started=0.0, _fire_timer=0.4)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}):
+            damage, payload = critical_damage.tick_fire(
+                vehicle, 5.0, now=12.0)
+
+        self.assertEqual(75, damage)
+        self.assertAlmostEqual(0.4, vehicle._fire_timer)
+        self.assertFalse(vehicle.is_on_fire)
+        self.assertEqual(50.0, vehicle.devices_hp['fuelTankHealth'])
+        self.assertIsNotNone(payload)
+
     def test_drowning_knocks_out_all_modules_and_real_crew_roster(self):
         vehicle = types.SimpleNamespace(
             typeDescriptor=_descriptor(), health=500,

@@ -17,10 +17,12 @@ from gui.mods.offline_lan_0922.account_rpc import commands, data, requests
 from gui.mods.offline_lan_0922.account_rpc import postbattle_store
 from lan_battle_server import (
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, MAX_RESULT_RECEIPTS,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY, Player)
+from effective_params_fixture import effective_params
 import lan_battle_server as lan_server_module
 from offline_rewards import compute_offline_rewards
 from gui.mods.offline_lan_0922.battle_runtime import BattleRuntime
@@ -789,11 +791,13 @@ class PostBattleContractTests(unittest.TestCase):
                     RAM_CONTACT_LEDGER_CAPABILITY,
                     HUMAN_RAM_TIMELINE_CAPABILITY,
                     PLAYER_FIRE_INTENT_CAPABILITY,
-                    PLAYER_ENVIRONMENT_CAPABILITY],
+                    PLAYER_ENVIRONMENT_CAPABILITY,
+                    EFFECTIVE_PARAMS_CAPABILITY],
                 'account_key': first.account_key,
                 'name': 'A', 'vehicle': first.vehicle,
                 'max_health': first.max_health, 'outfits': {},
                 'vehicle_compact_descr': 'dGVzdA==',
+                'effective_params': effective_params(),
             })
         self.assertIsNone(error)
         self.assertEqual(original,
@@ -810,11 +814,13 @@ class PostBattleContractTests(unittest.TestCase):
                 RAM_CONTACT_LEDGER_CAPABILITY,
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
-                PLAYER_ENVIRONMENT_CAPABILITY],
+                PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY],
             'account_key': account_key,
             'name': 'A', 'vehicle': 'ussr:R11_MS-1',
             'max_health': 100, 'outfits': {},
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': effective_params(),
         }
         first, error = state.add_player(
             _Socket(), ('127.0.0.1', 1), hello)

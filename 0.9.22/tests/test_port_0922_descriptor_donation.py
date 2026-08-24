@@ -14,12 +14,14 @@ from lan_battle_server import (  # noqa: E402
     AUTHORITY_DESCRIPTOR_TIMEOUT_SECONDS,
     AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS,
     BattleState, CLIENT_BUILD_0922, HUMAN_RAM_TIMELINE_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY, Player,
     PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
 )
 from server_battle_authority import SERVER_AUTHORITY_ID  # noqa: E402
 from gui.mods.offline_lan_0922 import descriptor_donation  # noqa: E402
+from effective_params_fixture import effective_params  # noqa: E402
 
 from test_port_0922_server_authority import _projection  # noqa: E402
 
@@ -49,7 +51,9 @@ def _player(player_id, team=1, vehicle='ussr:R11_MS-1'):
             RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
             PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY,
         ),
+        effective_params=effective_params(),
     )
 
 

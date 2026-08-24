@@ -134,6 +134,153 @@ def _selected_vehicle_compact_descr():
     return base64.b64encode(compact).decode('ascii')
 
 
+def _field(value, name, default=None):
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _crew_has_finished_skill(crew, wanted):
+    """Return whether the mounted garage crew owns one completed perk."""
+    wanted = str(wanted).lower()
+    for entry in (crew or ()):
+        member = (entry[1] if isinstance(entry, tuple) and len(entry) == 2
+                  else entry)
+        if member is None:
+            continue
+        skills = getattr(member, 'skills', None)
+        if skills is None:
+            skills = getattr(
+                getattr(member, 'descriptor', None), 'skills', ())
+        for skill in (skills or ()):
+            if str(getattr(skill, 'name', skill)).lower() != wanted:
+                continue
+            if not bool(getattr(skill, 'isActive', True)):
+                continue
+            try:
+                level = float(getattr(skill, 'level', 100.0))
+            except (TypeError, ValueError):
+                level = 0.0
+            if level >= 100.0:
+                return True
+    return False
+
+
+def _selected_vehicle_effective_params():
+    """Build the immutable effective-parameter snapshot from #1513 garage.
+
+    The worker must consume these final values instead of attempting to
+    recreate the player's mounted crew, equipment and ammunition from the
+    vehicle descriptor alone.
+    """
+    from CurrentVehicle import g_currentVehicle
+    from gui.mods.offline_lan_0922 import descriptor_donation
+    from gui.mods.offline_lan_0922 import effective_params
+    from gui.mods.offline_lan_0922 import loadout
+    from gui.mods.offline_lan_0922 import tank_collision
+    from gui.mods.offline_lan_0922 import vehicle_physics
+
+    item = g_currentVehicle.item
+    if item is None:
+        raise ValueError('the current garage vehicle is not available')
+    descriptor = item.descriptor
+    crew = tuple(getattr(item, 'crew', None) or ())
+    consumables = getattr(
+        getattr(item, 'equipment', None), 'regularConsumables', None)
+    equipments = (() if consumables is None else
+                  tuple(consumables.getInstalledItems()))
+    # A Removed RPM Limiter is trigger-only.  Supplying it to the passive
+    # attribute-factor chain would claim it is permanently enabled.
+    factor_equipments = tuple(
+        equipment for equipment in equipments
+        if not any('removedrpmlimiter' in name for name in
+                   loadout.equipment_names((equipment,))))
+    factors = loadout.attribute_factors(
+        descriptor, crew or None, factor_equipments)
+    if factors is None:
+        raise ValueError('the exact client attribute factors are unavailable')
+    crew_skills = loadout.crew_skill_names(crew) if crew else None
+    loadout_values = loadout.modifiers(
+        descriptor, equipments, crew_skills, factors=factors)
+    spotting_values = loadout.spotting_profile(
+        descriptor, crew or None,
+        level_increase=loadout.crew_level_increase(
+            descriptor, equipments, crew_skills),
+        factors=factors)
+    physics_values = vehicle_physics.derive_params(descriptor, factors)
+    ramming_values = tank_collision.descriptor_ram_profile(
+        descriptor, loadout.ramming_bonus(crew))
+
+    ammo = []
+    for shell in (getattr(item, 'shells', None) or ()):
+        try:
+            ammo.append([int(shell.intCD), max(0, int(shell.count))])
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError('the selected vehicle ammunition is invalid')
+    ammo.sort(key=lambda entry: entry[0])
+
+    camouflage_id = None
+    reader = getattr(item, 'getBonusCamo', None)
+    if callable(reader):
+        camouflage = reader()
+        if camouflage is not None:
+            camouflage_id = getattr(camouflage, 'id', None)
+            if camouflage_id is not None:
+                camouflage_id = int(camouflage_id)
+    calculator = getattr(descriptor, 'computeBaseInvisibility', None)
+    if not callable(calculator):
+        raise ValueError('the exact client camouflage calculator is unavailable')
+    base_invisibility = calculator(
+        spotting_values['camouflage_factor'], camouflage_id)
+    if (not isinstance(base_invisibility, (list, tuple)) or
+            len(base_invisibility) < 2):
+        raise ValueError('the exact client camouflage values are invalid')
+    gun = _field(descriptor, 'gun', {})
+    shot_factor = float(_field(gun, 'invisibilityFactorAtShot', 1.0))
+    deadeye = _crew_has_finished_skill(crew, 'gunner_sniper')
+    try:
+        clip_size = int(_field(gun, 'clip')[0])
+    except (IndexError, TypeError, ValueError):
+        raise ValueError('the selected vehicle gun clip is invalid')
+    shots = []
+    for shot in (_field(gun, 'shots', ()) or ()):
+        try:
+            compact_descr = int(_field(_field(shot, 'shell'), 'compactDescr'))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError('the selected vehicle gun shot is invalid')
+        shots.append({
+            'compact_descr': compact_descr,
+            'source_shot': descriptor_donation.project_shot(
+                shot, deadeye=deadeye),
+        })
+
+    result = effective_params.canonical({
+        'version': effective_params.SCHEMA_VERSION,
+        'loadout': loadout_values,
+        'physics': physics_values,
+        'spotting': spotting_values,
+        'ramming': ramming_values,
+        'ammo': ammo,
+        'camouflage': {
+            'camouflage_id': camouflage_id,
+            'base_moving': float(base_invisibility[0]),
+            'base_still': float(base_invisibility[1]),
+            'shot_factor': shot_factor,
+        },
+        'skills': {
+            'deadeye': deadeye,
+            'intuition_chances': loadout.intuition_chances(crew),
+        },
+        'gun': {
+            'clip_size': clip_size,
+            'shots': shots,
+        },
+    })
+    if result is None:
+        raise ValueError('the selected vehicle effective parameters are invalid')
+    return result
+
+
 def _message_value(message, name, default=None):
     if isinstance(message, dict):
         return message.get(name, default)
@@ -161,7 +308,8 @@ class LANSession(object):
                  callback=None, cancel_callback=None, status_notifier=None,
                  vehicle_provider=None, room_factory=None,
                  queue_screen_factory=None, postbattle_store=None,
-                 vehicle_compact_provider=None):
+                 vehicle_compact_provider=None,
+                 effective_params_provider=None):
         self._config = dict(config or {})
         self._client_factory = client_factory or _load_client
         self._queue_factory = queue_factory or queue_ui.QueueUI
@@ -183,6 +331,13 @@ class LANSession(object):
         self._outfit_provider = _selected_vehicle_outfits
         self._vehicle_compact_provider = (
             vehicle_compact_provider or _selected_vehicle_compact_descr)
+        # The production client always reads the exact garage snapshot.
+        # Embedders that replace the whole transport factory must explicitly
+        # provide the matching snapshot boundary as well.
+        self._effective_params_provider = effective_params_provider
+        if self._effective_params_provider is None and client_factory is None:
+            self._effective_params_provider = \
+                _selected_vehicle_effective_params
         self._postbattle_store = postbattle_store
         self._room_preferences = port_config.load_waiting_room_state()
         self._restored_team_generation = None
@@ -278,6 +433,11 @@ class LANSession(object):
             client.vehicle_compact_descr = self._vehicle_compact_provider()
         except Exception:
             client.vehicle_compact_descr = ''
+        if self._effective_params_provider is not None:
+            try:
+                client.effective_params = self._effective_params_provider()
+            except Exception:
+                raise _VehicleSelectionError()
         return client
 
     def _publish_postbattle_results(self):
@@ -522,6 +682,8 @@ class LANSession(object):
             max_health = int(max_health)
             outfits = self._outfit_provider()
             vehicle_compact_descr = self._vehicle_compact_provider()
+            effective_params = (None if self._effective_params_provider is None
+                                else self._effective_params_provider())
         except Exception:
             # A lobby transition can hide the garage selection.  Keep the
             # vehicle the server already holds for this player.
@@ -529,8 +691,12 @@ class LANSession(object):
         if not vehicle or max_health < 1:
             return False
         try:
+            if effective_params is None:
+                return bool(select(
+                    vehicle, max_health, outfits, vehicle_compact_descr))
             return bool(select(
-                vehicle, max_health, outfits, vehicle_compact_descr))
+                vehicle, max_health, outfits, vehicle_compact_descr,
+                effective_params))
         except TypeError:
             # Test doubles and the first protocol-v5 client accepted only the
             # original vehicle and max-health arguments.

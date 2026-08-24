@@ -19,12 +19,14 @@ from lan_battle_server import (  # noqa: E402
     HUMAN_RAM_TIMELINE_CAPABILITY,
     LEAN_SNAPSHOT_MANIFEST_CAPABILITY, Player, PREBATTLE_SECONDS,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     REPLICA_SNAPSHOT_TICKS,
     SimulationWorker,
     SIMULATION_WORKER_AUTHORITY_ID, SIMULATION_WORKER_CAPABILITY,
     SIMULATION_WORKER_ROLE, TICK_HZ, ThreadedTCPServer,
 )
+from effective_params_fixture import effective_params
 
 
 class _Connection(object):
@@ -110,7 +112,8 @@ def _worker_hello():
             SIMULATION_WORKER_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY],
+            PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY],
     }
 
 
@@ -123,9 +126,11 @@ def _player_hello(name='Human'):
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY],
+            PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY],
         'name': name, 'vehicle': 'ussr:R11_MS-1', 'max_health': 90,
         'vehicle_compact_descr': 'dGVzdA==',
+        'effective_params': effective_params(),
     }
 
 
@@ -142,6 +147,7 @@ def _manifest(roster):
             'z': -35.0 if team == 1 else 35.0,
             'yaw': 0.0 if team == 1 else 3.141592,
             'world_pose': True, 'profile': {},
+            'reload_time': 3.0, 'reload_duration': 3.0,
             'route': {'id': 'worker-test', 'waypoints': []},
         })
     return result
@@ -166,6 +172,8 @@ def _bot_publication(manifest, x_offset=0.0):
         'x': entry['x'] + x_offset, 'y': entry['y'], 'z': entry['z'],
         'yaw': entry['yaw'], 'health': entry['health'], 'alive': True,
         'fire_seq': 0, 'critical': {},
+        'reload_time': entry['reload_time'],
+        'reload_duration': entry['reload_duration'],
         'combat_base_revision': 0, 'combat_seq': 0,
         'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
     } for entry in manifest]
@@ -1403,8 +1411,9 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 'authority_fallback_reason', 'worker_status',
                 'destructibles_disabled',
                 'destructibles_disabled_reason',
-                'vehicle_compact_descr',
-            }, set(welcome))
+            'vehicle_compact_descr',
+            'effective_params',
+        }, set(welcome))
             roster = player.receive_until('roster')
             self.assertEqual('missing', roster['worker_status'])
             self.assertNotIn('worker_failure_reason', roster)

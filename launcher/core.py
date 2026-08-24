@@ -127,11 +127,12 @@ _SERVER_PROBES = {
         "capabilities": (
             "projectile_ledger_v2", "destructible_catalog_v5",
             "ram_contact_ledger_v2", "human_ram_timeline_v1",
-            "player_fire_intent_v3", "player_environment_v1"),
+            "player_fire_intent_v4", "player_environment_v1",
+            "effective_params_v1"),
         "server_capabilities": (
             "destructible_catalog_v5", "ram_contact_ledger_v2",
-            "human_ram_timeline_v1", "player_fire_intent_v3",
-            "player_environment_v1"),
+            "human_ram_timeline_v1", "player_fire_intent_v4",
+            "player_environment_v1", "effective_params_v1"),
     },
 }
 
@@ -1564,6 +1565,7 @@ def probe_server_protocol(port_version, host, port, timeout=1.5, connect=None):
             "max_health": 1,
         }
         if port_version == PORT_0_9_22:
+            hello["role"] = "probe"
             hello["vehicle_compact_descr"] = "AA=="
         if contract["capabilities"] is not None:
             hello["capabilities"] = list(contract["capabilities"])

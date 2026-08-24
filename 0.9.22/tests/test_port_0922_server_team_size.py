@@ -11,10 +11,12 @@ from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, PROJECTILE_CAPABILITY,
     MODERN_VISIBLE_MESSAGE_TYPES, PLAYER_ENVIRONMENT_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     SIMULATION_WORKER_CAPABILITY,
 )
+from effective_params_fixture import effective_params
 
 
 class _Connection(object):
@@ -32,11 +34,13 @@ def _hello(index, team=None):
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY],
+            PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY],
         'name': 'Player-%d' % index,
         'vehicle': 'ussr:R11_MS-1',
         'max_health': 90,
         'vehicle_compact_descr': 'dGVzdA==',
+        'effective_params': effective_params(),
     }
     if team is not None:
         result['requested_team'] = team
@@ -56,6 +60,7 @@ def _attach_worker(state):
                 RAM_CONTACT_LEDGER_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
                 PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY,
             ],
         })
     if error is not None:

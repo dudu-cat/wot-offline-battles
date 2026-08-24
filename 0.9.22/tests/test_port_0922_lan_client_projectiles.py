@@ -14,6 +14,7 @@ from gui.mods.offline_lan_0922 import lan_client as module
 from gui.mods.offline_lan_0922.authority_worker import (
     AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.lan_client import LANClient
+from effective_params_fixture import effective_params
 
 
 class RecordingSocket(object):
@@ -59,6 +60,14 @@ def source_shot(speed, gravity, maximum, is_he=False, radius=0.0,
 
 
 class ProjectileWireTests(unittest.TestCase):
+
+    @staticmethod
+    def gun_checkpoint(reload_time=0.0, clip=1, dispersion=0.02):
+        return {
+            'reload_time': reload_time, 'reload_duration': 5.0,
+            'clip': clip, 'clip_size': 1,
+            'dispersion': dispersion,
+        }
     def test_player_siege_snapshot_pair_is_strict_when_present(self):
         self.assertTrue(module._valid_player_siege_contract({}))
         self.assertTrue(module._valid_player_siege_contract({
@@ -73,6 +82,18 @@ class ProjectileWireTests(unittest.TestCase):
             'siege_state': True, 'siege_time_left_ms': 0}))
         self.assertFalse(module._valid_player_siege_contract({
             'siege_state': 0}))
+
+    def test_player_gun_checkpoint_pair_is_strict_when_present(self):
+        checkpoint = self.gun_checkpoint()
+        self.assertTrue(module._valid_player_gun_checkpoint_contract({}))
+        self.assertTrue(module._valid_player_gun_checkpoint_contract({
+            'input_seq': 3, 'gun_checkpoint_seq': 3,
+            'gun_checkpoint': checkpoint}))
+        self.assertFalse(module._valid_player_gun_checkpoint_contract({
+            'input_seq': 3, 'gun_checkpoint_seq': 2,
+            'gun_checkpoint': checkpoint}))
+        self.assertFalse(module._valid_player_gun_checkpoint_contract({
+            'input_seq': 3, 'gun_checkpoint': checkpoint}))
 
     def active_client(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
@@ -92,6 +113,7 @@ class ProjectileWireTests(unittest.TestCase):
             module.HUMAN_RAM_TIMELINE_CAPABILITY,
             module.PLAYER_FIRE_INTENT_CAPABILITY,
             module.PLAYER_ENVIRONMENT_CAPABILITY,
+            module.EFFECTIVE_PARAMS_CAPABILITY,
             module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
             module.PROJECTILE_WRECK_HIT_CAPABILITY,
             module.RANDOM_MAP_CAPABILITY,
@@ -119,6 +141,7 @@ class ProjectileWireTests(unittest.TestCase):
             module.HUMAN_RAM_TIMELINE_CAPABILITY,
             module.PLAYER_FIRE_INTENT_CAPABILITY,
             module.PLAYER_ENVIRONMENT_CAPABILITY,
+            module.EFFECTIVE_PARAMS_CAPABILITY,
             module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
             module.PROJECTILE_WRECK_HIT_CAPABILITY,
             module.RANDOM_MAP_CAPABILITY,
@@ -165,7 +188,10 @@ class ProjectileWireTests(unittest.TestCase):
         return client.send_input(
             0.5, -0.25, aim_yaw=0.3, gun_pitch=-0.1,
             position=[1.0, 2.0, 3.0], yaw=0.2, speed=4.0,
-            shell_index=shell_index, pose_time_us=1000)
+            shell_index=shell_index, next_shell_index=shell_index,
+            shell_change_pending=False,
+            gun_checkpoint=ProjectileWireTests.gun_checkpoint(),
+            pose_time_us=1000)
 
     def test_worker_player_launch_is_frozen_fifo_wire_with_intent_identity(self):
         client = self.active_worker_client()
@@ -246,12 +272,21 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertTrue(client.send_input(
             0.0, 0.0, position=[1.0, 2.0, 3.0], yaw=0.0,
             shell_index=0, next_shell_index=1,
-            shell_change_pending=True, pose_time_us=1000))
+            shell_change_pending=True,
+            gun_checkpoint=self.gun_checkpoint(), pose_time_us=1000))
 
         message = wire_copy(client._outbound_queue[-1][1])
         self.assertEqual(0, message['shell_index'])
         self.assertEqual(1, message['next_shell_index'])
         self.assertTrue(message['shell_change_pending'])
+        self.assertEqual(self.gun_checkpoint(), message['gun_checkpoint'])
+        self.assertFalse(client.send_input(
+            0.0, 0.0, shell_index=0, next_shell_index=0,
+            shell_change_pending=False, pose_time_us=1001))
+        self.assertFalse(client.send_input(
+            0.0, 0.0, shell_index=0, next_shell_index=0,
+            shell_change_pending=False, pose_time_us=1001,
+            gun_checkpoint=dict(self.gun_checkpoint(), clip=2)))
         self.assertFalse(client.send_input(
             0.0, 0.0, shell_index=0, next_shell_index=1))
         self.assertFalse(client.send_input(
@@ -499,7 +534,9 @@ class ProjectileWireTests(unittest.TestCase):
             [0.0, 0.0, 0.0], None, [], hit_vehicle='yes'))
 
     def test_hello_advertises_ledger_before_transport_is_published(self):
-        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client = LANClient(
+            '127.0.0.1', 28782, 'P', 'ussr:MS-1',
+            effective_params=effective_params())
         fake = RecordingSocket()
         original_socket = module.socket.socket
         module.socket.socket = lambda *unused_args: fake
@@ -531,6 +568,7 @@ class ProjectileWireTests(unittest.TestCase):
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
                 module.PLAYER_ENVIRONMENT_CAPABILITY,
+                module.EFFECTIVE_PARAMS_CAPABILITY,
                 module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 module.RANDOM_MAP_CAPABILITY,
             ] if server_capabilities is None else server_capabilities),
@@ -548,6 +586,7 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3,
             'state_revision': 1,
             'spawn': {'x': 0, 'y': 0, 'z': 0},
+            'effective_params': effective_params(),
         }
 
     def test_welcome_requires_server_echoed_capability(self):
@@ -611,7 +650,9 @@ class ProjectileWireTests(unittest.TestCase):
             'map': '01_karelia', 'host_player_id': 7,
             'bot_authority_id': None, 'authority_status': 'idle',
             'authority_epoch': 2,
-            'players': [{'id': 7, 'outfits': {}}],
+            'players': [{
+                'id': 7, 'outfits': {},
+                'effective_params': effective_params()}],
         })
 
         self.assertTrue(client.running)
@@ -664,6 +705,7 @@ class ProjectileWireTests(unittest.TestCase):
             'projectiles': [self.active_projectile()],
             'bot_manifest': [],
             'players': [{
+                'id': 7,
                 'critical_revision': 0,
                 'critical_base_revision': 0,
                 'critical_ack_seq': 0,
@@ -672,7 +714,8 @@ class ProjectileWireTests(unittest.TestCase):
         }
         client._handle_message(snapshot)
 
-        self.assertIs(snapshot, client.last_snapshot)
+        self.assertEqual(snapshot['projectiles'],
+                         client.last_snapshot['projectiles'])
         self.assertEqual(1000, client.server_time_ms)
         self.assertEqual('player:7:1',
                          client.last_snapshot['projectiles'][0]['projectile_id'])

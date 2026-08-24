@@ -429,11 +429,13 @@ class LocalDriver(object):
 			movement_intent=True):
 		"""Return ``throttle``, ``turn``, ``target_yaw`` and ``recovery_mode``.
 
-		All timing uses supplied seconds.  ``dt`` is clamped so a paused client
-		cannot immediately declare every bot stuck when it resumes.
+		All timing uses the complete supplied interval.  The authority caller
+		already advances vehicle physics in bounded substeps; throwing away the
+		planner's remaining wall time would leave recovery and route leases
+		permanently behind after every slow callback.
 		"""
 		state = self._state(bot_id, position)
-		step = min(0.35, max(0.0, float(dt)))
+		step = max(0.0, float(dt))
 		if not state.pop('traffic_waiting', False):
 			state['traffic_wait_time'] = 0.0
 		state['last_step'] = step

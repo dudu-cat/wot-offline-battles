@@ -1659,8 +1659,8 @@ class ListenerTest(unittest.TestCase):
                 "capabilities": hello.get("capabilities", []),
                 "server_capabilities": [
                     "destructible_catalog_v5", "ram_contact_ledger_v2",
-                    "human_ram_timeline_v1", "player_fire_intent_v3",
-                    "player_environment_v1"],
+                    "human_ram_timeline_v1", "player_fire_intent_v4",
+                    "player_environment_v1", "effective_params_v1"],
             }
             reply.update(self.reply_overrides)
             self.reply = (json.dumps(reply) + "\n").encode("utf-8")
@@ -1724,12 +1724,13 @@ class ListenerTest(unittest.TestCase):
             core.PORT_0_9_22, "127.0.0.1", 28782,
             connect=lambda address, timeout: connection))
 
-    def test_0922_probe_sends_a_compact_vehicle_descriptor(self):
+    def test_0922_probe_uses_the_non_player_probe_role(self):
         connection = self._ProtocolConnection()
 
         self.assertTrue(core.probe_server_protocol(
             core.PORT_0_9_22, "127.0.0.1", 28782,
             connect=lambda address, timeout: connection))
+        self.assertEqual("probe", connection.hello["role"])
         self.assertEqual("AA==", connection.hello["vehicle_compact_descr"])
 
     def test_listener_status_distinguishes_protocol_from_raw_tcp(self):
@@ -1797,12 +1798,14 @@ class ListenerTest(unittest.TestCase):
                 "HUMAN_RAM_TIMELINE_CAPABILITY",
                 "PLAYER_FIRE_INTENT_CAPABILITY"):
             self.assertIn(server0922[name], probe["capabilities"])
+        self.assertIn("effective_params_v1", probe["capabilities"])
         for name in (
                 "DESTRUCTIBLE_CATALOG_V5_CAPABILITY",
                 "RAM_CONTACT_LEDGER_CAPABILITY",
                 "HUMAN_RAM_TIMELINE_CAPABILITY",
                 "PLAYER_FIRE_INTENT_CAPABILITY"):
             self.assertIn(server0922[name], probe["server_capabilities"])
+        self.assertIn("effective_params_v1", probe["server_capabilities"])
 
 
 class ConnectionReportTest(unittest.TestCase):

@@ -8,6 +8,7 @@ The active module now intentionally diverges from the legacy extractor for
 must not overwrite this file.
 """
 
+import math
 import random
 
 from gui.mods.offline_lan_0922 import device_damage as _device_damage
@@ -1419,7 +1420,7 @@ def _restore_fuel_regen_cap(vehicle):
 
 
 def tick_fire(vehicle, dt, now=None, module_test_mode=False):
-    """Advance the copied 0.8.2 fire duration and one-second HP tick."""
+    """Advance every elapsed fire second without losing slow-frame time."""
     if vehicle is None or dt is None or dt <= 0.0:
         return 0, None
     if (not bool(getattr(vehicle, 'is_on_fire', False)) or
@@ -1432,30 +1433,45 @@ def tick_fire(vehicle, dt, now=None, module_test_mode=False):
             now = float(BigWorld.time())
         except Exception:
             now = None
+    dt = float(dt)
     started = getattr(vehicle, '_fire_started', None)
     if started is None and now is not None:
-        started = float(now)
+        # An engine-free authority can receive an already-burning snapshot
+        # without BigWorld.time(). The tank was burning throughout this rule
+        # interval, so anchor the missing edge at its beginning, not its end.
+        started = float(now) - dt
         vehicle._fire_started = started
-    if (started is not None and now is not None and
-            float(now) - float(started) >=
-            _device_damage.FIRE_DURATION_SECONDS):
-        # Keep the source ordering: the frame that extinguishes may also
-        # complete the final one-second burn tick below.
+    active_dt = dt
+    burnt_out = False
+    if started is not None and now is not None:
+        now = float(now)
+        started = float(started)
+        fire_end = started + _device_damage.FIRE_DURATION_SECONDS
+        active_start = max(now - dt, started)
+        active_end = min(now, fire_end)
+        active_dt = max(0.0, active_end - active_start)
+        burnt_out = now >= fire_end
+    timer = (float(getattr(vehicle, '_fire_timer', 0.0) or 0.0) +
+             active_dt)
+    damage = 0
+    completed_ticks = int(math.floor(timer + 1e-9))
+    if completed_ticks > 0:
+        timer = max(0.0, timer - float(completed_ticks))
+        if not module_test_mode:
+            damage_per_tick = max(1, int(
+                float(getattr(vehicle, 'maxHealth', 0.0) or 0.0) *
+                _device_damage.FIRE_DAMAGE_FRACTION_PER_SEC))
+            damage = damage_per_tick * completed_ticks
+    vehicle._fire_timer = timer
+    if burnt_out:
+        # The interval may complete the final burn tick before the fire-out
+        # transition. Only time after this exact boundary is excluded.
         _offh_extinguish(vehicle, False, 'burnt out')
         # ``_offh_extinguish`` is a copied presentation helper and imports
         # BigWorld before resolving the descriptor.  The authority simulator is
         # intentionally engine-free, so complete the same fuel-tank transition
         # through the pure descriptor seam as part of this public tick contract.
         _restore_fuel_regen_cap(vehicle)
-    timer = float(getattr(vehicle, '_fire_timer', 0.0) or 0.0) + float(dt)
-    damage = 0
-    if timer >= 1.0:
-        timer -= 1.0
-        if not module_test_mode:
-            damage = max(1, int(
-                float(getattr(vehicle, 'maxHealth', 0.0) or 0.0) *
-                _device_damage.FIRE_DAMAGE_FRACTION_PER_SEC))
-    vehicle._fire_timer = timer
     after = _state(vehicle)
     return damage, _payload(
         before, after, getattr(vehicle, 'typeDescriptor', None), 'repair')

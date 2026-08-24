@@ -184,6 +184,91 @@ def _critical_payload(*records, **values):
     }
 
 
+def _effective_params_snapshot(mass=25000.0, base_moving=0.171,
+                               base_still=0.228, shot_factor=0.10,
+                               ramming_bonus=0.0,
+                               spall_coefficient=1.0):
+    return {
+        'version': 1,
+        'loadout': {
+            'crew_level': 100.0, 'commander_level': 100.0,
+            'effective_crew_level': 100.0, 'crew_multiplier': 1.0,
+            'crew_factor': 1.0, 'gun_rotation_factor': 1.0,
+            'reload_factor': 1.0, 'aim_time_factor': 1.0,
+            'dispersion_factor': 1.0, 'repair_factor': 1.0,
+            'vehicle_rotation_factor': 1.0, 'radio_factor': 1.0,
+            'bloom_move_factor': 1.0, 'bloom_rotation_factor': 1.0,
+            'bloom_turret_factor': 1.0,
+            'terrain_resistance_factors': [1.0, 1.0, 1.0],
+            'has_big_kit': False, 'from_client_factors': True,
+            'has_rammer': False, 'has_aim_drives': False,
+            'has_ventilation': False, 'has_stabiliser': False,
+            'has_rations': False, 'has_brotherhood': False,
+            'has_snap_shot': False, 'has_smooth_ride': False,
+            'has_sixth_sense': False,
+        },
+        'physics': {
+            'mass': float(mass), 'powerW': 500000.0,
+            'speedFwd': 14.0, 'speedBwd': 7.0, 'rotSpd': 0.75,
+            'terrainResist': [1.0, 1.0, 1.0],
+            'specificFriction': 1.0, 'brakeDecel': 4.0,
+            'trackCenter': 2.0, 'minPlaneNormalY': 0.2,
+            'nativePowerRatio': 1.0,
+        },
+        'spotting': {
+            'commander_level': 100.0, 'recon_level': 0.0,
+            'situational_level': 0.0, 'camouflage_level': 0.0,
+            'binocular_factor': 1.0, 'binocular_delay': 3.0,
+            'camouflage_net_bonus': 0.0, 'camouflage_net_delay': 3.0,
+            'has_binoculars': False, 'has_camouflage_net': False,
+            'vision_factor': 1.0, 'camouflage_factor': 0.57,
+            'invisibility_moving': [0.0, 1.0],
+            'invisibility_still': [0.0, 1.0],
+            'from_client_factors': True,
+        },
+        'ramming': {
+            'spall_coefficient': float(spall_coefficient),
+            'ramming_bonus': float(ramming_bonus),
+        },
+        'ammo': [[1, 20]],
+        'camouflage': {
+            'camouflage_id': None,
+            'base_moving': float(base_moving),
+            'base_still': float(base_still),
+            'shot_factor': float(shot_factor),
+        },
+        'skills': {'deadeye': False, 'intuition_chances': 0},
+        'gun': {
+            'clip_size': 1,
+            'shots': [{
+                'compact_descr': 1,
+                'source_shot': {
+                    'speed': 800.0, 'gravity': 9.81,
+                    'maxDistance': 500.0,
+                    'piercingPower': [100.0, 80.0],
+                    'deadeye': False,
+                    'shell': {
+                        'kind': 'ARMOR_PIERCING', 'caliber': 37.0,
+                        'damage': [40.0, 20.0],
+                        'explosionRadius': 0.0,
+                    },
+                },
+            }],
+        },
+    }
+
+
+def _admit_player(value, **snapshot_overrides):
+    result = dict(value)
+    result['effective_params'] = _effective_params_snapshot(
+        **snapshot_overrides)
+    return result
+
+
+def _admit_players(*values):
+    return [_admit_player(value) for value in values]
+
+
 def _snapshot_bot(bot_id=11, health=1000, alive=True, critical=None,
                   revision=0, base_revision=0, ack_seq=0,
                   fire_elapsed=0.0, fire_timer=0.0, **values):
@@ -246,6 +331,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             }]},
             'shell_index': 0, 'next_shell_index': 0,
             'ammo_remaining': [20], 'ammo_reload_pending': False,
+            'reload_time': 0.5, 'reload_duration': 0.5,
         }
         if before_manifest is not None:
             before_manifest()
@@ -924,6 +1010,21 @@ class BotRuntimeTests(unittest.TestCase):
             server.bot_states[11]['display_health'],
             server.bot_states[11]['death_reason']))
 
+    def test_drowning_accounts_for_the_whole_slow_callback_interval(self):
+        runtime = self.module.BotRuntime(
+            1, water_depth_probe=lambda unused_position: 2.0)
+        runtime._descriptors[11] = _critical_descriptor()
+        state = {
+            'id': 11, 'health': 640, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'critical': {}, 'combat_fire_timer': 0.0,
+        }
+
+        self.assertFalse(runtime._advance_bot_drowning(state, 1.25))
+
+        self.assertEqual(1.25, state['_drown_time'])
+        self.assertEqual(0.0, state['_drown_check'])
+
     def test_countdown_prewarms_all_receipts_and_all_bots_start_together(self):
         command = {
             'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
@@ -1159,7 +1260,8 @@ class BotRuntimeTests(unittest.TestCase):
             direction_probe=direction, world_receipt_probe=receipt,
             ground_probe=lambda *unused: 0.0,
             physics_ground_probe=lambda *unused: 0.0,
-            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+            spawn_resolver=_spawn_resolver,
+            baked_graph=_graph())
         runtime.battle_start(self.start)
         state = runtime.states[11]
         state.update(yaw=0.00004, speed=4.0, grounded_once=True)
@@ -2830,15 +2932,19 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(11, first[0]['bots'][0]['id'])
         self.assertEqual([], self.runtime.battle_start(self.start))
 
-    def test_worker_donates_sorted_descriptor_human_collision_profiles(self):
+    def test_worker_donates_sorted_client_effective_collision_profiles(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
         self.runtime.descriptor_resolver = lambda unused: descriptor
         start = dict(self.start, human_ram_timeline=True, players=[
-            {'id': 2, 'vehicle': 'ussr:R11_MS-1'},
+            {'id': 2, 'vehicle': 'ussr:R11_MS-1',
+             'effective_params': _effective_params_snapshot(
+                 mass=48000.0, ramming_bonus=0.10)},
             {'id': self.module.lan_client.WORKER_AUTHORITY_ID,
              'vehicle': 'germany:G54_E-50'},
-            {'id': 1, 'vehicle': 'ussr:R11_MS-1'},
+            {'id': 1, 'vehicle': 'ussr:R11_MS-1',
+             'effective_params': _effective_params_snapshot(
+                 mass=51000.0, ramming_bonus=0.15)},
         ])
 
         outgoing = self.runtime.battle_start(start)
@@ -2848,12 +2954,84 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(
             ['ussr:R11_MS-1', 'ussr:R11_MS-1'],
             [profile['vehicle'] for profile in profiles])
-        self.assertEqual([25000.0, 25000.0],
+        self.assertEqual([51000.0, 48000.0],
                          [profile['mass'] for profile in profiles])
         self.assertEqual(
             [[1.5, 3.5, -0.8, 2.0], [1.5, 3.5, -0.8, 2.0]],
             [profile['shape'] for profile in profiles])
+        self.assertEqual([0.15, 0.10], [
+            profile['ram_profile']['ramming_bonus']
+            for profile in profiles])
         self.assertEqual([], self.runtime.battle_start(start))
+
+    def test_player_profiles_use_client_mass_ramming_and_camouflage(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 9000.0
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor)
+        first = _admit_player({
+            'id': 1, 'vehicle': 'ussr:R11_MS-1'},
+            mass=51000.0, base_moving=0.31, base_still=0.42,
+            shot_factor=0.17, ramming_bonus=0.15,
+            spall_coefficient=1.4)
+        second = _admit_player({
+            'id': 2, 'vehicle': 'ussr:R11_MS-1'},
+            mass=27000.0, base_moving=0.07, base_still=0.11,
+            shot_factor=0.33, ramming_bonus=0.04,
+            spall_coefficient=1.1)
+
+        first_collision = runtime._player_collision_profile(first)
+        second_collision = runtime._player_collision_profile(second)
+        first_spotting = runtime._player_vehicle_profile(first)['spotting']
+        second_spotting = runtime._player_vehicle_profile(second)['spotting']
+
+        self.assertEqual(51000.0, first_collision['mass'])
+        self.assertEqual(
+            {'spall_coefficient': 1.4, 'ramming_bonus': 0.15},
+            first_collision['ram_profile'])
+        self.assertEqual(27000.0, second_collision['mass'])
+        self.assertEqual(
+            {'spall_coefficient': 1.1, 'ramming_bonus': 0.04},
+            second_collision['ram_profile'])
+        self.assertEqual(((0.31, 0.42), 0.17), first_spotting[:2])
+        self.assertEqual(((0.07, 0.11), 0.33), second_spotting[:2])
+
+    def test_player_spotting_rejects_missing_effective_params(self):
+        runtime = self.module.BotRuntime(1)
+        source = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'view_range': 445.0,
+        }
+        target = {
+            'id': self.module.HUMAN_TARGET_ID_BASE + 1,
+            'kind': 'human', 'network_id': 1,
+            'vehicle': 'ussr:R11_MS-1',
+            'position': (0.0, 0.0, 100.0),
+            'speed': 0.0, 'fire_seq': 0,
+        }
+
+        with self.assertRaisesRegex(
+                ValueError, 'effective parameters are missing or invalid'):
+            runtime._visible(source, target, 1.0)
+
+    def test_player_collision_manifest_rejects_missing_effective_params(self):
+        start = dict(self.start, human_ram_timeline=True, players=[
+            {'id': 1, 'vehicle': 'ussr:R11_MS-1'},
+        ])
+
+        with self.assertRaisesRegex(
+                ValueError, 'effective parameters are missing or invalid'):
+            self.runtime.battle_start(start)
+
+    def test_player_collision_manifest_rejects_missing_descriptor(self):
+        self.runtime.player_descriptor_resolver = lambda unused: None
+        start = dict(self.start, human_ram_timeline=True, players=[
+            _admit_player({'id': 1, 'vehicle': 'ussr:R11_MS-1'}),
+        ])
+
+        with self.assertRaisesRegex(
+                ValueError, 'collision manifest descriptor is unavailable'):
+            self.runtime.battle_start(start)
 
     def test_injected_baked_graph_replaces_runtime_grid_and_passes_routes(self):
         graph = _graph()
@@ -2954,7 +3132,8 @@ class BotRuntimeTests(unittest.TestCase):
         first_pose = self.runtime.presentation_states()[0]
         second = self.runtime.update(.02, 1.02, players=[{
             'id': 2, 'team': 1, 'alive': True,
-            'x': 5, 'y': 0, 'z': 5}])
+            'x': 5, 'y': 0, 'z': 5,
+            'effective_params': _effective_params_snapshot()}])
         second_pose = self.runtime.presentation_states()[0]
         self.assertEqual('bot_state', first[0]['type'])
         self.assertEqual([], second)
@@ -2962,6 +3141,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(0, second_pose['fire_seq'])
         player = [{'id': 2, 'team': 1, 'alive': True,
                    'x': 5, 'y': 0, 'z': 5}]
+        player = [_admit_player(value) for value in player]
         self.runtime.update(.20, 1.22, players=player)
         self.runtime.update(.20, 1.42, players=player)
         result = self.runtime.update(.04, 1.46, players=player)
@@ -2983,17 +3163,37 @@ class BotRuntimeTests(unittest.TestCase):
                       if message.get('type') == 'bot_state')
         self.assertEqual(80000, second['sample_time_us'])
 
-        # The callback arrived 250 ms later, but BotRuntime intentionally
-        # integrated only its bounded 200 ms step. Native work after that pose
-        # is formed must not leak into the source sample timestamp.
-        stalled = next(message for message in self.runtime.update(.25, 10.29)
-                       if message.get('type') == 'bot_state')
-        self.assertEqual(280000, stalled['sample_time_us'])
+        # A slow callback is divided into stable integration slices, but the
+        # complete elapsed interval is consumed before update returns.
+        stalled = [
+            message for message in self.runtime.update(.25, 10.29)
+            if message.get('type') == 'bot_state']
+        self.assertEqual(
+            [280000, 330000],
+            [message['sample_time_us'] for message in stalled])
+        self.assertEqual([], self.runtime.update(0.0, 10.33))
 
         self.runtime.battle_start(dict(self.start, round_id=6))
         reset = next(message for message in self.runtime.update(.03, 20.0)
                      if message.get('type') == 'bot_state')
         self.assertEqual(30000, reset['sample_time_us'])
+
+    def test_one_second_callback_advances_all_time_and_preserves_events(self):
+        self.runtime.battle_start(self.start)
+        self.runtime._pending_ram_reports = [{
+            'type': 'ram_damage', 'event': 'once'}]
+
+        outgoing = self.runtime.update(1.0, 10.0)
+        states = [message for message in outgoing
+                  if message.get('type') == 'bot_state']
+        events = [message for message in outgoing
+                  if message.get('type') == 'ram_damage']
+
+        self.assertEqual(
+            [200000, 400000, 600000, 800000, 1000000],
+            [message['sample_time_us'] for message in states])
+        self.assertEqual([{'type': 'ram_damage', 'event': 'once'}], events)
+        self.assertEqual(0.0, self.runtime._accumulator)
 
     def test_authority_publication_and_server_ack_remain_live_for_two_minutes(self):
         command = {
@@ -3045,6 +3245,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 1, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 0.0, 'z': 100.0,
         }
+        player = _admit_player(player)
         published = 0
         accepted = 0
         fps = 24
@@ -3143,6 +3344,7 @@ class BotRuntimeTests(unittest.TestCase):
             'vehicle': 'ussr:R11_MS-1',
             'x': 0.0, 'y': 0.0, 'z': 100.0,
         }
+        player = _admit_player(player)
         previous_fire = dict((entry['id'], 0) for entry in roster)
         publications = 0
         for frame in range(240):
@@ -3402,7 +3604,9 @@ class BotRuntimeTests(unittest.TestCase):
             projected['speed'] == state['speed']
             for projected, state in zip(publication['bots'], internal)))
         self.assertTrue(all(
-            'profile' not in state and 'reload_duration' not in state
+            'profile' not in state and
+            state['reload_duration'] > 0.0 and
+            0.0 <= state['reload_time'] <= state['reload_duration']
             for state in publication['bots']))
 
     def test_contact_resolution_uses_the_banked_global_simulation_step(self):
@@ -3513,6 +3717,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 0.0, 'y': 0.0, 'z': 0.0,
             'health': 1000, 'max_health': 1000,
         }
+        player = _admit_player(player)
         for fps in (24, 40, 60, 120):
             with self.subTest(fps=fps):
                 frame_number = [0]
@@ -4029,7 +4234,8 @@ class BotRuntimeTests(unittest.TestCase):
 
         state = runtime.update(.04, 1.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
-             'x': 100.0, 'y': 0.5, 'z': 0.0}
+             'x': 100.0, 'y': 0.5, 'z': 0.0,
+             'effective_params': _effective_params_snapshot()}
         ])[0]['bots'][0]
 
         self.assertEqual(0, state['movement_dir'])
@@ -4075,6 +4281,7 @@ class BotRuntimeTests(unittest.TestCase):
         state['x'], state['y'], state['z'], state['yaw'] = 0.0, 0.0, 0.0, 0.0
         player = {'id': 2, 'team': 1, 'alive': True,
                   'x': 0.0, 'y': 10.5, 'z': 100.0}
+        player = _admit_player(player)
 
         # The gun first slews to the visible elevated target; it cannot fire
         # merely because the strategic order says fire_allowed.
@@ -4285,6 +4492,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 0.0, 'z': 100.0,
         }
+        player = _admit_player(player)
 
         pending = runtime.update(
             0.04, 1.0, players=[player])[0]['bots'][0]
@@ -5170,6 +5378,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.update(step, 1.0, players=[{
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 0.0, 'z': 100.0,
+            'effective_params': _effective_params_snapshot(),
         }])
 
         self.assertEqual(1, len(recorded))
@@ -5395,6 +5604,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 1.0, 'z': 100.0,
         }
+        player = _admit_player(player)
 
         blocked = runtime.update(.04, 1.0, players=[player])[0]['bots'][0]
         self.assertEqual(0, blocked['fire_seq'])
@@ -5453,6 +5663,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 1.0, 'z': 100.0,
         }
+        player = _admit_player(player)
 
         runtime.update(.04, 1.0, players=[player])
         self.assertIn(11, runtime._friendly_repositions)
@@ -5519,6 +5730,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 1.0, 'z': 100.0,
         }
+        player = _admit_player(player)
 
         runtime.update(.04, 1.0, players=[player])
         self.assertIn(11, runtime._friendly_repositions)
@@ -5575,6 +5787,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 1.0, 'z': 100.0,
         }
+        player = _admit_player(player)
 
         runtime.update(.04, 1.0, players=[player])
         self.assertNotIn(11, runtime._friendly_repositions)
@@ -5622,6 +5835,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.update(.04, 1.0, players=[{
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 1.0, 'z': 100.0,
+            'effective_params': _effective_params_snapshot(),
         }])
 
         self.assertEqual(0, state['fire_seq'])
@@ -5717,6 +5931,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 1, 'alive': True,
             'x': 0.0, 'y': 0.0, 'z': 100.0,
         }
+        player = _admit_player(player)
 
         blocked = runtime.update(.04, 1.0, players=[player])[0]['bots'][0]
         self.assertEqual(0, blocked['fire_seq'])
@@ -5747,6 +5962,7 @@ class BotRuntimeTests(unittest.TestCase):
             runtime.update(.04, 1.0, players=[{
                 'id': 2, 'team': 1, 'alive': True,
                 'x': 0.0, 'y': 0.0, 'z': 100.0,
+                'effective_params': _effective_params_snapshot(),
             }])
 
     def test_missing_or_nonpositive_installed_gun_dispersion_is_rejected(self):
@@ -5811,10 +6027,12 @@ class BotRuntimeTests(unittest.TestCase):
             runtime.update(.04, 1.0, players=[{
                 'id': 2, 'team': 1, 'alive': True,
                 'x': first_pose[0], 'y': first_pose[1], 'z': first_pose[2],
+                'effective_params': _effective_params_snapshot(),
             }])
             runtime.update(.04, 1.04, players=[{
                 'id': 2, 'team': 1, 'alive': True,
                 'x': moved_pose[0], 'y': moved_pose[1], 'z': moved_pose[2],
+                'effective_params': _effective_params_snapshot(),
             }])
         finally:
             runtime._update_gun_aim = original_update_aim
@@ -5958,6 +6176,7 @@ class BotRuntimeTests(unittest.TestCase):
                                'devices': []})
         player = {'id': 2, 'team': 1, 'alive': True,
                   'x': 0.0, 'y': 0.5, 'z': 100.0}
+        player = _admit_player(player)
 
         from gui.mods.offline_lan_0922 import device_damage
         expected_reload = 0.5 * device_damage.CREW_KO_TIME_FACTOR
@@ -6456,7 +6675,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=800, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=0.5,
+            reload_duration=0.5, critical=burning,
             combat_revision=22, combat_base_revision=1,
             combat_ack_seq=21, combat_fire_elapsed=4.4,
             combat_fire_timer=0.4)
@@ -6493,7 +6713,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=0.5,
+            reload_duration=0.5, critical=burning,
             combat_revision=4, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6541,7 +6762,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=0.5,
+            reload_duration=0.5, critical=burning,
             combat_revision=4, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6589,7 +6811,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=0.5,
+            reload_duration=0.5, critical=burning,
             combat_revision=3, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6636,7 +6859,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=0.5,
+            reload_duration=0.5, critical=burning,
             combat_revision=3, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6880,6 +7104,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 6.5, 'y': 0.0, 'z': 0.0,
             'yaw': math.pi / 2.0, 'speed': 0.0, 'alive': True,
         }
+        player = _admit_player(player)
 
         state.update(x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
                      speed=10.0, push_x=0.0, push_z=0.0)
@@ -7011,6 +7236,7 @@ class BotRuntimeTests(unittest.TestCase):
             'speed': 0.0,
             'alive': True,
         }
+        player = _admit_player(player)
 
         outgoing = runtime.update(.04, 10.0, players=[player])
 
@@ -7107,6 +7333,7 @@ class BotRuntimeTests(unittest.TestCase):
             },
             '_ram_contact_bot_state': historical,
         }
+        player = _admit_player(player)
 
         first = runtime._resolve_human_ram_receipts(
             [player], 10.0, step=.04)
@@ -7188,6 +7415,7 @@ class BotRuntimeTests(unittest.TestCase):
             },
             '_ram_contact_bot_state': historical,
         }
+        player = _admit_player(player)
 
         reports = runtime._resolve_tank_contacts([player], 10.0, 0.04)
 
@@ -7244,6 +7472,7 @@ class BotRuntimeTests(unittest.TestCase):
                 receipt(1, 1000000), receipt(2, 2000000),
                 receipt(3, 3000000, player_z=-30.0)],
         }
+        player = _admit_player(player)
 
         first = runtime._resolve_human_ram_receipts([player], 20.0)
         player['ram_contact_resolved_seq'] = 1
@@ -7289,6 +7518,7 @@ class BotRuntimeTests(unittest.TestCase):
             'alive': True,
             'ram_contacts': [receipt(1, False), receipt(2, True)],
         }
+        player = _admit_player(player)
 
         self.assertEqual([], runtime._resolve_human_ram_receipts(
             [player], 20.0))
@@ -7322,6 +7552,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 6.5, 'y': 0.0, 'z': 0.0,
             'yaw': math.pi / 2.0, 'speed': 0.0, 'alive': True,
         }
+        player = _admit_player(player)
         state.update(x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
                      speed=10.0, push_x=0.0, push_z=0.0)
         historical = dict(state)
@@ -7383,7 +7614,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime.battle_start(self.start)
         self.runtime.update(.04, 1.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
-             'x': 4, 'y': 0, 'z': 4}])
+             'x': 4, 'y': 0, 'z': 4,
+             'effective_params': _effective_params_snapshot()}])
         contacts = self.adapters[0].calls[0][0]['contacts']
         by_kind = dict((item['kind'], item) for item in contacts)
         self.assertEqual(2, by_kind['bot']['id'])
@@ -7399,7 +7631,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime.battle_start(self.start)
         self.runtime.update(.04, 1.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
-             'x': 5, 'y': 0, 'z': 5}])
+             'x': 5, 'y': 0, 'z': 5,
+             'effective_params': _effective_params_snapshot()}])
 
         self.runtime.apply_snapshot({'bots': [
             _snapshot_bot(health=0, alive=False,
@@ -7409,7 +7642,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(0.0, self.runtime.states[11]['speed'])
         final = self.runtime.update(.1, 2.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
-             'x': 5, 'y': 0, 'z': 5}])
+             'x': 5, 'y': 0, 'z': 5,
+             'effective_params': _effective_params_snapshot()}])
         self.assertFalse(final[0]['bots'][0]['alive'])
         self.assertEqual(0, self.runtime.states[11]['fire_seq'])
 
@@ -7431,6 +7665,7 @@ class BotRuntimeTests(unittest.TestCase):
         players = [{'id': 2, 'team': 1, 'alive': True,
                     'x': state['x'] + 100,
                     'y': state['y'], 'z': state['z']}]
+        players = [_admit_player(value) for value in players]
 
         self.runtime.update(.04, 1.0, players=players)
         self.runtime.update(.04, 1.04, players=players)
@@ -7458,7 +7693,8 @@ class BotRuntimeTests(unittest.TestCase):
              'kind': 'human', 'network_id': target_id,
              'vehicle': 'ussr:R11_MS-1',
              'position': (0.0, 0.0, distance),
-             'speed': 0.0, 'fire_seq': 0}
+             'speed': 0.0, 'fire_seq': 0,
+             'effective_params': _effective_params_snapshot()}
             for target_id, distance in ((2, 300.0), (3, 400.0),
                                         (4, 325.0))
         ]
@@ -7494,6 +7730,7 @@ class BotRuntimeTests(unittest.TestCase):
             'position': (0.0, 0.0, 400.0),
             'speed': 0.0, 'fire_seq': 0,
         }
+        target = _admit_player(target)
 
         for frame in range(12):
             self.assertFalse(runtime._visible(
@@ -7527,6 +7764,8 @@ class BotRuntimeTests(unittest.TestCase):
             'position': (0.0, 0.0, 400.0),
             'speed': 0.0, 'fire_seq': 0,
         }
+        target = _admit_player(
+            target, base_moving=0.0, base_still=0.0)
 
         self.assertTrue(runtime._visible(source, target, 1.0))
         self.assertEqual(['missing:vehicle'], descriptor_calls)
@@ -7566,11 +7805,12 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 0.0, 'y': 0.0, 'z': 400.0,
             'speed': 0.0, 'fire_seq': 0,
         }
+        player = _admit_player(player)
 
         contacts, unused_lookup = runtime._contacts_for(
             source, [player], 1.0)
         self.assertFalse(contacts[0]['visible'])
-        self.assertEqual([(0.57, 37)], camouflage_calls)
+        self.assertEqual([], camouflage_calls)
 
         player['fire_seq'] = 1
         contacts, unused_lookup = runtime._contacts_for(
@@ -7615,6 +7855,7 @@ class BotRuntimeTests(unittest.TestCase):
             'position': (0.0, 0.0, 400.0),
             'speed': 0.0, 'fire_seq': 0,
         }
+        target = _admit_player(target)
 
         self.assertEqual(
             [False, False],
@@ -7679,6 +7920,9 @@ class BotRuntimeTests(unittest.TestCase):
              'x': 0.0, 'y': 0.0, 'z': 40.0,
              'speed': 0.0, 'fire_seq': 0},
         ]
+        players = [
+            _admit_player(value, base_moving=0.0, base_still=0.0)
+            for value in players]
 
         contacts, unused_lookup = runtime._contacts_for(
             source, players, 1.0)
@@ -7790,6 +8034,7 @@ class BotRuntimeTests(unittest.TestCase):
             'id': 2, 'team': 2, 'alive': True,
             'x': 0.0, 'y': 1.0, 'z': 80.0,
         }
+        player = _admit_player(player)
         runtime.update(.04, 1.0, players=[player])
         self.assertEqual({11, 12}, set(runtime._decision_cache))
         self.assertEqual({11, 12}, set(runtime._motion_probe_cache))
@@ -7874,6 +8119,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 20.0, 'y': 0.0, 'z': 30.0,
             'health': 800, 'max_health': 900,
         }
+        player = _admit_player(player)
         probe_geometries = []
         original_probe_pose = runtime._probe_target_pose
 
@@ -8086,6 +8332,7 @@ class BotRuntimeTests(unittest.TestCase):
             alive=True, x=1, y=0, z=2, yaw=0.5,
             fire_seq=7, shell_index=0, next_shell_index=0,
             ammo_remaining=[38], ammo_reload_pending=False,
+            reload_time=0.1, reload_duration=0.2,
             critical=_critical_payload({
                 'name': 'gunHealth', 'hp': 10.0, 'max_hp': 54.0,
                 'state': 'critical',
@@ -8111,9 +8358,13 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(
             expected_dispersion,
             self.runtime._gun_states[11].dispersion)
+        self.assertAlmostEqual(0.1, self.runtime._gun_states[11].elapsed)
+        self.assertAlmostEqual(
+            0.1, self.runtime._gun_states[11].remaining(1.0))
         self.runtime.apply_snapshot({'bots': [dict(
             snapshot_bot, fire_seq=8, shell_index=0,
-            ammo_remaining=[37], ammo_reload_pending=True)]})
+            ammo_remaining=[37], ammo_reload_pending=True,
+            reload_time=0.3, reload_duration=0.5)]})
         self.assertEqual(8, self.runtime.states[11]['fire_seq'])
         self.assertEqual(0, self.runtime.states[11]['shell_index'])
         self.assertEqual([37], self.runtime.states[11]['ammo_remaining'])
@@ -8122,6 +8373,40 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(
             expected_dispersion,
             self.runtime._gun_states[11].dispersion)
+
+    def test_mid_reload_progress_survives_server_takeover_manifest(self):
+        self.runtime.battle_start(self.start)
+        publication = self.runtime.update(.20, 1.0)[0]
+        self.assertAlmostEqual(0.30, publication['bots'][0]['reload_time'])
+
+        server, unused_manifest, unused_socket = \
+            ServerBotStateRevisionTests._server()
+        for name in ('shell_index', 'next_shell_index', 'ammo_remaining',
+                     'ammo_reload_pending'):
+            server.bot_states[11][name] = publication['bots'][0][name]
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': server.round_id,
+                'bots': publication['bots'],
+                'sample_time_us': publication['sample_time_us'],
+            }), server.last_bot_state_reject)
+        start = server.current_battle_message()
+        start['bot_authority_id'] = 1
+        takeover = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+            direction_probe=lambda *unused: {
+                'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver,
+            baked_graph=_graph('04_himmelsdorf'))
+
+        takeover.battle_start(start)
+
+        gun = takeover._gun_states[11]
+        self.assertAlmostEqual(0.20, gun.elapsed)
+        self.assertAlmostEqual(0.30, gun.remaining(1.0))
 
     def test_new_round_discards_previous_bot_and_terminal_state(self):
         self.runtime.battle_start(self.start)
@@ -8175,7 +8460,8 @@ class BotRuntimeTests(unittest.TestCase):
             self.start['bots'][0], x=200.0, y=4.0, z=300.0,
             yaw=1.0, aim_yaw=1.4, gun_pitch=-0.25,
             movement_dir=-1, rotation_dir=1, health=900,
-            max_health=1000, alive=True)
+            max_health=1000, alive=True,
+            reload_time=0.5, reload_duration=0.5)
 
         resumed = self.runtime.battle_start(dict(
             self.start, bot_manifest=[takeover]))
@@ -8216,7 +8502,8 @@ class BotRuntimeTests(unittest.TestCase):
 
         self.runtime.update(.04, 1.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
-             'x': 5, 'y': 0, 'z': 5}])
+             'x': 5, 'y': 0, 'z': 5,
+             'effective_params': _effective_params_snapshot()}])
 
         order = self.adapters[0].server_orders[-1]
         self.assertEqual(self.module.HUMAN_TARGET_ID_BASE + 2,
@@ -8629,7 +8916,8 @@ class BotRuntimeTests(unittest.TestCase):
         outgoing = self.runtime.update(.04, 1.0, players=[
             {'id': 2, 'team': 1, 'alive': True,
              'x': 5, 'y': 0, 'z': 5,
-             'health': 100, 'max_health': 100}])
+             'health': 100, 'max_health': 100,
+             'effective_params': _effective_params_snapshot()}])
 
         observation = [value for value in outgoing
                        if value['type'] == 'bot_observation'][0]
@@ -8666,6 +8954,7 @@ class BotRuntimeTests(unittest.TestCase):
              'vehicle': 'test:hard', 'x': -10.0, 'y': 0.0, 'z': 100.0,
              'health': 1000, 'max_health': 1000},
         ]
+        players = [_admit_player(value) for value in players]
         contacts, unused_lookup = runtime._contacts_for(
             source, players, 1.0)
         runtime._contacts_for(source, players, 1.1)
@@ -8813,6 +9102,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 0.0, 'y': 0.0, 'z': 100.0,
             'health': 1000, 'max_health': 1000,
         }
+        enemy = _admit_player(enemy)
 
         outgoing = runtime.update(.04, 1.0, players=[enemy])
         bot_states = next(message['bots'] for message in outgoing
@@ -8886,6 +9176,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 0.0, 'y': 0.0, 'z': 20.0,
             'health': 1000, 'max_health': 1000,
         }
+        enemy = _admit_player(enemy)
         planner = BotPlanner()
         bot_states = [dict(state)]
         self.assertEqual(1, planner.report_contacts([{
@@ -8985,6 +9276,7 @@ class BotRuntimeTests(unittest.TestCase):
             'x': 0.0, 'y': 0.0, 'z': 30.0,
             'health': 1000, 'max_health': 1000,
         }
+        enemy = _admit_player(enemy)
 
         outgoing = runtime.update(.04, 1.0, players=[enemy])
         bot_states = next(message['bots'] for message in outgoing
@@ -9042,6 +9334,7 @@ class BotRuntimeTests(unittest.TestCase):
                 player = {
                     'id': 1, 'team': 1, 'alive': True,
                     'x': 0.0, 'y': 0.0, 'z': 100.0}
+                player = _admit_player(player)
                 per_frame = []
                 observations = []
                 observation_ages = []

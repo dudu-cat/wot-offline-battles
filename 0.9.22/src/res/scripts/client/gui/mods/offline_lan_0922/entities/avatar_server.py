@@ -452,7 +452,17 @@ class AvatarServerBridge(object):
             'gun_pitch': float(gun_pitch)})
 
     def vehicle_shoot(self):
-        self._send_input('shoot', {})
+        accepted = self._send_input('shoot', {})
+        if accepted is False:
+            rejected = getattr(
+                self._lan_sender, 'reject_native_shot_wait', None)
+            if callable(rejected):
+                # Exact #1513 starts PlayerAvatar's acknowledgement wait only
+                # after this mailbox returns.  Defer cancellation through the
+                # sender so a locally rejected trigger cannot time out into a
+                # predicted muzzle flash and sound.
+                rejected()
+        return accepted
 
     def setDevelopmentFeature(self, name, value, data):
         if name == 'pickup':

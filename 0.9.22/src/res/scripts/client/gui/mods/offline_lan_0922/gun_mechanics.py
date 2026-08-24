@@ -160,7 +160,7 @@ class GunState(object):
         A shell the current gun cannot fire is ignored, and a shot the player
         carries none of stays at zero, so an empty slot really is empty.
         """
-        if not ammo_layout:
+        if ammo_layout is None:
             return None
         wanted = {}
         for compact_descr, count in dict(ammo_layout).items():
@@ -169,7 +169,10 @@ class GunState(object):
             except (TypeError, ValueError):
                 continue
         if not wanted:
-            return None
+            # An explicit empty client snapshot means the tank carries no
+            # rounds. Only ``None`` means the garage layout was unavailable
+            # and permits the legacy maxAmmo fallback above.
+            return [0 for unused_shot in self.shots]
         result = []
         matched = False
         for shot in self.shots:
@@ -184,8 +187,67 @@ class GunState(object):
                 matched = True
             result.append(count)
         if not matched:
-            return None
+            raise RuntimeError(
+                'client ammunition does not match the installed gun')
         return result
+
+    def bind_client_contract(self, contract, ammo_layout):
+        """Bind the visible client's mounted shot order and clip shape.
+
+        The hidden worker still needs its native descriptor for collision and
+        presentation geometry, but its local XML must not redefine the
+        player's edited shells.  Dynamic reload/clip progress arrives in the
+        input checkpoint; this binding supplies the immutable array shape the
+        checkpoint indexes.
+        """
+        if not isinstance(contract, dict):
+            raise RuntimeError('client gun contract is invalid')
+        try:
+            clip_size = int(contract['clip_size'])
+            entries = tuple(contract['shots'])
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError('client gun contract is invalid')
+        if clip_size < 1 or not entries:
+            raise RuntimeError('client gun contract is invalid')
+        wanted = {}
+        try:
+            for compact_descr, count in dict(ammo_layout or {}).items():
+                wanted[int(compact_descr)] = max(0, int(count))
+        except (TypeError, ValueError):
+            raise RuntimeError('client ammunition snapshot is invalid')
+        shots = []
+        ammo = []
+        matched = False
+        seen = set()
+        for entry in entries:
+            try:
+                compact_descr = int(entry['compact_descr'])
+                source_shot = entry['source_shot']
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError('client gun contract is invalid')
+            if compact_descr < 1 or compact_descr in seen:
+                raise RuntimeError('client gun contract is invalid')
+            seen.add(compact_descr)
+            shots.append(source_shot)
+            ammo.append(wanted.get(compact_descr, 0))
+            matched = matched or compact_descr in wanted
+        if wanted and not matched:
+            raise RuntimeError(
+                'client ammunition does not match the mounted gun contract')
+        self.shots = tuple(shots)
+        self.ammo = ammo
+        self.clip_size = clip_size
+        self.shot_index = max(
+            0, min(int(self.shot_index), len(self.shots) - 1))
+        if self.ammo[self.shot_index] <= 0:
+            for index, count in enumerate(self.ammo):
+                if count > 0:
+                    self.shot_index = index
+                    break
+        self.clip = 0
+        self.pending_index = None
+        self._client_gun_contract = contract
+        return True
 
     @staticmethod
     def _distribute_ammo(maximum, count):

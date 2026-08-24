@@ -28,6 +28,7 @@ import random
 
 from gui.mods.offline_lan_0922 import combat_rules
 from gui.mods.offline_lan_0922 import critical_damage
+from gui.mods.offline_lan_0922 import effective_params
 from gui.mods.offline_lan_0922 import gun_mechanics
 from gui.mods.offline_lan_0922 import vehicle_physics
 from gui.mods.offline_lan_0922.destructibles_sensor import (
@@ -42,7 +43,6 @@ from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 
 SERVER_AUTHORITY_ID = 0
 ARTILLERY_ARC_RAYS_PER_TICK = 4
-PROJECTILE_CHORDS_PER_TICK = 240
 PROJECTILE_MAX_TIME_MS = 20000
 PROJECTILE_PROGRESS_BATCH = 30
 RAM_BOT_HISTORY_SAMPLES = 512
@@ -372,6 +372,7 @@ class ServerBattleAuthority(object):
         self._ram_bot_history_order = []
         self._ram_bot_history_times = {}
         self._player_environment_seq = 0
+        self._player_effective_params = {}
 
     def started(self):
         return self._started
@@ -462,6 +463,18 @@ class ServerBattleAuthority(object):
     def battle_start(self, message, now):
         """Build the authority BotRuntime and admit its opening manifest."""
         self._round_id = message.get('round_id')
+        self._player_effective_params = {}
+        for raw in message.get('players') or ():
+            try:
+                player_id = int(raw['id'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise ValueError('player identity is missing or invalid')
+            snapshot = effective_params.canonical(
+                raw.get('effective_params'))
+            if player_id <= 0 or snapshot is None:
+                raise ValueError(
+                    'player effective parameters are missing or invalid')
+            self._player_effective_params[player_id] = snapshot
         self._projectiles = InFlightProjectiles(initial_time=float(now))
         self._fire_seen = {}
         self._shot_seq = {}
@@ -786,8 +799,7 @@ class ServerBattleAuthority(object):
                     self.state._projectile_snapshot())
             if self._projectiles is not None and len(self._projectiles):
                 self._projectiles.advance(
-                    now, self._projectile_chord, self._projectile_terminal,
-                    maximum_chords=PROJECTILE_CHORDS_PER_TICK)
+                    now, self._projectile_chord, self._projectile_terminal)
                 self._flush_progress(now)
             self._flush_pending_resolutions()
         return tuple(observation_relays)
@@ -823,6 +835,16 @@ class ServerBattleAuthority(object):
                 continue
             public = self.state._public_player(
                 player, include_outfits=False)
+            snapshot = self._player_effective_params.get(player.player_id)
+            if snapshot is None:
+                snapshot = effective_params.canonical(
+                    player.effective_params)
+                if snapshot is not None:
+                    self._player_effective_params[player.player_id] = snapshot
+            if snapshot is None:
+                raise ValueError(
+                    'player effective parameters are missing or invalid')
+            public['effective_params'] = snapshot
             rows.append(self._decorate_ram_contacts(public))
         return rows
 

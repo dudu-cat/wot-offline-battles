@@ -14,6 +14,7 @@ from lan_battle_server import (  # noqa: E402
     MAX_LINE_BYTES,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PREBATTLE_SECONDS,
     HUMAN_RAM_TIMELINE_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
@@ -21,6 +22,7 @@ from lan_battle_server import (  # noqa: E402
     SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
     SIEGE_SWITCHING_ON, SIEGE_VEHICLE_PARAMS, TICK_HZ,
 )
+from effective_params_fixture import effective_params
 
 
 class _Socket(object):
@@ -36,7 +38,9 @@ def _player(player_id, team=1, x=0.0):
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY))
+            PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY),
+        effective_params=effective_params())
 
 
 def _state(players=2):
@@ -53,13 +57,24 @@ def _state(players=2):
     return state
 
 
+def _gun_checkpoint(reload_time=0.0, clip=1, clip_size=1,
+                    dispersion=0.02, reload_duration=5.0):
+    return {
+        'reload_time': float(reload_time),
+        'reload_duration': float(reload_duration),
+        'clip': int(clip), 'clip_size': int(clip_size),
+        'dispersion': float(dispersion),
+    }
+
+
 def _attach_worker_authority(state):
     state.simulation_worker = SimulationWorker(
         _Socket(), ('127.0.0.1', 28782), capabilities=(
             PROJECTILE_CAPABILITY, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
             HUMAN_RAM_TIMELINE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY,
             PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY))
+            PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY))
     state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
     state.simulation_worker.offer_reliable = lambda unused_message: True
     return state.simulation_worker
@@ -78,6 +93,7 @@ def _update_player_input(state, player_id, **changes):
         'fire_seq': player.fire_seq, 'shell_index': player.shell_index,
         'next_shell_index': player.next_shell_index,
         'shell_change_pending': player.shell_change_pending,
+        'gun_checkpoint': _gun_checkpoint(),
     }
     message.update(changes)
     return state.update_input(player_id, message)
@@ -155,7 +171,10 @@ def _launch_authority(state, message):
                 'x': player.x, 'y': player.y, 'z': player.z,
                 'yaw': player.yaw, 'pitch': player.pitch,
                 'roll': player.roll, 'fire_seq': player.fire_seq,
-                'shell_index': message['shell_index']}):
+                'shell_index': message['shell_index'],
+                'next_shell_index': message['shell_index'],
+                'shell_change_pending': False,
+                'gun_checkpoint': _gun_checkpoint()}):
             return False
         intent_seq = player.fire_intent_seq + 1
         launch_speed = math.sqrt(sum(
@@ -362,8 +381,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(0.01, relay['dispersion_angle'])
         self.assertEqual(0, relay['next_shell_index'])
         self.assertFalse(relay['shell_change_pending'])
-        self.assertGreaterEqual(
-            relay['deadline_server_time_ms'], state._server_time_ms())
+        self.assertEqual(player.input_seq, relay['gun_checkpoint_seq'])
+        self.assertEqual(_gun_checkpoint(), relay['gun_checkpoint'])
+        self.assertNotIn('deadline_server_time_ms', relay)
 
         self.assertTrue(state.submit_fire_intent(1, dict(message)))
         self.assertEqual(1, len(relayed))
@@ -381,6 +401,62 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             fire_input_seq=relay['input_seq'])
         self.assertFalse(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID, launch))
+
+    def test_player_fire_intent_survives_worker_stall_beyond_five_seconds(self):
+        state = _state(players=1)
+        now_ms = [1000]
+        state._server_time_ms = lambda: now_ms[0]
+        self.assertTrue(_update_player_input(state, 1))
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        player = state.players[1]
+        relay = player.pending_fire_intents[1]
+
+        now_ms[0] += 6001
+        self.assertTrue(state.launch_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _launch(
+                origin=list(relay['shot_origin']),
+                velocity=[0.0, 0.0, 100.0],
+                authority_epoch=state.authority_epoch,
+                fire_intent_seq=relay['intent_seq'],
+                fire_input_seq=relay['input_seq'])))
+
+        projectile_id = state._projectile_id(1, 'player', 1, 1)
+        self.assertNotIn(1, player.pending_fire_intents)
+        self.assertEqual(
+            (True, projectile_id), player.fire_intent_results[1])
+        self.assertIn(projectile_id, state.projectiles)
+
+    def test_late_next_gun_checkpoint_is_kept_and_old_retry_cannot_replace_it(self):
+        state = _state(players=1)
+        player = state.players[1]
+        first = _gun_checkpoint(reload_time=1.0, clip=0)
+        second = _gun_checkpoint(reload_time=0.0, clip=1)
+
+        self.assertTrue(_update_player_input(
+            state, 1, gun_checkpoint=first))
+        first_message = json.loads(player.input_fingerprints[1])
+        # The fingerprint is JSON, so retry the original semantic input
+        # through the helper's frozen server record instead of reusing it.
+        self.assertTrue(_update_player_input(
+            state, 1, gun_checkpoint=second))
+        self.assertEqual(2, player.gun_checkpoint_seq)
+        self.assertEqual(second, player.gun_checkpoint)
+        self.assertEqual(first, player.gun_checkpoints[1])
+        self.assertEqual(second, player.gun_checkpoints[2])
+
+        # An exact retry of input 1 remains idempotent but cannot roll the
+        # public checkpoint back from the already-admitted input 2.
+        self.assertTrue(state.update_input(1, first_message))
+        self.assertEqual(2, player.gun_checkpoint_seq)
+        self.assertEqual(second, player.gun_checkpoint)
+        self.assertFalse(state.update_input(1, {
+            'type': 'input', 'round_id': state.round_id,
+            'input_seq': 3, 'pose_time_us': state._logical_motion_time_us(),
+            'shell_index': 0, 'next_shell_index': 0,
+            'shell_change_pending': False,
+        }))
+        self.assertEqual(2, player.input_seq)
 
     def test_player_queued_shell_is_promoted_by_the_canonical_shot(self):
         state = _state()
@@ -561,6 +637,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'vehicle': 'ussr:R11_MS-1', 'health': 1000,
             'max_health': 1000, 'x': 20.0, 'y': 0.0, 'z': 0.0,
             'yaw': 0.0, 'world_pose': True, 'profile': {},
+            'reload_time': 0.0, 'reload_duration': 1.5,
             'route': {'id': 'test', 'waypoints': []},
         }]
         self.assertTrue(state.update_bot_manifest(
@@ -569,10 +646,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'player_collision_profiles': [
                 {
                     'id': player.player_id, 'vehicle': player.vehicle,
-                    'mass': 10000.0, 'shape': [3.0, 6.0, -1.0, 2.0],
+                    'mass': player.effective_params['physics']['mass'],
+                    'shape': [3.0, 6.0, -1.0, 2.0],
                     'ram_profile': {
-                        'spall_coefficient': 1.0,
-                        'ramming_bonus': 0.0,
+                        'spall_coefficient': player.effective_params[
+                            'ramming']['spall_coefficient'],
+                        'ramming_bonus': player.effective_params[
+                            'ramming']['ramming_bonus'],
                     },
                 }
                 for player in state.players.values()
@@ -581,6 +661,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         publication = {
             'id': 16, 'x': 20.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
             'health': 1000, 'alive': True, 'fire_seq': 1,
+            'reload_time': 0.0, 'reload_duration': 1.5,
             'critical': {}, 'combat_base_revision': 0, 'combat_seq': 0,
             'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
         }
@@ -1057,8 +1138,10 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 HUMAN_RAM_TIMELINE_CAPABILITY,
                 RAM_CONTACT_LEDGER_CAPABILITY,
                 PLAYER_FIRE_INTENT_CAPABILITY,
-                PLAYER_ENVIRONMENT_CAPABILITY],
-            'vehicle_compact_descr': 'dGVzdA=='})
+                PLAYER_ENVIRONMENT_CAPABILITY,
+                EFFECTIVE_PARAMS_CAPABILITY],
+            'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': effective_params()})
         self.assertIsNotNone(player)
         self.assertIsNone(error)
 

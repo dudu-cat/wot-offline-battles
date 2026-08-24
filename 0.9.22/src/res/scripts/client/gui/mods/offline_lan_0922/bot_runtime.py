@@ -15,6 +15,7 @@ from gui.mods.offline_lan_0922.ai.navigation import (
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import ballistics
 from gui.mods.offline_lan_0922 import device_damage
+from gui.mods.offline_lan_0922 import effective_params
 from gui.mods.offline_lan_0922 import prebaked_navigation
 from gui.mods.offline_lan_0922 import spotting
 from gui.mods.offline_lan_0922 import loadout
@@ -154,6 +155,23 @@ def _value(value, name, default=None):
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _player_effective_params(raw):
+    """Return the immutable client-derived player mechanics snapshot.
+
+    A hidden worker does not own the human's mounted crew, equipment,
+    consumables or camouflage. Reconstructing those values from a bare
+    descriptor silently changes collision and spotting results, so an absent
+    or malformed snapshot is a roster-contract failure rather than a reason
+    to install defaults.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError('player effective parameters row is invalid')
+    snapshot = effective_params.canonical(raw.get('effective_params'))
+    if snapshot is None:
+        raise ValueError('player effective parameters are missing or invalid')
+    return snapshot
 
 
 def _forward_speed(descriptor):
@@ -632,7 +650,9 @@ class _BotGunState(object):
         self.reload_factor = 1.0
         self.restore_fire_seq(fire_seq, dispersion_factor)
 
-    def restore_fire_seq(self, fire_seq, dispersion_factor=1.0):
+    def restore_fire_seq(self, fire_seq, dispersion_factor=1.0,
+                         reload_time=None, reload_duration=None,
+                         reload_factor=1.0):
         fire_seq = max(0, int(_number(fire_seq)))
         if self.clip_size > 1:
             used = fire_seq % self.clip_size
@@ -642,9 +662,38 @@ class _BotGunState(object):
         else:
             self.clip = 1
             self.reload_duration = self.reload_full
-        # A takeover does not know the previous authority's sub-frame clock.
-        # Waiting one complete interval is safe and prevents a duplicate shot.
-        self.elapsed = 0.0
+        has_reload_time = reload_time is not None
+        has_reload_duration = reload_duration is not None
+        if has_reload_time != has_reload_duration:
+            raise ValueError('bot reload progress must be an atomic pair')
+        if has_reload_time:
+            if (isinstance(reload_time, bool) or
+                    isinstance(reload_duration, bool) or
+                    isinstance(reload_factor, bool)):
+                raise ValueError('bot reload progress is invalid')
+            try:
+                reload_time = float(reload_time)
+                reload_duration = float(reload_duration)
+                reload_factor = float(reload_factor)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('bot reload progress is invalid')
+            if (math.isnan(reload_time) or math.isinf(reload_time) or
+                    math.isnan(reload_duration) or
+                    math.isinf(reload_duration) or
+                    math.isnan(reload_factor) or math.isinf(reload_factor) or
+                    reload_factor <= 0.0 or reload_duration <= 0.0 or
+                    reload_time < 0.0 or reload_time > reload_duration):
+                raise ValueError('bot reload progress is invalid')
+            expected_duration = self.reload_duration * reload_factor
+            tolerance = max(1.0, expected_duration) * 1.0e-9
+            if abs(reload_duration - expected_duration) > tolerance:
+                raise ValueError(
+                    'bot reload duration disagrees with installed gun')
+            self.elapsed = reload_duration - reload_time
+            self.reload_factor = reload_factor
+        else:
+            self.elapsed = 0.0
+            self.reload_factor = 1.0
         if fire_seq > 0:
             # The previous authority's exact aiming clock is not on the wire.
             # Start conservatively at one post-shot ideal and let the full safe
@@ -1831,7 +1880,9 @@ class BotRuntime(object):
                                              round_id or 0)
             if self.navigator is not None:
                 self.adapter.navigation_target = self._navigation_target
-        manifest = message.get('bot_manifest') or message.get('bots') or []
+        server_manifest = message.get('bot_manifest')
+        restoring_authority = bool(server_manifest)
+        manifest = server_manifest or message.get('bots') or []
         for raw in manifest:
             if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
@@ -1854,6 +1905,19 @@ class BotRuntime(object):
                 self._gun_states[bot_id] = _BotGunState(
                     descriptor, raw.get('fire_seq', 0),
                     _critical_factor(raw, descriptor, 'dispersion'))
+                if restoring_authority:
+                    if ('reload_time' not in raw or
+                            'reload_duration' not in raw):
+                        raise ValueError(
+                            'authority manifest has no bot reload progress')
+                    reload_factor = _critical_factor(
+                        raw, descriptor, 'reload')
+                    self._gun_states[bot_id].restore_fire_seq(
+                        raw.get('fire_seq', 0),
+                        _critical_factor(
+                            raw, descriptor, 'dispersion'),
+                        raw.get('reload_time'),
+                        raw.get('reload_duration'), reload_factor)
             self._physics_params[bot_id] = vehicle_physics.derive_params(
                 descriptor)
             self._turn_speeds[bot_id] = 0.0
@@ -1927,10 +1991,18 @@ class BotRuntime(object):
                 self._ammo_states[bot_id] = ammo_state
             elif authority_handoff:
                 ammo_state.restore(raw)
+                if ('reload_time' not in raw or
+                        'reload_duration' not in raw):
+                    raise ValueError(
+                        'authority manifest has no bot reload progress')
+                reload_factor = _critical_factor(
+                    raw, descriptor, 'reload')
                 gun_state.restore_fire_seq(
                     max(int(state.get('fire_seq', 0)),
                         int(_number(raw.get('fire_seq', 0)))),
-                    _critical_factor(state, descriptor, 'dispersion'))
+                    _critical_factor(raw, descriptor, 'dispersion'),
+                    raw.get('reload_time'), raw.get('reload_duration'),
+                    reload_factor)
             ammo_state.publish(state)
             if authority_handoff:
                 self._apply_authority_takeover_motion(state, raw)
@@ -2327,7 +2399,10 @@ class BotRuntime(object):
         state['_drown_check'] = check
         if check < BOT_DROWNING_PROBE_SECONDS:
             return False
-        elapsed = min(check, 0.5)
+        # The current depth sample is the only native fact available for this
+        # authority interval. Account for the whole elapsed interval instead
+        # of silently discarding time after a slow render callback.
+        elapsed = check
         state['_drown_check'] = 0.0
         depth = _number(self._water_depth_probe(_position(state)), -1.0)
         state['_water_depth'] = depth
@@ -2404,11 +2479,17 @@ class BotRuntime(object):
             if incoming_fire_seq > previous_fire_seq:
                 gun_state = self._gun_states.get(state['id'])
                 if gun_state is not None:
+                    if ('reload_time' not in raw or
+                            'reload_duration' not in raw):
+                        raise ValueError(
+                            'bot snapshot has no reload progress')
                     descriptor = self._descriptors.get(state['id'], {})
                     gun_state.restore_fire_seq(
                         incoming_fire_seq,
                         _critical_factor(
-                            state, descriptor, 'dispersion'))
+                            state, descriptor, 'dispersion'),
+                        raw.get('reload_time'), raw.get('reload_duration'),
+                        _critical_factor(state, descriptor, 'reload'))
                     reload_factor = _critical_factor(
                         state, descriptor, 'reload')
                     state['clip'] = gun_state.clip
@@ -2493,7 +2574,7 @@ class BotRuntime(object):
         keys = ('id', 'team', 'slot', 'name', 'vehicle', 'health',
                 'max_health', 'x', 'y', 'z', 'yaw', 'profile', 'fire_seq',
                 'shell_index', 'next_shell_index', 'ammo_remaining',
-                'ammo_reload_pending')
+                'ammo_reload_pending', 'reload_time', 'reload_duration')
         result = dict((key, state[key]) for key in keys)
         # These coordinates were resolved against the loaded retail map by
         # the authority.  Consumers must not run the formation resolver a
@@ -2514,7 +2595,7 @@ class BotRuntime(object):
         return result
 
     def _player_collision_manifest(self, players):
-        """Donate descriptor-derived human hull data to the LAN server."""
+        """Donate client-effective human collision data to the LAN server."""
         result = []
         seen = set()
         for raw in players or ():
@@ -2534,14 +2615,17 @@ class BotRuntime(object):
             if player_id <= 0 or player_id in seen or not vehicle_name:
                 raise ValueError('player collision manifest identity is invalid')
             seen.add(player_id)
+            snapshot = _player_effective_params(raw)
             descriptor = (self.player_descriptor_resolver(raw)
                           if callable(self.player_descriptor_resolver)
                           else self.descriptor_resolver(vehicle_name))
-            params = vehicle_physics.derive_params(descriptor)
-            mass = float(params['mass'])
+            if descriptor is None or descriptor == {}:
+                raise ValueError(
+                    'player collision manifest descriptor is unavailable')
+            mass = float(snapshot['physics']['mass'])
             shape = tuple(float(value) for value in
                           tank_collision.chassis_shape(descriptor))
-            ram_profile = tank_collision.descriptor_ram_profile(descriptor)
+            ram_profile = snapshot['ramming']
             if (math.isnan(mass) or math.isinf(mass) or mass <= 0.0 or
                     len(shape) != 4 or
                     any(math.isnan(value) or math.isinf(value)
@@ -3662,12 +3746,17 @@ class BotRuntime(object):
 
     def _player_vehicle_profile(self, raw):
         vehicle_name = raw.get('vehicle')
-        camouflage_id = raw.get('camouflage_id')
         compact = raw.get('vehicle_compact_descr') or ''
-        cache_key = (vehicle_name or '', compact, camouflage_id)
+        player_id = raw.get('network_id', raw.get('id'))
+        try:
+            player_id = int(player_id)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('player effective parameters identity is invalid')
+        cache_key = (player_id, vehicle_name or '', compact)
         cached = self._player_vehicle_profiles.get(cache_key)
         if cached is not None:
             return cached
+        snapshot = _player_effective_params(raw)
         descriptor = {}
         tactical = {}
         try:
@@ -3682,30 +3771,38 @@ class BotRuntime(object):
                 tactical = ai_planner.build_vehicle_profile(descriptor)
             except Exception:
                 tactical = {}
-        profile = _bot_profile(descriptor)
+        profile = snapshot['spotting']
+        camouflage = snapshot['camouflage']
         cached = {
             'descriptor': descriptor,
             'class_tag': str(tactical.get('class_tag') or 'unknown'),
             'armor': max(0.0, _number(tactical.get('armor'))),
-            'spotting': (_base_invisibility(
-                             descriptor, profile, camouflage_id),
-                         _shot_invisibility_factor(descriptor), profile),
+            'spotting': ((camouflage['base_moving'],
+                          camouflage['base_still']),
+                         camouflage['shot_factor'], profile),
         }
         self._player_vehicle_profiles[cache_key] = cached
         return cached
 
     def _player_collision_profile(self, raw):
-        cache_key = (raw.get('vehicle') or '',
+        player_id = raw.get('network_id', raw.get('id'))
+        try:
+            player_id = int(player_id)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('player collision identity is invalid')
+        cache_key = (player_id, raw.get('vehicle') or '',
                      raw.get('vehicle_compact_descr') or '')
         cached = self._player_collision_profiles.get(cache_key)
         if cached is not None:
             return cached
+        snapshot = _player_effective_params(raw)
         descriptor = self._player_vehicle_profile(raw)['descriptor']
-        params = vehicle_physics.derive_params(descriptor)
+        if descriptor is None or descriptor == {}:
+            raise ValueError('player collision descriptor is unavailable')
         cached = {
-            'mass': params.get('mass', 25000.0),
+            'mass': snapshot['physics']['mass'],
             'shape': _collision_shape(descriptor),
-            'ram_profile': tank_collision.descriptor_ram_profile(descriptor),
+            'ram_profile': snapshot['ramming'],
         }
         self._player_collision_profiles[cache_key] = cached
         return cached
@@ -5120,32 +5217,42 @@ class BotRuntime(object):
         return True
 
     def update(self, dt, now, players=None, neighbours=None):
-        """Advance bots locally and publish state plus periodic observations."""
+        """Advance the complete elapsed interval in stable bounded substeps."""
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
             return []
-        # One render callback may run one complete authority tick, never more.
-        # Faster render rates bank their delta until the existing 30 Hz
-        # publication deadline; a slower renderer still simulates every frame
-        # with its full elapsed time.  MatrixAnimation owns interpolation
-        # between these accepted poses, so no render-frame physics is needed.
         self._accumulator += max(0.0, _number(dt))
         if self._accumulator <= 0.0:
             return []
         now = _number(now)
-        publish = now + 1e-9 >= self._next_publication
-        if not publish:
+        # Faster render callbacks still bank their elapsed time until the 30 Hz
+        # authority deadline. Once due, consume the entire bank in this call:
+        # a one-second render gap is one second of battle rules, not a capped
+        # pose followed by discarded or future-frame time.
+        if now + 1e-9 < self._next_publication:
             return []
+        elapsed = self._accumulator
+        self._accumulator = 0.0
+        outgoing = []
+        while elapsed > 1e-12:
+            frame_step = min(elapsed, 0.2)
+            elapsed = max(0.0, elapsed - frame_step)
+            step_now = now - elapsed
+            outgoing.extend(self._update_once(
+                frame_step, step_now, players, neighbours))
+        return outgoing
+
+    def _update_once(self, frame_step, now, players=None, neighbours=None):
+        """Advance one stable authority substep and preserve its events."""
+        publish = True
         if self._next_publication <= 0.0:
             self._next_publication = now
         # Carry the nominal deadline to preserve an average 30 Hz at render
-        # rates such as 40 FPS, but skip every missed deadline in one pass.
-        # A stalled render callback therefore never triggers catch-up ticks.
+        # rates such as 40 FPS. Every bounded slice of a stalled callback
+        # advances this deadline and publishes its ordered catch-up state.
         while self._next_publication <= now + 1e-9:
             self._next_publication += PUBLICATION_SECONDS
         self._advance_probe_timing(now)
-        frame_step = min(self._accumulator, 0.2)
-        self._accumulator = 0.0
         players = list(players or [])
         live_players = None
         live_probe_targets = {}
@@ -5253,7 +5360,7 @@ class BotRuntime(object):
                 decision_step = step
                 if decision_cache is not None:
                     decision_step = max(
-                        step, min(0.35, _number(now) - decision_cache[2]))
+                        step, _number(now) - decision_cache[2])
                 decision_state = {
                     'id': state['id'], 'position': position,
                     'yaw': state['yaw'],

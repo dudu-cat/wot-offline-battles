@@ -21,6 +21,7 @@ from gui.mods.offline_lan_0922.authority_worker import (
 from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_BUILD, CLIENT_CAPABILITIES, LANClient, PROTOCOL_VERSION,
     SIMULATION_WORKER_CAPABILITY, WORKER_AUTHORITY_ID)
+from effective_params_fixture import effective_params
 
 
 class _DrawWorld(object):
@@ -153,6 +154,7 @@ def _human(player_id=1):
         'critical_ack_seq': 0,
         'outfits': {},
         'vehicle_compact_descr': 'dGVzdA==',
+        'effective_params': effective_params(),
     }
 
 
@@ -164,6 +166,7 @@ def _projected_bot_state(bot_id=11):
         'movement_dir': 1, 'rotation_dir': 0, 'fire_seq': 2,
         'shell_index': 0, 'next_shell_index': 1,
         'ammo_remaining': [20, 10], 'ammo_reload_pending': False,
+        'reload_time': 0.1, 'reload_duration': 0.2,
         'health': 700, 'alive': True,
         'critical': {
             'devices': [{
@@ -213,7 +216,8 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         client = LANClient(
             '127.0.0.1', 28782, 'Player', 'ussr:R11_MS-1',
             max_health=90, account_key='account', outfits={},
-            vehicle_compact_descr='dGVzdA==')
+            vehicle_compact_descr='dGVzdA==',
+            effective_params=effective_params())
 
         self.assertEqual({
             'type': 'hello',
@@ -226,6 +230,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             'account_key': 'account',
             'outfits': {},
             'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': effective_params(),
         }, client._hello_payload())
         self.assertNotIn('role', client._hello_payload())
 
@@ -410,6 +415,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
                 lan_client_module.RAM_CONTACT_LEDGER_CAPABILITY,
                 lan_client_module.PLAYER_FIRE_INTENT_CAPABILITY,
                 lan_client_module.PLAYER_ENVIRONMENT_CAPABILITY,
+                lan_client_module.EFFECTIVE_PARAMS_CAPABILITY,
                 lan_client_module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
                 lan_client_module.RANDOM_MAP_CAPABILITY],
             'map': '01_karelia', 'map_pool': ['01_karelia'],
@@ -878,6 +884,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         runtime = _WorkerRuntime(client, world)
         message = {
             'type': 'player_destructible_contact', 'round_id': 1,
+            'protocol': PROTOCOL_VERSION,
             'authority_epoch': 1, 'player': {
                 'id': 2, 'vehicle': 'ussr:R11_MS-1',
                 'vehicle_compact_descr': 'dGVzdA==',
@@ -899,6 +906,30 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             session._on_event('player_destructible_contact', message)
 
         self.assertEqual([message], runtime.player_destructible_contacts)
+
+    def test_worker_inherits_cached_effective_params_for_lean_contact(self):
+        received = []
+        client = AuthorityWorkerLANClient(
+            '127.0.0.1', 28782,
+            on_event=lambda kind, message: received.append((kind, message)))
+        client._published_player_effective_params[2] = effective_params()
+        message = {
+            'type': 'player_destructible_contact', 'round_id': 1,
+            'protocol': PROTOCOL_VERSION,
+            'authority_epoch': 1, 'player': {
+                'id': 2, 'vehicle': 'ussr:R11_MS-1',
+                'vehicle_compact_descr': 'dGVzdA==',
+                'destructible_contacts': [],
+            },
+        }
+
+        client._handle_message(message)
+
+        self.assertEqual('player_destructible_contact', received[0][0])
+        self.assertEqual(
+            effective_params(),
+            received[0][1]['player']['effective_params'])
+        self.assertNotIn('effective_params', message['player'])
 
     def test_worker_forces_compound_factory_and_track_animation_off(self):
         world = _DrawWorld()

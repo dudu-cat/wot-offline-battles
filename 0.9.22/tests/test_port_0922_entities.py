@@ -679,14 +679,38 @@ class _BridgeAvatar(object):
 
 
 class _Sender(object):
-    def __init__(self):
+    def __init__(self, shoot_result=None):
         self.events = []
+        self.shoot_result = shoot_result
+        self.shot_wait_rejections = 0
 
     def send_avatar_input(self, vehicle_id, kind, payload):
         self.events.append((vehicle_id, kind, payload))
+        return self.shoot_result if kind == 'shoot' else None
+
+    def reject_native_shot_wait(self):
+        self.shot_wait_rejections += 1
+        return True
 
 
 class AvatarServerBridgeTests(unittest.TestCase):
+    def test_sync_rejected_shot_cancels_native_wait_after_mailbox(self):
+        module = _avatar_bridge_module()
+        sender = _Sender(shoot_result=False)
+        bridge = module.AvatarServerBridge(
+            _BridgeAvatar(), _BridgeBinding(),
+            _runtime_module().EntityPropertyBuilder(
+                ('typeCompDescr', 'team')),
+            sender)
+        bridge.addVehicleToArena(_snapshot())
+        bridge.acceptVehicleEnter(91)
+        bridge.setClientReady()
+        bridge.completeVehicleEnter(91)
+        bridge.flushClientReady()
+
+        self.assertFalse(bridge.vehicle_shoot())
+        self.assertEqual(1, sender.shot_wait_rejections)
+
     def test_damaged_device_monitor_delegates_to_runtime_owner(self):
         module = _avatar_bridge_module()
         monitored = []

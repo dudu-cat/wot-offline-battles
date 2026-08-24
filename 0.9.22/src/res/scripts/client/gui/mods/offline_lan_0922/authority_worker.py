@@ -8,6 +8,7 @@ native battle space.  That synthetic identity is projected into this process'
 BattleRuntime messages and is never sent to the LAN server.
 """
 
+import math
 import os
 import sys
 import time
@@ -17,11 +18,13 @@ from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_BUILD, CLIENT_CAPABILITIES, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, MAX_MOTION_TIME_US,
     MAX_PROJECTILE_ID, PROTOCOL_VERSION, PROJECTILE_LEDGER_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY, SIMULATION_WORKER_CAPABILITY,
     WORKER_AUTHORITY_ID, LANClient,
     _BOT_STATE_WIRE_FIELDS,
-    _canonical_vehicle_compact_descr, _canonical_wire_outfits,
+    _canonical_effective_params, _canonical_vehicle_compact_descr,
+    _canonical_wire_outfits,
     _exact_int, _projectile_int_range, _safe_text,
     _strict_capabilities, _strict_mapping_list)
 
@@ -60,6 +63,19 @@ def _trusted_projected_bot_states(bots):
             return False
         if (present_ammo and
                 not isinstance(state.get('ammo_reload_pending'), bool)):
+            return False
+        try:
+            reload_time = float(state['reload_time'])
+            reload_duration = float(state['reload_duration'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (isinstance(state.get('reload_time'), bool) or
+                isinstance(state.get('reload_duration'), bool) or
+                math.isnan(reload_time) or math.isinf(reload_time) or
+                math.isnan(reload_duration) or
+                math.isinf(reload_duration) or
+                reload_duration <= 0.0 or reload_time < 0.0 or
+                reload_time > reload_duration):
             return False
     return True
 
@@ -176,12 +192,14 @@ class AuthorityWorkerLANClient(LANClient):
                 HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                 PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
                 PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
+                EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
                 RAM_CONTACT_LEDGER_CAPABILITY not in server_capabilities or
                 HUMAN_RAM_TIMELINE_CAPABILITY not in server_capabilities or
                 PLAYER_FIRE_INTENT_CAPABILITY not in
                 server_capabilities or
                 PLAYER_ENVIRONMENT_CAPABILITY not in
                 server_capabilities or
+                EFFECTIVE_PARAMS_CAPABILITY not in server_capabilities or
                 state_revision is None or state_revision < 0 or
                 round_id is None or round_id < 0 or
                 (host_player_id is not None and host_player_id <= 0) or
@@ -229,13 +247,17 @@ class AuthorityWorkerLANClient(LANClient):
             _canonical_vehicle_compact_descr(
                 value.get('vehicle_compact_descr')) is not None
             for value in players or ())
+        effective_params_valid = all(
+            _canonical_effective_params(
+                value.get('effective_params')) is not None
+            for value in players or ())
         if (
                 _exact_int(message.get('protocol')) != PROTOCOL_VERSION or
                 round_id is None or round_id < 0 or
                 state_revision is None or state_revision < 0 or
                 phase not in ('waiting', 'loading', 'battle') or
                 not map_name or players is None or not outfits_valid or
-                not compacts_valid or
+                not compacts_valid or not effective_params_valid or
                 ((players and host_player_id not in player_ids) or
                  (not players and host_player_id is not None)) or
                 authority_id != WORKER_AUTHORITY_ID or
@@ -315,6 +337,8 @@ class AuthorityWorkerLANClient(LANClient):
             'critical': {}, 'critical_revision': 0,
             'critical_base_revision': 0, 'critical_ack_seq': 0,
             'outfits': {},
+            'effective_params': _canonical_effective_params(
+                source['effective_params']),
         }
         self._worker_avatar = dummy
         self.vehicle = dummy['vehicle']
@@ -369,6 +393,24 @@ class AuthorityWorkerLANClient(LANClient):
             refreshed['server_time_ms'] = self.server_time_ms
         return refreshed
 
+    def _inherit_contact_effective_params(self, message):
+        """Attach cached static player inputs to one lean contact relay."""
+        if not isinstance(message, dict):
+            return None
+        player = message.get('player')
+        if not isinstance(player, dict):
+            return None
+        player_id = _exact_int(player.get('id'))
+        params = _canonical_effective_params(
+            self._published_player_effective_params.get(player_id))
+        if player_id is None or player_id <= 0 or params is None:
+            return None
+        projected = dict(message)
+        projected_player = dict(player)
+        projected_player['effective_params'] = params
+        projected['player'] = projected_player
+        return projected
+
     def _handle_message(self, message):
         if not isinstance(message, dict):
             return
@@ -388,7 +430,14 @@ class AuthorityWorkerLANClient(LANClient):
         if kind in ('battle_start', 'snapshot'):
             real_players = _strict_mapping_list(
                 message.get('players'), 63)
-            if (real_players is None or any(
+            effective_params_valid = all(
+                (_canonical_effective_params(
+                    value.get('effective_params')) is not None
+                 if 'effective_params' in value else
+                 _exact_int(value.get('id')) in
+                 self._published_player_effective_params)
+                for value in real_players or ())
+            if (real_players is None or not effective_params_valid or any(
                     _canonical_vehicle_compact_descr(
                         value.get('vehicle_compact_descr')) is None
                     for value in real_players)):
@@ -401,6 +450,12 @@ class AuthorityWorkerLANClient(LANClient):
                 return
             # Start a fresh local carrier from this round's real descriptor.
             self._worker_avatar = None
+        if kind == 'player_destructible_contact':
+            message = self._inherit_contact_effective_params(message)
+            if message is None:
+                self._invalid_worker_message(
+                    'worker player effective parameters are unavailable')
+                return
         if kind in ('battle_start', 'snapshot'):
             projected = self._project_runtime_message(message)
             if projected is None:

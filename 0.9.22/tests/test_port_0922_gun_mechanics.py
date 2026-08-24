@@ -127,6 +127,36 @@ class GunMechanicsParityTests(unittest.TestCase):
         self.assertEqual(0, state.clip)
         self.assertAlmostEqual(state.reload, state.reload_time)
 
+    def test_explicit_empty_client_ammo_never_becomes_synthetic_rounds(self):
+        state = GunState(_descriptor(), ammo_layout={})
+
+        self.assertEqual([0, 0, 0], state.ammo)
+        self.assertEqual(0, state.clip)
+        self.assertFalse(state.can_fire(True))
+
+    def test_mismatched_client_ammo_fails_instead_of_becoming_synthetic(self):
+        with self.assertRaisesRegex(
+                RuntimeError, 'does not match the installed gun'):
+            GunState(_descriptor(), ammo_layout={999: 40})
+
+    def test_client_contract_replaces_worker_local_shot_shape(self):
+        state = GunState(_descriptor())
+        contract = {
+            'clip_size': 2,
+            'shots': [
+                {'compact_descr': 101, 'source_shot': {'speed': 700.0}},
+                {'compact_descr': 102, 'source_shot': {'speed': 900.0}},
+            ],
+        }
+
+        self.assertTrue(state.bind_client_contract(
+            contract, {101: 12, 102: 7}))
+
+        self.assertEqual(2, state.clip_size)
+        self.assertEqual([12, 7], state.ammo)
+        self.assertEqual((700.0, 900.0), tuple(
+            shot['speed'] for shot in state.shots))
+
     def test_reload_does_not_advance_during_countdown(self):
         descriptor = _descriptor()
         state = GunState(descriptor)

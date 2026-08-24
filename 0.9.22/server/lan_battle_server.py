@@ -44,6 +44,7 @@ from server_battle_authority import (
 from server_bot_ai import BotPlanner
 from offline_rewards import compute_offline_rewards
 from gui.mods.offline_lan_0922 import tank_collision
+from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
 from gui.mods.offline_lan_0922.ai.maps_0922_extra import (
     TACTICAL_MAPS_0922_EXTRA as _MAPS_0922_DATA,
@@ -75,7 +76,7 @@ MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS = 16
 MAX_PLAYER_DESTRUCTIBLE_REJECTIONS = 16
 MAX_PLAYER_INPUT_FINGERPRINTS = 128
 HUMAN_POSE_HISTORY_SECONDS = 1.5
-HUMAN_POSE_MAX_SAMPLE_GAP_US = 250000
+HUMAN_RAM_MAX_SUBSTEP_US = 100000
 HUMAN_POSE_CLOCK_LEEWAY_US = 250000
 MAX_RESULT_RECEIPTS = 256
 RESULT_RECEIPT_STATE_SCHEMA = 1
@@ -185,11 +186,11 @@ PROJECTILE_MAX_PROGRESS_BATCH = 30
 PROJECTILE_MAX_SPLASH_TARGETS = 30
 PROJECTILE_MAX_DESTRUCTIBLES = 64
 PROJECTILE_MAX_LIFETIME_MS = 20000
-PLAYER_FIRE_INTENT_LIFETIME_MS = 5000
 PLAYER_FIRE_INTENT_MAX_PENDING = 1
 PLAYER_FIRE_INTENT_HISTORY = 64
 PLAYER_FIRE_ORIGIN_RADIUS = 25.0
 MAX_PLAYER_DISPERSION_ANGLE = 0.5
+MAX_PLAYER_CLIP_SIZE = 255
 PROJECTILE_MAX_GRAVITY = 500.0
 PROJECTILE_MAX_VELOCITY = 3000.0
 PROJECTILE_MAX_DISTANCE = 10000.0
@@ -207,8 +208,9 @@ DESTRUCTIBLE_CATALOG_V5_CAPABILITY = "destructible_catalog_v5"
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = "lean_snapshot_manifest_v1"
 RAM_CONTACT_LEDGER_CAPABILITY = "ram_contact_ledger_v2"
 HUMAN_RAM_TIMELINE_CAPABILITY = "human_ram_timeline_v1"
-PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v3"
+PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v4"
 PLAYER_ENVIRONMENT_CAPABILITY = "player_environment_v1"
+EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
 TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
 CLIENT_VERDICT_FIELDS = frozenset((
     "reported_health", "reported_critical", "reported_reason",
@@ -223,6 +225,7 @@ SERVER_CAPABILITIES = (
     HUMAN_RAM_TIMELINE_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY,
     PLAYER_ENVIRONMENT_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
     PROJECTILE_HIT_VEHICLE_CAPABILITY,
     PROJECTILE_WRECK_HIT_CAPABILITY,
     RANDOM_MAP_CAPABILITY,
@@ -337,6 +340,14 @@ def _validated_vehicle_compact_descr(value):
     canonical = base64.b64encode(raw).decode("ascii")
     if canonical != value:
         raise ValueError("non-canonical vehicle compact descriptor")
+    return canonical
+
+
+def _validated_effective_params(value):
+    """Return a detached canonical #1513 effective-parameter snapshot."""
+    canonical = effective_params_wire.canonical(value)
+    if canonical is None:
+        raise ValueError("invalid effective vehicle parameters")
     return canonical
 
 
@@ -459,6 +470,54 @@ def _has_finite_fields(value, names):
         except (TypeError, ValueError):
             return False
     return True
+
+
+def _validated_bot_reload_progress(raw, required=False):
+    """Return one exact finite reload clock or raise on a partial contract."""
+    has_time = isinstance(raw, dict) and "reload_time" in raw
+    has_duration = isinstance(raw, dict) and "reload_duration" in raw
+    if not has_time and not has_duration and not required:
+        return None
+    if not has_time or not has_duration:
+        raise ValueError("bot reload progress is incomplete")
+    if (isinstance(raw.get("reload_time"), bool) or
+            isinstance(raw.get("reload_duration"), bool)):
+        raise ValueError("bot reload progress is invalid")
+    try:
+        remaining = float(raw["reload_time"])
+        duration = float(raw["reload_duration"])
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("bot reload progress is invalid")
+    if (not math.isfinite(remaining) or not math.isfinite(duration) or
+            duration <= 0.0 or remaining < 0.0 or remaining > duration):
+        raise ValueError("bot reload progress is invalid")
+    return remaining, duration
+
+
+def _canonical_human_gun_checkpoint(raw):
+    """Validate one final visible-client gun state at an input sequence."""
+    if not isinstance(raw, dict) or set(raw) != {
+            "reload_time", "reload_duration", "clip", "clip_size",
+            "dispersion"}:
+        raise ValueError("player gun checkpoint has an invalid shape")
+    reload_time = _bounded_float(
+        raw.get("reload_time"), 0.0, 3600.0)
+    reload_duration = _bounded_float(
+        raw.get("reload_duration"), 0.0, 3600.0, False)
+    dispersion = _bounded_float(
+        raw.get("dispersion"), 0.0, MAX_PLAYER_DISPERSION_ANGLE)
+    clip = _exact_int(raw.get("clip"), 0, MAX_PLAYER_CLIP_SIZE)
+    clip_size = _exact_int(
+        raw.get("clip_size"), 1, MAX_PLAYER_CLIP_SIZE)
+    if reload_time > reload_duration or clip > clip_size:
+        raise ValueError("player gun checkpoint is inconsistent")
+    return {
+        "reload_time": reload_time,
+        "reload_duration": reload_duration,
+        "clip": clip,
+        "clip_size": clip_size,
+        "dispersion": dispersion,
+    }
 
 
 def _critical_proposal_admission(message, expected_base_revision,
@@ -1378,6 +1437,10 @@ class Player(_EndpointSendMixin):
     input_seq: int = 0
     input_fingerprints: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
+    gun_checkpoint_seq: int = 0
+    gun_checkpoint: dict = field(default_factory=dict, repr=False)
+    gun_checkpoints: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
     pose_time_us: Optional[int] = None
     pose_history: deque = field(default_factory=deque, repr=False)
     connected: bool = True
@@ -1389,6 +1452,7 @@ class Player(_EndpointSendMixin):
     account_key: str = ""
     outfits: dict = field(default_factory=dict)
     vehicle_compact_descr: str = ""
+    effective_params: dict = field(default_factory=dict)
     delivered_receipt_id: str = ""
     server_time_round_id: Optional[int] = field(default=None, repr=False)
     last_server_time_ms: int = field(default=-1, repr=False)
@@ -1911,7 +1975,8 @@ class BattleState:
                         RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
                         HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                         PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
-                        PLAYER_ENVIRONMENT_CAPABILITY not in capabilities):
+                        PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
+                        EFFECTIVE_PARAMS_CAPABILITY not in capabilities):
                     return None, "unsupported_capabilities"
                 account_key = hello.get("account_key")
                 if account_key is None:
@@ -1946,10 +2011,16 @@ class BattleState:
                             hello.get("vehicle_compact_descr"))
                 except ValueError:
                     return None, "invalid_vehicle_configuration"
+                try:
+                    effective_params = _validated_effective_params(
+                        hello.get("effective_params"))
+                except ValueError:
+                    return None, "invalid_effective_params"
             else:
                 account_key = ""
                 outfits = {}
                 vehicle_compact_descr = ""
+                effective_params = {}
             if (self.client_build is not None and
                     client_build != self.client_build):
                 return None, "incompatible_client_build"
@@ -2003,6 +2074,7 @@ class BattleState:
                 account_key=account_key,
                 outfits=outfits,
                 vehicle_compact_descr=vehicle_compact_descr,
+                effective_params=effective_params,
             )
             self.players[player_id] = player
             if self.host_player_id is None:
@@ -2121,7 +2193,8 @@ class BattleState:
                     RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
                     HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
                     PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
-                    PLAYER_ENVIRONMENT_CAPABILITY not in capabilities):
+                    PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
+                    EFFECTIVE_PARAMS_CAPABILITY not in capabilities):
                 return None, "unsupported_capabilities"
             if (self.client_build is not None and
                     self.client_build != client_build):
@@ -2198,12 +2271,15 @@ class BattleState:
                 vehicle_compact_descr = \
                     _validated_vehicle_compact_descr(
                         message.get("vehicle_compact_descr"))
+                effective_params = _validated_effective_params(
+                    message.get("effective_params"))
             except ValueError:
                 return False
             if (vehicle == player.vehicle and max_health == player.max_health
                     and outfits == player.outfits and
                     vehicle_compact_descr ==
-                    player.vehicle_compact_descr):
+                    player.vehicle_compact_descr and
+                    effective_params == player.effective_params):
                 return False
             player.vehicle = vehicle
             player.max_health = max_health
@@ -2212,6 +2288,7 @@ class BattleState:
             player.siege_transition_ticks = 0
             player.outfits = outfits
             player.vehicle_compact_descr = vehicle_compact_descr
+            player.effective_params = effective_params
             self.state_revision += 1
             return True
 
@@ -2378,6 +2455,9 @@ class BattleState:
             player.destructible_contact_rejections.clear()
             player.input_seq = 0
             player.input_fingerprints.clear()
+            player.gun_checkpoint_seq = 0
+            player.gun_checkpoint = {}
+            player.gun_checkpoints.clear()
             player.pose_time_us = None
             player.pose_history.clear()
             player.x, player.z, player.yaw = self._spawn_for(
@@ -2690,6 +2770,23 @@ class BattleState:
                       PLAYER_ENVIRONMENT_CAPABILITY not in
                       self.simulation_worker.capabilities))):
                 return None, "missing_player_environment_capability"
+            if (self.client_build == CLIENT_BUILD_0922 and
+                    (any(
+                        EFFECTIVE_PARAMS_CAPABILITY not in
+                        participant.capabilities
+                        for participant in self.players.values()
+                        if participant.connected) or
+                     (self.authority_mode == "client" and
+                      self.simulation_worker is not None and
+                      EFFECTIVE_PARAMS_CAPABILITY not in
+                      self.simulation_worker.capabilities))):
+                return None, "missing_effective_params_capability"
+            if (self.client_build == CLIENT_BUILD_0922 and any(
+                    effective_params_wire.canonical(
+                        participant.effective_params) is None
+                    for participant in self.players.values()
+                    if participant.connected)):
+                return None, "invalid_effective_params"
             if (self.client_build == CLIENT_BUILD_0922 and
                     self.authority_mode == "client" and
                     (self.simulation_worker is None or
@@ -3081,8 +3178,13 @@ class BattleState:
             "map": self.map_name,
             "bots": list(self.bot_roster),
             "bot_manifest": [],
-            "players": [self._public_player(
-                player, include_outfits=False) for player in participants],
+            # The in-process authority has no wire-side static snapshot cache.
+            # Give it each player's canonical garage snapshot directly while
+            # keeping recurring network snapshots lean.
+            "players": [dict(
+                self._public_player(player, include_outfits=False),
+                effective_params=copy.deepcopy(player.effective_params))
+                for player in participants],
             "human_ram_timeline": True,
             "bot_authority_id": SERVER_AUTHORITY_ID,
             "bot_order_revision": self.bot_orders["revision"],
@@ -3622,6 +3724,19 @@ class BattleState:
             if self.phase != "battle":
                 return None
             connected = [p for p in self.players.values() if p.connected]
+            takeover_manifest = []
+            for identity in self.bot_manifest:
+                entry = dict(identity)
+                state = self.bot_states.get(int(identity["id"]))
+                if self.client_build == CLIENT_BUILD_0922:
+                    if state is None:
+                        raise RuntimeError(
+                            "bot takeover manifest has no canonical state")
+                    _validated_bot_reload_progress(state, required=True)
+                    for name in (
+                            "fire_seq", "reload_time", "reload_duration"):
+                        entry[name] = state[name]
+                takeover_manifest.append(entry)
             message = {
                 "type": "battle_start",
                 "protocol": PROTOCOL_VERSION,
@@ -3637,7 +3752,7 @@ class BattleState:
                 "team_size": self.team_size,
                 "team_sizes": self._team_sizes_wire(),
                 "bot_authority_id": self.bot_authority_id,
-                "bot_manifest": list(self.bot_manifest),
+                "bot_manifest": takeover_manifest,
                 "bot_order_revision": self.bot_orders["revision"],
                 "bot_orders": list(self.bot_orders["orders"]),
                 "rules": self.rules_state,
@@ -3812,6 +3927,9 @@ class BattleState:
                 health = max(0, min(int(_finite_float(raw.get("health"), max_health)), max_health))
                 try:
                     route = self._sanitize_bot_route(raw.get("route"))
+                    _validated_bot_reload_progress(
+                        raw, required=(
+                            self.client_build == CLIENT_BUILD_0922))
                 except (TypeError, ValueError):
                     return False
                 entry = {
@@ -4060,6 +4178,7 @@ class BattleState:
         rotation = _finite_float(raw.get("rotation_dir"), 0.0)
         ammunition = BattleState._sanitize_bot_ammo(
             raw, identity, previous)
+        reload_progress = _validated_bot_reload_progress(raw)
         result = {
             "id": int(identity["id"]),
             "team": int(identity["team"]),
@@ -4116,6 +4235,9 @@ class BattleState:
             "fire_attacker_id": int((previous or {}).get(
                 "fire_attacker_id", 0)),
         }
+        if reload_progress is not None:
+            result["reload_time"], result["reload_duration"] = \
+                reload_progress
         critical = (previous or {}).get("critical")
         if "critical" in raw:
             critical = _critical_state(_critical_payload(raw.get("critical")))
@@ -4418,6 +4540,8 @@ class BattleState:
             seen = set()
             required = ("id", "x", "y", "z", "yaw", "health",
                         "alive", "fire_seq")
+            if self.client_build == CLIENT_BUILD_0922:
+                required += ("reload_time", "reload_duration")
             for raw in incoming:
                 if (not isinstance(raw, dict) or
                         not all(key in raw for key in required) or
@@ -4461,6 +4585,9 @@ class BattleState:
                 try:
                     current = self._sanitize_bot_state(
                         raw, identity, previous)
+                    _validated_bot_reload_progress(
+                        raw, required=(
+                            self.client_build == CLIENT_BUILD_0922))
                     if self.client_build == CLIENT_BUILD_0922:
                         self._reconcile_modern_bot_combat(
                             raw, previous, current)
@@ -4707,7 +4834,13 @@ class BattleState:
                 observation is not None and
                 self.tick - int(observation["observed_tick"]) <=
                 PLAYER_ENVIRONMENT_STALE_TICKS)
-            if not fresh or int(observation["level"]) != 2:
+            # Missing/stale telemetry is not evidence that the vehicle
+            # surfaced.  Pause at the already-earned drowning time until a
+            # fresh worker observation arrives; only a fresh non-drowning
+            # sample resets the continuous timer.
+            if not fresh:
+                continue
+            if int(observation["level"]) != 2:
                 self.player_drowning_seconds.pop(player.player_id, None)
                 continue
             elapsed = self.player_drowning_seconds.get(
@@ -4851,6 +4984,10 @@ class BattleState:
                        (player.x, player.y, player.z))) > \
                     PLAYER_FIRE_ORIGIN_RADIUS ** 2:
                 return False
+            gun_checkpoint = player.gun_checkpoints.get(input_seq)
+            if (gun_checkpoint is None or
+                    player.gun_checkpoint_seq != input_seq):
+                return False
             normalized = {
                 "player_id": int(player_id),
                 "intent_seq": intent_seq,
@@ -4861,6 +4998,8 @@ class BattleState:
                     component / direction_length, 8)
                     for component in shot_direction],
                 "dispersion_angle": round(dispersion_angle, 8),
+                "gun_checkpoint_seq": input_seq,
+                "gun_checkpoint": dict(gun_checkpoint),
             }
             fingerprint = _message_fingerprint(normalized)
             previous = player.fire_intent_fingerprints.get(intent_seq)
@@ -4873,7 +5012,6 @@ class BattleState:
                     player.pose_time_us is None or
                     player.fire_seq >= PROJECTILE_MAX_ID):
                 return False
-            now_ms = self._server_time_ms()
             if len(player.pending_fire_intents) >= \
                     PLAYER_FIRE_INTENT_MAX_PENDING:
                 return False
@@ -4890,6 +5028,9 @@ class BattleState:
                 "next_shell_index": int(player.next_shell_index),
                 "shell_change_pending": bool(
                     player.shell_change_pending),
+                "gun_checkpoint_seq": int(
+                    normalized["gun_checkpoint_seq"]),
+                "gun_checkpoint": dict(normalized["gun_checkpoint"]),
                 "shot_origin": list(normalized["shot_origin"]),
                 "shot_direction": list(normalized["shot_direction"]),
                 "dispersion_angle": normalized["dispersion_angle"],
@@ -4902,8 +5043,6 @@ class BattleState:
                 "pitch": round(float(player.pitch), 5),
                 "roll": round(float(player.roll), 5),
                 "speed": round(float(player.speed), 4),
-                "deadline_server_time_ms": (
-                    now_ms + PLAYER_FIRE_INTENT_LIFETIME_MS),
             }
             player.fire_intent_seq = intent_seq
             player.fire_intent_fingerprints[intent_seq] = fingerprint
@@ -5195,9 +5334,7 @@ class BattleState:
                         math.sqrt(sum(
                             (float(origin[index]) - float(intent[name])) ** 2
                             for index, name in enumerate(("x", "y", "z")))) >
-                        PLAYER_FIRE_ORIGIN_RADIUS or
-                        self._server_time_ms() >
-                        int(intent["deadline_server_time_ms"])):
+                        PLAYER_FIRE_ORIGIN_RADIUS):
                     return False
                 team = shooter.team
                 source_vehicle = shooter.vehicle
@@ -7079,9 +7216,7 @@ class BattleState:
         sample_time_us = min(sample_time_us, receipt_time_us)
         previous_time_us = player.pose_time_us
         if (previous_time_us is not None and
-                (sample_time_us <= previous_time_us or
-                 sample_time_us - previous_time_us >
-                 HUMAN_POSE_MAX_SAMPLE_GAP_US)):
+                sample_time_us <= previous_time_us):
             player.pose_history.clear()
         speed = float(player.speed) if player.alive else 0.0
         sample = {
@@ -7136,6 +7271,7 @@ class BattleState:
                 # attribution are never accepted as client verdicts.
                 return False
             shell_selection = None
+            gun_checkpoint = None
             has_next_shell = "next_shell_index" in message
             has_shell_pending = "shell_change_pending" in message
             if has_next_shell != has_shell_pending:
@@ -7159,6 +7295,22 @@ class BattleState:
                     return False
                 shell_selection = (
                     loaded_shell, next_shell, pending_shell)
+            checkpoint_required = bool(
+                message.get("type") == "input" and
+                PLAYER_FIRE_INTENT_CAPABILITY in player.capabilities)
+            if checkpoint_required and "gun_checkpoint" not in message:
+                return False
+            if "gun_checkpoint" in message:
+                if (
+                        shell_selection is None or
+                        HUMAN_RAM_TIMELINE_CAPABILITY not in
+                        player.capabilities):
+                    return False
+                try:
+                    gun_checkpoint = _canonical_human_gun_checkpoint(
+                        message.get("gun_checkpoint"))
+                except (TypeError, ValueError, OverflowError):
+                    return False
             if HUMAN_RAM_TIMELINE_CAPABILITY in player.capabilities:
                 accepted, duplicate = self._admit_player_input(
                     player, message)
@@ -7166,6 +7318,15 @@ class BattleState:
                     return False
                 if duplicate:
                     return True
+                if gun_checkpoint is not None:
+                    checkpoint_seq = int(player.input_seq)
+                    player.gun_checkpoint_seq = checkpoint_seq
+                    player.gun_checkpoint = dict(gun_checkpoint)
+                    player.gun_checkpoints[checkpoint_seq] = dict(
+                        gun_checkpoint)
+                    while (len(player.gun_checkpoints) >
+                           MAX_PLAYER_INPUT_FINGERPRINTS):
+                        player.gun_checkpoints.popitem(last=False)
             if (player.alive and self.phase == "battle" and
                     self.battle_result is None and
                     "siege_enabled" in message):
@@ -8119,8 +8280,6 @@ class BattleState:
             return None
         left_time = int(left["time_us"])
         right_time = int(right["time_us"])
-        if right_time - left_time > HUMAN_POSE_MAX_SAMPLE_GAP_US:
-            return None
         if right_time == left_time:
             ratio = 0.0
         else:
@@ -8211,7 +8370,7 @@ class BattleState:
         return True
 
     def _resolve_human_rams(self):
-        """Resolve each human pair at its latest common source-time frontier."""
+        """Resolve every due source-time segment for each human pair."""
         if (not self._combat_accepting() or self.battle_result is not None or
                 not self._human_ram_profiles_required() or
                 self.human_collision_profile_authority_id !=
@@ -8236,51 +8395,86 @@ class BattleState:
                 frontier = min(
                     int(first.pose_history[-1]["time_us"]),
                     int(second.pose_history[-1]["time_us"]))
-                if (frontier <= int(
-                        self.human_ram_pair_frontiers.get(pair, -1)) or
+                previous_frontier = self.human_ram_pair_frontiers.get(pair)
+                if ((previous_frontier is not None and
+                     frontier <= int(previous_frontier)) or
                         now_us - frontier > int(
                             HUMAN_POSE_HISTORY_SECONDS * 1000000.0)):
                     continue
-                first_pose = self._human_pose_at(
-                    first.pose_history, frontier)
-                second_pose = self._human_pose_at(
-                    second.pose_history, frontier)
-                if first_pose is None or second_pose is None:
+
+                # A source-time gap is still elapsed battle time. Build the
+                # complete common interval before mutating HP/contact state,
+                # then resolve it in bounded steps. Advancing only the newest
+                # endpoint lets two tanks pass through each other during a
+                # one-second callback stall without ever owning a contact.
+                if previous_frontier is None:
+                    cursor = max(
+                        int(first.pose_history[0]["time_us"]),
+                        int(second.pose_history[0]["time_us"]))
+                    sample_frontiers = [cursor]
+                else:
+                    cursor = int(previous_frontier)
+                    sample_frontiers = []
+                while cursor < frontier:
+                    cursor = min(
+                        frontier, cursor + HUMAN_RAM_MAX_SUBSTEP_US)
+                    sample_frontiers.append(cursor)
+
+                timeline = []
+                for sample_frontier in sample_frontiers:
+                    first_pose = self._human_pose_at(
+                        first.pose_history, sample_frontier)
+                    second_pose = self._human_pose_at(
+                        second.pose_history, sample_frontier)
+                    if first_pose is None or second_pose is None:
+                        timeline = []
+                        break
+                    timeline.append(
+                        (sample_frontier, first_pose, second_pose))
+                if not timeline:
                     continue
-                self.human_ram_pair_frontiers[pair] = frontier
                 first_profile = self.human_collision_profiles[first.player_id]
                 second_profile = self.human_collision_profiles[
                     second.player_id]
-                first_body = dict(first_pose, **{
-                    "id": first.player_id, "alive": True,
-                    "vehicle": first.vehicle,
-                    "mass": first_profile["mass"],
-                    "shape": first_profile["shape"],
-                    "ram_profile": first_profile["ram_profile"],
-                })
-                second_body = dict(second_pose, **{
-                    "id": second.player_id, "alive": True,
-                    "vehicle": second.vehicle,
-                    "mass": second_profile["mass"],
-                    "shape": second_profile["shape"],
-                    "ram_profile": second_profile["ram_profile"],
-                })
-                result = tank_collision.resolve_tank(
-                    first_body, (second_body,),
-                    # resolve_tank uses zero as the no-prior-contact
-                    # sentinel. Keep the round-relative timeline positive.
-                    now=float(frontier) / 1000000.0 + 1.0,
-                    ram_cooldowns=self.human_ram_cooldowns,
-                    active_ram_contacts=active_contacts)
-                self.human_ram_cooldowns = result["cooldowns"]
-                if pair in result["contacts"]:
-                    active_contacts.add(pair)
-                else:
-                    active_contacts.discard(pair)
-                for event in result["ram_events"]:
-                    if self._apply_human_ram_damage(
-                            first, second, event, pair, frontier):
-                        applied += 1
+                for sample_frontier, first_pose, second_pose in timeline:
+                    first_body = dict(first_pose, **{
+                        "id": first.player_id, "alive": True,
+                        "vehicle": first.vehicle,
+                        "mass": first_profile["mass"],
+                        "shape": first_profile["shape"],
+                        "ram_profile": first_profile["ram_profile"],
+                    })
+                    second_body = dict(second_pose, **{
+                        "id": second.player_id, "alive": True,
+                        "vehicle": second.vehicle,
+                        "mass": second_profile["mass"],
+                        "shape": second_profile["shape"],
+                        "ram_profile": second_profile["ram_profile"],
+                    })
+                    result = tank_collision.resolve_tank(
+                        first_body, (second_body,),
+                        # resolve_tank uses zero as the no-prior-contact
+                        # sentinel. Keep the round-relative timeline positive.
+                        now=float(sample_frontier) / 1000000.0 + 1.0,
+                        ram_cooldowns=self.human_ram_cooldowns,
+                        active_ram_contacts=active_contacts)
+                    self.human_ram_cooldowns = result["cooldowns"]
+                    if pair in result["contacts"]:
+                        active_contacts.add(pair)
+                    else:
+                        active_contacts.discard(pair)
+                    for event in result["ram_events"]:
+                        if self._apply_human_ram_damage(
+                                first, second, event, pair,
+                                sample_frontier):
+                            applied += 1
+                    if (self.battle_result is not None or
+                            not first.alive or not second.alive):
+                        break
+                # Publish the frontier only after every available source-time
+                # substep has been applied in order. No later tick can skip an
+                # unprocessed suffix of this interval.
+                self.human_ram_pair_frontiers[pair] = frontier
         self.human_ram_contacts = frozenset(active_contacts)
         return applied
 
@@ -8824,6 +9018,12 @@ class BattleState:
         }
         if include_outfits:
             result["outfits"] = dict(player.outfits)
+            result["effective_params"] = copy.deepcopy(
+                player.effective_params)
+        if player.gun_checkpoint_seq > 0:
+            result["gun_checkpoint_seq"] = int(
+                player.gun_checkpoint_seq)
+            result["gun_checkpoint"] = dict(player.gun_checkpoint)
         if player.ram_contact:
             result["ram_contact"] = dict(player.ram_contact)
         if player.ram_contacts:
@@ -9294,6 +9494,45 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 _server_log("Rejected %s:%d: protocol mismatch" % self.client_address)
                 return
             role = hello.get("role", "player")
+            if role == "probe":
+                client_build = hello.get("client_build")
+                raw_capabilities = hello.get("capabilities", ())
+                required_capabilities = (
+                    PROJECTILE_CAPABILITY,
+                    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                    RAM_CONTACT_LEDGER_CAPABILITY,
+                    HUMAN_RAM_TIMELINE_CAPABILITY,
+                    PLAYER_FIRE_INTENT_CAPABILITY,
+                    PLAYER_ENVIRONMENT_CAPABILITY,
+                    EFFECTIVE_PARAMS_CAPABILITY,
+                )
+                valid_capabilities = (
+                    isinstance(raw_capabilities, list) and
+                    len(raw_capabilities) <= 32 and
+                    all(isinstance(value, str) and value and
+                        len(value) <= 64 for value in raw_capabilities) and
+                    len(set(raw_capabilities)) == len(raw_capabilities) and
+                    all(value in raw_capabilities
+                        for value in required_capabilities))
+                if (client_build != CLIENT_BUILD_0922 or
+                        not valid_capabilities):
+                    self._send_raw(conn, {
+                        "type": "error",
+                        "code": "unsupported_capabilities",
+                        "message": "launcher probe is incompatible",
+                    })
+                    _server_log("PROBE rejected %s:%d" %
+                                self.client_address)
+                    return
+                self._send_raw(conn, {
+                    "type": "welcome",
+                    "protocol": PROTOCOL_VERSION,
+                    "client_build": CLIENT_BUILD_0922,
+                    "capabilities": list(required_capabilities),
+                    "server_capabilities": list(SERVER_CAPABILITIES),
+                })
+                _server_log("PROBE OK %s:%d" % self.client_address)
+                return
             if role == SIMULATION_WORKER_ROLE:
                 self._handle_simulation_worker(
                     server, conn, buffer, hello)
@@ -9325,6 +9564,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         "vehicle_compact_descr":
                             player.vehicle_compact_descr,
                         "outfits": dict(player.outfits),
+                        "effective_params": copy.deepcopy(
+                            player.effective_params),
                         "team": player.team,
                         "slot": player.slot,
                         "max_health": player.max_health,
@@ -9363,6 +9604,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "invalid_account_key": "invalid offline account identity",
                     "duplicate_account_key": "offline account identity is already connected",
                     "invalid_outfits": "invalid vehicle customization data",
+                    "invalid_effective_params":
+                        "invalid effective vehicle parameters",
                 }
                 message = messages.get(join_error, "join rejected")
                 self._send_raw(conn, {"type": "error", "code": join_error, "message": message})
@@ -9735,6 +9978,27 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+def _run_tick_loop(state, tick_clock=None, sleeper=None):
+    """Run every due fixed simulation step without dropping late ticks."""
+    interval = 1.0 / TICK_HZ
+    tick_clock = time.perf_counter if tick_clock is None else tick_clock
+    sleeper = time.sleep if sleeper is None else sleeper
+    next_tick = tick_clock() + interval
+    while state.running:
+        now = tick_clock()
+        delay = next_tick - now
+        if delay > 0.0:
+            sleeper(delay)
+            continue
+        # A one-second scheduler stall is thirty due rule steps. Consume all
+        # thirty before waiting again; resetting next_tick here would erase
+        # timeout, capture, drowning and movement time from the battle.
+        while state.running and now + 1e-9 >= next_tick:
+            state.tick_once(interval)
+            next_tick += interval
+            now = tick_clock()
+
+
 def run_server(host, port, map_name, max_players,
                authority_mode="client", team_size=15,
                receipt_state_path=None, team1_size=None, team2_size=None):
@@ -9747,20 +10011,9 @@ def run_server(host, port, map_name, max_players,
     tcp_server = ThreadedTCPServer((host, port), ClientHandler)
     tcp_server.game_server = type("GameServer", (), {"state": state})()
 
-    def tick_loop():
-        interval = 1.0 / TICK_HZ
-        tick_clock = time.perf_counter
-        next_tick = tick_clock()
-        while state.running:
-            next_tick += interval
-            state.tick_once(min(interval, 0.1))
-            delay = next_tick - tick_clock()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_tick = tick_clock()
-
-    thread = threading.Thread(target=tick_loop, name="battle-tick", daemon=True)
+    thread = threading.Thread(
+        target=_run_tick_loop, args=(state,),
+        name="battle-tick", daemon=True)
     thread.start()
     _server_log(
         "LAN battle server listening on %s:%d "
