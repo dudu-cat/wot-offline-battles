@@ -273,9 +273,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $launcher = Join-Path $PWD ("launcher\dist\WoT-Offline-Battles-Launcher\" +
               "WoT-Offline-Battles-Launcher.exe")
-          $navgraphs = Join-Path $PWD "0.8.2\scripts\client\gui\mods\offhangar\navgraphs"
-          $env:WOT_OFFLINE_NAVGRAPH_DIR = $navgraphs
-          foreach ($port in @("0.8.2", "0.9.22")) {
+          foreach ($port in @("0.9.22")) {
               $process = Start-Process -FilePath $launcher `
                   -ArgumentList "--serve", $port -PassThru
               try {
