@@ -50,6 +50,7 @@ MAX_OUTBOUND_BYTES = MAX_MESSAGE_BYTES * 4
 MAX_OUTBOUND_NODES = 16384
 MAX_OUTBOUND_DEPTH = 16
 MAX_PROJECTILE_BATCH = 30
+MAX_HUMAN_RAM_PROBES = 64
 MAX_PROJECTILE_DESTRUCTIBLES = 64
 MAX_PROJECTILE_ID = 2147483647
 # A process-relative microsecond clock fits comfortably in this bound for
@@ -463,6 +464,47 @@ def project_bot_state(state):
             reload_duration <= 0.0 or reload_time < 0.0 or
             reload_time > reload_duration):
         return None
+    return projected
+
+
+def _project_human_ram_armors(raw_results):
+    """Return the exact worker-only native contact-armour response batch."""
+    if (not isinstance(raw_results, (list, tuple)) or
+            len(raw_results) > MAX_HUMAN_RAM_PROBES):
+        return None
+    projected = []
+    seen = set()
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            return None
+        available = raw.get('available')
+        allowed = set(('seq', 'first_id', 'second_id', 'available'))
+        if available is True:
+            allowed.update(('armor_first', 'armor_second'))
+        if set(raw) != allowed or not isinstance(available, bool):
+            return None
+        sequence = _exact_int(raw.get('seq'))
+        first_id = _exact_int(raw.get('first_id'))
+        second_id = _exact_int(raw.get('second_id'))
+        if (sequence is None or not 0 < sequence <= MAX_PROJECTILE_ID or
+                sequence in seen or first_id is None or second_id is None or
+                not 0 < first_id < second_id <= MAX_PROJECTILE_ID):
+            return None
+        seen.add(sequence)
+        result = {
+            'seq': sequence, 'first_id': first_id,
+            'second_id': second_id, 'available': available,
+        }
+        if available:
+            armor_first = _projectile_float_range(
+                raw.get('armor_first'), 0.000001, 5000.0)
+            armor_second = _projectile_float_range(
+                raw.get('armor_second'), 0.000001, 5000.0)
+            if armor_first is None or armor_second is None:
+                return None
+            result['armor_first'] = armor_first
+            result['armor_second'] = armor_second
+        projected.append(result)
     return projected
 
 
@@ -2091,7 +2133,8 @@ class LANClient(object):
                 player_collision_profiles or ())[:64]
         return self._send(message)
 
-    def send_bot_state(self, bots, sample_time_us=None):
+    def send_bot_state(self, bots, sample_time_us=None,
+                       human_ram_armors=None):
         if not self.is_bot_authority():
             return False
         projected = []
@@ -2108,9 +2151,15 @@ class LANClient(object):
                     not 0 <= sample_time_us <= MAX_MOTION_TIME_US):
                 return False
             message['sample_time_us'] = sample_time_us
+        if human_ram_armors is not None:
+            human_ram_armors = _project_human_ram_armors(human_ram_armors)
+            if human_ram_armors is None:
+                return False
+            message['human_ram_armors'] = human_ram_armors
         return self._send(message)
 
-    def send_projected_bot_state(self, bots, sample_time_us=None):
+    def send_projected_bot_state(self, bots, sample_time_us=None,
+                                 human_ram_armors=None):
         """Send BotRuntime's already-projected canonical publication once."""
         if not self.is_bot_authority():
             return False
@@ -2125,6 +2174,11 @@ class LANClient(object):
                     not 0 <= sample_time_us <= MAX_MOTION_TIME_US):
                 return False
             message['sample_time_us'] = sample_time_us
+        if human_ram_armors is not None:
+            human_ram_armors = _project_human_ram_armors(human_ram_armors)
+            if human_ram_armors is None:
+                return False
+            message['human_ram_armors'] = human_ram_armors
         return self._send(message)
 
     def send_bot_observation(self, contacts, affordances=None):

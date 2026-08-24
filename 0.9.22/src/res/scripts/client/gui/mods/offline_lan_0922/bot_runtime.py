@@ -4396,7 +4396,8 @@ class BotRuntime(object):
             yaw = _number(state.get('yaw'))
             speed = _number(state.get('speed')) if alive else 0.0
             tanks.append({
-                'id': int(state['id']), 'alive': alive,
+                'id': int(state['id']), 'kind': 'bot',
+                'network_id': int(state['id']), 'alive': alive,
                 'team': int(_number(state.get('team'))),
                 'vehicle': str(state.get('vehicle') or ''),
                 'x': _number(state.get('x')), 'y': _number(state.get('y')),
@@ -4425,7 +4426,8 @@ class BotRuntime(object):
             yaw = _number(raw.get('yaw'))
             speed = _number(raw.get('speed')) if alive else 0.0
             tanks.append({
-                'id': player_id, 'alive': alive,
+                'id': player_id, 'kind': 'player',
+                'network_id': int(raw['id']), 'alive': alive,
                 'team': int(_number(raw.get('team'))),
                 'vehicle': str(raw.get('vehicle') or ''),
                 # The human client owns its own contact impulse; taking it

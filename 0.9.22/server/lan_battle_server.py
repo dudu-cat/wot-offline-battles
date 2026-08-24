@@ -78,6 +78,8 @@ MAX_PLAYER_INPUT_FINGERPRINTS = 128
 HUMAN_POSE_HISTORY_SECONDS = 1.5
 HUMAN_RAM_MAX_SUBSTEP_US = 100000
 HUMAN_POSE_CLOCK_LEEWAY_US = 250000
+MAX_HUMAN_RAM_PROBES = 64
+MAX_HUMAN_RAM_PROBE_HISTORY = 256
 MAX_RESULT_RECEIPTS = 256
 RESULT_RECEIPT_STATE_SCHEMA = 1
 RESULT_RECEIPT_STATE_FILE = "unacked_battle_receipts.json"
@@ -1570,6 +1572,9 @@ class BattleState:
         self.human_ram_contacts = frozenset()
         self.human_ram_pair_frontiers = {}
         self.human_ram_episode_seq = {}
+        self.human_ram_probe_seq = 0
+        self.human_ram_probe_requests = {}
+        self.human_ram_probe_fingerprints = OrderedDict()
         self.vehicle_statistics = {}
         self.vehicle_interactions = {}
         self.round_participants = {}
@@ -2515,6 +2520,9 @@ class BattleState:
         self.human_ram_contacts = frozenset()
         self.human_ram_pair_frontiers = {}
         self.human_ram_episode_seq = {}
+        self.human_ram_probe_seq = 0
+        self.human_ram_probe_requests = {}
+        self.human_ram_probe_fingerprints = OrderedDict()
         self.vehicle_statistics = {}
         self.vehicle_interactions = {}
         self.round_participants = {}
@@ -4601,7 +4609,7 @@ class BattleState:
                     "bot_state", "manifest_authority",
                     "sender=%s manifest_authority=%s" % (
                         player_id, self.bot_manifest_authority_id))
-            if not self.bot_manifest:
+            if not self.bot_manifest and self.bot_roster:
                 return self._set_protocol_reject(
                     "bot_state", "manifest_missing", "manifest=empty")
             source_time_us = None
@@ -4673,6 +4681,12 @@ class BattleState:
                             incoming, (list, tuple)) else None,
                         len(identities)))
             next_states = {}
+            human_ram_armors = self._validated_human_ram_armors(
+                message.get("human_ram_armors"))
+            if human_ram_armors is None:
+                return self._set_protocol_reject(
+                    "bot_state", "human_ram_armors",
+                    "worker human ram armor results are invalid")
             shot_events = []
             pending_projectile_launches = set()
             fire_deaths = []
@@ -4814,6 +4828,7 @@ class BattleState:
                 return self._set_protocol_reject(
                     "bot_state", "batch_members",
                     "missing=%s" % sorted(set(identities) - seen))
+            self._commit_human_ram_armors(human_ram_armors)
             self.bot_states = next_states
             self.bot_pending_projectile_launches.update(
                 pending_projectile_launches)
@@ -7371,6 +7386,7 @@ class BattleState:
             "speed": speed,
             "vx": math.sin(float(player.yaw)) * speed,
             "vz": math.cos(float(player.yaw)) * speed,
+            "pitch": float(player.pitch), "roll": float(player.roll),
         }
         player.pose_history.append(sample)
         player.pose_time_us = int(sample_time_us)
@@ -8442,6 +8458,178 @@ class BattleState:
             player.z = _clamp(player.z, -220.0, 220.0)
 
     @staticmethod
+    def _human_ram_probe_body(body):
+        return {
+            "id": int(body["id"]),
+            "vehicle": str(body["vehicle"]),
+            "x": round(float(body["x"]), 4),
+            "y": round(float(body["y"]), 4),
+            "z": round(float(body["z"]), 4),
+            "yaw": round(float(body["yaw"]), 5),
+            "pitch": round(float(body.get("pitch", 0.0)), 5),
+            "roll": round(float(body.get("roll", 0.0)), 5),
+            "shape": [round(float(value), 4)
+                      for value in body["shape"]],
+        }
+
+    def _queue_human_ram_probe(self, pair, first, second, frontier_time_us):
+        request = self.human_ram_probe_requests.get(pair)
+        if request is not None:
+            return request
+        if len(self.human_ram_probe_requests) >= MAX_HUMAN_RAM_PROBES:
+            return None
+        self.human_ram_probe_seq += 1
+        request = {
+            "seq": self.human_ram_probe_seq,
+            "first": self._human_ram_probe_body(first),
+            "second": self._human_ram_probe_body(second),
+            "frontier_time_us": int(frontier_time_us),
+            "_first_body": copy.deepcopy(first),
+            "_second_body": copy.deepcopy(second),
+        }
+        self.human_ram_probe_requests[pair] = request
+        return request
+
+    def _human_ram_probe_snapshot(self):
+        return [{
+            "seq": int(request["seq"]),
+            "first": copy.deepcopy(request["first"]),
+            "second": copy.deepcopy(request["second"]),
+        } for unused_pair, request in sorted(
+            self.human_ram_probe_requests.items())]
+
+    def _validated_human_ram_armors(self, raw_results):
+        if raw_results is None:
+            return ()
+        if (not isinstance(raw_results, (list, tuple)) or
+                len(raw_results) > MAX_HUMAN_RAM_PROBES):
+            return None
+        normalized = []
+        seen = set()
+        for raw in raw_results:
+            if not isinstance(raw, dict):
+                return None
+            available = raw.get("available")
+            allowed = {"seq", "first_id", "second_id", "available"}
+            if available is True:
+                allowed.update(("armor_first", "armor_second"))
+            if set(raw) != allowed or not isinstance(available, bool):
+                return None
+            try:
+                sequence = _exact_int(
+                    raw.get("seq"), 1, PROJECTILE_MAX_ID)
+                first_id = _exact_int(
+                    raw.get("first_id"), 1, PROJECTILE_MAX_ID)
+                second_id = _exact_int(
+                    raw.get("second_id"), 1, PROJECTILE_MAX_ID)
+            except ValueError:
+                return None
+            if (sequence in seen or first_id >= second_id or
+                    first_id not in self.human_collision_profiles or
+                    second_id not in self.human_collision_profiles):
+                return None
+            seen.add(sequence)
+            result = {
+                "seq": sequence, "first_id": first_id,
+                "second_id": second_id, "available": available,
+            }
+            if available:
+                try:
+                    armor_first = float(raw.get("armor_first"))
+                    armor_second = float(raw.get("armor_second"))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if (not math.isfinite(armor_first) or
+                        not 0.0 < armor_first <= 5000.0 or
+                        not math.isfinite(armor_second) or
+                        not 0.0 < armor_second <= 5000.0):
+                    return None
+                result["armor_first"] = round(armor_first, 4)
+                result["armor_second"] = round(armor_second, 4)
+            fingerprint = json.dumps(
+                result, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True)
+            previous = self.human_ram_probe_fingerprints.get(sequence)
+            if previous is not None:
+                if previous != fingerprint:
+                    return None
+                continue
+            pair = (first_id, second_id)
+            request = self.human_ram_probe_requests.get(pair)
+            if (request is None or int(request["seq"]) != sequence or
+                    int(request["first"]["id"]) != first_id or
+                    int(request["second"]["id"]) != second_id):
+                return None
+            normalized.append((pair, result, fingerprint))
+        return tuple(normalized)
+
+    def _commit_human_ram_armors(self, results):
+        for pair, result, fingerprint in results:
+            request = self.human_ram_probe_requests.get(pair)
+            if request is None or int(request["seq"]) != int(result["seq"]):
+                raise RuntimeError("human ram armor request changed at commit")
+            request["result"] = dict(result)
+            self.human_ram_probe_fingerprints[int(result["seq"])] = fingerprint
+            while (len(self.human_ram_probe_fingerprints) >
+                   MAX_HUMAN_RAM_PROBE_HISTORY):
+                self.human_ram_probe_fingerprints.popitem(last=False)
+
+    def _human_ram_contact_armors(
+            self, pair, first, second, frontier_time_us):
+        request = self._queue_human_ram_probe(
+            pair, first, second, frontier_time_us)
+        if request is None:
+            return None, False
+        result = request.get("result")
+        if result is None:
+            return None, False
+        self.human_ram_probe_requests.pop(pair, None)
+        if not result["available"]:
+            return None, True
+        return (float(result["armor_first"]),
+                float(result["armor_second"])), True
+
+    def _resolve_human_ram_substep(
+            self, pair, first_body, second_body, frontier_time_us,
+            active_contacts):
+        probe_state = {"resolved": False}
+
+        def contact_armor_probe(probe_first, probe_second, unused_contact):
+            armors, resolved = self._human_ram_contact_armors(
+                pair, probe_first, probe_second, frontier_time_us)
+            probe_state["resolved"] = resolved
+            return armors
+
+        result = tank_collision.resolve_tank(
+            first_body, (second_body,),
+            # resolve_tank uses zero as the no-prior-contact sentinel. Keep the
+            # round-relative source timeline positive.
+            now=float(frontier_time_us) / 1000000.0 + 1.0,
+            ram_cooldowns=self.human_ram_cooldowns,
+            active_ram_contacts=active_contacts,
+            contact_armor_probe=contact_armor_probe)
+        armor_pending = bool(
+            not probe_state["resolved"] and any(
+                diagnostic.get("reason") == "contact_armor_unavailable"
+                for diagnostic in result.get("ram_diagnostics", ())))
+        return result, armor_pending
+
+    def _apply_human_ram_substep(
+            self, first, second, pair, frontier_time_us, result,
+            active_contacts):
+        self.human_ram_cooldowns = result["cooldowns"]
+        if pair in result["contacts"]:
+            active_contacts.add(pair)
+        else:
+            active_contacts.discard(pair)
+        applied = 0
+        for event in result["ram_events"]:
+            if self._apply_human_ram_damage(
+                    first, second, event, pair, frontier_time_us):
+                applied += 1
+        return applied
+
+    @staticmethod
     def _human_pose_at(history, frontier_time_us):
         """Interpolate one canonical player pose; never extrapolate it."""
         samples = list(history or ())
@@ -8475,6 +8663,12 @@ class BattleState:
             "z": float(left["z"]) +
                  (float(right["z"]) - float(left["z"])) * ratio,
             "yaw": float(left["yaw"]) + yaw_delta * ratio,
+            "pitch": float(left.get("pitch", 0.0)) +
+                     (float(right.get("pitch", 0.0)) -
+                      float(left.get("pitch", 0.0))) * ratio,
+            "roll": float(left.get("roll", 0.0)) +
+                    (float(right.get("roll", 0.0)) -
+                     float(left.get("roll", 0.0))) * ratio,
             "vx": float(left["vx"]) +
                   (float(right["vx"]) - float(left["vx"])) * ratio,
             "vz": float(left["vz"]) +
@@ -8562,6 +8756,10 @@ class BattleState:
             if player.connected and player.participating and player.alive and
             player.player_id in self.human_collision_profiles),
             key=lambda value: value.player_id)
+        live_player_ids = set(player.player_id for player in players)
+        for pair in list(self.human_ram_probe_requests):
+            if not set(pair).issubset(live_player_ids):
+                self.human_ram_probe_requests.pop(pair, None)
         active_contacts = set(self.human_ram_contacts)
         applied = 0
         for first_index, first in enumerate(players):
@@ -8570,6 +8768,31 @@ class BattleState:
                         not first.alive or not second.alive):
                     continue
                 pair = (first.player_id, second.player_id)
+                pending_request = self.human_ram_probe_requests.get(pair)
+                if pending_request is not None:
+                    # A native probe can outlive the bounded pose history while
+                    # either real entity is still starting.  Replay the frozen
+                    # source-time bodies before consulting newer samples so a
+                    # delayed response cannot strand this pair frontier.
+                    if pending_request.get("result") is None:
+                        continue
+                    pending_frontier = int(
+                        pending_request["frontier_time_us"])
+                    result, armor_pending = self._resolve_human_ram_substep(
+                        pair,
+                        copy.deepcopy(pending_request["_first_body"]),
+                        copy.deepcopy(pending_request["_second_body"]),
+                        pending_frontier, active_contacts)
+                    if armor_pending:
+                        raise RuntimeError(
+                            "committed human ram armor was not consumed")
+                    applied += self._apply_human_ram_substep(
+                        first, second, pair, pending_frontier, result,
+                        active_contacts)
+                    self.human_ram_pair_frontiers[pair] = pending_frontier
+                    if (self.battle_result is not None or
+                            not first.alive or not second.alive):
+                        continue
                 if not first.pose_history or not second.pose_history:
                     continue
                 frontier = min(
@@ -8616,6 +8839,7 @@ class BattleState:
                 first_profile = self.human_collision_profiles[first.player_id]
                 second_profile = self.human_collision_profiles[
                     second.player_id]
+                processed_frontier = previous_frontier
                 for sample_frontier, first_pose, second_pose in timeline:
                     first_body = dict(first_pose, **{
                         "id": first.player_id, "alive": True,
@@ -8631,30 +8855,27 @@ class BattleState:
                         "shape": second_profile["shape"],
                         "ram_profile": second_profile["ram_profile"],
                     })
-                    result = tank_collision.resolve_tank(
-                        first_body, (second_body,),
-                        # resolve_tank uses zero as the no-prior-contact
-                        # sentinel. Keep the round-relative timeline positive.
-                        now=float(sample_frontier) / 1000000.0 + 1.0,
-                        ram_cooldowns=self.human_ram_cooldowns,
-                        active_ram_contacts=active_contacts)
-                    self.human_ram_cooldowns = result["cooldowns"]
-                    if pair in result["contacts"]:
-                        active_contacts.add(pair)
-                    else:
-                        active_contacts.discard(pair)
-                    for event in result["ram_events"]:
-                        if self._apply_human_ram_damage(
-                                first, second, event, pair,
-                                sample_frontier):
-                            applied += 1
+                    result, armor_pending = self._resolve_human_ram_substep(
+                        pair, first_body, second_body, sample_frontier,
+                        active_contacts)
+                    if armor_pending:
+                        # The hidden worker evaluates the exact native models at
+                        # this source-time pose. Keep the pair frontier behind
+                        # this substep so its result replays the same contact,
+                        # rather than applying a later asynchronous pose.
+                        break
+                    applied += self._apply_human_ram_substep(
+                        first, second, pair, sample_frontier, result,
+                        active_contacts)
+                    processed_frontier = sample_frontier
                     if (self.battle_result is not None or
                             not first.alive or not second.alive):
                         break
                 # Publish the frontier only after every available source-time
                 # substep has been applied in order. No later tick can skip an
                 # unprocessed suffix of this interval.
-                self.human_ram_pair_frontiers[pair] = frontier
+                if processed_frontier is not None:
+                    self.human_ram_pair_frontiers[pair] = processed_frontier
         self.human_ram_contacts = frozenset(active_contacts)
         return applied
 
@@ -9001,6 +9222,7 @@ class BattleState:
                     "bot_state_time_us": self.bot_state_time_us,
                     "projectile_revision": self.projectile_revision,
                     "projectiles": self._projectile_snapshot(),
+                    "human_ram_probes": self._human_ram_probe_snapshot(),
                 })
                 snapshot.update(self._authority_fields())
             # Freeze one exact wire image while holding the state lock. Bot,

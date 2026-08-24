@@ -100,6 +100,25 @@ class LanProtocolTests(unittest.TestCase):
         self.assertTrue(all(message['round_id'] == 7
                             for message in self.sent))
 
+    def test_worker_bot_state_projects_human_ram_armor_results_exactly(self):
+        worker = self._worker_client()
+        worker._send_preencoded_trusted = self.client._send
+        result = {
+            'seq': 7, 'first_id': 1, 'second_id': 2,
+            'available': True, 'armor_first': 45.0,
+            'armor_second': 80.0,
+        }
+
+        self.assertTrue(worker.send_projected_bot_state(
+            [], sample_time_us=40000, human_ram_armors=[result]))
+        self.assertEqual([result], self.sent[-1]['human_ram_armors'])
+        self.assertFalse(worker.send_projected_bot_state(
+            [], human_ram_armors=[dict(result, armor_first=float('nan'))]))
+        self.assertFalse(worker.send_projected_bot_state(
+            [], human_ram_armors=[dict(result, unexpected=True)]))
+        self.assertFalse(worker.send_projected_bot_state(
+            [], human_ram_armors=[dict(result, first_id=2, second_id=1)]))
+
     def test_siege_request_is_an_exact_boolean_input_field(self):
         self.assertTrue(self.client.send_input(
             0.0, 0.0, siege_enabled=True))

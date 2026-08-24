@@ -798,6 +798,105 @@ class HumanRamTimelineTest(unittest.TestCase):
                 if event.get('kind') == 'hit']
         self.assertEqual([], hits)
 
+    def test_native_armor_response_replays_the_exact_pending_substep(self):
+        state, clock = self._state(health=100000)
+        for player_id, z, speed, yaw in (
+                (1, -1.6, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 1, 100000, z, speed, yaw)
+        self.assertEqual(0, state._resolve_human_rams())
+        for player_id, z, speed, yaw in (
+                (1, 0.0, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 2, 200000, z, speed, yaw)
+
+        self.assertEqual(0, state._resolve_human_rams())
+        request = state._human_ram_probe_snapshot()
+        self.assertEqual(1, len(request))
+        self.assertEqual(100000, state.human_ram_pair_frontiers[(1, 2)])
+        self.assertEqual((1, 2), (
+            request[0]['first']['id'], request[0]['second']['id']))
+        self.assertEqual((0.0, 6.5), (
+            request[0]['first']['z'], request[0]['second']['z']))
+
+        response = {
+            'seq': request[0]['seq'], 'first_id': 1, 'second_id': 2,
+            'available': True, 'armor_first': 45.0,
+            'armor_second': 80.0,
+        }
+        message = {
+            'round_id': state.round_id, 'bots': [],
+            'human_ram_armors': [response],
+        }
+        # A publication which omits the result is an asynchronous retry, not
+        # an unavailable verdict and not permission to advance the pair.
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': state.round_id, 'bots': [],
+            }))
+        self.assertEqual(0, state._resolve_human_rams())
+        self.assertEqual(request, state._human_ram_probe_snapshot())
+        self.assertFalse(state.update_bot_states(
+            1, copy.deepcopy(message)))
+        self.assertEqual('authority', state.last_bot_state_reject_code)
+        self.assertEqual(request, state._human_ram_probe_snapshot())
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, copy.deepcopy(message)))
+
+        # Entity startup may delay the worker past the bounded pose-history
+        # window. The accepted response must still replay the frozen request,
+        # not depend on samples that happened to survive until this tick.
+        state.players[1].pose_history.clear()
+        state.players[2].pose_history.clear()
+
+        self.assertEqual(1, state._resolve_human_rams())
+        self.assertEqual(200000, state.human_ram_pair_frontiers[(1, 2)])
+        self.assertEqual([], state._human_ram_probe_snapshot())
+        self.assertLess(state.players[1].health, 100000)
+        self.assertLess(state.players[2].health, 100000)
+
+        # An exact transport retry folds after the request is consumed. A
+        # changed payload with the same sequence is a protocol conflict.
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, copy.deepcopy(message)))
+        before = (state.players[1].health, state.players[2].health)
+        conflict = copy.deepcopy(message)
+        conflict['human_ram_armors'][0]['armor_first'] = 46.0
+        self.assertFalse(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, conflict))
+        self.assertEqual('human_ram_armors',
+                         state.last_bot_state_reject_code)
+        self.assertEqual(before, (
+            state.players[1].health, state.players[2].health))
+
+    def test_explicit_unavailable_native_armor_advances_without_damage(self):
+        state, clock = self._state()
+        for player_id, z, speed, yaw in (
+                (1, -1.6, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 1, 100000, z, speed, yaw)
+        for player_id, z, speed, yaw in (
+                (1, 0.0, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 2, 200000, z, speed, yaw)
+        self.assertEqual(0, state._resolve_human_rams())
+        request = state._human_ram_probe_snapshot()[0]
+
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': state.round_id, 'bots': [],
+                'human_ram_armors': [{
+                    'seq': request['seq'], 'first_id': 1, 'second_id': 2,
+                    'available': False,
+                }],
+            }))
+        self.assertEqual(0, state._resolve_human_rams())
+
+        self.assertEqual(200000, state.human_ram_pair_frontiers[(1, 2)])
+        self.assertEqual((1000, 1000), (
+            state.players[1].health, state.players[2].health))
+        self.assertEqual([], state._human_ram_probe_snapshot())
+
     def test_input_retry_is_idempotent_and_identity_conflict_is_rejected(self):
         state, clock = self._state()
         message = {

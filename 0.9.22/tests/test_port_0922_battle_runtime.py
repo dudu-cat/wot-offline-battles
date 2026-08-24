@@ -5024,6 +5024,134 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          (second_hit.x, second_hit.y, second_hit.z))
         self.assertAlmostEqual(0.5, first_hit.y)
 
+    def test_worker_publishes_exact_human_ram_probe_with_player_entities(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        first_vehicle = _Vehicle(
+            21, _Descriptor('ussr:R11_MS-1'), _Vector(),
+            (0.0, 0.0, 0.0), {'health': 500})
+        second_vehicle = _Vehicle(
+            22, _Descriptor('ussr:R11_MS-1'), _Vector(0.0, 0.0, 6.5),
+            (0.0, 0.0, 0.0), {'health': 500})
+        runtime.bigworld.entities.update({
+            21: first_vehicle, 22: second_vehicle})
+        battle._records = {
+            'player:1': {
+                'engine_id': 21, 'kind': 'player', 'network_id': 1,
+                'ready': True, 'tombstone': False,
+                'state': {'vehicle': 'ussr:R11_MS-1'},
+            },
+            'player:2': {
+                'engine_id': 22, 'kind': 'player', 'network_id': 2,
+                'ready': True, 'tombstone': False,
+                'state': {'vehicle': 'ussr:R11_MS-1'},
+            },
+        }
+        battle._last_snapshot = {'human_ram_probes': [{
+            'seq': 7,
+            'first': {
+                'id': 1, 'vehicle': 'ussr:R11_MS-1',
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'pitch': 0.1, 'roll': -0.1,
+                'shape': [1.5, 3.5, -0.8, 2.0],
+            },
+            'second': {
+                'id': 2, 'vehicle': 'ussr:R11_MS-1',
+                'x': 0.0, 'y': 0.0, 'z': 6.5, 'yaw': math.pi,
+                'pitch': 0.0, 'roll': 0.0,
+                'shape': [1.5, 3.5, -0.8, 2.0],
+            },
+        }]}
+        first_matrix = object()
+        second_matrix = object()
+        battle._ram_pose_matrix = mock.Mock(
+            side_effect=[first_matrix, second_matrix])
+        battle._native_ram_vehicle_armor = mock.Mock(side_effect=[
+            {'armor': 45.0, 'screened': False},
+            {'armor': 80.0, 'screened': False},
+        ])
+        battle.client = types.SimpleNamespace(
+            send_projected_bot_state=mock.Mock(return_value=True))
+
+        self.assertTrue(battle._send_bot_message({
+            'type': 'bot_state', 'bots': [], 'sample_time_us': 40000}))
+
+        self.assertEqual([
+            mock.call((0.0, 0.0, 0.0), 0.0, 0.1, -0.1),
+            mock.call((0.0, 0.0, 6.5), math.pi, 0.0, 0.0),
+        ], battle._ram_pose_matrix.call_args_list)
+        self.assertIs(first_vehicle,
+                      battle._native_ram_vehicle_armor.call_args_list[0][0][0])
+        self.assertIs(first_matrix,
+                      battle._native_ram_vehicle_armor.call_args_list[0][0][1])
+        self.assertIs(second_vehicle,
+                      battle._native_ram_vehicle_armor.call_args_list[1][0][0])
+        self.assertIs(second_matrix,
+                      battle._native_ram_vehicle_armor.call_args_list[1][0][1])
+        battle.client.send_projected_bot_state.assert_called_once_with(
+            [], sample_time_us=40000, human_ram_armors=[{
+                'seq': 7, 'first_id': 1, 'second_id': 2,
+                'available': True, 'armor_first': 45.0,
+                'armor_second': 80.0,
+            }])
+
+    def test_worker_retains_human_ram_probe_until_entities_are_ready(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._last_snapshot = {'human_ram_probes': [{
+            'seq': 7,
+            'first': {
+                'id': 1, 'vehicle': 'ussr:R11_MS-1',
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'pitch': 0.0, 'roll': 0.0,
+                'shape': [1.5, 3.5, -0.8, 2.0],
+            },
+            'second': {
+                'id': 2, 'vehicle': 'ussr:R11_MS-1',
+                'x': 0.0, 'y': 0.0, 'z': 6.5, 'yaw': math.pi,
+                'pitch': 0.0, 'roll': 0.0,
+                'shape': [1.5, 3.5, -0.8, 2.0],
+            },
+        }]}
+        battle._records = {'player:1': {
+            'kind': 'player', 'network_id': 1, 'ready': False,
+            'tombstone': False, 'state': {'vehicle': 'ussr:R11_MS-1'},
+        }}
+        battle._native_ram_vehicle_armor = mock.Mock()
+
+        self.assertEqual([], battle._human_ram_armor_results())
+        battle._native_ram_vehicle_armor.assert_not_called()
+
+        first_vehicle = _Vehicle(
+            21, _Descriptor('ussr:R11_MS-1'), _Vector(),
+            (0.0, 0.0, 0.0), {'health': 500})
+        second_vehicle = _Vehicle(
+            22, _Descriptor('ussr:R11_MS-1'), _Vector(0.0, 0.0, 6.5),
+            (0.0, 0.0, 0.0), {'health': 500})
+        runtime.bigworld.entities.update({
+            21: first_vehicle, 22: second_vehicle})
+        battle._records = {
+            'player:1': {
+                'engine_id': 21, 'kind': 'player', 'network_id': 1,
+                'ready': True, 'tombstone': False,
+                'state': {'vehicle': 'ussr:R11_MS-1'},
+            },
+            'player:2': {
+                'engine_id': 22, 'kind': 'player', 'network_id': 2,
+                'ready': True, 'tombstone': False,
+                'state': {'vehicle': 'ussr:R11_MS-1'},
+            },
+        }
+        battle._native_ram_vehicle_armor = mock.Mock(return_value=None)
+
+        self.assertEqual([{
+            'seq': 7, 'first_id': 1, 'second_id': 2,
+            'available': False,
+        }], battle._human_ram_armor_results())
+        battle._native_ram_vehicle_armor.assert_called_once()
+
     def test_native_ram_callbacks_dedupe_one_sustained_contact_episode(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

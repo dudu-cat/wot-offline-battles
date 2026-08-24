@@ -7289,6 +7289,47 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(probes))
         self.assertEqual([], repeated)
 
+    def test_bot_human_native_armor_probe_carries_player_record_identity(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 25000.0
+        probes = []
+
+        def ram_contact_probe(first, second, contact):
+            probes.append((dict(first), dict(second), contact))
+            return 45.0, 80.0
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            ram_contact_probe=ram_contact_probe)
+        runtime.battle_start(dict(self.start, bots=[
+            {'id': 11, 'team': 1, 'slot': 0, 'name': 'First'},
+        ]))
+        runtime._clear = lambda *unused: True
+        runtime.states[11].update(
+            x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
+            speed=10.0, push_x=0.0, push_z=0.0)
+        player = _admit_player({
+            'id': 2, 'team': 2, 'vehicle': 'ussr:R11_MS-1',
+            'x': 6.5, 'y': 0.0, 'z': 0.0,
+            'yaw': math.pi / 2.0, 'speed': 0.0, 'alive': True,
+        })
+
+        runtime._resolve_tank_contacts([player], 10.0, .04)
+
+        self.assertEqual(1, len(probes))
+        first, second, unused_contact = probes[0]
+        self.assertEqual(('bot', 11), (
+            first['kind'], first['network_id']))
+        self.assertEqual(('player', 2), (
+            second['kind'], second['network_id']))
+        self.assertEqual(self.module.HUMAN_TARGET_ID_BASE + 2, second['id'])
+
     def test_current_human_contact_never_reports_damage_without_receipt(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
@@ -8122,6 +8163,16 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertGreater(
             self.adapters[0].calls[-1][0]['dt'],
             self.adapters[0].calls[0][0]['dt'])
+
+    def test_zero_bot_authority_still_publishes_authenticated_state(self):
+        outgoing = self.runtime.battle_start(dict(self.start, bots=[]))
+
+        self.assertEqual([{'type': 'bot_manifest', 'bots': []}], outgoing)
+        publications = self.runtime.update(.04, 1.0, players=[])
+        states = [message for message in publications
+                  if message.get('type') == 'bot_state']
+        self.assertEqual(1, len(states))
+        self.assertEqual([], states[0]['bots'])
 
     def test_traffic_feedback_refreshes_between_cached_decisions(self):
         self.runtime.battle_start(self.start)

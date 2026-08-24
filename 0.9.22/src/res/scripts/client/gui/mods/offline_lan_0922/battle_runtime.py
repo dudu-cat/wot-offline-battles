@@ -236,9 +236,11 @@ _PORT_PACKAGE = 'gui.mods.offline_lan_0922'
 _ATOMIC_TYPES = (bool, float, complex, bytes, bytearray)
 try:
     _INTEGER_TYPES = (int, long)
+    _STRING_TYPES = (basestring,)
     _ATOMIC_TYPES += (int, long, str, unicode)
 except NameError:
     _INTEGER_TYPES = (int,)
+    _STRING_TYPES = (str,)
     _ATOMIC_TYPES += (int, str)
 
 
@@ -11414,33 +11416,37 @@ class BattleRuntime(object):
             return {'armor': armor, 'screened': False}
         return None
 
-    def _bot_ram_contact_armor(self, first, second, unused_contact):
-        """Probe both real #1513 hit testers at one worker-owned contact."""
+    def _ram_contact_armor_status(self, first, second):
+        """Classify one native contact probe without folding transient state."""
         if not self._worker_mode:
-            return None
+            return 'pending', None
         vehicles = []
         for body in (first, second):
             try:
-                bot_id = int(body['id'])
+                body_kind = str(body.get('kind', 'bot'))
+                network_id = int(body.get('network_id', body['id']))
             except (KeyError, TypeError, ValueError, OverflowError):
-                return None
-            record = self._records.get('bot:%s' % bot_id)
-            if (record is None or record.get('kind') != 'bot' or
+                return 'invalid', None
+            if body_kind not in ('bot', 'player') or network_id <= 0:
+                return 'invalid', None
+            record = self._records.get('%s:%s' % (body_kind, network_id))
+            if (record is None or record.get('kind') != body_kind or
                     not record.get('ready') or record.get('tombstone')):
-                return None
+                return 'pending', None
             vehicle = self._server_entity(record.get('engine_id'))
-            if getattr(vehicle, 'typeDescriptor', None) is None:
-                return None
+            if (vehicle is None or not getattr(vehicle, 'isStarted', False) or
+                    getattr(vehicle, 'typeDescriptor', None) is None):
+                return 'pending', None
             vehicles.append(vehicle)
         if int(first['id']) == int(second['id']):
-            return None
+            return 'invalid', None
         if not tank_collision.vertical_overlap(
                 first.get('y'), first['shape'],
                 second.get('y'), second['shape']):
-            return None
+            return 'invalid', None
         overlap_point = self._ram_obb_overlap_point(first, second)
         if overlap_point is None:
-            return None
+            return 'invalid', None
         low = max(
             float(first['y']) + float(first['shape'][2]),
             float(second['y']) + float(second['shape'][2]))
@@ -11448,7 +11454,7 @@ class BattleRuntime(object):
             float(first['y']) + float(first['shape'][3]),
             float(second['y']) + float(second['shape'][3]))
         if high <= low:
-            return None
+            return 'invalid', None
         hit_point = self._vector((
             overlap_point[0], (low + high) * 0.5, overlap_point[1]))
         plates = []
@@ -11459,9 +11465,114 @@ class BattleRuntime(object):
             plate = self._native_ram_vehicle_armor(
                 vehicle, matrix, hit_point)
             if plate is None:
-                return None
+                # At this point both exact entities and their contact geometry
+                # are ready. None now means the native ray found no structural
+                # armour, rather than an asynchronous startup failure.
+                return 'unavailable', None
             plates.append(float(plate['armor']))
-        return tuple(plates)
+        return 'available', tuple(plates)
+
+    def _bot_ram_contact_armor(self, first, second, unused_contact):
+        """Probe both real #1513 hit testers at one worker-owned contact."""
+        status, armors = self._ram_contact_armor_status(first, second)
+        return armors if status == 'available' else None
+
+    @staticmethod
+    def _validated_human_ram_probe_body(raw):
+        allowed = set((
+            'id', 'vehicle', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',
+            'shape'))
+        if not isinstance(raw, dict) or set(raw) != allowed:
+            raise RuntimeError('worker human ram probe body is invalid')
+        player_id = lan_protocol._exact_int(raw.get('id'))
+        vehicle = raw.get('vehicle')
+        if (player_id is None or not 0 < player_id <= 2147483647 or
+                not isinstance(vehicle, _STRING_TYPES) or
+                not vehicle or len(vehicle) > 80 or
+                not isinstance(raw.get('shape'), (list, tuple)) or
+                len(raw['shape']) != 4):
+            raise RuntimeError('worker human ram probe body is invalid')
+        try:
+            values = dict((name, float(raw[name])) for name in (
+                'x', 'y', 'z', 'yaw', 'pitch', 'roll'))
+            shape = tuple(float(value) for value in raw['shape'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RuntimeError('worker human ram probe body is invalid')
+        if (any(math.isnan(value) or math.isinf(value)
+                for value in list(values.values()) + list(shape)) or
+                any(abs(values[name]) > 5000.0 for name in ('x', 'y', 'z')) or
+                not 0.5 <= shape[0] <= 20.0 or
+                not 0.75 <= shape[1] <= 30.0 or
+                not -20.0 <= shape[2] < shape[3] <= 30.0):
+            raise RuntimeError('worker human ram probe body is invalid')
+        return {
+            'id': player_id, 'kind': 'player', 'network_id': player_id,
+            'vehicle': str(vehicle), 'alive': True,
+            'x': values['x'], 'y': values['y'], 'z': values['z'],
+            'yaw': values['yaw'], 'pitch': values['pitch'],
+            'roll': values['roll'], 'shape': shape,
+        }
+
+    def _human_ram_armor_results(self):
+        """Probe each exact server substep with the worker's native entities."""
+        if not self._worker_mode:
+            return []
+        raw_requests = (self._last_snapshot or {}).get('human_ram_probes', ())
+        if (not isinstance(raw_requests, (list, tuple)) or
+                len(raw_requests) > 64):
+            raise RuntimeError('worker human ram probe batch is invalid')
+        results = []
+        seen = set()
+        for raw in raw_requests:
+            if not isinstance(raw, dict) or set(raw) != set((
+                    'seq', 'first', 'second')):
+                raise RuntimeError('worker human ram probe is invalid')
+            sequence = lan_protocol._exact_int(raw.get('seq'))
+            if (sequence is None or not 0 < sequence <= 2147483647 or
+                    sequence in seen):
+                raise RuntimeError('worker human ram probe is invalid')
+            seen.add(sequence)
+            first = self._validated_human_ram_probe_body(raw.get('first'))
+            second = self._validated_human_ram_probe_body(raw.get('second'))
+            if first['id'] >= second['id']:
+                raise RuntimeError('worker human ram probe order is invalid')
+            ready = True
+            for body in (first, second):
+                record = self._records.get('player:%s' % body['network_id'])
+                if (record is None or not record.get('ready') or
+                        record.get('tombstone')):
+                    ready = False
+                    break
+                state = record.get('state') or {}
+                if (record.get('kind') != 'player' or
+                        int(record.get('network_id', 0)) != body['id'] or
+                        str(state.get('vehicle') or '') != body['vehicle']):
+                    raise RuntimeError(
+                        'worker human ram probe identity is invalid')
+                entity = self._server_entity(record.get('engine_id'))
+                if (entity is None or not getattr(entity, 'isStarted', False) or
+                        getattr(entity, 'typeDescriptor', None) is None):
+                    ready = False
+                    break
+            if not ready:
+                # Entity startup is asynchronous. Omit this response so the
+                # server retains and republishes the exact pending substep.
+                continue
+            status, armors = self._ram_contact_armor_status(first, second)
+            if status == 'pending':
+                continue
+            if status == 'invalid':
+                raise RuntimeError(
+                    'worker human ram probe geometry is invalid')
+            result = {
+                'seq': sequence, 'first_id': first['id'],
+                'second_id': second['id'], 'available': status == 'available',
+            }
+            if status == 'available':
+                result['armor_first'] = float(armors[0])
+                result['armor_second'] = float(armors[1])
+            results.append(result)
+        return results
 
     @staticmethod
     def _native_ram_velocity(vehicle):
@@ -13208,15 +13319,20 @@ class BattleRuntime(object):
             return self.client.send_bot_manifest(
                 message.get('bots'), profiles)
         if kind == 'bot_state':
+            human_ram_armors = message.get('human_ram_armors')
+            if human_ram_armors is None and self._worker_mode:
+                human_ram_armors = self._human_ram_armor_results()
+            state_kwargs = {}
+            if 'sample_time_us' in message:
+                state_kwargs['sample_time_us'] = message.get('sample_time_us')
+            if human_ram_armors is not None:
+                state_kwargs['human_ram_armors'] = human_ram_armors
             projected_sender = getattr(
                 self.client, 'send_projected_bot_state', None)
             if callable(projected_sender):
-                if 'sample_time_us' in message:
-                    return projected_sender(
-                        message.get('bots'),
-                        sample_time_us=message.get('sample_time_us'))
-                return projected_sender(message.get('bots'))
-            return self.client.send_bot_state(message.get('bots'))
+                return projected_sender(message.get('bots'), **state_kwargs)
+            return self.client.send_bot_state(
+                message.get('bots'), **state_kwargs)
         if kind == 'bot_observation':
             return self.client.send_bot_observation(
                 message.get('contacts'), message.get('affordances'))
