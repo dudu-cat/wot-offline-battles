@@ -2,6 +2,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import threading
 import types
 import unittest
 
@@ -1094,6 +1095,59 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(['shot', 'projectile_impact', 'hit'],
                          [event['kind'] for event in events])
 
+    def test_disconnected_shooter_enemy_frag_uses_frozen_launch_identity(self):
+        state = _state()
+        for player in state.players.values():
+            player.account_key = 'player-%d' % player.player_id
+        state._freeze_round_participants(list(state.players.values()))
+        self.assertTrue(_launch_authority(state, _launch()))
+
+        state.remove_player(1)
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve('1:p:1:1', direct=_effect(damage=1000))))
+        attacker = state.vehicle_statistics[('player', 1)]
+        target = state.vehicle_statistics[('player', 2)]
+        self.assertEqual(1, attacker['team'])
+        self.assertEqual(1000, attacker['damage_dealt'])
+        self.assertEqual(1, attacker['kills'])
+        self.assertEqual(1000, target['damage_received'])
+        self.assertEqual(1, state.round_participants['player-1']['frags'])
+        self.assertFalse(
+            state.round_participants['player-1']['team_killer'])
+        statistics = [event for event in state.pending_events
+                      if event.get('kind') == 'vehicle_statistics']
+        self.assertEqual(1, statistics[-1]['frags'])
+
+    def test_disconnected_shooter_friendly_frag_keeps_enemy_stats_zero(self):
+        state = _state(players=3)
+        for player in state.players.values():
+            player.account_key = 'player-%d' % player.player_id
+        state._freeze_round_participants(list(state.players.values()))
+        self.assertTrue(_launch_authority(state, _launch()))
+
+        state.remove_player(1)
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve(
+                '1:p:1:1', impact=[20.0, 1.0, 0.0],
+                checked_distance=20.0,
+                direct=_effect(target_id=3, damage=1000, x=20.0))))
+        attacker = state.vehicle_statistics[('player', 1)]
+        target = state.vehicle_statistics[('player', 3)]
+        self.assertEqual(1, attacker['team'])
+        self.assertEqual(0, attacker['damage_dealt'])
+        self.assertEqual(0, attacker['kills'])
+        self.assertEqual(1000, target['damage_received'])
+        self.assertEqual(-1, state.round_participants['player-1']['frags'])
+        self.assertTrue(state.round_participants['player-1']['team_killer'])
+        statistics = [event for event in state.pending_events
+                      if event.get('kind') == 'vehicle_statistics']
+        self.assertEqual(-1, statistics[-1]['frags'])
+        self.assertTrue(statistics[-1]['team_killer'])
+
     def test_modern_legacy_hits_reject_but_082_remains_compatible(self):
         modern = _state()
         modern.players[1].fire_seq = 1
@@ -1230,6 +1284,57 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                          snapshots[-1]['server_time_ms'])
         self.assertEqual(events[0]['authority_epoch'],
                          snapshots[-1]['authority_epoch'])
+
+    def test_event_extraction_and_leave_are_one_ordered_state_transaction(self):
+        state = _state()
+        self.assertTrue(_launch_authority(state, _launch()))
+        entered_delivery = threading.Event()
+        release_delivery = threading.Event()
+        mutation_started = threading.Event()
+        mutation_done = threading.Event()
+        delivered = []
+
+        def offer_reliable(message):
+            if message.get('type') == 'events':
+                delivered.append(message)
+                if not entered_delivery.is_set():
+                    entered_delivery.set()
+                    self.assertTrue(release_delivery.wait(2.0))
+            return True
+
+        state.players[1].offer_reliable = offer_reliable
+        state.players[1].offer_snapshot = lambda unused_message: True
+        tick_thread = threading.Thread(
+            target=state.tick_once, args=(1.0 / TICK_HZ,))
+        tick_thread.start()
+        self.assertTrue(entered_delivery.wait(2.0))
+
+        def leave_player():
+            mutation_started.set()
+            state.leave_battle(2, {'round_id': state.round_id})
+            mutation_done.set()
+
+        leave_thread = threading.Thread(target=leave_player)
+        leave_thread.start()
+        self.assertTrue(mutation_started.wait(2.0))
+        self.assertFalse(mutation_done.wait(0.05))
+        release_delivery.set()
+        tick_thread.join(2.0)
+        leave_thread.join(2.0)
+        self.assertFalse(tick_thread.is_alive())
+        self.assertFalse(leave_thread.is_alive())
+        self.assertTrue(mutation_done.is_set())
+
+        state.tick_once(1.0 / TICK_HZ)
+
+        events = [event for message in delivered
+                  for event in message['events']]
+        event_ids = [event['event_id'] for event in events]
+        self.assertEqual(len(event_ids), len(set(event_ids)))
+        self.assertEqual(1, sum(event.get('kind') == 'shot'
+                                for event in events))
+        self.assertEqual(1, sum(event.get('source') == 'player_left'
+                                for event in events))
 
     def test_legacy_events_envelope_remains_082_compatible(self):
         state = _state(players=1)

@@ -2311,6 +2311,7 @@ class BattleState:
                     participant['death_attacker_id'] = int(
                         player.death_attacker_id or 0)
                     participant['team_killer'] = bool(player.team_killer)
+                    participant['frags'] = int(player.frags)
                 self.state_revision += 1
             self.player_spotted.pop(player_id, None)
             self.player_environment.pop(player_id, None)
@@ -2922,6 +2923,7 @@ class BattleState:
                 "death_attacker_id": int(
                     participant.death_attacker_id or 0),
                 "team_killer": bool(participant.team_killer),
+                "frags": int(participant.frags),
             }
         self.round_participants = frozen
 
@@ -3671,6 +3673,7 @@ class BattleState:
                 participant["death_attacker_id"] = int(
                     player.death_attacker_id or 0)
                 participant["team_killer"] = bool(player.team_killer)
+                participant["frags"] = int(player.frags)
             player.participating = False
             previous_health = player.health
             player.health = 0
@@ -5741,7 +5744,9 @@ class BattleState:
         self.pending_events.append(event)
         shooter = (str(record["shooter_kind"]), int(record["shooter_id"]))
         victim = (str(target_kind), int(target_id))
-        self._record_damage(shooter, victim, applied, critical_before)
+        self._record_damage(
+            shooter, victim, applied, critical_before,
+            attacker_team=int(record["team"]))
         if _destroyed_tracks(admitted_critical) - _destroyed_tracks(
                 critical_before):
             self.track_immobilisers[victim] = shooter
@@ -5780,7 +5785,8 @@ class BattleState:
                 target["death_attacker_id"] = record["shooter_id"]
             self._record_frag(
                 record["shooter_kind"], record["shooter_id"],
-                proposal["target_team"], target_kind, target_id)
+                proposal["target_team"], target_kind, target_id,
+                attacker_team=int(record["team"]))
 
     def resolve_projectile(self, player_id, message):
         """Validate one whole terminal effect batch before applying any HP."""
@@ -8144,7 +8150,8 @@ class BattleState:
         return [dict(self.vehicle_statistics[key])
                 for key in sorted(self.vehicle_statistics)]
 
-    def _record_damage(self, attacker, target, damage, target_critical):
+    def _record_damage(self, attacker, target, damage, target_critical,
+                       attacker_team=None):
         """Attribute one applied damage amount and every assist it earned.
 
         ``attacker`` and ``target`` are ``(kind, id)`` pairs; ``attacker`` is
@@ -8156,13 +8163,22 @@ class BattleState:
             return
         self._statistics_row(*target)["damage_received"] += damage
         target_team = self._vehicle_team(*target)
-        if attacker is None or self._vehicle_team(*attacker) == target_team:
+        if attacker is None:
+            return
+        if attacker_team is None:
+            attacker_team = self._vehicle_team(*attacker)
+        else:
+            attacker_team = int(attacker_team)
+        if attacker_team == target_team:
             return
         if target[0] == "bot":
             self.bot_planner.report_damage(
                 target[1], attacker[0], attacker[1], damage,
                 self._monotonic())
-        self._statistics_row(*attacker)["damage_dealt"] += damage
+        attacker_row = self._statistics_row(*attacker)
+        if not attacker_row["team"] and attacker_team in (1, 2):
+            attacker_row["team"] = attacker_team
+        attacker_row["damage_dealt"] += damage
         self._increment_interaction(
             attacker, target, "damage", damage)
         self._increment_interaction(
@@ -8190,23 +8206,47 @@ class BattleState:
                 "damage": damage,
             })
 
+    def _frozen_player_participant(self, player_id):
+        """Return one immutable-round player identity after socket removal."""
+        player_id = int(player_id)
+        for participant in self.round_participants.values():
+            if int(participant.get("player_id", 0)) == player_id:
+                return participant
+        return None
+
     def _record_frag(self, attacker_kind, attacker_id, victim_team,
-                     victim_kind, victim_id):
+                     victim_kind, victim_id, attacker_team=None):
         """Copy 0.8.2 +1 enemy / -1 ally frag and team-killer law."""
         if (attacker_kind == victim_kind and
                 int(attacker_id) == int(victim_id)):
             return False
         if attacker_kind == "player":
             actor = self.players.get(int(attacker_id))
-            if actor is None:
+            participant = self._frozen_player_participant(attacker_id)
+            if actor is None and participant is None:
                 return False
-            actor_team = actor.team
+            actor_team = int(
+                actor.team if actor is not None else participant["team"])
+            if (attacker_team is not None and
+                    int(attacker_team) != actor_team):
+                return False
             delta = -1 if actor_team == int(victim_team) else 1
-            actor.frags += delta
-            if delta < 0:
-                actor.team_killer = True
-            frags = actor.frags
-            team_killer = actor.team_killer
+            if actor is not None:
+                actor.frags += delta
+                if delta < 0:
+                    actor.team_killer = True
+                frags = actor.frags
+                team_killer = actor.team_killer
+            else:
+                participant["frags"] = int(
+                    participant.get("frags", 0)) + delta
+                if delta < 0:
+                    participant["team_killer"] = True
+                frags = participant["frags"]
+                team_killer = bool(participant.get("team_killer", False))
+            if participant is not None:
+                participant["frags"] = int(frags)
+                participant["team_killer"] = bool(team_killer)
         elif attacker_kind == "bot":
             actor = self.bot_states.get(int(attacker_id))
             if actor is None:
@@ -8221,7 +8261,10 @@ class BattleState:
         else:
             return False
         if delta > 0:
-            self._statistics_row(attacker_kind, attacker_id)["kills"] += 1
+            row = self._statistics_row(attacker_kind, attacker_id)
+            if not row["team"] and actor_team in (1, 2):
+                row["team"] = actor_team
+            row["kills"] += 1
             attacker = (str(attacker_kind), int(attacker_id))
             victim = (str(victim_kind), int(victim_id))
             interaction = self._statistics_interaction(attacker, victim)
@@ -8679,6 +8722,7 @@ class BattleState:
         reset_message = None
         had_pending_live = False
         failed_live_recipients = []
+        failed_event_recipients = []
         authority_observation_relays = ()
         with self.lock:
             if self.pending_live_message is not None:
@@ -8854,6 +8898,14 @@ class BattleState:
             recipients = list(self.players.values())
             if self.simulation_worker is not None:
                 recipients.append(self.simulation_worker)
+            # Enqueue ordered causes in the same state transaction that assigns
+            # their IDs and removes them from pending_events. A leave, worker
+            # loss, or epoch change cannot invalidate this batch between
+            # extraction and delivery; the reliable outbox fences its snapshot.
+            if events_message is not None:
+                for endpoint in recipients:
+                    if not endpoint.offer_reliable(events_message):
+                        failed_event_recipients.append(endpoint)
             snapshot_client_build = self.client_build
             snapshot_round_id = self.round_id
             snapshot_tick = self.tick
@@ -8874,16 +8926,6 @@ class BattleState:
                     event, self.players, self.bot_states)
                 if message is not None:
                     _server_log(message)
-            failed_event_recipients = []
-            with self.lock:
-                if (self.round_id == snapshot_round_id and
-                        self.state_revision == snapshot_state_revision and
-                        self.authority_epoch ==
-                        snapshot_authority_epoch):
-                    for endpoint in recipients:
-                        if (self._endpoint_is_current(endpoint) and
-                                not endpoint.offer_reliable(events_message)):
-                            failed_event_recipients.append(endpoint)
             for endpoint in failed_event_recipients:
                 self._remove_endpoint(endpoint)
         # Ordered combat causes must reach the client before the durable state
