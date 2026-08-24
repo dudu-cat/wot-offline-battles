@@ -12007,7 +12007,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         sender.send_avatar_input(1, 'track_relative', {
             'point': _Vector(10.0, 2.0, 20.0)})
         self.assertAlmostEqual(math.atan2(10.0, 20.0), sender.aim_yaw)
-        self.assertAlmostEqual(math.atan2(2.0, math.sqrt(500.0)),
+        self.assertAlmostEqual(-math.atan2(2.0, math.sqrt(500.0)),
                                sender.gun_pitch)
         owner._echo_local_gun_angles.assert_called_once_with()
 
@@ -13339,6 +13339,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._publish_ammo_state = mock.Mock()
         battle._publish_reload_event = mock.Mock()
         battle._resolve_hit = mock.Mock()
+        battle._local_yaw = 0.4
+        battle._avatar.gunRotator.turretYaw = 0.15
+        battle._avatar.gunRotator.gunPitch = -0.08
         battle._records = {
             'player:1': {'engine_id': 10, 'local': True}}
 
@@ -13356,6 +13359,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
                       if item[0] == 'fire_intent')
         self.assertEqual((0,), intent[1])
         self.assertEqual({'input_seq': 1, 'intent_seq': 1}, intent[2])
+        current_input = next(item for item in client.sent
+                             if item[0] == 'input')
+        self.assertAlmostEqual(0.55, current_input[1][2])
+        self.assertAlmostEqual(-0.08, current_input[1][3])
+        self.assertAlmostEqual(0.55, battle._sender.aim_yaw)
+        self.assertAlmostEqual(-0.08, battle._sender.gun_pitch)
         battle._show_shot({
             'attacker': 1, 'shooter_kind': 'player', 'shooter_id': 1,
             'fire_intent_seq': 1, 'fire_input_seq': 1,
@@ -13454,6 +13463,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._gun_state = gun_mechanics.GunState(descriptor)
         battle._gun_state.reload_time = 0.0
         battle._gun_state.clip = 1
+        battle._avatar.gunRotator.turretYaw = 0.2
+        battle._avatar.gunRotator.gunPitch = -0.1
 
         self.assertFalse(battle.shoot(0.2, -0.1))
         self.assertEqual([], battle._avatar.dispersion_queries)

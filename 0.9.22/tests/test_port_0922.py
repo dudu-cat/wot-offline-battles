@@ -1782,6 +1782,73 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertIs(stock_vehicle_enter,
                       vehicle_type.__dict__['onEnterWorld'])
 
+    def test_enemy_start_visual_initializes_stock_without_first_spot_flash(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, operations = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+
+        def stock_show(vehicle, visible):
+            operations.append(('stock_vehicle_show', vehicle.id, visible))
+            vehicle.model.visible = bool(visible)
+
+        def stock_start_visual(vehicle):
+            operations.append(('stock_visual_controllers_started', vehicle.id))
+            vehicle.show(True)
+            vehicle.guiSessionProvider.startVehicleVisual(vehicle, True)
+            vehicle.isStarted = True
+            return 'stock-started'
+
+        vehicle_type.show = stock_show
+        vehicle_type.startVisual = stock_start_visual
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.configure_battle(player_team=1)
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.team = 1
+        avatar.playerVehicleID = 10
+
+        class Provider(object):
+            def startVehicleVisual(self, vehicle, is_immediate):
+                operations.append((
+                    'start_vehicle_visual', vehicle.id, is_immediate))
+
+            def stopVehicleVisual(self, vehicle_id, is_player):
+                operations.append((
+                    'stop_vehicle_visual', vehicle_id, is_player))
+
+        provider = Provider()
+        avatar.guiSessionProvider = provider
+        runtime.bigworld._player = avatar
+        enemy = vehicle_type()
+        enemy.id = 11
+        enemy.publicInfo = {'team': 2}
+        enemy.guiSessionProvider = provider
+        enemy.targetCaps = [1]
+        enemy.model = types.SimpleNamespace(visible=True)
+        enemy.isStarted = False
+
+        result = enemy.startVisual()
+
+        self.assertEqual('stock-started', result)
+        self.assertIn(
+            ('stock_visual_controllers_started', 11), operations)
+        self.assertNotIn(('stock_vehicle_show', 11, True), operations)
+        self.assertNotIn(('start_vehicle_visual', 11, True), operations)
+        self.assertFalse(enemy.model.visible)
+        self.assertEqual([], enemy.targetCaps)
+
+        # A later LAN spotting edge is outside the exact stock startVisual
+        # call and must still be able to reveal both model and native UI.
+        enemy._offlineNativeDrawVisible = True
+        enemy._offlineNativeMarkerVisible = True
+        enemy.show(True)
+        provider.startVehicleVisual(enemy, True)
+        self.assertIn(('stock_vehicle_show', 11, True), operations)
+        self.assertIn(('start_vehicle_visual', 11, True), operations)
+
+        compatibility.fini()
+        self.assertIs(stock_start_visual,
+                      vehicle_type.__dict__['startVisual'])
+
     def test_compatibility_does_not_replace_stock_vehicle_filters(self):
         compatibility_module = _load_port_source('compat')
         runtime, operations = self._runtime()

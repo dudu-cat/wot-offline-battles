@@ -872,6 +872,7 @@ static int attach_ready_player_procdumps(PlayerProcessTracker *tracker,
 {
 	DWORD marker_attributes;
 	DWORD index;
+	BOOL marker_consumed = FALSE;
 	if (!tracker->procdump_configured) {
 		return 1;
 	}
@@ -888,6 +889,7 @@ static int attach_ready_player_procdumps(PlayerProcessTracker *tracker,
 			continue;
 		}
 		tracked->procdump_attempted = TRUE;
+		marker_consumed = TRUE;
 		tracked->procdump_process = start_procdump_configured(
 			tracked->process, tracked->id, tracker->procdump_path,
 			tracked->dump_path);
@@ -897,6 +899,13 @@ static int attach_ready_player_procdumps(PlayerProcessTracker *tracker,
 				WaitForSingleObject(tracked->process, 0) == WAIT_TIMEOUT) {
 			log_failure("player_procdump_unavailable", ERROR_OPEN_FAILED);
 		}
+	}
+	/* One ready publication belongs to the currently tracked client set.  A
+	 * replacement WorldOfTanks process inherits the same marker path and must
+	 * publish it again after its own loader reaches the Hangar; retaining this
+	 * file would attach ProcDump to that replacement during native startup. */
+	if (marker_consumed && !remove_marker_path(ready_marker)) {
+		log_failure("consume_player_ready_marker", GetLastError());
 	}
 	return 1;
 }

@@ -967,7 +967,11 @@ class _LANInputSender(object):
             dz = target[2] - position[2]
         horizontal = math.sqrt(dx * dx + dz * dz)
         self.aim_yaw = math.atan2(dx, dz)
-        self.gun_pitch = math.atan2(dy, max(horizontal, 0.001))
+        # Exact #1513 stores the rendered gun angle as negative-up.  The
+        # relative tracking point uses normal world coordinates (positive Y
+        # is up), so its geometric elevation must be inverted before it is
+        # echoed through VehicleGunRotator or donated to the worker.
+        self.gun_pitch = -math.atan2(dy, max(horizontal, 0.001))
 
     def send_current(self, siege_enabled=None):
         position, yaw = self.owner.local_pose()
@@ -13723,9 +13727,23 @@ class BattleRuntime(object):
             return False
         shell_index = state.shot_index
         sender = getattr(self.client, 'send_fire_intent', None)
-        if not callable(sender):
+        if not callable(sender) or self._sender is None:
             return False
-        if self._sender is None or not self._sender.send_current():
+        # The tracking mailbox carries the desired target angle, while the
+        # stock rotator may still be moving toward it.  Freeze the exact
+        # native barrel angle visible at the trigger edge; the immediately
+        # following input is what the server binds to this fire intent.
+        rotator = getattr(self._avatar, 'gunRotator', None)
+        try:
+            turret_yaw = float(rotator.turretYaw)
+            gun_pitch = float(rotator.gunPitch)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        unused_position, hull_yaw = self.local_pose()
+        aim_yaw = float(hull_yaw) + turret_yaw
+        self._sender.aim_yaw = aim_yaw
+        self._sender.gun_pitch = gun_pitch
+        if not self._sender.send_current():
             return False
         intent_seq = sender(shell_index, aim_yaw, gun_pitch)
         if not intent_seq:

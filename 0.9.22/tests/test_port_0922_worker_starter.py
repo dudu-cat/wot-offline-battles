@@ -156,6 +156,9 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertLess(
             attach.index('GetFileAttributesW(ready_marker)'),
             attach.index('start_procdump_configured('))
+        self.assertGreater(
+            attach.index('remove_marker_path(ready_marker)'),
+            attach.index('start_procdump_configured('))
 
         worker_assign = main.index(
             'AssignProcessToJobObject(job, process.hProcess)')

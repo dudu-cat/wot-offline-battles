@@ -434,6 +434,24 @@ class _OfflineVehicleFilterSyncProxy(object):
         return self._vehicle_filter.interpolateStabilisedMatrix(timestamp)
 
 
+class _OfflineInitialVehicleVisualProvider(object):
+    """Suppress only stock's first visible enemy marker registration."""
+
+    __slots__ = ('_provider',)
+
+    def __init__(self, provider):
+        self._provider = provider
+
+    def __getattr__(self, name):
+        return getattr(self._provider, name)
+
+    def startVehicleVisual(self, unused_proxy, unused_is_immediate):
+        # The LAN spotting edge registers the marker and minimap entry later.
+        # Letting stock add it here and removing it after startVisual returns
+        # still queues one visible UI frame in exact #1513.
+        return None
+
+
 class OfflineCompatibility(object):
 
     def __init__(self, runtime=None):
@@ -489,6 +507,8 @@ class OfflineCompatibility(object):
         self._original_vehicle_marker_start = None
         self._original_vehicle_marker_stop = None
         self._original_vehicle_enter_world = None
+        self._original_vehicle_start_visual = None
+        self._vehicle_start_visual_code = None
         self._original_vehicle_leave_world = None
         self._original_vehicle_start_wg_physics = None
         self._vehicle_start_wg_physics_code = None
@@ -533,12 +553,14 @@ class OfflineCompatibility(object):
         self._vehicle_marker_start_wrapper = None
         self._vehicle_marker_stop_wrapper = None
         self._vehicle_enter_world_wrapper = None
+        self._vehicle_start_visual_wrapper = None
         self._vehicle_leave_world_wrapper = None
         self._vehicle_start_wg_physics_wrapper = None
         self._vehicle_set_gun_angles_wrapper = None
         self._compound_getattribute_wrapper = None
         self._compound_deactivate_wrapper = None
         self._compound_models_refresh_wrapper = None
+        self._vehicle_starting_visual = None
         self._vehicle_starting_wg_physics = None
         self._vehicle_syncing_gun_angles = None
         self._avatar_syncing_aux_physics = None
@@ -764,6 +786,16 @@ class OfflineCompatibility(object):
                 vehicle_type.__dict__.get(
                     'onEnterWorld',
                     getattr(vehicle_type, 'onEnterWorld', None)))
+            self._original_vehicle_start_visual = (
+                vehicle_type.__dict__.get(
+                    'startVisual',
+                    getattr(vehicle_type, 'startVisual', None)))
+            if self._original_vehicle_start_visual is not None:
+                self._vehicle_start_visual_code = getattr(
+                    self._original_vehicle_start_visual,
+                    'func_code', getattr(
+                        self._original_vehicle_start_visual,
+                        '__code__', None))
             self._original_vehicle_leave_world = (
                 vehicle_type.__dict__.get(
                     'onLeaveWorld',
@@ -1316,6 +1348,35 @@ class OfflineCompatibility(object):
                 hide_initial_remote_enemy(avatar, vehicle)
             return result
 
+        def vehicle_start_visual(vehicle):
+            """Run every stock controller without publishing an enemy yet.
+
+            Exact #1513 unconditionally calls ``show(True)`` and immediately
+            registers the marker/minimap entry inside ``Vehicle.startVisual``.
+            Hiding them after the method returns is too late: the GUI adaptor
+            has already queued one visible frame.  The scoped attribute gates
+            below alter only those two direct calls; appearance, physics,
+            wheels, tracks, sounds and model ownership remain stock-owned.
+            """
+            original = compatibility._original_vehicle_start_visual
+            if not compatibility._battle_active:
+                return original(vehicle)
+            try:
+                avatar = runtime.bigworld.player()
+            except ReferenceError:
+                avatar = None
+            if avatar is not None:
+                prime_initial_remote_enemy(avatar, vehicle)
+            previous = compatibility._vehicle_starting_visual
+            compatibility._vehicle_starting_visual = vehicle
+            try:
+                result = original(vehicle)
+            finally:
+                compatibility._vehicle_starting_visual = previous
+            if avatar is not None:
+                hide_initial_remote_enemy(avatar, vehicle)
+            return result
+
         def avatar_prereqs_loaded(avatar, resource_names, resource_refs):
             if compatibility._fake_connected:
                 try:
@@ -1352,7 +1413,8 @@ class OfflineCompatibility(object):
                 if overlay is not None and name in overlay:
                     return overlay[name]
             caller_code = None
-            if (compatibility._vehicle_starting_wg_physics is not None or
+            if (compatibility._vehicle_starting_visual is not None or
+                    compatibility._vehicle_starting_wg_physics is not None or
                     compatibility._vehicle_syncing_gun_angles is not None or
                     compatibility._avatar_syncing_aux_physics is not None or
                     compatibility._avatar_entering_vehicle is not None or
@@ -1361,6 +1423,37 @@ class OfflineCompatibility(object):
                     caller_code = sys._getframe(1).f_code
                 except (AttributeError, ValueError):
                     pass
+            direct_start_visual = (
+                compatibility._vehicle_starting_visual is vehicle and
+                caller_code is compatibility._vehicle_start_visual_code)
+            if (direct_start_visual and compatibility._battle_active and
+                    name in ('show', 'guiSessionProvider')):
+                try:
+                    marker_visible = bool(
+                        compatibility._original_vehicle_getattribute(
+                            vehicle, '_offlineNativeMarkerVisible'))
+                except AttributeError:
+                    marker_visible = True
+                try:
+                    draw_visible = bool(
+                        compatibility._original_vehicle_getattribute(
+                            vehicle, '_offlineNativeDrawVisible'))
+                except AttributeError:
+                    draw_visible = True
+                if name == 'show' and not draw_visible:
+                    stock_show = \
+                        compatibility._original_vehicle_getattribute(
+                            vehicle, name)
+
+                    def keep_initial_enemy_hidden(unused_visible):
+                        return stock_show(False)
+
+                    return keep_initial_enemy_hidden
+                if name == 'guiSessionProvider' and not marker_visible:
+                    provider = \
+                        compatibility._original_vehicle_getattribute(
+                            vehicle, name)
+                    return _OfflineInitialVehicleVisualProvider(provider)
             direct_start_filter = (
                 compatibility._vehicle_starting_wg_physics is vehicle and
                 caller_code is compatibility._vehicle_start_wg_physics_code)
@@ -1951,6 +2044,7 @@ class OfflineCompatibility(object):
         self._vehicle_setattr_wrapper = vehicle_setattr
         self._vehicle_get_speed_wrapper = vehicle_get_speed
         self._vehicle_enter_world_wrapper = vehicle_enter_world
+        self._vehicle_start_visual_wrapper = vehicle_start_visual
         self._vehicle_leave_world_wrapper = vehicle_leave_world
         self._vehicle_start_wg_physics_wrapper = vehicle_start_wg_physics
         self._vehicle_set_gun_angles_wrapper = vehicle_set_gun_angles
@@ -2006,6 +2100,8 @@ class OfflineCompatibility(object):
                     vehicle_type.getSpeed = vehicle_get_speed
                 if self._original_vehicle_enter_world is not None:
                     vehicle_type.onEnterWorld = vehicle_enter_world
+                if self._original_vehicle_start_visual is not None:
+                    vehicle_type.startVisual = vehicle_start_visual
                 if self._original_vehicle_leave_world is not None:
                     vehicle_type.onLeaveWorld = vehicle_leave_world
                 if self._original_vehicle_start_wg_physics is not None:
@@ -2189,6 +2285,11 @@ class OfflineCompatibility(object):
                 vehicle_type.__dict__.get('onEnterWorld') is
                 self._vehicle_enter_world_wrapper):
             vehicle_type.onEnterWorld = self._original_vehicle_enter_world
+        if (vehicle_type is not None and
+                self._original_vehicle_start_visual is not None and
+                vehicle_type.__dict__.get('startVisual') is
+                self._vehicle_start_visual_wrapper):
+            vehicle_type.startVisual = self._original_vehicle_start_visual
         if (vehicle_type is not None and
                 self._original_vehicle_start_wg_physics is not None and
                 vehicle_type.__dict__.get('_Vehicle__startWGPhysics') is
