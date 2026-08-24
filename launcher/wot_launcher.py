@@ -282,6 +282,12 @@ class LauncherWindow(object):
         self._worker = None
         self._worker_starter_root = None
         self._worker_stop_lock = threading.Lock()
+        # A LAN room owns its simulation worker independently of any visible
+        # player client.  Do not reuse the per-session worker slot here: the
+        # latter is deliberately torn down when its visible client exits.
+        self._room_worker = None
+        self._room_worker_starter_root = None
+        self._room_worker_stop_lock = threading.Lock()
         self._game = None
         self._game_starter_root = None
         self._busy = False
@@ -711,6 +717,10 @@ class LauncherWindow(object):
     def _server_is_running(self):
         return self._server is not None and self._server.poll() is None
 
+    def _room_worker_is_running(self):
+        return (self._room_worker is not None and
+                self._room_worker.poll() is None)
+
     def _update_action_controls(self):
         server_running = self._server_is_running()
         self.start_button = (self.single_start_button
@@ -737,14 +747,14 @@ class LauncherWindow(object):
                 "normal" if not self._busy and not self._maintenance_busy
                 else "disabled")
             self.server_button.config(
-                state=server_state, text=self._t("Stop server"))
+                state=server_state, text=self._t("Stop LAN room"))
         else:
             server_state = (
                 "normal" if self._selected_client in core.SUPPORTED_PORTS and
                 self.mode.get() == core.MODE_JOIN and not self._busy and
                 not self._maintenance_busy else "disabled")
             self.server_button.config(
-                state=server_state, text=self._t("Start server"))
+                state=server_state, text=self._t("Start LAN room"))
         maintenance_state = (
             "normal" if self._selected_client == core.PORT_0_9_22 and
             not self._busy and not self._maintenance_busy and
@@ -1185,6 +1195,8 @@ class LauncherWindow(object):
                         self._log(
                             "Could not close the started process: %s" % error)
         self._stop_worker()
+        if stop_persistent_server:
+            self._stop_worker(room_owned=True)
         if force_cleanup:
             core.kill_game()
         self._stop_server(force=stop_persistent_server)
@@ -1492,8 +1504,8 @@ class LauncherWindow(object):
         if self._busy or self._maintenance_busy:
             self._log("Wait for the current launcher operation to finish.")
             return False
-        if self._server_is_running():
-            self._stop_server(force=True)
+        if self._server_is_running() or self._room_worker_is_running():
+            self._stop_lan_room()
             self._update_action_controls()
             return True
         if self._server is not None:
@@ -1513,6 +1525,7 @@ class LauncherWindow(object):
             return False
         self._remember_folder()
         self._save_settings()
+        self._stop_requested = False
         self._set_maintenance_busy(True)
 
         def run():
@@ -1522,16 +1535,28 @@ class LauncherWindow(object):
                 for action in core.install_client_mod(
                         status["path"], status["client"]):
                     self._log(action)
-                start_options = {"persistent": True}
+                start_options = {
+                    "persistent": True,
+                    "require_owned": True,
+                }
                 if bot_lineup:
                     start_options["bot_lineup"] = bot_lineup
                 started = self._start_server(
                     status["path"], status["client"], **start_options)
-                if started:
+                if started and self._start_worker(
+                        status["path"], core.LOCAL_HOST,
+                        core.DEFAULT_SERVER_PORT, room_owned=True):
                     self.root.after(0, self._use_local_server_address)
+                elif started:
+                    self._log(
+                        "The LAN room was not opened because its hidden "
+                        "simulation worker is unavailable.")
+                    self._stop_lan_room()
             except core.LauncherError as error:
+                self._stop_lan_room()
                 self._log(str(error))
             except Exception as error:
+                self._stop_lan_room()
                 self._log("The LAN server could not start: %s" % error)
             finally:
                 self._set_maintenance_busy(False)
@@ -1561,15 +1586,6 @@ class LauncherWindow(object):
             else None)
         try:
             session_mode = self.mode.get()
-            if (session_mode == core.MODE_JOIN and
-                    self._server_is_running() and
-                    core.endpoint_for_mode(
-                        session_mode, self.join_address.get()) ==
-                    (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)):
-                # The Online tab deliberately keeps one Join UI. When this
-                # launcher owns the local server, its player is also the host
-                # and must carry the hidden simulation worker for the room.
-                session_mode = core.MODE_HOST
             session = core.plan_session(
                 status, session_mode, self.join_address.get(),
                 vehicle_profile=profile_name)
@@ -1599,7 +1615,7 @@ class LauncherWindow(object):
         port = session["tcp_port"]
         needs_worker = (
             session["client"] == core.PORT_0_9_22 and
-            session["mode"] in (core.MODE_SINGLE, core.MODE_HOST))
+            session["mode"] == core.MODE_SINGLE)
         server_loopback_only = (
             session["client"] == core.PORT_0_9_22 and
             session["mode"] == core.MODE_SINGLE)
@@ -1797,7 +1813,7 @@ class LauncherWindow(object):
 
     def _start_server(self, game_root, port_version,
                       loopback_only=False, persistent=False,
-                      bot_lineup=None):
+                      bot_lineup=None, require_owned=False):
         requested_context = {
             "game_root": os.path.normcase(os.path.realpath(
                 os.path.abspath(game_root))),
@@ -1822,10 +1838,10 @@ class LauncherWindow(object):
         status = core.listener_status(
             port_version, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)
         if status == core.LISTENER_COMPATIBLE:
-            if loopback_only:
+            if loopback_only or require_owned:
                 self._log(
-                    "Single player needs a fresh launcher-owned server, but "
-                    "a compatible server already uses port %d. Close it "
+                    "This mode needs a fresh launcher-owned server, but a "
+                    "compatible server already uses port %d. Close it "
                     "first." % core.DEFAULT_SERVER_PORT)
                 return False
             if bot_lineup:
@@ -1896,12 +1912,18 @@ class LauncherWindow(object):
             return
         for line in iter(server.stdout.readline, b""):
             self._log("[server] " + line.decode("utf-8", "replace").rstrip())
-        if server is self._server and server.poll() not in (None, 0):
-            self._log("The LAN server stopped with exit code %s." %
-                      server.poll())
+        if server is self._server:
+            exit_code = server.poll()
+            if self._room_worker_is_running():
+                self._log(
+                    "Stopping the LAN room worker because its server closed.")
+                self._stop_worker(room_owned=True)
+            if exit_code not in (None, 0):
+                self._log("The LAN server stopped with exit code %s." %
+                          exit_code)
         self.root.after(0, self._update_action_controls)
 
-    def _start_worker(self, game_root, host, port):
+    def _start_worker(self, game_root, host, port, room_owned=False):
         self._worker_exited_unexpectedly = False
         starter = core.worker_starter_executable(game_root)
         if not os.path.isfile(starter):
@@ -1921,19 +1943,29 @@ class LauncherWindow(object):
         environment = core.worker_environment(game_root, host, port)
         environment = self._crash_capture_environment(
             environment, error_reports.ROLE_HIDDEN_WORKER)
-        self._worker = subprocess.Popen(
+        worker = subprocess.Popen(
             core.worker_child_command(game_root), cwd=game_root,
             env=environment,
             creationflags=_no_console_flags())
-        self._worker_starter_root = game_root
+        if room_owned:
+            self._room_worker = worker
+            self._room_worker_starter_root = game_root
+        else:
+            self._worker = worker
+            self._worker_starter_root = game_root
         if core.wait_for_worker_ready(
-                self._worker, game_root,
+                worker, game_root,
                 cancelled=lambda: self._stop_requested,
                 previous_marker_token=previous_marker_token):
             self._log("The hidden simulation worker is ready.")
+            if room_owned:
+                watcher = threading.Thread(
+                    target=self._watch_room_worker, args=(worker,))
+                watcher.daemon = True
+                watcher.start()
             return True
         exit_code = self._observe_process_exit(
-            self._worker, error_reports.ROLE_HIDDEN_WORKER)
+            worker, error_reports.ROLE_HIDDEN_WORKER)
         if not self._stop_requested:
             if exit_code is None:
                 self._log("The hidden simulation worker did not become ready.")
@@ -1943,8 +1975,25 @@ class LauncherWindow(object):
                     "The hidden simulation worker stopped with exit code %s." %
                     exit_code)
             self._log_worker_failure(game_root)
-        self._stop_worker()
+        self._stop_worker(room_owned=room_owned)
         return False
+
+    def _watch_room_worker(self, worker):
+        """Expose a failed room worker as a failed room, never a fallback."""
+        try:
+            exit_code = worker.wait()
+        except Exception:
+            return
+        if worker is not self._room_worker:
+            return
+        self._room_worker = None
+        self._room_worker_starter_root = None
+        self._observe_process_exit(worker, error_reports.ROLE_HIDDEN_WORKER)
+        self._log(
+            "The LAN room simulation worker stopped with exit code %s. "
+            "The room is unavailable; stop it and start a new room." %
+            exit_code)
+        self.root.after(0, self._update_action_controls)
 
     def _log_worker_failure(self, game_root):
         try:
@@ -1956,15 +2005,23 @@ class LauncherWindow(object):
         if detail:
             self._log("[worker] %s" % detail.replace("\n", " | "))
 
-    def _stop_worker(self):
-        with self._worker_stop_lock:
-            return self._stop_worker_locked()
+    def _stop_worker(self, room_owned=False):
+        lock = (self._room_worker_stop_lock if room_owned else
+                self._worker_stop_lock)
+        with lock:
+            return self._stop_worker_locked(room_owned=room_owned)
 
-    def _stop_worker_locked(self):
-        worker = self._worker
-        starter_root = self._worker_starter_root
-        self._worker = None
-        self._worker_starter_root = None
+    def _stop_worker_locked(self, room_owned=False):
+        if room_owned:
+            worker = self._room_worker
+            starter_root = self._room_worker_starter_root
+            self._room_worker = None
+            self._room_worker_starter_root = None
+        else:
+            worker = self._worker
+            starter_root = self._worker_starter_root
+            self._worker = None
+            self._worker_starter_root = None
         if worker is None:
             return None
         exit_code = self._observe_process_exit(
@@ -2106,6 +2163,10 @@ class LauncherWindow(object):
         self.root.after(0, self._update_action_controls)
         return server is not None
 
+    def _stop_lan_room(self):
+        self._stop_worker(room_owned=True)
+        return self._stop_server(force=True)
+
     def _on_close(self):
         if self._maintenance_busy:
             self._log(
@@ -2123,7 +2184,7 @@ class LauncherWindow(object):
             return False
         self._save_settings()
         self._stop_worker()
-        self._stop_server(force=True)
+        self._stop_lan_room()
         self.root.destroy()
         return True
 

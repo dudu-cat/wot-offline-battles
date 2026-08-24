@@ -26,7 +26,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
         ensure.assert_called_once_with(28782)
         run_server.assert_called_once_with(
             '0.0.0.0', 28782, 'server_random', 30,
-            authority_mode='client', team_size=15,
+            team_size=15,
             team1_size=15, team2_size=15,
             bot_lineup=[],
         )
@@ -39,7 +39,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         def run_server(host, port, map_name, max_players, **options):
             events.append(('server', host, port, map_name, max_players,
-                           options['authority_mode'], options['team_size'],
+                           options['team_size'],
                            options['team1_size'], options['team2_size']))
 
         with mock.patch.object(
@@ -52,8 +52,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         self.assertEqual([
             ('firewall', 28782),
-            ('server', '0.0.0.0', 28782, 'server_random', 30, 'client',
-             15, 15, 15),
+            ('server', '0.0.0.0', 28782, 'server_random', 30, 15, 15, 15),
         ], events)
 
     def test_hidden_coordinator_loopback_mode_skips_firewall(self):
@@ -72,7 +71,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
         ensure.assert_not_called()
         run_server.assert_called_once_with(
             '127.0.0.1', 28782, 'server_random', 30,
-            authority_mode='client', team_size=15,
+            team_size=15,
             team1_size=15, team2_size=15,
             bot_lineup=[],
         )

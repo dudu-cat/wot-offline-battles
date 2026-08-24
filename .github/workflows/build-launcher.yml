@@ -140,7 +140,7 @@ jobs:
               fake0922, 'mods', 'configs', 'offline_lan_0922')
           inventories = [(os.path.join(data_root_0922, name), 41)
               for name in
-              ('navgraphs', 'foliage', 'destructibles', 'occluders')]
+              ('navgraphs', 'foliage', 'destructibles')]
           for data_root, expected_count in inventories:
               manifest_path = os.path.join(data_root, 'manifest.json')
               with open(manifest_path, 'rb') as stream:
@@ -156,8 +156,6 @@ jobs:
               throw "Bundled client installation verification failed"
           }
 
-          $env:WOT_0922_SERVER_DATA = Join-Path $fake0922 `
-              "mods\configs\offline_lan_0922"
           $ProtocolProbe = @'
           import os
           import sys

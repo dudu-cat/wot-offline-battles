@@ -235,8 +235,6 @@ def main():
             _ensure_windows_firewall_rule(SERVER_PORT)
         run_server(
             server_host, SERVER_PORT, default_map, SERVER_MAX_PLAYERS,
-            authority_mode=os.environ.get(
-                "WOT_LAN_AUTHORITY", "client"),
             team_size=SERVER_TEAM_SIZE,
             team1_size=team1_size,
             team2_size=team2_size,

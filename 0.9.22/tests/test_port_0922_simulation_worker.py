@@ -1408,10 +1408,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
                 'map_pool', 'host_player_id', 'phase', 'round_id',
                 'state_revision', 'spawn', 'bot_authority_id', 'team_size',
                 'authority_epoch', 'capabilities', 'server_capabilities',
-                'team_sizes', 'authority_status',
-                'authority_fallback_reason', 'worker_status',
-                'destructibles_disabled',
-                'destructibles_disabled_reason',
+                'team_sizes', 'bot_tier_mode', 'worker_status',
             'vehicle_compact_descr',
             'effective_params',
         }, set(welcome))

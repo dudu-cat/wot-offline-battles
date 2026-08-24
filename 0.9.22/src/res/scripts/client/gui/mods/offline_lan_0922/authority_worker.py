@@ -784,10 +784,6 @@ class WorkerSession(object):
         self._pending_start_deadline = None
         self._last_progress_frame = 0
         self._next_progress_time = 0.0
-        if message.get('need_destructible_map'):
-            self._worker_failure(RuntimeError(
-                'worker cannot own a server-authority donation round'))
-            return False
         if self.runtime is not None:
             if round_id == self._active_round_id:
                 return False

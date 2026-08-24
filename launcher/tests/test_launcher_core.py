@@ -34,8 +34,8 @@ class EndpointTest(unittest.TestCase):
     def test_port_text_is_rejected(self):
         self.assertRaises(core.LauncherError, core.parse_endpoint, "host:abc")
 
-    def test_single_player_and_host_use_the_local_endpoint(self):
-        for mode in (core.MODE_SINGLE, core.MODE_HOST):
+    def test_single_player_uses_the_local_endpoint(self):
+        for mode in (core.MODE_SINGLE, core.MODE_SINGLE):
             self.assertEqual(core.endpoint_for_mode(mode, "10.0.0.5"),
                              (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT))
 
@@ -45,9 +45,9 @@ class EndpointTest(unittest.TestCase):
 
 
 class ServerRequirementTest(unittest.TestCase):
-    def test_host_always_needs_a_server(self):
+    def test_single_player_needs_a_server(self):
         for port_version in core.SUPPORTED_PORTS:
-            self.assertTrue(core.server_required(port_version, core.MODE_HOST))
+            self.assertTrue(core.server_required(port_version, core.MODE_SINGLE))
 
     def test_join_never_starts_a_local_server(self):
         for port_version in core.SUPPORTED_PORTS:
@@ -175,7 +175,7 @@ class SessionPlanTest(unittest.TestCase):
 
     def test_0_9_22_plan_carries_independent_team_sizes_and_preference(self):
         session = core.plan_session(
-            self._status(), core.MODE_HOST,
+            self._status(), core.MODE_SINGLE,
             team1_size="3", team2_size="11", preferred_team="2")
         self.assertEqual(11, session["team_size"])
         self.assertEqual(3, session["team1_size"])
@@ -183,9 +183,7 @@ class SessionPlanTest(unittest.TestCase):
         self.assertEqual(2, session["preferred_team"])
 
     def test_modified_profile_is_refused_for_lan(self):
-        for status, mode in (
-                (self._status(), core.MODE_HOST),
-                (self._status(), core.MODE_JOIN)):
+        for status, mode in ((self._status(), core.MODE_JOIN),):
             with self.assertRaisesRegex(
                     core.LauncherError, "limited to 0.9.22 single player"):
                 core.plan_session(
@@ -196,7 +194,7 @@ class SessionPlanTest(unittest.TestCase):
         for value in ("", "four", 0, 16, 1.5, True):
             with self.assertRaises(core.LauncherError, msg=value):
                 core.plan_session(
-                    self._status(), core.MODE_HOST, team_size=value)
+                    self._status(), core.MODE_SINGLE, team_size=value)
 
     def test_join_does_not_apply_the_local_team_size(self):
         session = core.plan_session(
@@ -243,7 +241,7 @@ class SessionPlanTest(unittest.TestCase):
 
     def test_a_missing_mod_still_plans_a_session(self):
         session = core.plan_session(self._status(mod_installed=False),
-                                    core.MODE_HOST)
+                                    core.MODE_SINGLE)
         self.assertTrue(session["needs_server"])
 
 
@@ -294,7 +292,7 @@ class SettingsFileTest(unittest.TestCase):
         os.makedirs(os.path.dirname(config_path))
         with open(config_path, "w") as stream:
             json.dump({"schema": 1, "name": "Player", "max_health": 90}, stream)
-        core.write_settings(self.root, core.PORT_0_9_22, core.MODE_HOST,
+        core.write_settings(self.root, core.PORT_0_9_22, core.MODE_SINGLE,
                             core.LOCAL_HOST, core.DEFAULT_SERVER_PORT, "Peng")
         config = self._read(os.path.join(
             "mods", "configs", "offline_lan_0922", "config.json"))
@@ -323,7 +321,7 @@ class SettingsFileTest(unittest.TestCase):
 
         with mock.patch("core.os.replace", side_effect=windows_replace):
             core.write_settings(
-                self.root, core.PORT_0_9_22, core.MODE_HOST,
+                self.root, core.PORT_0_9_22, core.MODE_SINGLE,
                 core.LOCAL_HOST, core.DEFAULT_SERVER_PORT, "Peng")
 
         config = self._read(os.path.join(
@@ -604,15 +602,11 @@ class ServerPayloadTest(unittest.TestCase):
                                    "/repo/launcher/wot_launcher.py",
                                    core.SERVE_FLAG, core.PORT_0_9_22])
 
-    def test_each_server_receives_its_client_baked_data_directory(self):
+    def test_server_environment_keeps_only_live_server_inputs(self):
         environment = core.server_environment(core.PORT_0_8_2, "/game", {})
         self.assertTrue(environment[core.NAVGRAPH_DIR_ENV].endswith("navgraphs"))
         self.assertIn("/game", environment[core.NAVGRAPH_DIR_ENV])
-        self.assertNotIn(core.SERVER_DATA_ENV_0922, environment)
         environment = core.server_environment(core.PORT_0_9_22, "/game", {})
-        self.assertTrue(environment[core.SERVER_DATA_ENV_0922].endswith(
-            os.path.join("configs", "offline_lan_0922")))
-        self.assertIn("/game", environment[core.SERVER_DATA_ENV_0922])
         self.assertEqual(
             str(core.DEFAULT_TEAM_SIZE),
             environment[core.SERVER_TEAM_SIZE_ENV_0922])
@@ -776,7 +770,7 @@ class ClientInstallTest(unittest.TestCase):
             "res_mods/0.9.22.0.1/engine_config.offline-player.xml": content,
             "res_mods/0.9.22.0.1/engine_config.offline-worker.xml": content,
         }
-        for name in ("navgraphs", "foliage", "destructibles", "occluders"):
+        for name in ("navgraphs", "foliage", "destructibles"):
             records = []
             for index in range(41):
                 filename = "map-%02d.json" % index
@@ -1156,7 +1150,7 @@ class ClientInstallTest(unittest.TestCase):
         self._stage_0_9_22()
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
         manifest = os.path.join(
-            self.game, "mods", "configs", "offline_lan_0922", "occluders",
+            self.game, "mods", "configs", "offline_lan_0922", "destructibles",
             "manifest.json")
         os.unlink(manifest)
 
@@ -1170,7 +1164,7 @@ class ClientInstallTest(unittest.TestCase):
         self._stage_0_9_22()
         core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
         map_path = os.path.join(
-            self.game, "mods", "configs", "offline_lan_0922", "occluders",
+            self.game, "mods", "configs", "offline_lan_0922", "destructibles",
             "map-17.json")
         os.unlink(map_path)
 
@@ -1199,7 +1193,7 @@ class ClientInstallTest(unittest.TestCase):
         with zipfile.ZipFile(archive_path, "r") as archive:
             members = {
                 name: archive.read(name) for name in archive.namelist()
-                if name != ("mods/configs/offline_lan_0922/occluders/"
+                if name != ("mods/configs/offline_lan_0922/destructibles/"
                             "map-17.json")
             }
         self._archive(core.PORT_0_9_22, members)
@@ -1217,7 +1211,7 @@ class ClientInstallTest(unittest.TestCase):
     def test_a_malformed_0_9_22_manifest_archive_is_rejected(self):
         archive_path = self._stage_0_9_22()
         manifest_name = (
-            "mods/configs/offline_lan_0922/occluders/manifest.json")
+            "mods/configs/offline_lan_0922/destructibles/manifest.json")
         with zipfile.ZipFile(archive_path, "r") as archive:
             members = {name: archive.read(name)
                        for name in archive.namelist()}
@@ -1370,8 +1364,7 @@ class PayloadStagingTest(unittest.TestCase):
                 stream.write("runtime")
         data_root = os.path.join(
             overlay, "mods", "configs", "offline_lan_0922")
-        for dataset in ("navgraphs", "foliage", "destructibles",
-                        "occluders"):
+        for dataset in ("navgraphs", "foliage", "destructibles"):
             dataset_root = os.path.join(data_root, dataset)
             os.makedirs(dataset_root)
             records = []
@@ -1830,14 +1823,14 @@ class ConnectionReportTest(unittest.TestCase):
         self.assertIn("No answer from 10.0.0.5:28782", message)
         self.assertIn("firewall", message)
 
-    def test_a_busy_port_warns_the_host(self):
-        message = core.connection_report(core.MODE_HOST, core.LOCAL_HOST,
+    def test_a_busy_port_warns_the_local_player(self):
+        message = core.connection_report(core.MODE_SINGLE, core.LOCAL_HOST,
                                          28782, True)
         self.assertIn("already listens", message)
 
     def test_an_unrelated_listener_is_not_reported_as_the_server(self):
         message = core.listener_report(
-            core.MODE_HOST, core.LOCAL_HOST, 28782,
+            core.MODE_SINGLE, core.LOCAL_HOST, 28782,
             core.LISTENER_OCCUPIED)
         self.assertIn("Another program", message)
 
@@ -2099,8 +2092,8 @@ class LauncherSettingsTest(unittest.TestCase):
         directory = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, directory, True)
         path = os.path.join(directory, "launcher.json")
-        self.assertTrue(core.save_settings({"mode": core.MODE_HOST}, path))
-        self.assertEqual(core.load_settings(path), {"mode": core.MODE_HOST})
+        self.assertTrue(core.save_settings({"mode": core.MODE_SINGLE}, path))
+        self.assertEqual(core.load_settings(path), {"mode": core.MODE_SINGLE})
 
     def test_missing_settings_are_empty(self):
         self.assertEqual(core.load_settings("/nonexistent/launcher.json"), {})

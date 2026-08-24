@@ -9,7 +9,6 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0600
-#include <winsock2.h>
 #include <windows.h>
 #include <strsafe.h>
 #include <wchar.h>
@@ -30,20 +29,11 @@
 #define WORKER_READY_MARKER_FILE L"offline-worker.ready"
 #define WORKER_INTERNAL_READY_MARKER_FILE L"offline-worker.internal-ready"
 #define PLAYER_READY_MARKER_FORMAT L"offline-player-%lu.ready"
-#define SERVER_FILENAME L"WoT-0.9.22-LAN-Server.exe"
 #define SERVER_HOST_ENV L"OFFLINE_LAN_0922_SERVER_HOST"
-#define SERVER_HOST_VALUE L"127.0.0.1"
 #define SERVER_PORT_ENV L"OFFLINE_LAN_0922_SERVER_PORT"
-#define SERVER_PORT_VALUE L"28782"
-#define SERVER_LOOPBACK_ENV L"WOT_0922_LOOPBACK_ONLY"
-#define SERVER_LOOPBACK_VALUE L"1"
-#define SERVER_DATA_ENV L"WOT_0922_SERVER_DATA"
-#define SERVER_DATA_RELATIVE L"mods\\configs\\offline_lan_0922"
-#define SERVER_PORT 28782
 #define PLAYER_MODE L"--player"
 #define PAIRED_PLAYER_MODE L"--paired-player"
 #define WORKER_ONLY_MODE L"--worker-only"
-#define SERVER_READY_TIMEOUT_MS 30000
 #define WORKER_READY_TIMEOUT_MS 60000
 #define WORKER_READY_POLL_MS 50
 #define PLAYER_HANDOFF_GRACE_MS 10000
@@ -577,69 +567,6 @@ static int configure_player_ready_marker(WCHAR *path, size_t path_count)
 }
 
 
-static int sibling_path(WCHAR *path, size_t path_count,
-		const WCHAR *filename)
-{
-	return SUCCEEDED(StringCchCopyW(path, path_count, g_root)) &&
-		SUCCEEDED(StringCchCatW(path, path_count, filename));
-}
-
-
-static int local_server_is_listening(void)
-{
-	SOCKET connection;
-	struct sockaddr_in address;
-	int connected;
-	connection = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (connection == INVALID_SOCKET) {
-		return 0;
-	}
-	ZeroMemory(&address, sizeof(address));
-	address.sin_family = AF_INET;
-	address.sin_port = htons(SERVER_PORT);
-	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	connected = connect(connection, (struct sockaddr *)&address,
-		sizeof(address)) == 0;
-	closesocket(connection);
-	return connected;
-}
-
-
-static int wait_for_local_server(HANDLE server_process, HANDLE stop_event)
-{
-	DWORD elapsed = 0;
-	DWORD server_state;
-	DWORD exit_code;
-	while (elapsed <= SERVER_READY_TIMEOUT_MS) {
-		if (stop_event != 0 &&
-				WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) {
-			return -1;
-		}
-		server_state = WaitForSingleObject(server_process, 0);
-		if (server_state != WAIT_TIMEOUT) {
-			exit_code = ERROR_PROCESS_ABORTED;
-			if (server_state == WAIT_FAILED) {
-				exit_code = GetLastError();
-			} else if (!GetExitCodeProcess(server_process, &exit_code)) {
-				exit_code = GetLastError();
-			}
-			log_failure("local_server_exited", exit_code);
-			return 0;
-		}
-		if (local_server_is_listening()) {
-			return 1;
-		}
-		if (elapsed == SERVER_READY_TIMEOUT_MS) {
-			break;
-		}
-		Sleep(WORKER_READY_POLL_MS);
-		elapsed += WORKER_READY_POLL_MS;
-	}
-	log_failure("wait_for_local_server", WAIT_TIMEOUT);
-	return 0;
-}
-
-
 static int remove_marker_path(const WCHAR *marker_path)
 {
 	WCHAR temporary_path[MAX_PATH];
@@ -713,8 +640,7 @@ static int publish_ready_marker(const WCHAR *marker_path)
 }
 
 
-static int wait_for_worker_ready(HANDLE worker_process, HANDLE server_process,
-		HANDLE stop_event)
+static int wait_for_worker_ready(HANDLE worker_process, HANDLE stop_event)
 {
 	DWORD elapsed = 0;
 	DWORD marker_attributes;
@@ -723,12 +649,6 @@ static int wait_for_worker_ready(HANDLE worker_process, HANDLE server_process,
 		if (stop_event != 0 &&
 				WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) {
 			return -1;
-		}
-		if (server_process != 0 &&
-				WaitForSingleObject(server_process, 0) != WAIT_TIMEOUT) {
-			log_failure("local_server_exited_before_worker_ready",
-				ERROR_PROCESS_ABORTED);
-			return 0;
 		}
 		worker_state = WaitForSingleObject(worker_process, 0);
 		if (worker_state != WAIT_TIMEOUT) {
@@ -1318,8 +1238,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		LPWSTR command_line, int show_command)
 {
 	WCHAR game_path[MAX_PATH];
-	WCHAR server_path[MAX_PATH];
-	WCHAR server_data_path[MAX_PATH];
 	WCHAR child_command[2 * MAX_PATH];
 	WCHAR desktop_name[96];
 	WCHAR full_desktop_name[128];
@@ -1328,7 +1246,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 	WCHAR worker_monitor_dump_path[MAX_PATH];
 	STARTUPINFOW startup;
 	PROCESS_INFORMATION process;
-	PROCESS_INFORMATION server_process;
 	HANDLE singleton = 0;
 	HANDLE desktop = 0;
 	HANDLE job = 0;
@@ -1340,14 +1257,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 	DWORD stop_target_process_id = 0;
 	DWORD wait_state;
 	BOOL child_created = FALSE;
-	BOOL server_created = FALSE;
 	BOOL worker_only = FALSE;
 	BOOL worker_crashed = FALSE;
 	BOOL worker_dump_complete = FALSE;
 	BOOL worker_procdump_configured = FALSE;
 	BOOL worker_stopped = FALSE;
-	BOOL sockets_started = FALSE;
-	WSADATA socket_data;
 	int ready_state;
 	int result = 1;
 	int stop_command_state;
@@ -1356,7 +1270,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 	(void)show_command;
 
 	ZeroMemory(&process, sizeof(process));
-	ZeroMemory(&server_process, sizeof(server_process));
 	worker_procdump_path[0] = L'\0';
 	worker_final_dump_path[0] = L'\0';
 	worker_monitor_dump_path[0] = L'\0';
@@ -1399,6 +1312,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		return result;
 	}
 	worker_only = lstrcmpiW(command_line, WORKER_ONLY_MODE) == 0;
+	if (!worker_only) {
+		log_failure("unsupported_mode", ERROR_INVALID_PARAMETER);
+		CloseHandle(stop_event);
+		return 30;
+	}
 
 	singleton = CreateMutexW(0, TRUE, WORKER_MUTEX_NAME);
 	if (singleton == 0) {
@@ -1432,85 +1350,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		goto worker_cleanup;
 	}
 
-	if (!worker_only) {
-		if (!sibling_path(
-				server_data_path, MAX_PATH, SERVER_DATA_RELATIVE) ||
-				!SetEnvironmentVariableW(
-					SERVER_DATA_ENV, server_data_path) ||
-				!SetEnvironmentVariableW(SERVER_HOST_ENV, SERVER_HOST_VALUE) ||
-				!SetEnvironmentVariableW(SERVER_PORT_ENV,
-					SERVER_PORT_VALUE)) {
-			log_failure("SetEnvironmentVariableW(server endpoint)",
-				GetLastError());
-			result = 7;
-			goto worker_cleanup;
-		}
-		if (WSAStartup(MAKEWORD(2, 2), &socket_data) != 0) {
-			log_failure("WSAStartup", WSAGetLastError());
-			result = 14;
-			goto worker_cleanup;
-		}
-		sockets_started = TRUE;
-		if (local_server_is_listening()) {
-			log_failure("local_server_port_in_use", WSAEADDRINUSE);
-			result = 15;
-			goto worker_cleanup;
-		}
-		if (!sibling_path(server_path, MAX_PATH, SERVER_FILENAME) ||
-					GetFileAttributesW(server_path) ==
-					INVALID_FILE_ATTRIBUTES) {
-			log_failure("local_server_missing", ERROR_FILE_NOT_FOUND);
-			result = 15;
-			goto worker_cleanup;
-		}
-		if (!SetEnvironmentVariableW(
-					SERVER_LOOPBACK_ENV, SERVER_LOOPBACK_VALUE)) {
-			log_failure("SetEnvironmentVariableW(loopback server)",
-					GetLastError());
-			result = 7;
-			goto worker_cleanup;
-		}
-		ZeroMemory(&startup, sizeof(startup));
-		startup.cb = sizeof(startup);
-		server_created = CreateProcessW(
-				server_path, 0, 0, 0, FALSE,
-				CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP |
-				CREATE_NO_WINDOW,
-				0, g_root, &startup, &server_process);
-		if (!server_created) {
-				error_code = GetLastError();
-				SetEnvironmentVariableW(SERVER_LOOPBACK_ENV, 0);
-				log_failure("CreateProcessW(local server)", error_code);
-				result = 16;
-				goto worker_cleanup;
-		}
-		SetEnvironmentVariableW(SERVER_LOOPBACK_ENV, 0);
-		if (!AssignProcessToJobObject(job, server_process.hProcess)) {
-				error_code = GetLastError();
-				log_failure("AssignProcessToJobObject(local server)",
-					error_code);
-				TerminateProcess(server_process.hProcess, 17);
-				WaitForSingleObject(server_process.hProcess, INFINITE);
-				result = 17;
-				goto worker_cleanup;
-		}
-		if (ResumeThread(server_process.hThread) == (DWORD)-1) {
-				error_code = GetLastError();
-				log_failure("ResumeThread(local server)", error_code);
-				TerminateProcess(server_process.hProcess, 18);
-				WaitForSingleObject(server_process.hProcess, INFINITE);
-				result = 18;
-				goto worker_cleanup;
-		}
-		CloseHandle(server_process.hThread);
-		server_process.hThread = 0;
-		ready_state = wait_for_local_server(
-			server_process.hProcess, stop_event);
-		if (ready_state <= 0) {
-			result = ready_state < 0 ? 0 : 19;
-			goto worker_cleanup;
-		}
-	}
 
 	if (FAILED(StringCchPrintfW(desktop_name, 96,
 			L"OfflineLanWorker_%lu",
@@ -1604,9 +1443,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 		 * starter waits for that full Hangar+LAN boundary, attaches ProcDump,
 		 * rechecks liveness, and only then publishes the marker the launcher
 		 * observes. */
-		ready_state = wait_for_worker_ready(
-			process.hProcess,
-			worker_only ? 0 : server_process.hProcess, stop_event);
+		ready_state = wait_for_worker_ready(process.hProcess, stop_event);
 		if (ready_state <= 0) {
 			if (ready_state < 0 && WaitForSingleObject(
 					process.hProcess, 0) == WAIT_TIMEOUT) {
@@ -1651,69 +1488,57 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 			result = 25;
 			goto worker_cleanup;
 		}
-		if (worker_only) {
-			wait_handles[0] = process.hProcess;
-			wait_handles[1] = stop_event;
-			wait_state = WaitForMultipleObjects(
-				2, wait_handles, FALSE, INFINITE);
-			if (wait_state == WAIT_OBJECT_0 + 1) {
-				/* A process exit wins if it raced the stop event. */
-				if (WaitForSingleObject(
-						process.hProcess, 0) == WAIT_OBJECT_0) {
-					if (!GetExitCodeProcess(
-							process.hProcess, &child_exit_code)) {
-						child_exit_code = 13;
-						log_failure(
-							"GetExitCodeProcess", GetLastError());
-					}
-					worker_crashed = child_exit_code != 0;
-					result = (int)child_exit_code;
-				} else {
-					worker_stopped = TRUE;
-					cancel_procdump_now(&procdump_process,
-						worker_procdump_path, process.dwProcessId);
-					if (worker_procdump_configured) {
-						cleanup_monitor_dump_slots(
-							worker_final_dump_path);
-					}
-					TerminateJobObject(job, ERROR_PROCESS_ABORTED);
-					if (WaitForSingleObject(process.hProcess,
-							TARGET_STOP_TIMEOUT_MS) == WAIT_TIMEOUT) {
-						log_failure(
-							"worker_stop_timeout", WAIT_TIMEOUT);
-					}
-					result = 0;
-				}
-			} else if (wait_state == WAIT_OBJECT_0) {
-				if (!GetExitCodeProcess(process.hProcess, &child_exit_code)) {
+		wait_handles[0] = process.hProcess;
+		wait_handles[1] = stop_event;
+		wait_state = WaitForMultipleObjects(
+			2, wait_handles, FALSE, INFINITE);
+		if (wait_state == WAIT_OBJECT_0 + 1) {
+			/* A process exit wins if it raced the stop event. */
+			if (WaitForSingleObject(
+					process.hProcess, 0) == WAIT_OBJECT_0) {
+				if (!GetExitCodeProcess(
+						process.hProcess, &child_exit_code)) {
 					child_exit_code = 13;
-					log_failure("GetExitCodeProcess", GetLastError());
-				} else if (child_exit_code != 0) {
-					log_failure("worker_process_exit", child_exit_code);
+					log_failure(
+						"GetExitCodeProcess", GetLastError());
 				}
 				worker_crashed = child_exit_code != 0;
 				result = (int)child_exit_code;
 			} else {
-				log_failure(
-					"WaitForMultipleObjects(worker)", GetLastError());
 				worker_stopped = TRUE;
-				result = 13;
+				cancel_procdump_now(&procdump_process,
+					worker_procdump_path, process.dwProcessId);
+				if (worker_procdump_configured) {
+					cleanup_monitor_dump_slots(
+						worker_final_dump_path);
+				}
+				TerminateJobObject(job, ERROR_PROCESS_ABORTED);
+				if (WaitForSingleObject(process.hProcess,
+						TARGET_STOP_TIMEOUT_MS) == WAIT_TIMEOUT) {
+					log_failure(
+						"worker_stop_timeout", WAIT_TIMEOUT);
+				}
+				result = 0;
 			}
+		} else if (wait_state == WAIT_OBJECT_0) {
+			if (!GetExitCodeProcess(process.hProcess, &child_exit_code)) {
+				child_exit_code = 13;
+				log_failure("GetExitCodeProcess", GetLastError());
+			} else if (child_exit_code != 0) {
+				log_failure("worker_process_exit", child_exit_code);
+			}
+			worker_crashed = child_exit_code != 0;
+			result = (int)child_exit_code;
 		} else {
-			/* Keep the hidden authority alive only for the visible host client.
-			 * Returning from launch_player means that client has closed or
-			 * crashed. Cleanup cancels the diagnostic monitor before the Job's
-			 * intentional termination. */
-			result = launch_player(game_path, TRUE, stop_event);
-			worker_stopped = WaitForSingleObject(
-				process.hProcess, 0) == WAIT_TIMEOUT;
+			log_failure(
+				"WaitForMultipleObjects(worker)", GetLastError());
+			worker_stopped = TRUE;
+			result = 13;
 		}
 	}
 
 
 worker_cleanup:
-	SetEnvironmentVariableW(SERVER_LOOPBACK_ENV, 0);
-	SetEnvironmentVariableW(SERVER_DATA_ENV, 0);
 	SetEnvironmentVariableW(SERVER_HOST_ENV, 0);
 	SetEnvironmentVariableW(SERVER_PORT_ENV, 0);
 	SetEnvironmentVariableW(WORKER_READY_MARKER_ENV, 0);
@@ -1761,17 +1586,8 @@ worker_cleanup:
 	if (process.hProcess != 0) {
 		CloseHandle(process.hProcess);
 	}
-	if (server_process.hThread != 0) {
-		CloseHandle(server_process.hThread);
-	}
-	if (server_process.hProcess != 0) {
-		CloseHandle(server_process.hProcess);
-	}
 	if (desktop != 0) {
 		CloseDesktop(desktop);
-	}
-	if (sockets_started) {
-		WSACleanup();
 	}
 	(void)remove_ready_markers();
 	if (singleton != 0) {

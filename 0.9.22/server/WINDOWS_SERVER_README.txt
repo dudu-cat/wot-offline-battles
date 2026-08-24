@@ -14,26 +14,20 @@ The server always listens on 0.0.0.0:28782, supports up to 30 players, and
 selects a supported map at random. Keep the console window open while playing.
 Press Ctrl+C or close the window to stop the server.
 
-The default is client authority: one connected client simulates bots while the
-server owns the shared LAN state. To choose the number of tanks per team, set
-WOT_0922_TEAM_SIZE to 1 through 15 before starting the EXE. The number includes
-human players. For example, this batch file starts a seven-tank-per-team game:
+The server accepts human LAN clients and relays every battle simulation request
+to the dedicated hidden worker. It does not simulate bots, projectiles,
+collisions, or damage itself. Start a LAN room from the launcher: it starts
+this server first and then exactly one hidden worker. If that worker cannot
+start or later exits, the room stops accepting battle actions and must be
+stopped and started again from the launcher.
+
+To choose the number of tanks per team, set WOT_0922_TEAM_SIZE to 1 through 15
+before starting the EXE. The number includes human players. For example, this
+batch file starts a seven-tank-per-team game:
 
   @echo off
   set "WOT_0922_TEAM_SIZE=7"
-  set "WOT_LAN_AUTHORITY=client"
   "%~dp0WoT-0.9.22-LAN-Server.exe"
-
-The experimental server-authority mode requires WOT_LAN_AUTHORITY=server and
-WOT_0922_SERVER_DATA pointing at the client install's
-mods\configs\offline_lan_0922 folder. It is not the normal configuration and
-does not replace the native calculations that still originate on clients.
-
-In experimental server-authority mode, the server owns Bot simulation and the
-shared projectile/collision/damage ledger. Human movement, launch inputs and
-several native vehicle-state calculations still originate on trusted clients.
-It is not an anti-cheat mode or a claim that every game calculation runs in
-this process.
 
 If the server exits immediately, port 28782 may already be in use. Close the
 other server instance and try again.

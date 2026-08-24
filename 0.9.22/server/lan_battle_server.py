@@ -38,11 +38,6 @@ _CLIENT_SCRIPT_ROOT = os.path.join(
 if _CLIENT_SCRIPT_ROOT not in sys.path:
     sys.path.insert(0, _CLIENT_SCRIPT_ROOT)
 
-import server_world
-from descriptor_projection import DescriptorStore
-from server_battle_authority import (
-    SERVER_AUTHORITY_ID, ServerBattleAuthority, bot_lineup_allowed_names,
-    propose_player_drowning)
 from server_bot_ai import BotPlanner
 from offline_rewards import compute_offline_rewards
 from gui.mods.offline_lan_0922 import tank_collision
@@ -171,8 +166,7 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
     "spotted_report", "fire_intent", "fire_intent_result",
     "projectile_launch", "projectile_progress", "projectile_resolve",
-    "rules_state", "destructible", "descriptor_bundle",
-    "destructible_map",
+    "rules_state", "destructible",
     "player_destructible_contact_result",
     "battle_result", "leave_battle", "battle_ready", "simulation_progress",
     "player_environment",
@@ -181,9 +175,8 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
 ))
 MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
     "input", "fire_intent", "start_battle", "battle_ready", "leave_battle",
-    "battle_receipt_ack", "descriptor_catalog", "descriptor_bundle",
-    "destructible_map", "select_vehicle", "select_team", "set_team_size",
-    "set_bot_tier_mode",
+    "battle_receipt_ack", "descriptor_catalog", "select_vehicle",
+    "select_team", "set_team_size", "set_bot_tier_mode",
     "ping", "leave",
     "track_repair",
     "equipment_intent",
@@ -611,6 +604,15 @@ def _bounded_float(value, low, high, inclusive_low=True):
             (value < low if inclusive_low else value <= low)):
         raise ValueError("number outside bounds")
     return value
+
+
+def _bot_lineup_allowed_names(catalog):
+    """Return selectable catalog identities without hidden test vehicles."""
+    return set(
+        row.get("name") for row in (catalog or ())
+        if isinstance(row, dict) and row.get("name") and
+        "secret" not in (row.get("tags") or ()) and
+        row.get("name") != "usa:T23")
 
 
 def _bounded_vector(value, lows, highs):
@@ -1561,13 +1563,11 @@ class SimulationWorker(_EndpointSendMixin):
 
 class BattleState:
     def __init__(self, map_name=DEFAULT_MAP, max_players=30, clock=None,
-                 authority_mode="client", team_size=15,
+                 team_size=15,
                  receipt_state_path=None, team1_size=None, team2_size=None,
                  bot_tier_mode='random', bot_lineup=None):
         self.map_option = map_name
         self.map_name = self._choose_map()
-        self.authority_mode = (
-            "client" if str(authority_mode) == "client" else "server")
         self.client_build = None
         self.max_players = max(1, min(int(max_players), 30))
         legacy_team_size = _team_capacity(team_size, "team_size")
@@ -1602,15 +1602,7 @@ class BattleState:
         self.bot_states = {}
         self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
-        self.server_authority = None
-        self.descriptor_store = DescriptorStore()
         self.vehicle_catalogs = {}
-        self.pending_descriptor_names = ()
-        self.descriptor_requested_names = ()
-        self.descriptor_failed_names = set()
-        self.authority_prerequisite_deadline = None
-        self.authority_status = "idle"
-        self.authority_fallback_reason = ""
         self._monotonic = clock or time.monotonic
         # Windows CPython implements monotonic() with GetTickCount64, whose
         # practical 15.6 ms resolution aliases both a 25-30 Hz bot producer
@@ -1632,7 +1624,6 @@ class BattleState:
         # raw time catch up under max(raw, sample) would flatten successive
         # snapshot timestamps and recreate a presentation hold.
         self.motion_time_offset_us = 0
-        self.destructible_maps = {}
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -1947,11 +1938,8 @@ class BattleState:
 
     def _elect_bot_authority(self):
         if self.client_build == CLIENT_BUILD_0922:
-            if self.server_authority is not None:
-                connected = [SERVER_AUTHORITY_ID]
-            elif (self.authority_mode == "client" and
-                  self.simulation_worker is not None and
-                  self.simulation_worker.connected):
+            if (self.simulation_worker is not None and
+                    self.simulation_worker.connected):
                 connected = [SIMULATION_WORKER_AUTHORITY_ID]
             else:
                 # A visible #1513 client is never a simulation authority.
@@ -2299,8 +2287,6 @@ class BattleState:
                 return None, "battle_in_progress"
             if hello.get("role") != SIMULATION_WORKER_ROLE:
                 return None, "unsupported_role"
-            if self.authority_mode != "client":
-                return None, "worker_not_supported"
             if (self.simulation_worker is not None and
                     self.simulation_worker.connected):
                 return None, "worker_already_connected"
@@ -2445,18 +2431,6 @@ class BattleState:
             self.player_environment.pop(player_id, None)
             self.player_drowning_seconds.pop(player_id, None)
             self.vehicle_catalogs.pop(player_id, None)
-            if (self.server_authority is not None and
-                    self.authority_status == "server_pending" and
-                    player_id == self.host_player_id):
-                if self.server_authority.started():
-                    # Destructibles are optional. The remaining players can
-                    # keep the server-hosted battle even when the sole native
-                    # identity donor leaves during loading.
-                    self._disable_server_destructibles(
-                        "destructible_map_donor_disconnected")
-                else:
-                    self._fail_server_authority_round(
-                        "descriptor_donor_disconnected")
             if player_id == self.host_player_id:
                 self._elect_room_host()
             if player_id == self.bot_authority_id:
@@ -2538,10 +2512,6 @@ class BattleState:
         self.phase = "waiting"
         self.round_id += 1
         self.tick = 0
-        # A player can refit in the garage between rounds, so the next round
-        # asks its owner for the fitted descriptor again.
-        for player in self.players.values():
-            self.descriptor_store.forget(player.vehicle)
         self.map_name = self._choose_map(self._active_map_pool())
         for player in self.players.values():
             player.health = player.max_health
@@ -2639,13 +2609,6 @@ class BattleState:
         self.bot_source_receipt_time_us = None
         self.motion_time_offset_us = 0
         self.bot_planner.reset()
-        self.server_authority = None
-        self.pending_descriptor_names = ()
-        self.descriptor_requested_names = ()
-        self.descriptor_failed_names = set()
-        self.authority_prerequisite_deadline = None
-        self.authority_status = "idle"
-        self.authority_fallback_reason = ""
         self.bot_orders = {"revision": 0, "orders": []}
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
@@ -2705,135 +2668,18 @@ class BattleState:
         self.state_revision += 1
 
     def _authority_fields(self):
-        destructibles_disabled_reason = ""
-        authority = self.server_authority
-        world = None if authority is None else authority.world
-        disabled_reason = getattr(
-            world, "destructibles_disabled_reason", None)
-        if callable(disabled_reason):
-            reason = disabled_reason()
-            if isinstance(reason, str):
-                destructibles_disabled_reason = reason
-        fields = {
-            "authority_status": self.authority_status,
-            "authority_fallback_reason": self.authority_fallback_reason,
-            "destructibles_disabled": bool(
-                destructibles_disabled_reason),
-            "destructibles_disabled_reason":
-                destructibles_disabled_reason,
-        }
         worker = self.simulation_worker
-        if (self.authority_mode == "client" and
-                worker is not None and worker.connected):
-            fields.update({
+        if worker is not None and worker.connected:
+            return {
                 "worker_status": "connected",
                 "worker_failure_reason": "",
-            })
-        elif (self.authority_mode == "client" and
-              self.worker_failure_reason):
-            fields.update({
+            }
+        if self.worker_failure_reason:
+            return {
                 "worker_status": "failed",
                 "worker_failure_reason": self.worker_failure_reason,
-            })
-        elif self.authority_mode == "client":
-            fields["worker_status"] = "missing"
-        return fields
-
-    def _wait_for_authority_prerequisite(
-            self, timeout=AUTHORITY_DESCRIPTOR_TIMEOUT_SECONDS,
-            restart=False):
-        if restart or self.authority_prerequisite_deadline is None:
-            self.authority_prerequisite_deadline = (
-                float(self._monotonic()) + float(timeout))
-        self.authority_status = "server_pending"
-        self.authority_fallback_reason = ""
-
-    def _server_authority_prerequisites_ready(self):
-        authority = self.server_authority
-        return bool(
-            authority is not None and authority.started() and
-            authority.world.destructible_identities_ready())
-
-    def _mark_server_authority_ready(self):
-        if not self._server_authority_prerequisites_ready():
-            return False
-        self.authority_status = "server"
-        self.authority_fallback_reason = ""
-        self.authority_prerequisite_deadline = None
-        return True
-
-    def _disable_server_destructibles(self, reason):
-        """Keep the round alive without untrusted native object identities."""
-        authority = self.server_authority
-        if authority is None:
-            return False
-        reason = str(reason or "destructible_data_unavailable")
-        changed = authority.world.disable_destructibles(reason)
-        self.destructible_maps.pop(self.map_name, None)
-        previous_status = self.authority_status
-        if (authority.started() and
-                not self._mark_server_authority_ready()):
-            return False
-        if changed:
-            _server_log(
-                "SERVER AUTHORITY destructibles disabled reason=%s round=%s; "
-                "continuing battle" % (reason, self.round_id))
-        if changed or previous_status != self.authority_status:
-            self.state_revision += 1
-        return True
-
-    def _fail_server_authority_round(self, reason):
-        """Abort a #1513 round whose server-authority prerequisites failed.
-
-        The server owns every #1513 battle simulation, so a failed
-        prerequisite ends the round instead of degrading to a
-        client-simulated battle.
-        """
-        reason = str(reason)
-        authority = self.server_authority
-        if (authority is not None and
-                not authority.world.destructible_identities_ready()):
-            self.destructible_maps.pop(self.map_name, None)
-        _server_log("SERVER AUTHORITY hard fail reason=%s round=%s" %
-                    (reason, self.round_id))
-        self._reset_round()
-        self.authority_status = "failed"
-        self.authority_fallback_reason = reason
-        return True
-
-    def _refuse_battle_start(self, reason):
-        """Refuse a #1513 start that cannot run under the server authority."""
-        reason = str(reason)
-        self.phase = "waiting"
-        self.roster_finalized = False
-        self.server_authority = None
-        self.pending_descriptor_names = ()
-        self.descriptor_requested_names = ()
-        self.descriptor_failed_names = set()
-        self.authority_prerequisite_deadline = None
-        self.authority_status = "failed"
-        self.authority_fallback_reason = reason
-        self.state_revision += 1
-        _server_log("SERVER AUTHORITY refused start reason=%s" % reason)
-        return None, reason
-
-    def _expire_authority_prerequisite(self):
-        if (self.phase != "loading" or
-                self.authority_status != "server_pending" or
-                self.authority_prerequisite_deadline is None or
-                float(self._monotonic()) <
-                float(self.authority_prerequisite_deadline)):
-            return False
-        authority = self.server_authority
-        reason = ("descriptor_timeout"
-                  if authority is None or not authority.started()
-                  else "destructible_map_timeout")
-        if reason == "destructible_map_timeout":
-            disabled = self._disable_server_destructibles(reason)
-            if disabled:
-                self._activate_battle_if_ready()
-            return disabled
-        return self._fail_server_authority_round(reason)
+            }
+        return {"worker_status": "missing"}
 
     def lobby_message(self):
         with self.lock:
@@ -2869,65 +2715,59 @@ class BattleState:
             if (self.client_build == CLIENT_BUILD_0922 and
                     player_id != self.host_player_id):
                 return None, "host_only"
+            if (self.client_build == CLIENT_BUILD_0922 and
+                    (self.simulation_worker is None or
+                     not self.simulation_worker.connected)):
+                return None, "simulation_worker_required"
             if (self.client_build == CLIENT_BUILD_0922 and any(
                     PROJECTILE_CAPABILITY not in participant.capabilities
                     for participant in self.players.values()
                     if participant.connected)):
                 return None, "missing_projectile_capability"
             if (self.client_build == CLIENT_BUILD_0922 and
-                    (any(
-                        HUMAN_RAM_TIMELINE_CAPABILITY not in
-                        participant.capabilities
-                        for participant in self.players.values()
-                        if participant.connected) or
-                     (self.authority_mode == "client" and
-                      self.simulation_worker is not None and
-                      HUMAN_RAM_TIMELINE_CAPABILITY not in
-                      self.simulation_worker.capabilities))):
+                    (any(HUMAN_RAM_TIMELINE_CAPABILITY not in
+                         participant.capabilities
+                         for participant in self.players.values()
+                         if participant.connected) or
+                     self.simulation_worker is None or
+                     HUMAN_RAM_TIMELINE_CAPABILITY not in
+                     self.simulation_worker.capabilities)):
                 return None, "missing_human_ram_timeline_capability"
             if (self.client_build == CLIENT_BUILD_0922 and
-                    (any(
-                        RAM_CONTACT_LEDGER_CAPABILITY not in
-                        participant.capabilities
-                        for participant in self.players.values()
-                        if participant.connected) or
-                     (self.authority_mode == "client" and
-                      self.simulation_worker is not None and
-                      RAM_CONTACT_LEDGER_CAPABILITY not in
-                      self.simulation_worker.capabilities))):
+                    (any(RAM_CONTACT_LEDGER_CAPABILITY not in
+                         participant.capabilities
+                         for participant in self.players.values()
+                         if participant.connected) or
+                     self.simulation_worker is None or
+                     RAM_CONTACT_LEDGER_CAPABILITY not in
+                     self.simulation_worker.capabilities)):
                 return None, "missing_ram_contact_ledger_capability"
             if (self.client_build == CLIENT_BUILD_0922 and
-                    (any(
-                        PLAYER_FIRE_INTENT_CAPABILITY not in
-                        participant.capabilities
-                        for participant in self.players.values()
-                        if participant.connected) or
-                     (self.authority_mode == "client" and
-                      self.simulation_worker is not None and
-                      PLAYER_FIRE_INTENT_CAPABILITY not in
-                        self.simulation_worker.capabilities))):
+                    (any(PLAYER_FIRE_INTENT_CAPABILITY not in
+                         participant.capabilities
+                         for participant in self.players.values()
+                         if participant.connected) or
+                     self.simulation_worker is None or
+                     PLAYER_FIRE_INTENT_CAPABILITY not in
+                     self.simulation_worker.capabilities)):
                 return None, "missing_player_fire_intent_capability"
             if (self.client_build == CLIENT_BUILD_0922 and
-                    (any(
-                        PLAYER_ENVIRONMENT_CAPABILITY not in
-                        participant.capabilities
-                        for participant in self.players.values()
-                        if participant.connected) or
-                     (self.authority_mode == "client" and
-                      self.simulation_worker is not None and
-                      PLAYER_ENVIRONMENT_CAPABILITY not in
-                      self.simulation_worker.capabilities))):
+                    (any(PLAYER_ENVIRONMENT_CAPABILITY not in
+                         participant.capabilities
+                         for participant in self.players.values()
+                         if participant.connected) or
+                     self.simulation_worker is None or
+                     PLAYER_ENVIRONMENT_CAPABILITY not in
+                     self.simulation_worker.capabilities)):
                 return None, "missing_player_environment_capability"
             if (self.client_build == CLIENT_BUILD_0922 and
-                    (any(
-                        EFFECTIVE_PARAMS_CAPABILITY not in
-                        participant.capabilities
-                        for participant in self.players.values()
-                        if participant.connected) or
-                     (self.authority_mode == "client" and
-                      self.simulation_worker is not None and
-                      EFFECTIVE_PARAMS_CAPABILITY not in
-                      self.simulation_worker.capabilities))):
+                    (any(EFFECTIVE_PARAMS_CAPABILITY not in
+                         participant.capabilities
+                         for participant in self.players.values()
+                         if participant.connected) or
+                     self.simulation_worker is None or
+                     EFFECTIVE_PARAMS_CAPABILITY not in
+                     self.simulation_worker.capabilities)):
                 return None, "missing_effective_params_capability"
             if (self.client_build == CLIENT_BUILD_0922 and any(
                     effective_params_wire.canonical(
@@ -2935,13 +2775,8 @@ class BattleState:
                     for participant in self.players.values()
                     if participant.connected)):
                 return None, "invalid_effective_params"
-            if (self.client_build == CLIENT_BUILD_0922 and
-                    self.authority_mode == "client" and
-                    (self.simulation_worker is None or
-                     not self.simulation_worker.connected)):
-                return None, "simulation_worker_required"
             if self.bot_lineup:
-                allowed_names = bot_lineup_allowed_names(
+                allowed_names = _bot_lineup_allowed_names(
                     self.vehicle_catalogs.get(self.host_player_id))
                 if any(
                         raw["vehicle"] not in allowed_names
@@ -2970,47 +2805,7 @@ class BattleState:
             self.roster_finalized = True
             self.phase = ("loading" if self.client_build == CLIENT_BUILD_0922
                           else "battle")
-            refusal = self._prepare_server_authority()
-            if refusal is not None:
-                return self._refuse_battle_start(refusal)
             self._elect_bot_authority()
-            descriptor_request = None
-            if self.server_authority is not None:
-                try:
-                    prepared = self.server_authority.prepare_lineup(
-                        self.vehicle_catalogs.get(self.host_player_id),
-                        list(self.bot_roster),
-                        [self._public_player(p, include_outfits=False)
-                         for p in connected],
-                        player.vehicle, self.bot_tier_mode,
-                        self.bot_lineup)
-                except Exception as error:
-                    _server_log(
-                        "server authority lineup preparation failed: %s" %
-                        error)
-                    prepared = False
-                if not prepared:
-                    return self._refuse_battle_start("lineup_unavailable")
-                names = self.server_authority.required_projections()
-                missing = tuple(sorted(
-                    name for name in names
-                    if self.descriptor_store.get(name) is None))
-                self.pending_descriptor_names = missing
-                self.descriptor_requested_names = missing
-                self.descriptor_failed_names = set()
-                if missing:
-                    self._wait_for_authority_prerequisite(restart=True)
-                    descriptor_request = {
-                        "type": "descriptor_request",
-                        "round_id": self.round_id,
-                        "names": list(missing),
-                    }
-                elif not self._start_server_authority():
-                    return self._refuse_battle_start("server_start_failed")
-                elif not self._mark_server_authority_ready():
-                    self._wait_for_authority_prerequisite(
-                        AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS,
-                        restart=True)
             self.state_revision += 1
             start_message = {
                 "type": "battle_start",
@@ -3043,18 +2838,10 @@ class BattleState:
                     "authority_epoch": self.authority_epoch,
                     "server_time_ms": self._server_time_ms(),
                 })
-            if descriptor_request is not None:
-                host = self.players.get(self.host_player_id)
-                if host is None or not host.send(descriptor_request):
-                    return self._refuse_battle_start(
-                        "descriptor_request_failed")
             start_message["bot_authority_id"] = self.bot_authority_id
             if self.client_build == CLIENT_BUILD_0922:
                 start_message["authority_epoch"] = self.authority_epoch
                 start_message.update(self._authority_fields())
-            if (self.server_authority is not None and
-                    not self.server_authority.world.destructible_identities_ready()):
-                start_message["need_destructible_map"] = True
             return start_message, None
 
     def _install_player_equipments(self, player):
@@ -3112,45 +2899,6 @@ class BattleState:
             }
         self.round_participants = frozen
 
-    def _prepare_server_authority(self):
-        """Build this round's server-hosted authority when it can own bots.
-
-        Returns None on success and a refusal reason when the #1513 round
-        cannot run under the server authority.
-        """
-        self.server_authority = None
-        self.pending_descriptor_names = ()
-        self.descriptor_requested_names = ()
-        self.descriptor_failed_names = set()
-        self.authority_prerequisite_deadline = None
-        self.authority_status = "idle"
-        self.authority_fallback_reason = ""
-        if self.client_build != CLIENT_BUILD_0922:
-            return None
-        if self.authority_mode == "client":
-            _server_log(
-                "AUTHORITY MODE client: this round requires the simulation worker")
-            return None
-        if not self.vehicle_catalogs.get(self.host_player_id):
-            return "vehicle_catalog_unavailable"
-        try:
-            world = server_world.load_world(self.map_name)
-        except Exception as error:
-            _server_log("server authority world load failed: %s" % error)
-            return "world_data_unavailable"
-        if world is None:
-            _server_log(
-                "server authority has no baked world for %s" % self.map_name)
-            return "world_data_unavailable"
-        for warning in getattr(world, "optional_warnings", ()):
-            _server_log(
-                "SERVER AUTHORITY optional world feature disabled map=%s: %s" %
-                (self.map_name, warning))
-        self.server_authority = ServerBattleAuthority(
-            self, world, self.descriptor_store)
-        self._wait_for_authority_prerequisite(restart=True)
-        return None
-
     def store_vehicle_catalog(self, player_id, message):
         """Keep one connection's eligible-vehicle catalog for lineups."""
         with self.lock:
@@ -3194,217 +2942,14 @@ class BattleState:
                 player_id, len(catalog)))
             return True
 
-    def store_destructible_map(self, player_id, message):
-        """Cache one map's donated native identities and install them."""
-        with self.lock:
-            player = self.players.get(player_id)
-            if (player is None or not player.connected or
-                    player_id != self.host_player_id or
-                    not self._message_round_matches(message)):
-                return False
-            map_name = str(message.get("map") or "")
-            if not map_name:
-                return False
-            if message.get("unavailable") is True:
-                if (map_name != self.map_name or self.phase != "loading" or
-                        self.authority_status != "server_pending"):
-                    return False
-                if self._disable_server_destructibles(
-                        "client_destructible_map_unavailable"):
-                    if self._server_authority_prerequisites_ready():
-                        return "ready"
-                    return True
-                return False
-            try:
-                part = int(message.get("part"))
-                parts = int(message.get("parts"))
-                unit_mass = float(message.get("unit_vehicle_mass"))
-            except (TypeError, ValueError):
-                return False
-            if not 0 <= part < parts or parts > 64 or unit_mass <= 0.0:
-                return False
-            rows = message.get("instances")
-            resources = message.get("resources")
-            if (not isinstance(rows, list) or len(rows) > 2000 or
-                    not isinstance(resources, dict)):
-                return False
-            for row in rows:
-                if (not isinstance(row, list) or len(row) != 5 or
-                        not isinstance(row[0], list) or
-                        len(row[0]) != 12):
-                    return False
-            cache = self.destructible_maps.setdefault(map_name, {
-                "unit_vehicle_mass": unit_mass,
-                "resources": {},
-                "instances": {},
-                "parts_seen": set(),
-                "parts": parts,
-            })
-            if cache["parts"] != parts:
-                return False
-            for name, raw in resources.items():
-                if isinstance(raw, dict):
-                    cache["resources"][str(name)] = {
-                        "destr_type": str(raw.get("destr_type") or ""),
-                        "kinetic_correction": _finite_float(
-                            raw.get("kinetic_correction"), 0.0),
-                    }
-            for row in rows:
-                cache["instances"][tuple(int(v) for v in row[0])] = row
-            cache["parts_seen"].add(part)
-            if cache["parts_seen"] != set(range(parts)):
-                return True
-            self._install_destructible_map(map_name)
-            if (map_name == self.map_name and
-                    self._mark_server_authority_ready()):
-                self.state_revision += 1
-                return "ready"
-            if (map_name == self.map_name and
-                    self.server_authority is not None and
-                    not self.server_authority.world.destructible_identities_ready()):
-                if self._disable_server_destructibles(
-                        "destructible_map_incomplete"):
-                    return "ready"
-                return False
-            return True
-
-    def _install_destructible_map(self, map_name):
-        if (self.server_authority is None or
-                map_name != self.map_name):
-            return 0
-        cache = self.destructible_maps.get(map_name)
-        if cache is None or cache["parts_seen"] != set(
-                range(cache["parts"])):
-            return 0
-        installed = self.server_authority.world.install_destructible_map(
-            list(cache["instances"].values()), cache["resources"],
-            cache["unit_vehicle_mass"])
-        if installed:
-            _server_log("DESTRUCTIBLE MAP installed map=%s instances=%d" % (
-                map_name, installed))
-        return installed
-
-    def donate_descriptors(self, player_id, message):
-        """Admit requested projections; start the authority when complete."""
-        with self.lock:
-            if (not self._message_round_matches(message) or
-                    self.phase != "loading" or
-                    self.server_authority is None or
-                    self.server_authority.started() or
-                    player_id != self.host_player_id):
-                return False
-            projections = message.get("projections")
-            requested = message.get("requested")
-            failures = message.get("failures")
-            complete = message.get("complete")
-            if (not isinstance(projections, dict) or len(projections) > 64 or
-                    not isinstance(requested, list) or not requested or
-                    len(requested) > 64 or
-                    not isinstance(failures, list) or len(failures) > 64 or
-                    not isinstance(complete, bool)):
-                return False
-            clean_requested = []
-            for raw in requested:
-                if not isinstance(raw, str):
-                    return False
-                clean = _safe_vehicle(raw, "")
-                if not clean or clean != raw or clean in clean_requested:
-                    return False
-                clean_requested.append(clean)
-            if tuple(clean_requested) != self.descriptor_requested_names:
-                return False
-            wanted = set(clean_requested)
-            clean_failures = set()
-            for raw in failures:
-                if not isinstance(raw, str):
-                    return False
-                clean = _safe_vehicle(raw, "")
-                if (not clean or clean != raw or clean not in wanted or
-                        clean in clean_failures):
-                    return False
-                clean_failures.add(clean)
-            for name, raw in projections.items():
-                clean = _safe_vehicle(name, "")
-                if (not isinstance(name, str) or not clean or clean != name or
-                        clean not in wanted or clean in clean_failures):
-                    return False
-                if not isinstance(raw, dict):
-                    return False
-                try:
-                    self.descriptor_store.add(clean, raw)
-                except ValueError:
-                    return False
-            self.descriptor_failed_names.update(clean_failures)
-            missing = [name for name in self.descriptor_requested_names
-                       if self.descriptor_store.get(name) is None]
-            self.pending_descriptor_names = tuple(missing)
-            if not complete:
-                return True
-            if self.descriptor_failed_names or missing:
-                self._fail_server_authority_round(
-                    "descriptor_projection_failed")
-                return "failed"
-            self.pending_descriptor_names = ()
-            self.descriptor_requested_names = ()
-            self.descriptor_failed_names = set()
-            if not self._start_server_authority():
-                self._fail_server_authority_round("server_start_failed")
-                return "failed"
-            if not self._mark_server_authority_ready():
-                self._wait_for_authority_prerequisite(
-                    AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS, restart=True)
-            return "started"
-
-    def _start_server_authority(self):
-        authority = self.server_authority
-        participants = [
-            player for player in self.players.values()
-            if player.connected and player.participating]
-        message = {
-            "round_id": self.round_id,
-            "map": self.map_name,
-            "bots": list(self.bot_roster),
-            "bot_manifest": [],
-            # The in-process authority has no wire-side static snapshot cache.
-            # Give it each player's canonical garage snapshot directly while
-            # keeping recurring network snapshots lean.
-            "players": [dict(
-                self._public_player(player, include_outfits=False),
-                effective_params=copy.deepcopy(player.effective_params))
-                for player in participants],
-            "human_ram_timeline": True,
-            "bot_authority_id": SERVER_AUTHORITY_ID,
-            "bot_order_revision": self.bot_orders["revision"],
-            "bot_orders": list(self.bot_orders["orders"]),
-            "battle_result": self.battle_result,
-        }
-        try:
-            authority.battle_start(message, float(self.tick) / TICK_HZ)
-        except Exception as error:
-            _server_log("server authority start failed: %s" % error)
-            return False
-        bases = self._sanitize_capture_bases(authority.capture_bases())
-        if bases:
-            self.capture_bases = bases
-        self._install_destructible_map(self.map_name)
-        return True
-
     def _activate_battle_if_ready(self):
         if self.phase != "loading":
             return None
         if (self.client_build == CLIENT_BUILD_0922 and
-                self.authority_mode == "client" and
                 (self.simulation_worker is None or
                  not self.simulation_worker.connected or
                  self.bot_authority_id !=
                  SIMULATION_WORKER_AUTHORITY_ID)):
-            return None
-        if (self.client_build == CLIENT_BUILD_0922 and
-                self.authority_mode != "client" and
-                self.server_authority is None):
-            return None
-        if (self.server_authority is not None and
-                not self._server_authority_prerequisites_ready()):
             return None
         participants = [
             player for player in self.players.values()
@@ -3640,15 +3185,9 @@ class BattleState:
                     not self._combat_accepting() or
                     self.battle_result is not None):
                 return False
-            if (self.server_authority is not None and
-                    self.server_authority.world.
-                    destructibles_disabled_reason() is not None):
-                return True
             dedicated_authority = (
                 player_id == self.bot_authority_id and
-                player_id in (
-                    SERVER_AUTHORITY_ID,
-                    SIMULATION_WORKER_AUTHORITY_ID))
+                player_id == SIMULATION_WORKER_AUTHORITY_ID)
             if (self.client_build == CLIENT_BUILD_0922 and
                     not dedicated_authority):
                 return False
@@ -3674,7 +3213,6 @@ class BattleState:
             event["reported_by"] = player_id
             self.destructibles[key] = event
             self.pending_events.append(dict(event))
-            self._mark_world_destroyed(event)
             return True
 
     @staticmethod
@@ -3785,14 +3323,6 @@ class BattleState:
         # if the visible endpoint cannot accept this offer immediately.
         player.offer_reliable(terminal)
 
-    def _mark_world_destroyed(self, event):
-        if self.server_authority is None:
-            return
-        self.server_authority.world.mark_destroyed_wire(
-            event["chunk_id"], event["item_index"],
-            event.get("mat_kind") if
-            event["destructible_kind"] == "module" else None)
-
     @staticmethod
     def _destructible_key(event):
         return (event["destructible_kind"], event["chunk_id"],
@@ -3837,7 +3367,6 @@ class BattleState:
             stored["reported_by"] = int(player_id)
             self.destructibles[key] = stored
             self.pending_events.append(dict(stored))
-            self._mark_world_destroyed(stored)
             changed += 1
         return changed
 
@@ -3975,10 +3504,8 @@ class BattleState:
             if player.connected and player.participating]
         return bool(
             self.client_build == CLIENT_BUILD_0922 and participants and
-            ((self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
-              worker is not None and worker.connected) or
-             (self.bot_authority_id == SERVER_AUTHORITY_ID and
-              self.server_authority is not None)))
+            self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
+            worker is not None and worker.connected)
 
     def _sanitize_human_collision_profiles(self, raw_profiles):
         """Bind worker-donated collision bodies to this exact player roster."""
@@ -5159,19 +4686,13 @@ class BattleState:
                         "sample_seq", "observations"} or
                     message.get("type") != "player_environment" or
                     authority_id != self.bot_authority_id or
-                    authority_id not in (
-                        SERVER_AUTHORITY_ID,
-                        SIMULATION_WORKER_AUTHORITY_ID) or
+                    authority_id != SIMULATION_WORKER_AUTHORITY_ID or
                     not self._combat_accepting() or
                     self.battle_result is not None):
                 return False
-            if authority_id == SERVER_AUTHORITY_ID:
-                if self.server_authority is None:
-                    return False
-            else:
-                worker = self.simulation_worker
-                if worker is None or not worker.connected:
-                    return False
+            worker = self.simulation_worker
+            if worker is None or not worker.connected:
+                return False
             try:
                 round_id = _exact_int(
                     message.get("round_id"), 1, PROJECTILE_MAX_ID)
@@ -5196,7 +4717,10 @@ class BattleState:
             observations = {}
             for raw in raw_observations:
                 if (not isinstance(raw, dict) or
-                        set(raw) != {"player_id", "input_seq", "level"}):
+                        set(raw) not in (
+                            {"player_id", "input_seq", "level"},
+                            {"player_id", "input_seq", "level",
+                             "drowning_critical"})):
                     return False
                 try:
                     player_id = _exact_int(
@@ -5214,11 +4738,20 @@ class BattleState:
                         (previous is not None and
                          input_seq < int(previous["input_seq"]))):
                     return False
-                observations[player_id] = {
+                observation = {
                     "input_seq": input_seq,
                     "level": level,
                     "observed_tick": int(self.tick),
                 }
+                if "drowning_critical" in raw:
+                    if level != 2:
+                        return False
+                    try:
+                        observation["drowning_critical"] = _critical_payload(
+                            raw["drowning_critical"])
+                    except ValueError:
+                        return False
+                observations[player_id] = observation
             self.player_environment = observations
             self.player_environment_seq = sample_seq
             self.player_environment_authority_epoch = authority_epoch
@@ -5253,13 +4786,17 @@ class BattleState:
             self.player_drowning_seconds[player.player_id] = elapsed
             if elapsed <= PLAYER_DROWNING_SECONDS:
                 continue
-            descriptor = self.descriptor_store.get(player.vehicle)
-            critical = propose_player_drowning(player, descriptor)
+            critical = observation.get("drowning_critical")
             if critical is None:
                 self.player_drowning_seconds[player.player_id] = (
                     PLAYER_DROWNING_SECONDS)
                 continue
-            critical = _critical_payload(critical)
+            try:
+                critical = _critical_payload(critical)
+            except ValueError:
+                self.player_drowning_seconds[player.player_id] = (
+                    PLAYER_DROWNING_SECONDS)
+                continue
             critical_before = player.critical
             display_health = max(0, int(player.health))
             damage = display_health
@@ -5327,12 +4864,6 @@ class BattleState:
 
     def _trusted_internal_projectile_authority(self, authority_id):
         """Recognize only the configured non-player simulation endpoint."""
-        if self.authority_mode == "server":
-            return bool(
-                authority_id == SERVER_AUTHORITY_ID and
-                self.bot_authority_id == SERVER_AUTHORITY_ID and
-                self.server_authority is not None and
-                self.server_authority.started())
         worker = self.simulation_worker
         return bool(
             authority_id == SIMULATION_WORKER_AUTHORITY_ID and
@@ -5353,14 +4884,11 @@ class BattleState:
                 return False
             player = self.players.get(player_id)
             worker = self.simulation_worker
-            server_authority = self.server_authority
             worker_mode = self._trusted_internal_projectile_authority(
                 SIMULATION_WORKER_AUTHORITY_ID)
-            server_mode = self._trusted_internal_projectile_authority(
-                SERVER_AUTHORITY_ID)
             if (player is None or not player.connected or
                     not player.participating or not player.alive or
-                    not (worker_mode or server_mode)):
+                    not worker_mode):
                 return False
             try:
                 intent_seq = _exact_int(
@@ -5463,17 +4991,6 @@ class BattleState:
                 player.fire_intent_seq -= 1
                 self.remove_simulation_worker(worker, "worker_send_stalled")
                 return False
-            if server_authority.launch_player_intent(relay):
-                return True
-            return self.resolve_fire_intent(SERVER_AUTHORITY_ID, {
-                "type": "fire_intent_result",
-                "round_id": self.round_id,
-                "authority_epoch": self.authority_epoch,
-                "player_id": int(player_id),
-                "intent_seq": intent_seq,
-                "accepted": False,
-                "reason": "server_rejected",
-            })
 
     def resolve_fire_intent(self, player_id, message):
         """Commit one internal-authority rejection for a player trigger."""
@@ -6473,12 +5990,6 @@ class BattleState:
     def _expire_projectiles(self):
         if self.client_build != CLIENT_BUILD_0922:
             return 0
-        if (self.server_authority is not None and
-                self.server_authority.started()):
-            # The bounded server manager owns these terminals. A wall-clock
-            # expiry here could retire a shot while its final collision chord
-            # is still queued behind other projectiles.
-            return 0
         if (self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
                 self.simulation_worker is not None and
                 self.simulation_worker.connected):
@@ -7046,7 +6557,6 @@ class BattleState:
                          self.players.get(player_id))
             requires_contact = bool(
                 target_kind == "human" and
-                player_id != SERVER_AUTHORITY_ID and
                 self.client_build == CLIENT_BUILD_0922)
             if requires_contact and not has_contact_player:
                 # New authorities may physically separate a currently visible
@@ -7915,10 +7425,9 @@ class BattleState:
                                  SIMULATION_WORKER_AUTHORITY_ID else
                                  self.players.get(self.bot_authority_id))
                     ledger_authority = bool(
-                        self.bot_authority_id == SERVER_AUTHORITY_ID or
-                        (authority is not None and
-                         RAM_CONTACT_LEDGER_CAPABILITY in
-                         authority.capabilities))
+                        authority is not None and
+                        RAM_CONTACT_LEDGER_CAPABILITY in
+                        authority.capabilities)
                     pending_limit = (
                         MAX_PENDING_RAM_CONTACTS if ledger_authority else 1)
                     by_seq = {}
@@ -10170,14 +9679,6 @@ class BattleState:
             # valid barrier likewise remains its own ordered wire transition.
             return
         with self.lock:
-            authority_fallback = self._expire_authority_prerequisite()
-        if authority_fallback:
-            self.broadcast_current_roster()
-            # A disabled optional feature may have made the loading round ready
-            # and queued its tick-zero live barrier. Publish that barrier on the
-            # next tick before advancing simulation.
-            return
-        with self.lock:
             if self.phase != "battle":
                 return
             self.tick += 1
@@ -10192,13 +9693,6 @@ class BattleState:
             for player in list(self.players.values()):
                 self._apply_movement(player, dt)
             self._resolve_human_rams()
-            if self.server_authority is not None:
-                authority_observation_relays = (
-                    self.server_authority.update(
-                        dt, float(self.tick) / TICK_HZ,
-                        live=(self.battle_result is None and
-                              self._timing_payload()["phase"] == "battle"))
-                    or ())
             self._tick_player_critical(dt)
             self._tick_player_fire(dt)
             self._tick_player_drowning(dt)
@@ -10264,11 +9758,6 @@ class BattleState:
             # mutable objects; serializing later per endpoint could make one
             # server_tick describe different state to different peers.
             snapshot = copy.deepcopy(snapshot)
-            if self.server_authority is not None:
-                authority_view = dict(snapshot)
-                authority_view["bots"] = [
-                    dict(value) for value in snapshot["bots"]]
-                self.server_authority.apply_snapshot(authority_view)
             events_message = None
             if events:
                 events_message = {
@@ -11343,40 +10832,6 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     elif message_type == "descriptor_catalog":
                         server.state.store_vehicle_catalog(
                             player.player_id, message)
-                    elif message_type == "destructible_map":
-                        installed = server.state.store_destructible_map(
-                            player.player_id, message)
-                        if installed == "ready":
-                            loading_snapshot = server.state.loading_snapshot()
-                            if loading_snapshot is not None:
-                                server.state.broadcast_loading_transition(
-                                    loading_snapshot)
-                            live = server.state.activate_battle_if_ready()
-                            if live is not None:
-                                _server_log(
-                                    "BATTLE LIVE round=%d countdown=%ss players=%d" % (
-                                        live["round_id"],
-                                        live["countdown_seconds"],
-                                        len(server.state.players)))
-                        elif installed == "failed":
-                            server.state.broadcast_current_roster()
-                    elif message_type == "descriptor_bundle":
-                        accepted = server.state.donate_descriptors(
-                            player.player_id, message)
-                        if accepted == "started":
-                            server.state.broadcast_loading_transition({
-                                "type": "snapshot",
-                                "round_id": server.state.round_id,
-                            })
-                            live = server.state.activate_battle_if_ready()
-                            if live is not None:
-                                _server_log(
-                                    "BATTLE LIVE round=%d countdown=%ss players=%d" % (
-                                        live["round_id"],
-                                        live["countdown_seconds"],
-                                        len(server.state.players)))
-                        elif accepted == "failed":
-                            server.state.broadcast_current_roster()
                     elif message_type == "select_vehicle":
                         if server.state.select_vehicle(
                                 player.player_id, message):
@@ -11502,13 +10957,13 @@ def _run_tick_loop(state, tick_clock=None, sleeper=None):
 
 
 def run_server(host, port, map_name, max_players,
-               authority_mode="client", team_size=15,
-               receipt_state_path=None, team1_size=None, team2_size=None,
+               team_size=15, receipt_state_path=None,
+               team1_size=None, team2_size=None,
                bot_tier_mode="random", bot_lineup=None):
     if receipt_state_path is None:
         receipt_state_path = _default_result_receipt_state_path(port)
     state = BattleState(map_name=map_name, max_players=max_players,
-                        authority_mode=authority_mode, team_size=team_size,
+                        team_size=team_size,
                         receipt_state_path=receipt_state_path,
                         team1_size=team1_size, team2_size=team2_size,
                         bot_tier_mode=bot_tier_mode,
@@ -11554,16 +11009,10 @@ def main():
     parser.add_argument(
         "--team-2-size", type=int, choices=range(1, 16), default=None,
         help="total Team 2 tanks, including players")
-    parser.add_argument(
-        "--authority", dest="authority_mode",
-        choices=("server", "client"),
-        default=os.environ.get("WOT_LAN_AUTHORITY", "client"),
-        help="who simulates bots in 0.9.22 rounds (default: client; "
-             "WOT_LAN_AUTHORITY overrides)")
     args = parser.parse_args()
     run_server(
         args.host, args.port, args.map_name, args.max_players,
-        authority_mode=args.authority_mode, team_size=args.team_size,
+        team_size=args.team_size,
         team1_size=args.team_1_size, team2_size=args.team_2_size)
 
 

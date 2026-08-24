@@ -135,7 +135,7 @@ class ServerTeamSizeTests(unittest.TestCase):
             {(bot['team'], bot['slot']) for bot in state.bot_roster})
 
     def test_humans_occupy_selected_slots_in_both_rounds(self):
-        state = BattleState(team_size=4, authority_mode='client')
+        state = BattleState(team_size=4)
         _attach_worker(state)
         players = []
         for index in range(3):
@@ -155,12 +155,37 @@ class ServerTeamSizeTests(unittest.TestCase):
         self.assertEqual(8 - len(players), len(state.bot_roster))
 
         state._reset_round()
-
         self.assertEqual('waiting', state.phase)
         self.assertFalse(occupied & {
             (bot['team'], bot['slot']) for bot in state.bot_roster})
         self.assertEqual(8 - len(players), len(state.bot_roster))
         self.assertEqual(4, state.lobby_message()['team_size'])
+
+    def test_worker_drowning_proposal_is_committed_without_descriptors(self):
+        state = BattleState(team_size=1)
+        _attach_worker(state)
+        player, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1001), _hello(1))
+        self.assertIsNone(error)
+        player.participating = True
+        state.phase = 'battle'
+        state._elect_bot_authority()
+
+        for sample in range(1, 102):
+            state.tick = 450 + sample
+            self.assertTrue(state.update_player_environment(-1, {
+                'type': 'player_environment', 'round_id': state.round_id,
+                'authority_epoch': state.authority_epoch,
+                'sample_seq': sample,
+                'observations': [{
+                    'player_id': player.player_id, 'input_seq': 0,
+                    'level': 2, 'drowning_critical': {},
+                }],
+            }))
+            state._tick_player_drowning(0.1)
+
+        self.assertFalse(player.alive)
+        self.assertEqual(0, player.health)
 
     def test_humans_cannot_expand_a_selected_four_tank_team(self):
         state = BattleState(team_size=4)
@@ -301,7 +326,7 @@ class ServerTeamSizeTests(unittest.TestCase):
 
     def test_random_start_chooses_from_the_active_client_map_pool(self):
         state = BattleState(
-            map_name='01_karelia', team_size=1, authority_mode='client')
+            map_name='01_karelia', team_size=1)
         _attach_worker(state)
         player, error = state.add_player(
             _Connection(), ('10.0.0.1', 1001), _hello(1))
@@ -320,7 +345,7 @@ class ServerTeamSizeTests(unittest.TestCase):
 
     def test_unknown_start_map_remains_fail_closed(self):
         state = BattleState(
-            map_name='01_karelia', team_size=1, authority_mode='client')
+            map_name='01_karelia', team_size=1)
         _attach_worker(state)
         player, error = state.add_player(
             _Connection(), ('10.0.0.1', 1001), _hello(1))

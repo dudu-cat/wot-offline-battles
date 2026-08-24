@@ -1471,11 +1471,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         payload = (json.dumps(snapshot, separators=(',', ':')) + '\n').encode()
         self.assertLessEqual(len(payload), MAX_LINE_BYTES)
 
-    def test_current_battle_message_includes_modern_authority_ledger(self):
+    def test_current_battle_message_includes_worker_projectile_ledger(self):
         state = _state(players=1)
         state.phase = 'battle'
-        state.authority_status = 'failed'
-        state.authority_fallback_reason = 'world_data_unavailable'
         self.assertTrue(_launch_authority(state, _launch()))
 
         message = state.current_battle_message()
@@ -1484,9 +1482,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(state.projectile_revision,
                          message['projectile_revision'])
         self.assertEqual(state._projectile_snapshot(), message['projectiles'])
-        self.assertEqual('failed', message['authority_status'])
-        self.assertEqual('world_data_unavailable',
-                         message['authority_fallback_reason'])
+        self.assertEqual('connected', message['worker_status'])
+        self.assertNotIn('authority_status', message)
+        self.assertNotIn('authority_fallback_reason', message)
 
     def test_launch_event_pitch_uses_physical_positive_up_convention(self):
         state = _state(players=1)

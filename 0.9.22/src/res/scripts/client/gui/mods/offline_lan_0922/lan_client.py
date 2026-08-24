@@ -40,7 +40,6 @@ CLIENT_CAPABILITIES = (
     EFFECTIVE_PARAMS_CAPABILITY,
 )
 WORKER_AUTHORITY_ID = -1
-SERVER_AUTHORITY_ID = 0
 POLL_INTERVAL = 1.0 / 60.0
 PING_INTERVAL = 1.0
 MAX_MESSAGE_BYTES = 256 * 1024
@@ -609,7 +608,7 @@ def _projectile_float_range(value, minimum, maximum):
 
 def _valid_visible_authority_id(value):
     """Accept infrastructure authorities, never a visible player id."""
-    return _exact_int(value) in (WORKER_AUTHORITY_ID, SERVER_AUTHORITY_ID)
+    return _exact_int(value) == WORKER_AUTHORITY_ID
 
 
 def _valid_visible_authority_message(message):
@@ -621,7 +620,7 @@ def _valid_visible_authority_message(message):
     if message.get('bot_authority_id') is not None:
         return False
     if _safe_text(message.get('phase'), '') == 'waiting':
-        # A room may legitimately wait for its worker or server authority.
+        # A room may legitimately wait for its worker.
         # Visible clients cannot become authority, so this cannot enable a
         # player-side fallback.
         return True
@@ -629,10 +628,7 @@ def _valid_visible_authority_message(message):
     worker_reason = _safe_text(message.get('worker_failure_reason'), '')
     if worker_status == 'failed' and worker_reason:
         return True
-    return bool(
-        _safe_text(message.get('phase'), '') == 'waiting' and
-        _safe_text(message.get('authority_status'), '') == 'failed' and
-        _safe_text(message.get('authority_fallback_reason'), ''))
+    return False
 
 
 def _strict_projectile_source_shot(value):
@@ -1770,7 +1766,10 @@ class LANClient(object):
         seen = set()
         for raw in observations:
             if (not isinstance(raw, dict) or
-                    set(raw) != {'player_id', 'input_seq', 'level'}):
+                    set(raw) not in (
+                        {'player_id', 'input_seq', 'level'},
+                        {'player_id', 'input_seq', 'level',
+                         'drowning_critical'})):
                 return False
             player_id = _projectile_int_range(
                 raw.get('player_id'), 1, MAX_PROJECTILE_ID)
@@ -1781,11 +1780,16 @@ class LANClient(object):
                     player_id in seen):
                 return False
             seen.add(player_id)
-            rows.append({
+            row = {
                 'player_id': player_id,
                 'input_seq': input_seq,
                 'level': level,
-            })
+            }
+            if 'drowning_critical' in raw:
+                if level != 2 or not isinstance(raw['drowning_critical'], dict):
+                    return False
+                row['drowning_critical'] = raw['drowning_critical']
+            rows.append(row)
         return self._send({
             'type': 'player_environment',
             'round_id': self.round_id,
@@ -2386,29 +2390,6 @@ class LANClient(object):
             return False
         return self._send({'type': 'descriptor_catalog',
                            'vehicles': list(vehicles or ())[:1024]})
-
-    def send_descriptor_bundle(self, projections, requested=None,
-                               failures=None, complete=True):
-        if not self.ready:
-            return False
-        projections = dict(projections or {})
-        if requested is None:
-            requested = sorted(projections)
-        return self._send({'type': 'descriptor_bundle',
-                           'round_id': self.round_id,
-                           'requested': list(requested or ())[:64],
-                           'failures': list(failures or ())[:64],
-                           'complete': bool(complete),
-                           'projections': projections})
-
-    def send_destructible_map(self, map_name, payload):
-        if not self.ready or not isinstance(payload, dict):
-            return False
-        message = dict(payload)
-        message['type'] = 'destructible_map'
-        message['round_id'] = self.round_id
-        message['map'] = map_name
-        return self._send(message)
 
     def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
                      impact_position=None, critical=None, splash=False,

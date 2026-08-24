@@ -21,9 +21,8 @@ PORT_0_9_22 = "0.9.22"
 SUPPORTED_PORTS = (PORT_0_9_22,)
 
 MODE_SINGLE = "single"
-MODE_HOST = "host"
 MODE_JOIN = "join"
-MODES = (MODE_SINGLE, MODE_HOST, MODE_JOIN)
+MODES = (MODE_SINGLE, MODE_JOIN)
 
 DEFAULT_SERVER_PORT = 28782
 DEFAULT_TEAM_SIZE = 15
@@ -65,7 +64,6 @@ _NAVGRAPH_RELATIVE_DIR = os.path.join(
     "res_mods", "0.8.2", "scripts", "client", "gui", "mods", "offhangar",
     "navgraphs")
 
-SERVER_DATA_ENV_0922 = "WOT_0922_SERVER_DATA"
 SERVER_TEAM_SIZE_ENV_0922 = "WOT_0922_TEAM_SIZE"
 SERVER_TEAM1_SIZE_ENV_0922 = "WOT_0922_TEAM1_SIZE"
 SERVER_TEAM2_SIZE_ENV_0922 = "WOT_0922_TEAM2_SIZE"
@@ -79,9 +77,6 @@ CLIENT_PREFERRED_TEAM_ENV_0922 = "OFFLINE_LAN_0922_PREFERRED_TEAM"
 ALLOW_MULTIPLE_CLIENTS_ENV_0922 = "OFFLINE_LAN_0922_ALLOW_MULTIPLE_CLIENTS"
 HIDDEN_DESKTOP_ENV_0922 = "OFFLINE_LAN_0922_HIDDEN_DESKTOP"
 WORKER_READY_MARKER_ENV_0922 = "OFFLINE_LAN_0922_WORKER_READY_MARKER"
-_SERVER_DATA_RELATIVE_DIR_0922 = os.path.join(
-    "mods", "configs", "offline_lan_0922")
-
 WORKER_STARTER_FILENAME_0922 = "offline_worker_starter.exe"
 WORKER_READY_MARKER_FILENAME_0922 = "offline-worker.ready"
 WORKER_FAILURE_LOG_FILENAME_0922 = "offline-worker-starter.log"
@@ -141,7 +136,7 @@ LISTENER_FREE = "free"
 LISTENER_COMPATIBLE = "compatible"
 LISTENER_OCCUPIED = "occupied"
 
-_DATASETS_0_9_22 = ("navgraphs", "foliage", "destructibles", "occluders")
+_DATASETS_0_9_22 = ("navgraphs", "foliage", "destructibles")
 _DATA_INVENTORIES = {
     PORT_0_8_2: ((
         "res_mods/0.8.2/scripts/client/gui/mods/offhangar/navgraphs", 33),),
@@ -1444,14 +1439,12 @@ def server_argv(port_version, base_dir=None):
 def server_environment(port_version, game_root, environment=None,
                        team_size=DEFAULT_TEAM_SIZE, loopback_only=False,
                        team1_size=None, team2_size=None, bot_lineup=None):
-    """Point each server at the baked data installed with its client."""
+    """Build the endpoint and roster environment for one LAN server."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_8_2:
         environment[NAVGRAPH_DIR_ENV] = os.path.join(
             game_root, _NAVGRAPH_RELATIVE_DIR)
     elif port_version == PORT_0_9_22:
-        environment[SERVER_DATA_ENV_0922] = os.path.join(
-            game_root, _SERVER_DATA_RELATIVE_DIR_0922)
         team1_size = parse_team_size(
             team_size if team1_size is None else team1_size)
         team2_size = parse_team_size(

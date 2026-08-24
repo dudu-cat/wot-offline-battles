@@ -378,7 +378,7 @@ class WindowTest(unittest.TestCase):
         self.assertEqual("normal", self.window.crash_report_check.cget("state"))
 
     def test_old_host_setting_migrates_to_the_online_tab(self):
-        core.save_settings({"mode": core.MODE_HOST})
+        core.save_settings({"mode": "host"})
 
         reopened = wot_launcher.LauncherWindow(
             _FakeTk, _FakeTtk, self.dialog)
@@ -538,7 +538,7 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(core.MODE_JOIN, plan.call_args.args[1])
         thread.return_value.start.assert_called_once_with()
 
-    def test_local_server_owner_plans_a_host_session_with_worker(self):
+    def test_local_room_owner_still_plans_a_join_session(self):
         self._game()
         self.window.join_address.set(
             "%s:%d" % (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT))
@@ -546,17 +546,17 @@ class WindowTest(unittest.TestCase):
         self.window._server_persistent = True
         session = {
             "client": core.PORT_0_9_22,
-            "mode": core.MODE_HOST,
+            "mode": core.MODE_JOIN,
             "host": core.LOCAL_HOST,
             "tcp_port": core.DEFAULT_SERVER_PORT,
-            "needs_server": True,
+            "needs_server": False,
             "vehicle_profile": None,
         }
         with mock.patch("core.plan_session", return_value=session) as plan, \
                 mock.patch("wot_launcher.threading.Thread") as thread:
             self.window._start_network()
 
-        self.assertEqual(core.MODE_HOST, plan.call_args.args[1])
+        self.assertEqual(core.MODE_JOIN, plan.call_args.args[1])
         thread.return_value.start.assert_called_once_with()
 
     def test_the_address_field_and_test_button_follow_the_mode(self):
@@ -588,12 +588,12 @@ class WindowTest(unittest.TestCase):
         self.window._refresh_mode()
         self.assertEqual("normal", self.window.server_button.cget("state"))
         self.assertEqual(
-            "Start server", self.window.server_button.cget("text"))
+            "Start LAN room", self.window.server_button.cget("text"))
         self.window.mode.set(core.MODE_SINGLE)
         self.window._refresh_mode()
         self.assertEqual("disabled", self.window.server_button.cget("state"))
 
-    def test_lan_server_button_installs_data_and_starts_persistent_server(self):
+    def test_lan_room_button_starts_persistent_server_and_worker(self):
         game_root = self._game("0.9.22.0.1", "1513")
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()
@@ -601,7 +601,9 @@ class WindowTest(unittest.TestCase):
                 "core.install_client_mod", return_value=["installed"]) \
                 as install, mock.patch.object(
                     self.window, "_start_server", return_value=True) \
-                as start_server:
+                as start_server, mock.patch.object(
+                    self.window, "_start_worker", return_value=True) \
+                as start_worker:
             self.assertTrue(self.window._toggle_lan_server())
             for unused in range(200):
                 if not self.window._maintenance_busy:
@@ -610,7 +612,10 @@ class WindowTest(unittest.TestCase):
 
         install.assert_called_once_with(game_root, core.PORT_0_9_22)
         start_server.assert_called_once_with(
-            game_root, core.PORT_0_9_22, persistent=True)
+            game_root, core.PORT_0_9_22, persistent=True, require_owned=True)
+        start_worker.assert_called_once_with(
+            game_root, core.LOCAL_HOST, core.DEFAULT_SERVER_PORT,
+            room_owned=True)
         self.assertEqual(
             "%s:%d" % (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT),
             self.window.join_address.get())
@@ -1843,45 +1848,6 @@ class WindowTest(unittest.TestCase):
         isolate.assert_called_once_with(self.settings_dir)
         run_game.assert_not_called()
         self.assertIn("not the server for this client", self._log_text())
-
-    def test_host_starts_hidden_worker_without_hiding_server(self):
-        session = {
-            "client": core.PORT_0_9_22,
-            "host": core.LOCAL_HOST,
-            "tcp_port": core.DEFAULT_SERVER_PORT,
-            "needs_server": True,
-            "mode": core.MODE_HOST,
-            "vehicle_profile": None,
-        }
-        with mock.patch("core.install_client_mod", return_value=[]), \
-                mock.patch(
-                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
-                    return_value={"profile": None, "installedMembers": 0,
-                                  "removedMembers": 0}), \
-                mock.patch(
-                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
-                    return_value=0), \
-                mock.patch(
-                    "core.ensure_0_9_22_preferences_isolation",
-                    return_value="preferences isolated"), \
-                mock.patch("core.write_settings", return_value=[]), \
-                mock.patch.object(
-                    self.window, "_start_server", return_value=True) \
-                    as start_server, \
-                mock.patch.object(self.window, "_start_worker") as worker, \
-                mock.patch.object(self.window, "_run_game") as game, \
-                mock.patch.object(self.window, "_stop_worker"), \
-                mock.patch.object(self.window, "_stop_server"):
-            self.window._run_session(self.settings_dir, session, "Peng")
-
-        start_server.assert_called_once_with(
-            self.settings_dir, core.PORT_0_9_22, loopback_only=False)
-        worker.assert_called_once_with(
-            self.settings_dir, core.LOCAL_HOST,
-            core.DEFAULT_SERVER_PORT)
-        game.assert_called_once_with(
-            self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
-            core.DEFAULT_SERVER_PORT, paired_worker=True)
 
     def test_closing_the_window_saves_the_settings(self):
         self.window.player_name.set("Peng")

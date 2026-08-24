@@ -17,7 +17,6 @@ import bot_lineup_profiles  # noqa: E402
 import bot_lineup_ui  # noqa: E402
 import core as launcher_core  # noqa: E402
 import windows_server  # noqa: E402
-from server_battle_authority import ServerBattleAuthority  # noqa: E402
 from gui.mods.offline_lan_0922 import vehicle_blacklist  # noqa: E402
 from gui.mods.offline_lan_0922.battle_runtime import BattleRuntime  # noqa: E402
 
@@ -76,7 +75,7 @@ class BotLineupIntegrationTests(unittest.TestCase):
         self.assertEqual(1, len(saved))
         return bot_lineup_profiles.assignments_for(saved[0], profile_name)
 
-    def test_ui_profile_env_and_both_authorities_keep_the_exact_type_name(self):
+    def test_ui_profile_env_and_hidden_worker_keep_the_exact_type_name(self):
         assignments = self._ui_saved_assignment()
         expected_name = "germany:G12_Ltraktor"
         self.assertEqual(expected_name, assignments[0]["vehicle"])
@@ -88,23 +87,7 @@ class BotLineupIntegrationTests(unittest.TestCase):
             environment)
         self.assertEqual(assignments, server_lineup)
 
-        catalog = (
-            {"name": "ussr:R11_MS-1", "level": 1,
-             "tags": ("lightTank",)},
-            {"name": expected_name, "level": 1,
-             "tags": ("lightTank",)},
-        )
         roster = ({"id": 21, "team": 2, "slot": 0},)
-        authority = ServerBattleAuthority.__new__(ServerBattleAuthority)
-        authority._assignments = {}
-        authority._required_names = ()
-        self.assertTrue(authority.prepare_lineup(
-            catalog, roster,
-            ({"id": 1, "team": 1, "slot": 0,
-              "vehicle": "ussr:R11_MS-1"},),
-            "ussr:R11_MS-1", "same", server_lineup))
-        self.assertEqual(expected_name, authority._assignments[(2, 0)])
-
         entries = {
             1: types.SimpleNamespace(
                 name="ussr:R11_MS-1", level=1,
@@ -149,21 +132,11 @@ class BotLineupIntegrationTests(unittest.TestCase):
             frozenset(vehicle_blacklist.UNUSABLE_VEHICLES),
             bot_lineup_profiles.UNUSABLE_BOT_VEHICLES_0922)
 
-    def test_missing_exact_vehicle_is_rejected_by_both_authorities(self):
+    def test_missing_exact_vehicle_is_rejected_by_hidden_worker(self):
         lineup = [{
             "team": 2, "slot": 0, "vehicle": "germany:Missing",
         }]
-        catalog = ({
-            "name": "ussr:R11_MS-1", "level": 1,
-            "tags": ("lightTank",),
-        },)
         roster = ({"id": 21, "team": 2, "slot": 0},)
-        authority = ServerBattleAuthority.__new__(ServerBattleAuthority)
-        authority._assignments = {}
-        authority._required_names = ()
-        self.assertFalse(authority.prepare_lineup(
-            catalog, roster, (), "ussr:R11_MS-1", "same", lineup))
-
         entries = {1: types.SimpleNamespace(
             name="ussr:R11_MS-1", level=1, tags=("lightTank",))}
         battle = BattleRuntime.__new__(BattleRuntime)

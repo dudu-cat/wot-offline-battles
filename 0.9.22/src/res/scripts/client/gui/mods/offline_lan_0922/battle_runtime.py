@@ -4271,8 +4271,8 @@ class BattleRuntime(object):
             self._drown_level = level
             self._present_drowning_level(level, now)
         # The visible process owns only this native UI state. BattleState
-        # applies the ten-second law after a hidden-worker or baked-world
-        # observation; no local record, HP or critical state changes here.
+        # applies the ten-second law after a hidden-worker observation; no
+        # local record, HP or critical state changes here.
         return changed
 
     def _publish_player_environment(self, dt, now):
@@ -4312,11 +4312,22 @@ class BattleRuntime(object):
                 input_seq = max(0, int(state.get('input_seq', 0) or 0))
             except (TypeError, ValueError):
                 input_seq = 0
-            observations.append({
+            observation = {
                 'player_id': int(record['network_id']),
                 'input_seq': input_seq,
                 'level': int(level),
-            })
+            }
+            if int(level) == 2:
+                try:
+                    # The worker has the native descriptor and crew roster.
+                    # Publish a proposal for the server to admit only after
+                    # its authoritative continuous countdown completes.
+                    critical = critical_damage.propose_drowning(entity)
+                except Exception:
+                    critical = None
+                if isinstance(critical, dict):
+                    observation['drowning_critical'] = critical
+            observations.append(observation)
         sender = getattr(self.client, 'send_player_environment', None)
         if not callable(sender):
             return False
@@ -6139,8 +6150,8 @@ class BattleRuntime(object):
 
         The server does not tick snapshots while #1513 clients are behind the
         native entity-load barrier, so a loading-phase roster is the only
-        durable authority update channel.  A round that loses its server
-        authority is ended by the server; this client never takes the bot
+        durable authority update channel. A round that loses its worker is
+        ended by the server; this client never takes the bot
         simulation over.
         """
         if self.state in ('failed', 'stopped', 'leaving'):
@@ -6155,12 +6166,6 @@ class BattleRuntime(object):
         self._observe_projectile_message(message)
         player_id = message.get('bot_authority_id')
         self._start_message['bot_authority_id'] = player_id
-        if 'authority_status' in message:
-            self._start_message['authority_status'] = message.get(
-                'authority_status')
-        if 'authority_fallback_reason' in message:
-            self._start_message['authority_fallback_reason'] = message.get(
-                'authority_fallback_reason')
         self._observe_destructibles_disabled(message)
         if self._bots is None:
             return True
@@ -11165,10 +11170,7 @@ class BattleRuntime(object):
         Bot presentation remains staggered to keep one 32-bit render callback
         from constructing 29 HD compounds.  It now finishes behind the stock
         BattleLoading screen instead of spending the first countdown seconds
-        loading the line-up that will shortly begin moving.  A server-requested
-        native destructible map is also a readiness boundary: a transport
-        refusal is retried next frame, while unavailable optional baked data
-        is reported explicitly for the server to resolve.
+        loading the line-up that will shortly begin moving.
         """
         if self._ready_sent or self._battle_live:
             return False
@@ -11191,64 +11193,10 @@ class BattleRuntime(object):
         ready = getattr(self.client, 'send_battle_ready', None)
         if not callable(ready):
             return False
-        if (self._start_message.get('need_destructible_map') and
-                not self._maybe_donate_destructible_map()):
-            return False
         bases = getattr(self._spawn_planner, 'bases', None)
         if not ready(bases):
             raise RuntimeError('LAN server did not accept battle readiness')
         self._ready_sent = True
-        return True
-
-    def _maybe_donate_destructible_map(self):
-        """Send the map's complete baked destructible identities.
-
-        A client that cannot project the optional map reports that bounded
-        state to the server.  Only transport refusal stays retryable here.
-        """
-        if not self._start_message.get('need_destructible_map'):
-            return False
-        sender = getattr(self.client, 'send_destructible_map', None)
-        if not callable(sender):
-            raise RuntimeError(
-                'LAN server requires a destructible map donation this '
-                'client cannot send')
-        donation_error = None
-        if self._destructibles is None:
-            donation = None
-            donation_error = RuntimeError(
-                'destructible catalog is unavailable')
-        else:
-            try:
-                donation = self._destructibles.donation_rows_1513()
-            except Exception as error:
-                donation = None
-                donation_error = error
-        if not donation:
-            if donation_error is None:
-                donation_error = RuntimeError(
-                    'destructible map donation requires the baked catalog')
-            self._warn_optional_failure(
-                'destructible map donation', donation_error,
-                disable=False)
-            return bool(sender(
-                self._start_message.get('map'), {
-                    'unavailable': True,
-                    'reason': self._bounded_failure_reason(
-                        donation_error,
-                        DESTRUCTIBLE_UNAVAILABLE_REASON_LIMIT),
-                }))
-        rows = donation.pop('instances')
-        part_size = 1000
-        parts = max(1, (len(rows) + part_size - 1) // part_size)
-        for part in range(parts):
-            payload = dict(donation)
-            payload['part'] = part
-            payload['parts'] = parts
-            payload['instances'] = rows[part * part_size:
-                                        (part + 1) * part_size]
-            if not sender(self._start_message.get('map'), payload):
-                return False
         return True
 
     def _sample_ground_plane(self, position, yaw, descriptor=None):

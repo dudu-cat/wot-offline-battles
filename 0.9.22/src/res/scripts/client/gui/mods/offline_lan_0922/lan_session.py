@@ -410,7 +410,6 @@ class LANSession(object):
         self._client_generation = 0
         self._host_player_id = None
         self._waiting_notice_host_id = None
-        self._authority_fallback_notice = None
 
     def _new_client(self):
         # Advancing before resolution also retires callbacks from an old
@@ -2042,85 +2041,13 @@ class LANSession(object):
             print('[Offline LAN 0.9.22] vehicle catalog donation was not '
                   'accepted by the transport (%d rows)' % len(rows))
 
-    @staticmethod
-    def _local_fitting():
-        """Map the selected vehicle's type name to its mounted descriptor."""
-        try:
-            from CurrentVehicle import g_currentVehicle
-            descriptor = g_currentVehicle.item.descriptor
-            return {str(descriptor.type.name): descriptor.makeCompactDescr()}
-        except Exception:
-            return {}
-
-    def _donate_descriptors(self, message):
-        """Answer one server request for battle descriptor projections."""
-        names = message.get('names') if isinstance(message, dict) else None
-        if not isinstance(names, (list, tuple)) or not names:
-            return
-        requested = []
-        for raw_name in names[:64]:
-            name = str(raw_name)
-            if name and name not in requested:
-                requested.append(name)
-        if not requested:
-            return
-        failures = []
-        projections = {}
-        runtime = self._donation_runtime()
-        try:
-            if runtime is None:
-                failures.extend(requested)
-            else:
-                from gui.mods.offline_lan_0922 import descriptor_donation
-                projections = descriptor_donation.project_vehicles(
-                    runtime, requested, failures=failures,
-                    fittings=self._local_fitting())
-        except Exception as error:
-            print('[Offline LAN 0.9.22] descriptor donation '
-                  'failed: %s' % error)
-            projections = {}
-            failures = list(requested)
-        items = sorted(projections.items())
-        if not items:
-            self.client.send_descriptor_bundle(
-                {}, requested=requested, failures=failures, complete=True)
-            return
-        for start in range(0, len(items), 12):
-            end = start + 12
-            self.client.send_descriptor_bundle(
-                dict(items[start:end]), requested=requested,
-                failures=failures, complete=end >= len(items))
-
-    def _notify_authority_failure(self, message):
-        """Expose a per-round server-authority hard failure once."""
-        if (not isinstance(message, dict) or
-                message.get('authority_status') != 'failed'):
-            return False
-        reason = str(message.get('authority_fallback_reason') or
-                     'server prerequisites unavailable')
-        key = (message.get('round_id'), reason)
-        if self._authority_fallback_notice == key:
-            return False
-        self._authority_fallback_notice = key
-        sys.stdout.write(
-            '[Offline LAN 0.9.22] LAN server ended round %r: authority '
-            'prerequisites failed (%s)\n' % (message.get('round_id'), reason))
-        self._status_notifier(
-            'The LAN server ended the battle: server authority '
-            'prerequisites failed (%s).' % reason)
-        return True
-
     def _on_event(self, kind, message):
         if self._stopped:
             return
-        if kind in ('welcome', 'roster', 'battle_start'):
-            self._notify_authority_failure(message)
         if kind in ('welcome', 'roster'):
             if kind == 'welcome':
                 self._send_vehicle_catalog()
             self._waiting_event(message)
-        elif kind == 'descriptor_request':
-            self._donate_descriptors(message)
         elif kind == 'start_denied':
             # Concurrent start requests can produce an accepted battle_start
             # and a denial for this client's losing request in either order.

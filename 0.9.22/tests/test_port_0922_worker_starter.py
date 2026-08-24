@@ -32,15 +32,13 @@ class WorkerStarterTests(unittest.TestCase):
                         source.index('ResumeThread'))
         self.assertIn('JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE', source)
 
-    def test_host_waits_for_worker_and_retires_it_with_the_player(self):
+    def test_worker_starts_only_in_worker_mode_and_waits_for_readiness(self):
         source = SOURCE.read_text(encoding='utf-8')
 
         self.assertIn('CreateMutexW(0, TRUE, WORKER_MUTEX_NAME)', source)
         self.assertIn('OFFLINE_LAN_0922_WORKER_READY_MARKER', source)
-        self.assertIn(
-            'wait_for_worker_ready(\n\t\t\tprocess.hProcess,\n'
-            '\t\t\tworker_only ? 0 : server_process.hProcess, stop_event)',
-            source)
+        self.assertIn('wait_for_worker_ready(process.hProcess, stop_event)',
+                      source)
         wait_body = source.split(
             'static int wait_for_worker_ready', 1)[1].split(
                 'static int launch_player', 1)[0]
@@ -63,36 +61,23 @@ class WorkerStarterTests(unittest.TestCase):
             'result = launch_player(game_path, FALSE, stop_event);', source)
         self.assertIn('TerminateJobObject(job, ERROR_PROCESS_ABORTED)', source)
         main = source.split('int WINAPI wWinMain', 1)[1]
-        worker_wait = main.index('wait_for_worker_ready(\n')
-        host_player = main.index(
-            'result = launch_player(game_path, TRUE, stop_event);',
-            worker_wait)
-        self.assertLess(worker_wait, host_player)
+        self.assertIn('wait_for_worker_ready(process.hProcess, stop_event)',
+                      main)
+        worker_path = main.split('if (!worker_only)', 1)[1]
+        self.assertNotIn('launch_player(', worker_path)
 
-    def test_offline_host_owns_a_hidden_loopback_server_before_the_worker(self):
+    def test_worker_only_starter_never_creates_a_server(self):
         source = SOURCE.read_text(encoding='utf-8')
         main = source.split('int WINAPI wWinMain', 1)[1]
 
-        server_create = main.index('CreateProcessW(\n\t\t\t\tserver_path')
-        server_job = main.index(
-            'AssignProcessToJobObject(job, server_process.hProcess)',
-            server_create)
-        server_ready = main.index(
-            'wait_for_local_server(\n\t\t\tserver_process.hProcess, '
-            'stop_event)', server_job)
-        worker_create = main.index(
-            'CreateProcessW(game_path, child_command', server_ready)
-        self.assertLess(server_create, server_job)
-        self.assertLess(server_job, server_ready)
-        self.assertLess(server_ready, worker_create)
-        self.assertIn('CREATE_NO_WINDOW', main[server_create:server_job])
-        self.assertIn('WOT_0922_LOOPBACK_ONLY', source)
+        self.assertIn('if (!worker_only)', main)
+        self.assertIn('unsupported_mode', main)
+        self.assertIn('CreateProcessW(game_path, child_command', main)
+        self.assertNotIn('server_path', main)
+        self.assertNotIn('server_process', main)
         self.assertIn('OFFLINE_LAN_0922_SERVER_HOST', source)
         self.assertIn('OFFLINE_LAN_0922_SERVER_PORT', source)
-        self.assertIn('WOT_0922_SERVER_DATA', source)
-        self.assertIn('mods\\\\configs\\\\offline_lan_0922', source)
-        self.assertIn('WoT-0.9.22-LAN-Server.exe', source)
-        self.assertIn('local_server_port_in_use', source)
+        self.assertNotIn('WOT_0922_SERVER_DATA', source)
 
     def test_lan_player_preserves_launcher_server_override(self):
         source = SOURCE.read_text(encoding='utf-8')
@@ -285,7 +270,7 @@ class WorkerStarterTests(unittest.TestCase):
             player_cancel)
         worker_stop = main.index('wait_state == WAIT_OBJECT_0 + 1')
         worker_recheck = main.index(
-            'WaitForSingleObject(\n\t\t\t\t\t\tprocess.hProcess, 0)',
+            'WaitForSingleObject(\n\t\t\t\t\tprocess.hProcess, 0)',
             worker_stop)
         worker_cancel = main.index(
             'cancel_procdump_now(&procdump_process,', worker_recheck)
@@ -355,7 +340,7 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertLess(first_process_check, marker_check)
         self.assertLess(marker_check, second_process_check)
         self.assertIn('worker_exited_after_ready', wait_body)
-        self.assertIn('local_server_exited_before_worker_ready', wait_body)
+        self.assertNotIn('local_server_exited_before_worker_ready', wait_body)
 
     def test_lan_player_returns_before_any_worker_resource_is_created(self):
         source = SOURCE.read_text(encoding='utf-8')
@@ -381,7 +366,7 @@ class WorkerStarterTests(unittest.TestCase):
         player_starts = [line.strip() for line in player.splitlines()
                          if line.strip().startswith('start ""')]
         self.assertEqual([
-            'start "" "%GAME_ROOT%offline_worker_starter.exe"',
+            'start "" "%GAME_ROOT%offline_worker_starter.exe" --player',
         ], player_starts)
         self.assertIn(
             'start "" "%GAME_ROOT%offline_worker_starter.exe" --player',
@@ -426,9 +411,13 @@ class WorkerStarterTests(unittest.TestCase):
             'offline-worker.internal-ready'.encode('utf-16le'), payload)
         self.assertIn(
             'offline-player-%lu.ready'.encode('utf-16le'), payload)
-        self.assertIn(
+        self.assertNotIn(
             'WoT-0.9.22-LAN-Server.exe'.encode('utf-16le'), payload)
-        self.assertIn('WOT_0922_LOOPBACK_ONLY'.encode('utf-16le'), payload)
+        self.assertNotIn(
+            'WOT_0922_LOOPBACK_ONLY'.encode('utf-16le'), payload)
+        self.assertNotIn('local_server_'.encode('utf-16le'), payload)
+        self.assertNotIn('wait_for_local_server'.encode('utf-16le'), payload)
+        self.assertNotIn('WOT_0922_SERVER_DATA'.encode('utf-16le'), payload)
         self.assertIn(b'player_mode', payload)
         self.assertIn(
             'WOT_OFFLINE_PROCDUMP_PATH'.encode('utf-16le'), payload)
