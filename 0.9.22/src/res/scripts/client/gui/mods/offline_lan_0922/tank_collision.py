@@ -164,6 +164,45 @@ def chassis_shape(type_descriptor):
                            error)
 
 
+def pose_axes(yaw, pitch=0.0, roll=0.0):
+    """Return BigWorld YPR local axes in world coordinates."""
+    sy, cy = math.sin(float(yaw)), math.cos(float(yaw))
+    sp, cp = math.sin(float(pitch)), math.cos(float(pitch))
+    sr, cr = math.sin(float(roll)), math.cos(float(roll))
+
+    def rotate(vector):
+        x, y, z = vector
+        y, z = cp * y - sp * z, sp * y + cp * z
+        return (cy * x + sy * z, y, -sy * x + cy * z)
+
+    return (rotate((cr, sr, 0.0)),
+            rotate((-sr, cr, 0.0)),
+            rotate((0.0, 0.0, 1.0)))
+
+
+def body_contains_point(body, point, slop=POSITION_SLOP):
+    """Return whether a world point lies in one frozen pitched hull body."""
+    try:
+        shape = body['shape']
+        delta = (
+            float(point[0]) - float(body['x']),
+            float(point[1]) - float(body['y']),
+            float(point[2]) - float(body['z']))
+        axes = pose_axes(
+            body['yaw'], body.get('pitch', 0.0), body.get('roll', 0.0))
+        local = tuple(
+            sum(axis[index] * delta[index] for index in range(3))
+            for axis in axes)
+        margin = max(0.0, float(slop))
+        return bool(
+            abs(local[0]) <= float(shape[0]) + margin and
+            float(shape[2]) - margin <= local[1] <=
+            float(shape[3]) + margin and
+            abs(local[2]) <= float(shape[1]) + margin)
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+        return False
+
+
 def forget_chassis_shape(type_descriptor):
     """Release one descriptor-derived shape at its BSP owner boundary."""
     cache_key = id(type_descriptor)
@@ -263,14 +302,15 @@ def _ram_profile(tank):
     return spall, bonus
 
 
-def _contact_ram_inputs(tank):
+def _contact_ram_inputs(tank, contact_armor=None):
     """Return per-contact armour plus descriptor/crew ram modifiers.
 
     A missing contact scalar fails closed. OBB orientation is insufficient to
     reconstruct retail's contact point, nominal armour group and spaced-armour
     handling, so it must never be silently replaced with primaryArmor.
     """
-    armor = _tank_value(tank, 'contact_armor')
+    armor = (contact_armor if contact_armor is not None else
+             _tank_value(tank, 'contact_armor'))
     if armor is None:
         return None
     try:
@@ -458,7 +498,7 @@ def _tank_shape(tank):
 
 
 def resolve_tank(tank, others, now=None, ram_cooldowns=None,
-                 active_ram_contacts=None):
+                 active_ram_contacts=None, contact_armor_probe=None):
     """Resolve one hull against other hulls using only plain data.
 
     A body with ``alive`` false is a wreck: it still blocks and separates, but
@@ -485,6 +525,11 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
 
     Supplying ``now=None`` disables ram-event admission while retaining all
     collision correction and impulses.
+
+    ``contact_armor_probe`` is an optional native boundary returning nominal
+    structural armour for ``(tank, other)`` at this exact contact.  It is
+    consulted only for a live, compressing pair whose plain bodies do not
+    already carry their per-contact armour.
     """
     self_id = _tank_value(tank, 'id', -1)
     x = float(_tank_value(tank, 'x', 0.0) or 0.0)
@@ -574,9 +619,25 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
 
         if other_is_wreck or now is None:
             continue
+        # The previous complete frame already owns this damaging episode.
+        # ``overlap_pairs`` keeps it armed until physical separation, so no
+        # armour ray or damage recomputation is needed while it persists.
+        if pair in previous_contacts:
+            continue
         closing_speed = -normal_velocity
         own_ram_inputs = _contact_ram_inputs(tank)
         other_ram_inputs = _contact_ram_inputs(other)
+        if ((own_ram_inputs is None or other_ram_inputs is None) and
+                callable(contact_armor_probe)):
+            probed = contact_armor_probe(tank, other, contact)
+            if probed is not None:
+                if not isinstance(probed, (list, tuple)) or len(probed) != 2:
+                    raise RuntimeError(
+                        'tank contact armor probe result is invalid')
+                if own_ram_inputs is None:
+                    own_ram_inputs = _contact_ram_inputs(tank, probed[0])
+                if other_ram_inputs is None:
+                    other_ram_inputs = _contact_ram_inputs(other, probed[1])
         if own_ram_inputs is None or other_ram_inputs is None:
             ram_diagnostics.append({
                 'pair': pair,
@@ -612,8 +673,6 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         # briefly falls below the damage threshold. A harmless initial touch
         # is not an impact and must not suppress a later acceleration into the
         # other hull.
-        if pair in previous_contacts:
-            continue
         cooldowns[pair] = float(now)
         ram_events.append({
             'pair': pair,

@@ -72,6 +72,7 @@ OUTBOUND_SYNC_TIMEOUT_SECONDS = 2.0
 OUTBOUND_STALL_TIMEOUT_SECONDS = 5.0
 MAX_PENDING_RAM_CONTACTS = 32
 MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS = 16
+MAX_PLAYER_DESTRUCTIBLE_REJECTIONS = 16
 MAX_PLAYER_INPUT_FINGERPRINTS = 128
 HUMAN_POSE_HISTORY_SECONDS = 1.5
 HUMAN_POSE_MAX_SAMPLE_GAP_US = 250000
@@ -1332,9 +1333,13 @@ class Player(_EndpointSendMixin):
     ram_contact: dict = field(default_factory=dict)
     ram_contacts: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
+    ram_contact_rejections: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
     destructible_contact_seq: int = 0
     destructible_contact_resolved_seq: int = 0
     destructible_contacts: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
+    destructible_contact_rejections: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
     input_seq: int = 0
     input_fingerprints: OrderedDict = field(
@@ -2331,9 +2336,11 @@ class BattleState:
             player.ram_contact_resolved_seq = 0
             player.ram_contact = {}
             player.ram_contacts.clear()
+            player.ram_contact_rejections.clear()
             player.destructible_contact_seq = 0
             player.destructible_contact_resolved_seq = 0
             player.destructible_contacts.clear()
+            player.destructible_contact_rejections.clear()
             player.input_seq = 0
             player.input_fingerprints.clear()
             player.pose_time_us = None
@@ -3413,8 +3420,39 @@ class BattleState:
                             self.destructibles:
                         return False
             target.destructible_contacts.pop(seq, None)
-            target.destructible_contact_resolved_seq = seq
+            if message["accepted"]:
+                target.destructible_contact_resolved_seq = seq
+            else:
+                self._reject_player_destructible_contact(
+                    target, seq, pending)
             return True
+
+    def _reject_player_destructible_contact(
+            self, player, seq, admitted_pose=None):
+        """Publish one terminal rejection and retain a snapshot fallback."""
+        player.destructible_contact_resolved_seq = max(
+            player.destructible_contact_resolved_seq, seq)
+        player.destructible_contact_rejections[seq] = True
+        while (len(player.destructible_contact_rejections) >
+               MAX_PLAYER_DESTRUCTIBLE_REJECTIONS):
+            player.destructible_contact_rejections.popitem(last=False)
+        terminal = {
+            "type": "player_destructible_contact_result",
+            "round_id": self.round_id,
+            "contact_seq": int(seq),
+            "accepted": False,
+        }
+        if admitted_pose is not None:
+            terminal.update({
+                "x": float(admitted_pose["x"]),
+                "y": float(admitted_pose["y"]),
+                "z": float(admitted_pose["z"]),
+                "yaw": float(admitted_pose["yaw"]),
+            })
+        # This ordered relay removes one snapshot interval from correction
+        # latency.  The bounded public ledger below is the idempotent fallback
+        # if the visible endpoint cannot accept this offer immediately.
+        player.offer_reliable(terminal)
 
     def _mark_world_destroyed(self, event):
         if self.server_authority is None:
@@ -6222,14 +6260,37 @@ class BattleState:
             return True
 
     @staticmethod
-    def _consume_player_ram_contact(player, contact_seq):
+    def _advance_player_ram_resolved(player):
+        """Advance only across contiguous terminal receipt decisions."""
+        resolved = int(player.ram_contact_resolved_seq)
+        admitted = int(player.ram_contact_seq)
+        while resolved < admitted:
+            candidate = resolved + 1
+            if candidate in player.ram_contacts:
+                break
+            resolved = candidate
+        player.ram_contact_resolved_seq = resolved
+
+    @classmethod
+    def _consume_player_ram_contact(cls, player, contact_seq):
         player.ram_contacts.pop(contact_seq, None)
-        player.ram_contact_resolved_seq = max(
-            int(player.ram_contact_resolved_seq), int(contact_seq))
+        cls._advance_player_ram_resolved(player)
         if int(player.ram_contact.get("seq", 0) or 0) == contact_seq:
             player.ram_contact = (dict(next(reversed(
                 player.ram_contacts.values())))
                 if player.ram_contacts else {})
+
+    @classmethod
+    def _reject_player_ram_contact(cls, player, contact_seq, reason):
+        """Record one fail-closed terminal input decision."""
+        player.ram_contact_seq = int(contact_seq)
+        player.ram_contact_rejections[int(contact_seq)] = str(reason)
+        _server_log(
+            "RAM CONTACT rejected player=%d seq=%d reason=%s" % (
+                int(player.player_id), int(contact_seq), str(reason)))
+        while len(player.ram_contact_rejections) > MAX_PENDING_RAM_CONTACTS:
+            player.ram_contact_rejections.popitem(last=False)
+        cls._advance_player_ram_resolved(player)
 
     def report_bot_ram(self, player_id, message):
         """Apply one receipt-owned authority tank collision atomically."""
@@ -6776,8 +6837,13 @@ class BattleState:
         return self._finish_battle(winner, "team_eliminated", 0)
 
     def _validated_ram_contact(self, player, raw_ram):
+        """Compatibility surface for direct validators and older tests."""
+        return self._validate_ram_contact(player, raw_ram)[0]
+
+    def _validate_ram_contact(self, player, raw_ram):
+        """Return one admitted contact or a stable fail-closed reason."""
         if not isinstance(raw_ram, dict):
-            return None
+            return None, "malformed_contact"
         try:
             seq = _exact_int(raw_ram.get("seq"), 1, 2147483647)
             bot_id = _exact_int(raw_ram.get("bot_id"), 1, 30)
@@ -6793,8 +6859,10 @@ class BattleState:
             bot_armor = float(raw_ram.get("contact_armor_bot"))
             player_spall = float(raw_ram.get("contact_spall_player"))
             player_bonus = float(raw_ram.get("contact_bonus_player"))
+            pitch = float(raw_ram.get("pitch", 0.0))
+            roll = float(raw_ram.get("roll", 0.0))
         except (TypeError, ValueError, OverflowError):
-            return None
+            return None, "malformed_contact"
         if (seq is None or bot_id not in self.bot_states or
                 revision is None or revision > self.bot_state_revision or
                 revision + 255 < self.bot_state_revision or
@@ -6811,6 +6879,8 @@ class BattleState:
                 not 1.0 <= player_spall <= 1.5 or
                 not math.isfinite(player_bonus) or
                 not 0.0 <= player_bonus <= 0.15 or
+                not math.isfinite(pitch) or not -0.61 <= pitch <= 0.61 or
+                not math.isfinite(roll) or not -0.61 <= roll <= 0.61 or
                 not isinstance(raw_ram.get("contact_screened_player"), bool) or
                 not isinstance(raw_ram.get("contact_screened_bot"), bool) or
                 raw_ram.get("contact_screened_player") or
@@ -6819,13 +6889,13 @@ class BattleState:
                     raw_ram, ("x", "y", "z", "yaw", "vx", "vy", "vz",
                               "bot_vx", "bot_vy", "bot_vz",
                               "contact_x", "contact_y", "contact_z"))):
-            return None
+            return None, "invalid_contact_contract"
         profile = self.human_collision_profiles.get(player.player_id)
-        if (profile is None or abs(
-                player_spall - float(
-                    profile["ram_profile"]["spall_coefficient"])) > 0.0001):
-            return None
-        shape = profile["shape"]
+        if profile is None:
+            return None, "missing_collision_profile"
+        if abs(player_spall - float(
+                profile["ram_profile"]["spall_coefficient"])) > 0.0001:
+            return None, "ram_profile_mismatch"
         center_x = _finite_float(raw_ram.get("x"))
         center_y = _finite_float(raw_ram.get("y"))
         center_z = _finite_float(raw_ram.get("z"))
@@ -6833,18 +6903,12 @@ class BattleState:
         hit_x = _finite_float(raw_ram.get("contact_x"))
         hit_y = _finite_float(raw_ram.get("contact_y"))
         hit_z = _finite_float(raw_ram.get("contact_z"))
-        delta_x = hit_x - center_x
-        delta_z = hit_z - center_z
-        cosine = math.cos(yaw)
-        sine = math.sin(yaw)
-        local_x = delta_x * cosine - delta_z * sine
-        local_z = delta_x * sine + delta_z * cosine
-        slop = tank_collision.POSITION_SLOP
-        if (abs(local_x) > float(shape[0]) + slop or
-                abs(local_z) > float(shape[1]) + slop or
-                hit_y < center_y + float(shape[2]) - slop or
-                hit_y > center_y + float(shape[3]) + slop):
-            return None
+        if not tank_collision.body_contains_point({
+                "x": center_x, "y": center_y, "z": center_z,
+                "yaw": yaw, "pitch": pitch, "roll": roll,
+                "shape": profile["shape"],
+        }, (hit_x, hit_y, hit_z)):
+            return None, "contact_outside_player_body"
         return {
             "seq": seq,
             "bot_id": bot_id,
@@ -6867,6 +6931,8 @@ class BattleState:
             "z": round(_clamp(_finite_float(
                 raw_ram.get("z")), -2000.0, 2000.0), 4),
             "yaw": round(_finite_float(raw_ram.get("yaw")), 5),
+            "pitch": round(pitch, 5),
+            "roll": round(roll, 5),
             "vx": round(_clamp(_finite_float(
                 raw_ram.get("vx")), -200.0, 200.0), 4),
             "vy": round(_clamp(_finite_float(
@@ -6879,7 +6945,7 @@ class BattleState:
                 raw_ram.get("bot_vy")), -200.0, 200.0), 4),
             "bot_vz": round(_clamp(_finite_float(
                 raw_ram.get("bot_vz")), -200.0, 200.0), 4),
-        }
+        }, None
 
     @staticmethod
     def _validated_player_destructible_contact(raw_contact):
@@ -7154,14 +7220,18 @@ class BattleState:
                             break
                         if len(player.ram_contacts) >= pending_limit:
                             break
-                        contact = (None if seq in conflicting else
-                                   self._validated_ram_contact(
-                                       player, raw_ram))
+                        if seq in conflicting:
+                            contact = None
+                            reject_reason = "conflicting_contact_payload"
+                        else:
+                            contact, reject_reason = (
+                                self._validate_ram_contact(player, raw_ram))
                         if contact is None:
                             # A permanently invalid but identifiable head row
                             # still needs a terminal input decision. Otherwise
                             # it blocks every later collision indefinitely.
-                            player.ram_contact_seq = seq
+                            self._reject_player_ram_contact(
+                                player, seq, reject_reason)
                             continue
                         if self.client_build == CLIENT_BUILD_0922:
                             # The contact body is sampled before local
@@ -7223,8 +7293,8 @@ class BattleState:
                         if contact is None or sample is None:
                             # Invalid/stale rows are terminal so one bad head
                             # cannot keep every later exact contact blocked.
-                            player.destructible_contact_resolved_seq = max(
-                                player.destructible_contact_resolved_seq, seq)
+                            self._reject_player_destructible_contact(
+                                player, seq)
                             continue
                         contact.update({
                             "input_seq": int(sample["input_seq"]),
@@ -7236,6 +7306,28 @@ class BattleState:
                             "forward": round(float(sample["forward"]), 4),
                         })
                         player.destructible_contacts[seq] = contact
+                        worker = self.simulation_worker
+                        if (self.bot_authority_id ==
+                                SIMULATION_WORKER_AUTHORITY_ID and
+                                worker is not None and worker.connected):
+                            # Do not wait for the next replica snapshot to
+                            # carry a contact that has already been validated
+                            # against this player's admitted pose.  The normal
+                            # snapshot remains an idempotent retry if this
+                            # latency-only relay cannot be queued.
+                            worker.offer_reliable({
+                                "type": "player_destructible_contact",
+                                "protocol": PROTOCOL_VERSION,
+                                "round_id": self.round_id,
+                                "authority_epoch": self.authority_epoch,
+                                "player": {
+                                    "id": int(player.player_id),
+                                    "vehicle": str(player.vehicle),
+                                    "vehicle_compact_descr":
+                                        player.vehicle_compact_descr,
+                                    "destructible_contacts": [dict(contact)],
+                                },
+                            })
             if shell_selection is not None:
                 player.shell_index = shell_selection[0]
                 player.next_shell_index = shell_selection[1]
@@ -8614,6 +8706,9 @@ class BattleState:
             result["destructible_contacts"] = [
                 dict(value)
                 for value in player.destructible_contacts.values()]
+        if player.destructible_contact_rejections:
+            result["destructible_contact_rejected_seqs"] = list(
+                player.destructible_contact_rejections)
         if player.critical:
             result["critical"] = player.critical
         return result

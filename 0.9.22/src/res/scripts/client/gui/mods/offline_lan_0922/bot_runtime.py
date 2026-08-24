@@ -95,6 +95,10 @@ MOTION_PROBE_FORWARD_BUDGET = 3.5
 # extents: ``clearance`` below is already measured edge-to-edge.
 TRAFFIC_HEADWAY_SECONDS = 1.0
 TRAFFIC_STANDSTILL_CLEARANCE = 1.5
+# Match the copied longitudinal integrator's parked-speed boundary when
+# integrating the remaining coast distance.  A parked hull still keeps its
+# physical yaw for same-lane versus crossing classification.
+TRAFFIC_DIRECTION_SPEED_EPSILON = 0.02
 # A friendly-hull escape is a temporary tactical override, not a new route.
 # Bound it so an unreachable lateral point cannot suppress the server order
 # forever; every metre still has to pass the ordinary native motion gate.
@@ -1202,7 +1206,7 @@ class BotRuntime(object):
                  native_motion=False, baked_graph=None, probe_clock=None,
                  motion_resolver=None, motion_report=None,
                  world_receipt_probe=None, probe_timing_seconds=0.0,
-                 water_depth_probe=None):
+                 water_depth_probe=None, ram_contact_probe=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.player_descriptor_resolver = player_descriptor_resolver
@@ -1267,6 +1271,8 @@ class BotRuntime(object):
         self.motion_resolver = motion_resolver
         self.motion_report = motion_report
         self.world_receipt_probe = world_receipt_probe
+        self.ram_contact_probe = (
+            ram_contact_probe if callable(ram_contact_probe) else None)
         self._water_depth_probe = (
             water_depth_probe if callable(water_depth_probe) else
             (lambda unused_position: -1.0))
@@ -3404,6 +3410,88 @@ class BotRuntime(object):
         return result
 
     @staticmethod
+    def _traffic_stopping_distance(
+            speed, physics_params, slope_pitch=0.0, steering=False):
+        """Integrate the copied coast law to the first stationary pose.
+
+        Traffic is evaluated before this authority tick's longitudinal step,
+        so there is no separate reaction-distance term.  Advancing with the
+        same nominal 30 Hz semi-implicit step used by copied physics gives the
+        actual forward travel remaining after throttle is released.  A grade
+        which cannot reduce forward speed has no finite stopping distance.
+        """
+        current = abs(_number(speed))
+        if current <= TRAFFIC_DIRECTION_SPEED_EPSILON:
+            return 0.0
+        step = PUBLICATION_SECONDS
+        distance = 0.0
+        # Valid #1513 vehicle parameters settle in a few dozen steps.  This is
+        # only a finite-number guard for malformed/tuned inputs, not a traffic
+        # distance coefficient.
+        for unused_step in range(4096):
+            following = vehicle_physics.longitudinal_step(
+                physics_params, current, 0.0, bool(steering),
+                float(slope_pitch), step, False, 0, False)
+            if math.isnan(following) or math.isinf(following):
+                return float('inf')
+            if following <= TRAFFIC_DIRECTION_SPEED_EPSILON:
+                return distance + max(0.0, following) * step
+            if following >= current:
+                return float('inf')
+            distance += following * step
+            current = following
+        return float('inf')
+
+    @staticmethod
+    def _traffic_obb_clearance(
+            dx, dz, corridor_yaw, own_yaw, own_width, own_length,
+            other_yaw, other_width, other_length):
+        """Return exact forward travel to first contact with a frozen OBB.
+
+        Continuous SAT intersects the travel intervals on both local axes of
+        both hulls.  Unlike independent forward/lateral projection bounds,
+        this does not invent a blocker where two rotated hull corners pass one
+        another without their OBBs ever meeting.
+        """
+        direction_x = math.sin(corridor_yaw)
+        direction_z = math.cos(corridor_yaw)
+
+        def body_axes(yaw):
+            sine = math.sin(yaw)
+            cosine = math.cos(yaw)
+            return ((cosine, -sine), (sine, cosine))
+
+        own_axes = body_axes(own_yaw)
+        other_axes = body_axes(other_yaw)
+        entry = 0.0
+        leave = float('inf')
+        for axis_x, axis_z in own_axes + other_axes:
+            centre = dx * axis_x + dz * axis_z
+            rate = direction_x * axis_x + direction_z * axis_z
+            radius = (
+                abs(own_axes[0][0] * axis_x +
+                    own_axes[0][1] * axis_z) * own_width +
+                abs(own_axes[1][0] * axis_x +
+                    own_axes[1][1] * axis_z) * own_length +
+                abs(other_axes[0][0] * axis_x +
+                    other_axes[0][1] * axis_z) * other_width +
+                abs(other_axes[1][0] * axis_x +
+                    other_axes[1][1] * axis_z) * other_length)
+            if abs(rate) <= 1e-12:
+                if abs(centre) > radius:
+                    return float('inf')
+                continue
+            first = (centre - radius) / rate
+            last = (centre + radius) / rate
+            entry = max(entry, min(first, last))
+            leave = min(leave, max(first, last))
+            if entry > leave:
+                return float('inf')
+        if leave < 0.0:
+            return float('inf')
+        return entry
+
+    @staticmethod
     def _traffic_throttle(source, command, neighbours, physics_params=None):
         """Return ``(throttle, waiting)`` for nearby friendly traffic.
 
@@ -3426,6 +3514,18 @@ class BotRuntime(object):
         own_speed = abs(_number(source.get('speed')))
         own_length = max(0.5, _number(source.get('half_length'), 3.5))
         own_width = max(0.3, _number(source.get('half_width'), 1.7))
+        if physics_params is None:
+            physics_params = vehicle_physics.derive_params({})
+        slope_pitch = _number(source.get('last_drive_pitch'))
+        steering = abs(_number(command.get('turn'))) > 0.01
+        stopping_clearance = (
+            TRAFFIC_STANDSTILL_CLEARANCE +
+            BotRuntime._traffic_stopping_distance(
+                own_speed, physics_params, slope_pitch, steering))
+        scan_clearance = max(
+            9.0, TRAFFIC_STANDSTILL_CLEARANCE +
+            own_speed * TRAFFIC_HEADWAY_SECONDS,
+            stopping_clearance)
         sine, cosine = math.sin(yaw), math.cos(yaw)
         target_yaw = _number(command.get('target_yaw'), yaw)
         target_sine = math.sin(target_yaw)
@@ -3448,6 +3548,7 @@ class BotRuntime(object):
                 continue
             forward = dx * sine + dz * cosine
             lateral = abs(dx * cosine - dz * sine)
+            corridor_yaw = yaw
             if abs(_angle_delta(target_yaw, yaw)) > 0.20:
                 target_forward = dx * target_sine + dz * target_cosine
                 target_lateral = abs(
@@ -3456,29 +3557,11 @@ class BotRuntime(object):
                         target_lateral < lateral):
                     forward = target_forward
                     lateral = target_lateral
+                    corridor_yaw = target_yaw
             other_length = max(
                 0.5, _number(raw.get('half_length'), 3.5))
             other_width = max(
                 0.3, _number(raw.get('half_width'), 1.7))
-            corridor_yaw = yaw
-            if abs(_angle_delta(target_yaw, yaw)) > 0.20:
-                corridor_yaw = target_yaw
-            other_yaw = _number(raw.get('yaw'), corridor_yaw)
-            same_direction = abs(
-                _angle_delta(other_yaw, corridor_yaw)) < 0.65
-            if (not same_direction and raw.get('id') is not None and
-                    source.get('id') is not None):
-                try:
-                    other_id = int(raw.get('id'))
-                    if (other_id < HUMAN_TARGET_ID_BASE and
-                            other_id > int(source.get('id'))):
-                        continue
-                except (TypeError, ValueError):
-                    pass
-            clearance = forward - own_length - other_length
-            if (forward <= 0.0 or clearance > 9.0 or
-                    lateral > own_width + other_width + 0.75):
-                continue
             other_velocity = raw.get('velocity') or raw.get('vel')
             try:
                 other_vx = float(other_velocity[0])
@@ -3486,6 +3569,30 @@ class BotRuntime(object):
             except (TypeError, ValueError, IndexError):
                 other_vx = 0.0
                 other_vz = 0.0
+            other_yaw = _number(raw.get('yaw'), corridor_yaw)
+            # Velocity has no direction once a teammate is parked.  Its hull
+            # yaw still tells us whether it occupies this lane longitudinally
+            # or crosses it, and therefore whether deterministic right of way
+            # can break a spawn-grid deadlock.  The physical near-field gate
+            # below still makes both ids brake inside the copied stopping
+            # distance.
+            same_direction = abs(
+                _angle_delta(other_yaw, corridor_yaw)) < 0.65
+            clearance = BotRuntime._traffic_obb_clearance(
+                dx, dz, corridor_yaw, yaw, own_width, own_length,
+                other_yaw, other_width, other_length)
+            if forward <= 0.0 or clearance > scan_clearance:
+                continue
+            if (not same_direction and raw.get('id') is not None and
+                    source.get('id') is not None):
+                try:
+                    other_id = int(raw.get('id'))
+                    if (other_id < HUMAN_TARGET_ID_BASE and
+                            other_id > int(source.get('id')) and
+                            clearance > stopping_clearance):
+                        continue
+                except (TypeError, ValueError):
+                    pass
             corridor_sine = math.sin(corridor_yaw)
             corridor_cosine = math.cos(corridor_yaw)
             other_forward = max(
@@ -3503,23 +3610,24 @@ class BotRuntime(object):
             # gate; the continuous controller below applies only to vehicles
             # travelling along the same corridor.
             safe_clearance = max(
-                TRAFFIC_STANDSTILL_CLEARANCE,
+                stopping_clearance,
+                TRAFFIC_STANDSTILL_CLEARANCE +
                 own_speed * TRAFFIC_HEADWAY_SECONDS)
             if clearance <= safe_clearance:
-                return 0.0, True
+                return (0.0,
+                        own_speed > TRAFFIC_DIRECTION_SPEED_EPSILON)
             if own_speed > leader_speed + 0.5:
                 limited = min(throttle, max(0.0, min(
                     1.0, (clearance - safe_clearance) / 4.0)))
-                return limited, limited + 1e-9 < throttle
+                return (limited, bool(
+                    limited <= 0.01 and
+                    own_speed > TRAFFIC_DIRECTION_SPEED_EPSILON))
             return throttle, False
         if clearance <= TRAFFIC_STANDSTILL_CLEARANCE:
-            return 0.0, True
-        if physics_params is None:
-            physics_params = vehicle_physics.derive_params({})
+            return (0.0,
+                    own_speed > TRAFFIC_DIRECTION_SPEED_EPSILON)
         try:
             mass = max(1.0, float(physics_params['mass']))
-            slope_pitch = _number(source.get('last_drive_pitch'))
-            steering = abs(_number(command.get('turn'))) > 0.01
             drive_accel = vehicle_physics.engine_force(
                 physics_params, own_speed, 1.0, slope_pitch) / mass
             rolling_accel = vehicle_physics.rolling_resist_force(
@@ -3529,8 +3637,10 @@ class BotRuntime(object):
             return throttle, False
         if drive_accel <= 0.000001:
             return throttle, False
-        desired_clearance = (TRAFFIC_STANDSTILL_CLEARANCE +
-                             own_speed * TRAFFIC_HEADWAY_SECONDS)
+        desired_clearance = max(
+            stopping_clearance,
+            TRAFFIC_STANDSTILL_CLEARANCE +
+            own_speed * TRAFFIC_HEADWAY_SECONDS)
         # Standard constant-time-headway feedback: close the spacing error in
         # one headway while also matching the leader's forward velocity.  The
         # result is an acceleration, not a hand-tuned throttle blend.
@@ -3541,7 +3651,14 @@ class BotRuntime(object):
         required = ((desired_accel - gravity_accel + rolling_accel) /
                     drive_accel)
         limited = min(throttle, max(0.0, min(1.0, required)))
-        return limited, limited + 1e-9 < throttle
+        # ``waiting`` suppresses route-stuck recovery only while a moving hull
+        # is actually coasting to a traffic stop.  A partial drive command is
+        # still progress, and a parked crossing must enter the existing
+        # recovery path so two stopped neighbours cannot reset one another's
+        # stuck clock forever.
+        return (limited, bool(
+            limited <= 0.01 and
+            own_speed > TRAFFIC_DIRECTION_SPEED_EPSILON))
 
     def _player_vehicle_profile(self, raw):
         vehicle_name = raw.get('vehicle')
@@ -3596,25 +3713,7 @@ class BotRuntime(object):
     @staticmethod
     def _native_ram_hit_supported(body, hit):
         """Require the native contact point to lie on the frozen OBB body."""
-        try:
-            shape = body['shape']
-            dx = float(hit[0]) - float(body['x'])
-            dy = float(hit[1]) - float(body['y'])
-            dz = float(hit[2]) - float(body['z'])
-            yaw = float(body['yaw'])
-            cosine = math.cos(yaw)
-            sine = math.sin(yaw)
-            local_x = dx * cosine - dz * sine
-            local_z = dx * sine + dz * cosine
-            slop = tank_collision.POSITION_SLOP
-            return bool(
-                abs(local_x) <= float(shape[0]) + slop and
-                abs(local_z) <= float(shape[1]) + slop and
-                float(shape[2]) - slop <= dy <=
-                float(shape[3]) + slop)
-        except (KeyError, TypeError, ValueError, IndexError,
-                OverflowError):
-            return False
+        return tank_collision.body_contains_point(body, hit)
 
     def _ram_reports(self, state, events, human_ram_receipt=None):
         reports = []
@@ -3868,6 +3967,8 @@ class BotRuntime(object):
                             'vehicle': str(raw.get('vehicle') or ''),
                             'x': player_x, 'y': player_y, 'z': player_z,
                             'yaw': player_yaw,
+                            'pitch': _number(receipt.get('pitch')),
+                            'roll': _number(receipt.get('roll')),
                             'mass': profile['mass'],
                             'shape': profile['shape'],
                             'ram_profile': profile['ram_profile'],
@@ -4019,8 +4120,12 @@ class BotRuntime(object):
                 'ram_profile': state.get('ram_profile'),
                 'vx': (math.sin(yaw) * speed +
                        _number(state.get('push_x'))),
+                'vy': _number(state.get(
+                    'ram_vy', state.get('vertical_speed'))),
                 'vz': (math.cos(yaw) * speed +
                        _number(state.get('push_z'))),
+                'pitch': _number(state.get('pitch')),
+                'roll': _number(state.get('roll')),
             })
         for raw in players or ():
             if not isinstance(raw, dict) or raw.get('id') is None:
@@ -4068,6 +4173,28 @@ class BotRuntime(object):
             players, now, step=step, processed_pairs=receipt_pairs)
         previous_ram_contacts = self._ram_contacts
         current_ram_contacts = set()
+        frame_ram_armors = {}
+
+        def contact_armor_probe(first, second, contact):
+            first_id = int(first['id'])
+            second_id = int(second['id'])
+            pair = (min(first_id, second_id), max(first_id, second_id))
+            if pair not in frame_ram_armors:
+                armors = self.ram_contact_probe(first, second, contact)
+                if armors is None:
+                    frame_ram_armors[pair] = None
+                elif (isinstance(armors, (list, tuple)) and
+                      len(armors) == 2):
+                    frame_ram_armors[pair] = (
+                        tuple(armors) if first_id <= second_id else
+                        tuple(reversed(armors)))
+                else:
+                    return armors
+            canonical = frame_ram_armors[pair]
+            if canonical is None or first_id <= second_id:
+                return canonical
+            return tuple(reversed(canonical))
+
         for state in self._ordered_states():
             if not state.get('alive', True):
                 continue
@@ -4085,10 +4212,17 @@ class BotRuntime(object):
                     continue
                 other = by_id[tank_id]
                 others.append(other)
+            resolve_kwargs = {
+                'now': now,
+                'ram_cooldowns': self._ram_cooldowns,
+                'active_ram_contacts': frozenset(
+                    set(previous_ram_contacts) | current_ram_contacts),
+            }
+            if self.ram_contact_probe is not None:
+                resolve_kwargs['contact_armor_probe'] = \
+                    contact_armor_probe
             result = tank_collision.resolve_tank(
-                own, others,
-                now=now, ram_cooldowns=self._ram_cooldowns,
-                active_ram_contacts=previous_ram_contacts)
+                own, others, **resolve_kwargs)
             self._ram_cooldowns = result['cooldowns']
             current_ram_contacts.update(result['contacts'])
             self._apply_tank_contact_response(state, result, step)
@@ -5347,19 +5481,26 @@ class BotRuntime(object):
                 motion_probe = self._probe_direction(
                     position, travel_yaw, state.get('speed', 0.0), descriptor)
                 # Planner alternatives keep the mature six horizontal rays.
-                # Only the finally selected, powered, non-turning travel sample
-                # pays for the exact 3x3 receipt used by commit-side motion.
+                # Only the finally selected, translating, non-turning travel
+                # sample pays for the exact 3x3 receipt used by commit-side
+                # motion.  Releasing the throttle does not stop an already
+                # moving hull in this tick, so traffic coasting still needs
+                # the same native receipt before its pose can advance.
                 if (isinstance(motion_probe, dict) and
                         self._probe_is_clear(motion_probe) and
                         not motion_probe.get('deferred', False) and
                         abs(_number(motion_probe.get('slope'))) <= 0.01 and
-                        abs(throttle) > 0.01 and abs(turn) <= 0.01 and
+                        (abs(throttle) > 0.01 or
+                         abs(_number(state.get('speed'))) > 0.0001) and
+                        abs(turn) <= 0.01 and
                         abs(_number(self._turn_speeds.get(
                             state['id'], 0.0))) <= 0.01 and
                         not state.get('airborne', False)):
                     motion_probe = dict(motion_probe)
                     receipt_speed = abs(_number(state.get('speed')))
-                    if throttle < 0.0:
+                    if (throttle < 0.0 or
+                            (abs(throttle) <= 0.01 and
+                             _number(state.get('speed')) < 0.0)):
                         # Preserve reverse intent even when the copied hull is
                         # starting from exactly zero. ``-0.0 < 0`` is false
                         # and would select the forward hull extent.
@@ -5434,7 +5575,9 @@ class BotRuntime(object):
             probe_deferred = bool(
                 isinstance(motion_probe, dict) and
                 motion_probe.get('deferred', False))
-            path_clear = (True if (abs(throttle) <= 0.01 or
+            path_clear = (True if ((abs(throttle) <= 0.01 and
+                                    abs(_number(state.get('speed'))) <=
+                                    0.0001) or
                                    state.get('airborne', False)) else
                           self._probe_is_clear(motion_probe))
             if not path_clear:

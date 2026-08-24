@@ -98,6 +98,22 @@ class _Descriptor(object):
 
 class TankCollisionTests(unittest.TestCase):
 
+    def test_pitched_body_contains_its_world_space_front_contact(self):
+        body = _tank(
+            1, 0.0, 0.0, shape=(1.5, 3.5, -0.8, 2.0))
+        body.update(pitch=0.30, roll=-0.12)
+        axes = tank_collision.pose_axes(
+            body['yaw'], body['pitch'], body['roll'])
+        local = (0.0, 1.0, body['shape'][1])
+        point = tuple(
+            body[name] + sum(
+                local[row] * axes[row][index] for row in range(3))
+            for index, name in enumerate(('x', 'y', 'z')))
+
+        self.assertTrue(tank_collision.body_contains_point(body, point))
+        self.assertFalse(tank_collision.body_contains_point(
+            dict(body, pitch=0.0, roll=0.0), point))
+
     def test_spatial_index_returns_nearby_cells_without_distant_tanks(self):
         bodies = {
             1: {'position': (0.0, 0.0, 0.0)},
@@ -418,6 +434,28 @@ class TankCollisionTests(unittest.TestCase):
             event['shape_self'], event['shape_other']))
         self.assertGreater(event['damage_to_other'], 0)
         self.assertGreater(event['damage_to_self'], 0)
+
+    def test_native_contact_armor_probe_fills_only_missing_contact_inputs(self):
+        first = _tank(
+            4, 0.0, 0.0, mass=25000.0, vx=10.0,
+            contact_armor=None)
+        second = _tank(
+            9, 0.8, 0.0, mass=30000.0, contact_armor=None)
+        calls = []
+
+        def probe(owner, other, contact):
+            calls.append((owner['id'], other['id'], contact))
+            return 45.0, 80.0
+
+        result = tank_collision.resolve_tank(
+            first, (second,), now=10.0, contact_armor_probe=probe)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual((45.0, 80.0), (
+            result['ram_events'][0]['armor_self'],
+            result['ram_events'][0]['armor_other']))
+        self.assertGreater(result['ram_events'][0]['damage_to_other'], 0)
+        self.assertGreater(result['ram_events'][0]['damage_to_self'], 0)
 
     def test_documented_kinetic_formula_and_inverse_mass_distribution(self):
         heavy_owner = tank_collision.ram_damage(

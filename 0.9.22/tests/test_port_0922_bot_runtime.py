@@ -2406,7 +2406,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.update(0.04, 2.0)
         self.assertEqual(29, len(calls) - before)
 
-    def test_friendly_crossing_traffic_has_one_right_of_way_winner(self):
+    def test_friendly_crossing_traffic_brakes_both_inside_safe_clearance(self):
         lower = {
             'id': 21, 'team': 2,
             'x': 0.0, 'y': 0.0, 'z': 0.0,
@@ -2432,10 +2432,312 @@ class BotRuntimeTests(unittest.TestCase):
                 lower, position=(lower['x'], lower['y'], lower['z']),
                 velocity=(0.0, 0.0, 5.0))])
 
-        self.assertEqual((1.0, False),
+        self.assertEqual((0.0, True),
                          (lower_throttle, lower_waiting))
         self.assertEqual((0.0, True),
                          (higher_throttle, higher_waiting))
+
+    def test_friendly_crossing_traffic_keeps_right_of_way_at_safe_distance(self):
+        lower = {
+            'id': 21, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 5.0,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        higher = {
+            'id': 23, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 15.0,
+            'yaw': math.pi, 'speed': 5.0,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        lower_command = {'throttle': 1.0, 'target_yaw': 0.0}
+        higher_command = {'throttle': 1.0, 'target_yaw': math.pi}
+
+        traffic_throttle = self.module.BotRuntime._traffic_throttle
+        lower_throttle, lower_waiting = traffic_throttle(
+            lower, lower_command, [dict(
+                higher, position=(higher['x'], higher['y'], higher['z']),
+                velocity=(0.0, 0.0, -5.0))])
+        higher_throttle, higher_waiting = traffic_throttle(
+            higher, higher_command, [dict(
+                lower, position=(lower['x'], lower['y'], lower['z']),
+                velocity=(0.0, 0.0, 5.0))])
+
+        self.assertEqual((1.0, False),
+                         (lower_throttle, lower_waiting))
+        self.assertLess(higher_throttle, 1.0)
+        self.assertFalse(higher_waiting)
+
+    def test_crossing_nearfield_uses_copied_stopping_distance(self):
+        vehicle_physics = self.module.vehicle_physics
+        params = vehicle_physics.derive_params(_combat_descriptor())
+        speed = 13.0
+        stopping = self.module.BotRuntime._traffic_stopping_distance(
+            speed, params)
+        simulated = 0.0
+        current = speed
+        while current > self.module.TRAFFIC_DIRECTION_SPEED_EPSILON:
+            current = vehicle_physics.longitudinal_step(
+                params, current, 0.0, False, 0.0,
+                self.module.PUBLICATION_SECONDS)
+            simulated += max(0.0, current) * self.module.PUBLICATION_SECONDS
+        self.assertAlmostEqual(simulated, stopping, places=9)
+
+        source = {
+            'id': 21, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': speed,
+            'half_length': 3.5, 'half_width': 1.7,
+            'last_drive_pitch': 0.0,
+        }
+        command = {'throttle': 1.0, 'target_yaw': 0.0, 'turn': 0.0}
+        edge_threshold = (
+            self.module.TRAFFIC_STANDSTILL_CLEARANCE + stopping)
+
+        def crossing(clearance):
+            return {
+                'id': 23, 'team': 2,
+                'position': (0.0, 0.0, 7.0 + clearance),
+                'yaw': math.pi, 'velocity': (0.0, 0.0, -speed),
+                'half_length': 3.5, 'half_width': 1.7,
+            }
+
+        self.assertEqual((0.0, True), self.module.BotRuntime.
+                         _traffic_throttle(
+                             source, command,
+                             [crossing(edge_threshold - 0.01)], params))
+        self.assertEqual((1.0, False), self.module.BotRuntime.
+                         _traffic_throttle(
+                             source, command,
+                             [crossing(edge_threshold + 0.01)], params))
+
+    def test_stopped_crossing_keeps_hull_yaw_and_nearfield_gate(self):
+        source = {
+            'id': 10, 'team': 1,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 0.0,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        command = {
+            'throttle': 1.0, 'target_yaw': 0.0, 'turn': 0.0,
+        }
+
+        def stopped_crossing(clearance):
+            # Perpendicular projected forward support is its half-width.
+            return {
+                'id': 12, 'team': 1,
+                'position': (0.0, 0.0, 3.5 + 1.7 + clearance),
+                'yaw': math.pi * 0.5,
+                'velocity': (0.0, 0.0, 0.0),
+                'half_length': 3.5, 'half_width': 1.7,
+            }
+
+        self.assertEqual((0.0, False), self.module.BotRuntime.
+                         _traffic_throttle(source, command, [
+                             stopped_crossing(
+                                 self.module.
+                                 TRAFFIC_STANDSTILL_CLEARANCE - 0.01)]))
+        self.assertEqual((1.0, False), self.module.BotRuntime.
+                         _traffic_throttle(source, command, [
+                             stopped_crossing(
+                                 self.module.
+                                 TRAFFIC_STANDSTILL_CLEARANCE + 0.01)]))
+
+    def test_rotated_obb_corners_that_miss_the_corridor_do_not_block(self):
+        source = {
+            'id': 12, 'team': 1,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 0.0,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        other = {
+            'id': 15, 'team': 1,
+            'position': (5.3, 0.0, 6.0),
+            'yaw': math.pi * 0.5,
+            'velocity': (0.0, 0.0, 0.0),
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+
+        self.assertEqual(float('inf'), self.module.BotRuntime.
+                         _traffic_obb_clearance(
+                             5.3, 6.0, 0.0, 0.0, 1.7, 3.5,
+                             math.pi * 0.5, 1.7, 3.5))
+        self.assertEqual((1.0, False), self.module.BotRuntime.
+                         _traffic_throttle(source, {
+                             'throttle': 1.0,
+                             'target_yaw': 0.0,
+                             'turn': 0.0,
+                         }, [other]))
+
+    def test_lower_id_fast_bot_brakes_for_rotated_stopped_teammate(self):
+        source = {
+            'id': 23, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.641, 'speed': 13.163,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        forward = 11.0
+        other = {
+            'id': 30, 'team': 2,
+            'position': (
+                math.sin(source['yaw']) * forward, 0.0,
+                math.cos(source['yaw']) * forward),
+            'yaw': 2.582,
+            'velocity': (-0.0010, 0.0, 0.0016),
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+
+        self.assertEqual((0.0, True), self.module.BotRuntime.
+                         _traffic_throttle(source, {
+                             'throttle': 1.0,
+                             'target_yaw': source['yaw'],
+                         }, [other]))
+
+    def test_rotated_stopped_teammate_uses_projected_hull_width(self):
+        source = {
+            'id': 19, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 8.59,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        other = {
+            'id': 30, 'team': 2,
+            # The centre is outside the parallel-width corridor.  Its long
+            # hull is nearly perpendicular, however, and occupies that lane
+            # inside the follower's copied stopping clearance.
+            'position': (4.5, 0.0, 9.0),
+            'yaw': math.pi * 0.5,
+            'velocity': (0.0, 0.0, 0.0),
+            'half_length': 5.0, 'half_width': 1.5,
+        }
+
+        self.assertEqual((0.0, True), self.module.BotRuntime.
+                         _traffic_throttle(source, {
+                             'throttle': 1.0, 'target_yaw': 0.0,
+                         }, [other]))
+
+    def test_high_speed_headway_is_not_clipped_at_nine_metres(self):
+        source = {
+            'id': 23, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 13.163,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        # Twelve metres edge-to-edge is outside the former fixed 9 m scan,
+        # but inside the established standstill gap + one-second headway.
+        other = {
+            'id': 30, 'team': 2,
+            'position': (0.0, 0.0, 19.0), 'yaw': 0.0,
+            'velocity': (0.0, 0.0, 0.0),
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+
+        self.assertEqual((0.0, True), self.module.BotRuntime.
+                         _traffic_throttle(source, {
+                             'throttle': 1.0, 'target_yaw': 0.0,
+                         }, [other]))
+
+    def test_malinovka_fast_follower_stops_before_rotated_teammate(self):
+        vehicle_physics = self.module.vehicle_physics
+        params = vehicle_physics.derive_params({})
+        yaw = 0.641
+        source = {
+            'id': 23, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': yaw, 'speed': 13.163,
+            'half_length': 3.5, 'half_width': 1.7,
+            'last_drive_pitch': 0.0,
+        }
+        leader_forward = 21.5
+        other = {
+            'id': 30, 'team': 2,
+            'position': (
+                math.sin(yaw) * leader_forward, 0.0,
+                math.cos(yaw) * leader_forward),
+            'yaw': 2.582,
+            'velocity': (-0.0010, 0.0, 0.0016),
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        command = {'throttle': 1.0, 'target_yaw': yaw, 'turn': 0.0}
+        minimum_clearance = leader_forward - 7.0
+
+        # Twenty-four seconds is long enough to prove this converges to the
+        # stopped queue instead of merely delaying the same collision.
+        for unused_frame in range(600):
+            throttle, unused_waiting = self.module.BotRuntime.\
+                _traffic_throttle(source, command, [other], params)
+            source['speed'] = vehicle_physics.longitudinal_step(
+                params, source['speed'], throttle, False, 0.0, 0.04)
+            source['x'] += math.sin(yaw) * source['speed'] * 0.04
+            source['z'] += math.cos(yaw) * source['speed'] * 0.04
+            travelled = (source['x'] * math.sin(yaw) +
+                         source['z'] * math.cos(yaw))
+            minimum_clearance = min(
+                minimum_clearance, leader_forward - travelled - 7.0)
+
+        self.assertGreater(minimum_clearance, 0.0)
+        self.assertAlmostEqual(0.0, source['speed'], delta=0.05)
+
+    def test_opening_queue_runtime_never_reaches_stopped_teammate(self):
+        yaw = 0.641
+
+        class TrafficAdapter(_Adapter):
+            def decide(adapter_self, state, clear):
+                adapter_self.calls.append((state, clear(state['yaw'])))
+                moving = state['id'] == 23
+                heading = yaw if moving else state['yaw']
+                position = state['position']
+                aim = (
+                    position[0] + math.sin(heading) * 100.0,
+                    position[1],
+                    position[2] + math.cos(heading) * 100.0)
+                return {
+                    'target_yaw': heading,
+                    'throttle': 1.0 if moving else 0.0,
+                    'turn': 0.0, 'shell_index': 0,
+                    'fire_allowed': False, 'target_id': None,
+                    'fire_range': 0.0, 'combat_mode': 'route',
+                    'aim_position': aim, 'face_position': aim,
+                    'move_position': aim,
+                    'recovery_mode': 'drive' if moving else 'arrived',
+                    'movement_intent': moving,
+                }
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: TrafficAdapter(),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(dict(self.start, bots=[
+            {'id': 23, 'team': 2, 'slot': 0, 'name': 'T-43'},
+            {'id': 30, 'team': 2, 'slot': 1, 'name': 'Lorraine'},
+        ]))
+        leader_forward = 21.5
+        runtime.states[23].update(
+            x=0.0, y=0.0, z=0.0, yaw=yaw, speed=13.163,
+            half_length=3.5, half_width=1.7)
+        runtime.states[30].update(
+            x=math.sin(yaw) * leader_forward, y=0.0,
+            z=math.cos(yaw) * leader_forward,
+            yaw=2.582, speed=-0.001887,
+            half_length=3.5, half_width=1.7)
+        minimum_clearance = leader_forward - 7.0
+
+        for frame in range(300):
+            runtime.update(0.04, 1.0 + frame * 0.04)
+            follower = runtime.states[23]
+            leader = runtime.states[30]
+            dx = leader['x'] - follower['x']
+            dz = leader['z'] - follower['z']
+            clearance = dx * math.sin(yaw) + dz * math.cos(yaw) - 7.0
+            minimum_clearance = min(minimum_clearance, clearance)
+
+        self.assertGreater(minimum_clearance, 0.0)
+        self.assertTrue(runtime.states[23]['alive'])
+        self.assertTrue(runtime.states[30]['alive'])
+        self.assertEqual([], runtime._pending_ram_reports)
 
     def test_traffic_yield_is_friendly_only_and_humans_have_priority(self):
         source = {
@@ -6631,6 +6933,58 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0), (
             runtime.states[11]['push_x'], runtime.states[12]['push_x']))
 
+    def test_bot_pair_uses_native_contact_armor_and_reports_one_transaction(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 25000.0
+        probes = []
+
+        def ram_contact_probe(first, second, contact):
+            probes.append((first['id'], second['id'], contact))
+            return 45.0, 80.0
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            ram_contact_probe=ram_contact_probe)
+        runtime.battle_start(dict(self.start, bots=[
+            {'id': 11, 'team': 1, 'slot': 0, 'name': 'First'},
+            {'id': 12, 'team': 2, 'slot': 0, 'name': 'Second'},
+        ]))
+        runtime._clear = lambda *unused: True
+        runtime.states[11].update(
+            x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
+            speed=10.0, push_x=0.0, push_z=0.0)
+        runtime.states[12].update(
+            x=6.5, y=0.0, z=0.0, yaw=math.pi / 2.0,
+            speed=0.0, push_x=0.0, push_z=0.0)
+
+        reports = runtime._resolve_tank_contacts([], 10.0, .04)
+
+        self.assertEqual(1, len(probes))
+        self.assertEqual(1, len(reports))
+        self.assertEqual('bot_ram', reports[0]['type'])
+        self.assertEqual((11, 'bot', 12), (
+            reports[0]['bot_id'], reports[0]['target_kind'],
+            reports[0]['target_id']))
+        self.assertTrue(
+            reports[0]['damage_to_bot'] or reports[0]['damage_to_target'])
+
+        runtime.states[11].update(
+            x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
+            speed=10.0, push_x=0.0, push_z=0.0)
+        runtime.states[12].update(
+            x=6.5, y=0.0, z=0.0, yaw=math.pi / 2.0,
+            speed=0.0, push_x=0.0, push_z=0.0)
+        repeated = runtime._resolve_tank_contacts([], 10.04, .04)
+
+        self.assertEqual(1, len(probes))
+        self.assertEqual([], repeated)
+
     def test_current_human_contact_never_reports_damage_without_receipt(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
@@ -6690,6 +7044,24 @@ class BotRuntimeTests(unittest.TestCase):
         new_contact = runtime.update(.04, 11.0, players=[player])
         self.assertNotIn(
             'bot_ram', [message['type'] for message in new_contact])
+
+    def test_human_ram_receipt_hit_validation_uses_frozen_pitch_and_roll(self):
+        body = {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'pitch': 0.30, 'roll': -0.12,
+            'shape': (1.5, 3.5, -0.8, 2.0),
+        }
+        axes = self.module.tank_collision.pose_axes(
+            body['yaw'], body['pitch'], body['roll'])
+        local = (0.0, 1.0, body['shape'][1])
+        hit = tuple(sum(
+            local[row] * axes[row][index] for row in range(3))
+            for index in range(3))
+
+        self.assertTrue(self.module.BotRuntime._native_ram_hit_supported(
+            body, hit))
+        self.assertFalse(self.module.BotRuntime._native_ram_hit_supported(
+            dict(body, pitch=0.0, roll=0.0), hit))
 
     def test_human_ram_receipt_replays_pre_correction_pose_once(self):
         descriptor = _combat_descriptor()

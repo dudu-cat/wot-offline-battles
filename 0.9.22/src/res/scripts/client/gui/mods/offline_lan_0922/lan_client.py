@@ -102,11 +102,13 @@ STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
     'start_denied', 'team_denied', 'team_size_denied', 'events', 'error'))
 ORDERED_RECEIVE_TYPES = STATE_BARRIER_TYPES | frozenset((
-    'battle_receipt', 'fire_intent', 'fire_intent_result'))
+    'battle_receipt', 'fire_intent', 'fire_intent_result',
+    'player_destructible_contact',
+    'player_destructible_contact_result'))
 SERVER_STATE_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live', 'start_denied',
     'team_denied', 'team_size_denied', 'snapshot', 'events', 'bot_observation',
-    'battle_receipt'))
+    'battle_receipt', 'player_destructible_contact'))
 
 
 def _monotonic_time():

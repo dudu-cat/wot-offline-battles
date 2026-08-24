@@ -1994,6 +1994,13 @@ class LANSession(object):
                     round_id == self._active_round_id and
                     self._battle_runtime is not None):
                 self._battle_runtime.on_fire_intent_result(message)
+        elif kind == 'player_destructible_contact_result':
+            round_id = _message_value(message, 'round_id')
+            if (self._battle_started and
+                    round_id == self._active_round_id and
+                    self._battle_runtime is not None):
+                self._battle_runtime.on_player_destructible_contact_result(
+                    message)
         elif kind in ('disconnected', 'connection_lost', 'error'):
             if (not self._battle_started and
                     bool(getattr(self.client, 'ready', False)) and

@@ -899,6 +899,7 @@ class WorkerSession(object):
                 self.state = 'standby'
         elif kind in ('snapshot', 'events', 'battle_live',
                       'bot_observation', 'fire_intent',
+                      'player_destructible_contact',
                       'fire_intent_result'):
             if (self.runtime is not None and
                     not self.client.is_bot_authority()):
@@ -917,6 +918,8 @@ class WorkerSession(object):
                 self.runtime.on_battle_live(message)
             elif kind == 'fire_intent':
                 self.runtime.on_fire_intent(message)
+            elif kind == 'player_destructible_contact':
+                self.runtime.on_player_destructible_contact(message)
             elif kind == 'fire_intent_result':
                 self.runtime.on_fire_intent_result(message)
             else:

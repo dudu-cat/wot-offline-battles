@@ -219,6 +219,7 @@ def _load_runtime():
     import BigWorld
     import ChatManager
     import Math
+    import ProjectileMover
     import SoundGroups
     import Vehicle
     import VehicleGunRotator
@@ -243,6 +244,8 @@ def _load_runtime():
     from helpers import dependency
     from predefined_hosts import g_preDefinedHosts
     from skeletons.connection_mgr import IConnectionManager
+    from gui.mods.offline_lan_0922.entities.remote_vehicle import (
+        _RemoteFilter, collide_vehicle_at_matrix)
 
     class Runtime(object):
         pass
@@ -265,8 +268,11 @@ def _load_runtime():
     runtime.math = Math
     runtime.offline_map_creator = g_offlineMapCreator
     runtime.player_events = g_playerEvents
+    runtime.projectile_mover_module = ProjectileMover
     runtime.predefined_hosts = g_preDefinedHosts
     runtime.prb_loader = g_prbLoader
+    runtime.remote_filter_type = _RemoteFilter
+    runtime.segment_collision_result_type = Vehicle.SegmentCollisionResult
     runtime.sound_groups_module = SoundGroups
     runtime.sniper_camera_type = SniperCamera
     runtime.strategic_camera_type = StrategicCamera
@@ -275,6 +281,7 @@ def _load_runtime():
     runtime.vehicle_marker_plugin_type = VehicleMarkerPlugin
     runtime.vehicle_marker_damage_type = VehicleMarkerSettings.DAMAGE_TYPE
     runtime.vehicle_gun_rotator = VehicleGunRotator
+    runtime.visible_vehicle_collision = collide_vehicle_at_matrix
     return runtime
 
 
@@ -513,8 +520,12 @@ class OfflineCompatibility(object):
         self._original_vehicle_start_wg_physics = None
         self._vehicle_start_wg_physics_code = None
         self._original_vehicle_set_gun_angles = None
+        self._original_vehicle_collide_segment = None
+        self._original_vehicle_collide_segment_ext = None
         self._vehicle_set_gun_angles_code = None
         self._gun_rotator_stabilised_code = None
+        self._gun_rotator_predict_locked_target_code = None
+        self._projectile_segment_may_hit_code = None
         self._camera_acceleration_update_code = None
         self._arcade_oscillator_acceleration_code = None
         self._sniper_oscillator_acceleration_code = None
@@ -557,6 +568,8 @@ class OfflineCompatibility(object):
         self._vehicle_leave_world_wrapper = None
         self._vehicle_start_wg_physics_wrapper = None
         self._vehicle_set_gun_angles_wrapper = None
+        self._vehicle_collide_segment_wrapper = None
+        self._vehicle_collide_segment_ext_wrapper = None
         self._compound_getattribute_wrapper = None
         self._compound_deactivate_wrapper = None
         self._compound_models_refresh_wrapper = None
@@ -749,6 +762,29 @@ class OfflineCompatibility(object):
         if self._gun_rotator_stabilised_code is None:
             raise RuntimeError(
                 '#1513 fixed-turret stabilised matrix code is unavailable')
+        gun_rotator_predict_locked_target = getattr(
+            gun_rotator_type, 'predictLockedTargetShotPoint', None)
+        if gun_rotator_predict_locked_target is None:
+            raise RuntimeError(
+                '#1513 target-lock prediction boundary is unavailable')
+        self._gun_rotator_predict_locked_target_code = getattr(
+            gun_rotator_predict_locked_target, 'func_code', getattr(
+                gun_rotator_predict_locked_target, '__code__', None))
+        if self._gun_rotator_predict_locked_target_code is None:
+            raise RuntimeError(
+                '#1513 target-lock prediction code is unavailable')
+        projectile_segment_may_hit = getattr(
+            getattr(runtime, 'projectile_mover_module', None),
+            'segmentMayHitEntity', None)
+        if projectile_segment_may_hit is None:
+            raise RuntimeError(
+                '#1513 projectile collision prefilter is unavailable')
+        self._projectile_segment_may_hit_code = getattr(
+            projectile_segment_may_hit, 'func_code', getattr(
+                projectile_segment_may_hit, '__code__', None))
+        if self._projectile_segment_may_hit_code is None:
+            raise RuntimeError(
+                '#1513 projectile collision prefilter code is unavailable')
         if (acceleration_smoother_type is None or
                 arcade_camera_type is None or sniper_camera_type is None):
             raise RuntimeError('#1513 dynamic-camera motion ABI is unavailable')
@@ -820,6 +856,19 @@ class OfflineCompatibility(object):
                     'func_code', getattr(
                         self._original_vehicle_set_gun_angles,
                         '__code__', None))
+            self._original_vehicle_collide_segment = (
+                vehicle_type.__dict__.get(
+                    'collideSegment',
+                    getattr(vehicle_type, 'collideSegment', None)))
+            self._original_vehicle_collide_segment_ext = (
+                vehicle_type.__dict__.get(
+                    'collideSegmentExt',
+                    getattr(vehicle_type, 'collideSegmentExt', None)))
+            if (not callable(self._original_vehicle_collide_segment) or
+                    not callable(
+                        self._original_vehicle_collide_segment_ext)):
+                raise RuntimeError(
+                    '#1513 vehicle collision methods are unavailable')
         if vehicle_marker_type is None:
             raise RuntimeError('#1513 vehicle-marker plugin is unavailable')
         self._original_vehicle_marker_start = \
@@ -1404,25 +1453,92 @@ class OfflineCompatibility(object):
             finally:
                 compatibility._avatar_syncing_aux_physics = outer_avatar
 
+        def visible_native_remote_collisions(
+                vehicle, start_point, end_point):
+            """Collide against the same pose that #1513 currently draws."""
+            if not compatibility._battle_active:
+                return None
+            overlay = compatibility._vehicle_property_overlays.get(
+                id(vehicle))
+            if overlay is None or not overlay.get('_pose_active'):
+                return None
+            try:
+                native_remote = bool(
+                    compatibility._original_vehicle_getattribute(
+                        vehicle, '_offlineNativeRemote'))
+            except AttributeError:
+                native_remote = False
+            if not native_remote:
+                return None
+            return runtime.visible_vehicle_collision(
+                vehicle, overlay['matrix'], start_point, end_point,
+                runtime.math)
+
+        def vehicle_collide_segment(
+                vehicle, start_point, end_point, skipGun=False,
+                optimized=True):
+            collisions = visible_native_remote_collisions(
+                vehicle, start_point, end_point)
+            if collisions is None:
+                return compatibility._original_vehicle_collide_segment(
+                    vehicle, start_point, end_point, skipGun, optimized)
+            if skipGun:
+                collisions = [
+                    item for item in collisions
+                    if item.compName != 'vehicleGun']
+            if not collisions:
+                return None
+            closest = min(collisions, key=lambda item: item.dist)
+            material = closest.matInfo
+            armor = getattr(material, 'armor', 0) \
+                if material is not None else 0
+            return runtime.segment_collision_result_type(
+                closest.dist, closest.hitAngleCos, armor)
+
+        def vehicle_collide_segment_ext(vehicle, start_point, end_point):
+            collisions = visible_native_remote_collisions(
+                vehicle, start_point, end_point)
+            if collisions is None:
+                return compatibility._original_vehicle_collide_segment_ext(
+                    vehicle, start_point, end_point)
+            if not collisions:
+                return None
+            collisions = list(collisions)
+            collisions.sort(key=lambda item: item.dist)
+            return collisions
+
         def vehicle_getattribute(vehicle, name):
+            caller_code = None
+            locked_target_code = \
+                compatibility._gun_rotator_predict_locked_target_code
+            if (compatibility._vehicle_starting_visual is not None or
+                    compatibility._vehicle_starting_wg_physics is not None or
+                    compatibility._vehicle_syncing_gun_angles is not None or
+                    compatibility._avatar_syncing_aux_physics is not None or
+                    compatibility._avatar_entering_vehicle is not None or
+                    name in ('filter', 'position')):
+                try:
+                    caller_code = sys._getframe(1).f_code
+                except (AttributeError, ValueError):
+                    pass
             if (compatibility._battle_active and
                     name in ('health', 'isCrewActive',
                              'position', 'yaw', 'matrix')):
                 overlay = compatibility._vehicle_property_overlays.get(
                     id(vehicle))
                 if overlay is not None and name in overlay:
+                    if (name == 'position' and
+                            caller_code is locked_target_code):
+                        try:
+                            native_remote = bool(
+                                compatibility._original_vehicle_getattribute(
+                                    vehicle, '_offlineNativeRemote'))
+                        except AttributeError:
+                            native_remote = False
+                        if native_remote:
+                            return runtime.math.Matrix(
+                                overlay['matrix']).translation
                     return overlay[name]
-            caller_code = None
-            if (compatibility._vehicle_starting_visual is not None or
-                    compatibility._vehicle_starting_wg_physics is not None or
-                    compatibility._vehicle_syncing_gun_angles is not None or
-                    compatibility._avatar_syncing_aux_physics is not None or
-                    compatibility._avatar_entering_vehicle is not None or
-                    name == 'filter'):
-                try:
-                    caller_code = sys._getframe(1).f_code
-                except (AttributeError, ValueError):
-                    pass
             direct_start_visual = (
                 compatibility._vehicle_starting_visual is vehicle and
                 caller_code is compatibility._vehicle_start_visual_code)
@@ -1480,6 +1596,32 @@ class OfflineCompatibility(object):
                     compatibility._arcade_oscillator_acceleration_code,
                     compatibility._sniper_oscillator_acceleration_code) and
                 overlay is not None and overlay.get('_pose_active'))
+            direct_visible_collision = (
+                caller_code is
+                compatibility._projectile_segment_may_hit_code and
+                overlay is not None and overlay.get('_pose_active'))
+            if (name == 'filter' and compatibility._battle_active and
+                    direct_visible_collision):
+                try:
+                    native_remote = bool(
+                        compatibility._original_vehicle_getattribute(
+                            vehicle, '_offlineNativeRemote'))
+                except AttributeError:
+                    native_remote = False
+                if native_remote:
+                    visible_position = runtime.math.Matrix(
+                        overlay['matrix']).translation
+                    collision_filter = overlay.get('_collision_filter')
+                    if collision_filter is None:
+                        collision_filter = runtime.remote_filter_type(
+                            runtime.math, visible_position,
+                            overlay['matrix'])
+                        overlay['_collision_filter'] = collision_filter
+                    velocity = overlay.get('velocity')
+                    if velocity is None:
+                        velocity = runtime.math.Vector3(0.0, 0.0, 0.0)
+                    collision_filter.update(visible_position, velocity)
+                    return collision_filter
             if (name == 'filter' and compatibility._battle_active and
                     (direct_start_filter or direct_gun_sync or
                      direct_avatar_aux_sync or direct_avatar_pose_init or
@@ -2048,6 +2190,8 @@ class OfflineCompatibility(object):
         self._vehicle_leave_world_wrapper = vehicle_leave_world
         self._vehicle_start_wg_physics_wrapper = vehicle_start_wg_physics
         self._vehicle_set_gun_angles_wrapper = vehicle_set_gun_angles
+        self._vehicle_collide_segment_wrapper = vehicle_collide_segment
+        self._vehicle_collide_segment_ext_wrapper = vehicle_collide_segment_ext
         self._compound_getattribute_wrapper = compound_getattribute
         self._compound_deactivate_wrapper = compound_deactivate
         self._compound_models_refresh_wrapper = compound_models_refresh
@@ -2109,6 +2253,8 @@ class OfflineCompatibility(object):
                         vehicle_start_wg_physics)
                 if self._original_vehicle_set_gun_angles is not None:
                     vehicle_type.set_gunAnglesPacked = vehicle_set_gun_angles
+                vehicle_type.collideSegment = vehicle_collide_segment
+                vehicle_type.collideSegmentExt = vehicle_collide_segment_ext
             if compound_type is not None:
                 compound_type.__getattribute__ = compound_getattribute
                 if self._original_compound_deactivate is not None:
@@ -2320,6 +2466,18 @@ class OfflineCompatibility(object):
                 self._vehicle_set_gun_angles_wrapper):
             vehicle_type.set_gunAnglesPacked = (
                 self._original_vehicle_set_gun_angles)
+        if (vehicle_type is not None and
+                self._original_vehicle_collide_segment is not None and
+                vehicle_type.__dict__.get('collideSegment') is
+                self._vehicle_collide_segment_wrapper):
+            vehicle_type.collideSegment = (
+                self._original_vehicle_collide_segment)
+        if (vehicle_type is not None and
+                self._original_vehicle_collide_segment_ext is not None and
+                vehicle_type.__dict__.get('collideSegmentExt') is
+                self._vehicle_collide_segment_ext_wrapper):
+            vehicle_type.collideSegmentExt = (
+                self._original_vehicle_collide_segment_ext)
         if (compound_type is not None and
                 self._original_compound_models_refresh is not None and
                 compound_type.__dict__.get(
@@ -2360,6 +2518,12 @@ class OfflineCompatibility(object):
         self._vehicle_syncing_gun_angles = None
         self._vehicle_set_gun_angles_code = None
         self._gun_rotator_stabilised_code = None
+        self._gun_rotator_predict_locked_target_code = None
+        self._projectile_segment_may_hit_code = None
+        self._original_vehicle_collide_segment = None
+        self._original_vehicle_collide_segment_ext = None
+        self._vehicle_collide_segment_wrapper = None
+        self._vehicle_collide_segment_ext_wrapper = None
         self._camera_acceleration_update_code = None
         self._arcade_oscillator_acceleration_code = None
         self._sniper_oscillator_acceleration_code = None
@@ -2966,7 +3130,8 @@ class OfflineCompatibility(object):
         if overlay is None:
             return False
         for name in ('_pose_active', 'position', 'yaw', 'matrix',
-                     'speed', 'turn_speed', 'velocity', 'acceleration'):
+                     'speed', 'turn_speed', 'velocity', 'acceleration',
+                     '_collision_filter'):
             overlay.pop(name, None)
         if not overlay:
             self._vehicle_property_overlays.pop(id(vehicle), None)

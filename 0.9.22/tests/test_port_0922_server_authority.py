@@ -14,6 +14,7 @@ from lan_battle_server import (  # noqa: E402
     BattleState, CLIENT_BUILD_0922, ClientHandler, CRITICAL_DEVICE_NAMES,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, Player, PREBATTLE_SECONDS,
+    MAX_PLAYER_DESTRUCTIBLE_REJECTIONS,
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
@@ -204,7 +205,7 @@ def _valid_ram_receipt(state, bot_id, seq=1, **values):
         'contact_screened_player': False,
         'contact_screened_bot': False,
         'x': float(player.x), 'y': float(player.y), 'z': float(player.z),
-        'yaw': float(player.yaw),
+        'yaw': float(player.yaw), 'pitch': 0.0, 'roll': 0.0,
         'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
         'bot_vx': 0.0, 'bot_vy': 0.0, 'bot_vz': 0.0,
     }
@@ -739,6 +740,12 @@ class HumanRamTimelineTest(unittest.TestCase):
     def test_player_destructible_contact_is_bound_to_an_admitted_pose(self):
         state, clock = self._state()
         clock[0] = 0.2
+        relays = []
+        visible_results = []
+        state.simulation_worker.offer_reliable = lambda message: (
+            relays.append(copy.deepcopy(message)) or True)
+        state.players[1].offer_reliable = lambda message: (
+            visible_results.append(copy.deepcopy(message)) or True)
         contact = {
             'seq': 1, 'x': 0.0, 'y': 0.0, 'z': -1.6,
             'yaw': 0.0, 'speed': 16.0, 'dt': 0.04,
@@ -762,6 +769,16 @@ class HumanRamTimelineTest(unittest.TestCase):
             [1], [row['seq'] for row in
                   state._public_player(player)['destructible_contacts']])
         self.assertEqual({}, state.destructibles)
+        self.assertEqual(1, len(relays))
+        self.assertEqual('player_destructible_contact', relays[0]['type'])
+        self.assertEqual(state.round_id, relays[0]['round_id'])
+        self.assertEqual(state.authority_epoch,
+                         relays[0]['authority_epoch'])
+        self.assertEqual({
+            'id', 'vehicle', 'vehicle_compact_descr',
+            'destructible_contacts'}, set(relays[0]['player']))
+        self.assertEqual(admitted,
+                         relays[0]['player']['destructible_contacts'][0])
 
         self.assertTrue(state.report_player_destructible_contact_result(
             SIMULATION_WORKER_AUTHORITY_ID, {
@@ -770,6 +787,17 @@ class HumanRamTimelineTest(unittest.TestCase):
                 'contact_seq': 1, 'accepted': False,
                 'token': [[22, 3, None]],
             }))
+        self.assertEqual([1], list(
+            player.destructible_contact_rejections))
+        self.assertEqual([1], state._public_player(player)[
+            'destructible_contact_rejected_seqs'])
+        self.assertEqual({
+            'type': 'player_destructible_contact_result',
+            'round_id': state.round_id, 'contact_seq': 1,
+            'accepted': False,
+            'x': admitted['x'], 'y': admitted['y'],
+            'z': admitted['z'], 'yaw': admitted['yaw'],
+        }, visible_results[-1])
 
         # A contact body that does not match an admitted pose is terminally
         # rejected instead of being relayed to the hidden worker.
@@ -783,6 +811,50 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual([], list(player.destructible_contacts))
         self.assertEqual(2, player.destructible_contact_seq)
         self.assertEqual(2, player.destructible_contact_resolved_seq)
+        self.assertEqual([1, 2], state._public_player(player)[
+            'destructible_contact_rejected_seqs'])
+        self.assertEqual({
+            'type': 'player_destructible_contact_result',
+            'round_id': state.round_id, 'contact_seq': 2,
+            'accepted': False,
+        }, visible_results[-1])
+
+    def test_player_destructible_rejection_history_is_bounded(self):
+        state, unused_clock = self._state()
+        player = state.players[1]
+        player.offer_reliable = lambda unused_message: True
+
+        for seq in range(1, MAX_PLAYER_DESTRUCTIBLE_REJECTIONS + 3):
+            state._reject_player_destructible_contact(player, seq)
+
+        self.assertEqual(MAX_PLAYER_DESTRUCTIBLE_REJECTIONS, len(
+            player.destructible_contact_rejections))
+        self.assertEqual(
+            list(range(3, MAX_PLAYER_DESTRUCTIBLE_REJECTIONS + 3)),
+            list(player.destructible_contact_rejections))
+
+    def test_player_destructible_relay_failure_keeps_snapshot_retry(self):
+        state, clock = self._state()
+        clock[0] = 0.2
+        state.simulation_worker.offer_reliable = lambda unused_message: False
+
+        self.assertTrue(state.update_input(1, {
+            'round_id': state.round_id, 'input_seq': 1,
+            'pose_time_us': 100000,
+            'x': 0.0, 'y': 0.0, 'z': -1.6, 'yaw': 0.0,
+            'forward': 1.0, 'speed': 16.0,
+            'destructible_contacts': [{
+                'seq': 1, 'x': 0.0, 'y': 0.0, 'z': -1.6,
+                'yaw': 0.0, 'speed': 16.0, 'dt': 0.04,
+                'token': [[22, 3, None]],
+            }],
+        }))
+
+        player = state.players[1]
+        self.assertEqual([1], list(player.destructible_contacts))
+        self.assertEqual(
+            [1], [row['seq'] for row in
+                  state._public_player(player)['destructible_contacts']])
 
     def test_only_hidden_worker_can_resolve_player_destructible_contact(self):
         state, clock = self._state()
@@ -1090,17 +1162,38 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             })
         state.bot_state_revision = 22
         state.bot_state_time_us = 220000
+        pitch, roll = 0.08, -0.04
+        shape = state.human_collision_profiles[player.player_id]['shape']
+        axes = server_battle_authority._pose_axes(0.0, pitch, roll)
+        local_midpoint = (
+            0.0, (shape[2] + shape[3]) * 0.5, 3.2)
+        world_midpoint = tuple(
+            sum(local_midpoint[row] * axes[row][index]
+                for row in range(3))
+            for index in range(3))
         state.update_input(1, {
             'round_id': state.round_id,
             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'pitch': pitch, 'roll': roll,
             'speed': 16.0,
             'ram_contacts': [_valid_ram_receipt(
                 state, bot_id, bot_state_revision=21,
                 presentation_time_us=210000,
                 x=0.0, y=0.0, z=0.0, yaw=0.0,
+                pitch=pitch, roll=roll,
                 vx=0.0, vy=0.0, vz=16.0,
-                contact_z=3.25)],
+                contact_x=world_midpoint[0],
+                contact_y=world_midpoint[1],
+                contact_z=world_midpoint[2])],
         })
+
+        admitted = player.ram_contacts[1]
+        self.assertEqual((pitch, roll), (
+            admitted['pitch'], admitted['roll']))
+        self.assertEqual(
+            tuple(round(value, 4) for value in world_midpoint),
+            tuple(admitted[key] for key in (
+                'contact_x', 'contact_y', 'contact_z')))
 
         reports = authority._bots._resolve_human_ram_receipts(
             authority._players_payload(), 1.0,
@@ -1264,6 +1357,70 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             player, dict(receipt, native_contact_time_us=1)))
         self.assertIsNone(state._validated_ram_contact(
             player, dict(receipt, contact_screened_player=True)))
+
+    def test_native_ram_receipt_validates_contact_in_pitched_frozen_body(self):
+        state = self._live_state()
+        player = state.players[1]
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 300
+        state.bot_state_time_us = 3000000
+        shape = state.human_collision_profiles[player.player_id]['shape']
+        pitch, roll = 0.30, -0.12
+        axes = server_battle_authority._pose_axes(
+            player.yaw, pitch, roll)
+        local = (0.0, (shape[2] + shape[3]) * 0.5, shape[1])
+        point = tuple(
+            origin + sum(
+                local[row] * axes[row][index] for row in range(3))
+            for index, origin in enumerate((player.x, player.y, player.z)))
+        receipt = _valid_ram_receipt(
+            state, bot_id, bot_state_revision=299,
+            presentation_time_us=2900000,
+            pitch=pitch, roll=roll,
+            contact_x=point[0], contact_y=point[1],
+            contact_z=point[2], vx=0.0, vy=0.0, vz=16.5)
+
+        accepted = state._validated_ram_contact(player, receipt)
+
+        self.assertIsNotNone(accepted)
+        self.assertEqual((pitch, roll), (
+            accepted['pitch'], accepted['roll']))
+        self.assertIsNone(state._validated_ram_contact(
+            player, dict(receipt, pitch=0.0, roll=0.0)))
+
+    def test_outside_body_ram_receipt_is_terminal_with_stable_reason(self):
+        state = self._live_state()
+        player = state.players[1]
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 300
+        state.bot_state_time_us = 3000000
+        shape = state.human_collision_profiles[player.player_id]['shape']
+        receipt = _valid_ram_receipt(
+            state, bot_id, bot_state_revision=299,
+            presentation_time_us=2900000,
+            x=0.0, y=0.0, z=0.0, yaw=0.0,
+            contact_x=float(shape[0]) + 1.0,
+            contact_y=(float(shape[2]) + float(shape[3])) * 0.5,
+            contact_z=0.0)
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contacts': [receipt]})
+
+        self.assertEqual(1, player.ram_contact_seq)
+        self.assertEqual(1, player.ram_contact_resolved_seq)
+        self.assertEqual([], list(player.ram_contacts))
+        self.assertEqual(
+            'contact_outside_player_body',
+            player.ram_contact_rejections[1])
+        public = state._public_player(player)
+        self.assertEqual(1, public['ram_contact_admitted_seq'])
+        self.assertEqual(1, public['ram_contact_resolved_seq'])
+
+        state.update_input(1, {
+            'round_id': state.round_id, 'ram_contacts': [receipt]})
+        self.assertEqual(
+            {1: 'contact_outside_player_body'},
+            dict(player.ram_contact_rejections))
 
     def test_accepted_ram_receipt_cannot_reappear_after_authority_change(self):
         state = self._live_state()
@@ -1435,6 +1592,46 @@ class ServerAuthorityBattleTest(unittest.TestCase):
 
         self.assertEqual(4, player.ram_contact_seq)
         self.assertEqual([2, 4], list(player.ram_contacts))
+
+    def test_invalid_ram_receipt_waits_for_prior_terminal_frontier(self):
+        state = self._live_state()
+        player = state.players[1]
+        player.capabilities = (
+            PROJECTILE_CAPABILITY, RAM_CONTACT_LEDGER_CAPABILITY)
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 10
+        state.bot_state_time_us = 100000
+        shape = state.human_collision_profiles[player.player_id]['shape']
+        first = _valid_ram_receipt(
+            state, bot_id, seq=1, bot_state_revision=10,
+            presentation_time_us=100000,
+            x=0.0, y=0.0, z=0.0, yaw=0.0)
+        invalid = _valid_ram_receipt(
+            state, bot_id, seq=2, bot_state_revision=10,
+            presentation_time_us=100000,
+            x=0.0, y=0.0, z=0.0, yaw=0.0,
+            contact_x=float(shape[0]) + 1.0)
+
+        state.update_input(1, {
+            'round_id': state.round_id,
+            'ram_contacts': [first, invalid],
+        })
+
+        self.assertEqual(2, player.ram_contact_seq)
+        self.assertEqual(0, player.ram_contact_resolved_seq)
+        self.assertEqual([1], list(player.ram_contacts))
+        self.assertEqual(
+            'contact_outside_player_body',
+            player.ram_contact_rejections[2])
+
+        self.assertTrue(state.report_bot_ram(SERVER_AUTHORITY_ID, {
+            'round_id': state.round_id,
+            'bot_id': bot_id, 'target_kind': 'human', 'target_id': 1,
+            'ram_seq': 1, 'damage_to_bot': 0, 'damage_to_target': 0,
+            'ram_contact_player_id': 1, 'ram_contact_seq': 1,
+        }))
+        self.assertEqual(2, player.ram_contact_resolved_seq)
+        self.assertEqual([], list(player.ram_contacts))
 
     def test_full_ram_ledger_does_not_advance_admission(self):
         state = self._live_state()

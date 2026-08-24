@@ -84,6 +84,7 @@ class _WorkerRuntime(object):
         self.draw_ready = True
         self.start_config = None
         self.fire_intent_results = []
+        self.player_destructible_contacts = []
         self.sample = {
             'round_finished': False,
             'frame_callbacks': 1,
@@ -121,6 +122,10 @@ class _WorkerRuntime(object):
 
     def on_fire_intent_result(self, message):
         self.fire_intent_results.append(dict(message))
+        return True
+
+    def on_player_destructible_contact(self, message):
+        self.player_destructible_contacts.append(dict(message))
         return True
 
 
@@ -866,6 +871,34 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             session._on_event('fire_intent_result', message)
 
         self.assertEqual([message], runtime.fire_intent_results)
+
+    def test_worker_routes_player_destructible_contact_to_runtime(self):
+        world = _DrawWorld()
+        client = _WorkerClient()
+        runtime = _WorkerRuntime(client, world)
+        message = {
+            'type': 'player_destructible_contact', 'round_id': 1,
+            'authority_epoch': 1, 'player': {
+                'id': 2, 'vehicle': 'ussr:R11_MS-1',
+                'vehicle_compact_descr': 'dGVzdA==',
+                'destructible_contacts': [{
+                    'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+                    'yaw': 0.0, 'speed': 8.0, 'dt': 0.04,
+                    'forward': 1.0, 'token': [[22, 3, None]],
+                }],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            session = WorkerSession(
+                {}, bigworld=world,
+                status_path=str(Path(directory) / 'status.json'))
+            session.client = client
+            session.runtime = runtime
+            session._active_round_id = 1
+
+            session._on_event('player_destructible_contact', message)
+
+        self.assertEqual([message], runtime.player_destructible_contacts)
 
     def test_worker_forces_compound_factory_and_track_animation_off(self):
         world = _DrawWorld()

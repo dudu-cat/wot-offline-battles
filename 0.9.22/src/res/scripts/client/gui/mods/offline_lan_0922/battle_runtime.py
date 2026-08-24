@@ -1133,6 +1133,7 @@ class BattleRuntime(object):
         self._local_ram_seq = 0
         self._local_ram_receipt = None
         self._local_ram_receipts = collections.OrderedDict()
+        self._local_ram_admitted_seq = 0
         self._native_ram_contact_hook = None
         self._native_ram_contact_proofs = collections.OrderedDict()
         self._native_ram_contact_failures = set()
@@ -1142,6 +1143,7 @@ class BattleRuntime(object):
         self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
+        self._local_destructible_safe_poses = collections.OrderedDict()
         self._ram_bot_history = {}
         self._ram_bot_history_order = []
         self._ram_bot_history_times = {}
@@ -1369,11 +1371,13 @@ class BattleRuntime(object):
         self._local_ram_seq = 0
         self._local_ram_receipt = None
         self._local_ram_receipts = collections.OrderedDict()
+        self._local_ram_admitted_seq = 0
         self._local_ram_episode_contacts = frozenset()
         self._local_ram_profile_cache = None
         self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
+        self._local_destructible_safe_poses = collections.OrderedDict()
         self._ram_bot_history = {}
         self._ram_bot_history_order = []
         self._ram_bot_history_times = {}
@@ -2550,6 +2554,7 @@ class BattleRuntime(object):
                 motion_report=self._report_bot_destructible_contact,
                 world_receipt_probe=self._direction_world_receipt,
                 water_depth_probe=self._water_depth,
+                ram_contact_probe=self._bot_ram_contact_armor,
                 baked_graph=self._navigation_graph,
                 # Keep the mature 0.8.2 authority model: the copied physics
                 # integrator owns bot poses and the engine interpolates those
@@ -6013,6 +6018,85 @@ class BattleRuntime(object):
             raise RuntimeError('worker received overlapping fire intents')
         self._player_fire_intents[key] = frozen
         return True
+
+    def on_player_destructible_contact(self, message):
+        """Resolve one server-admitted player hull contact immediately."""
+        if not self._worker_mode or self.state != 'running':
+            return False
+        required = {
+            'type', 'protocol', 'round_id', 'authority_epoch', 'player'}
+        transport_fields = {
+            '_client_received_time', '_client_dispatch_delay'}
+        if (not isinstance(message, dict) or
+                not required.issubset(message) or
+                not set(message).issubset(required | transport_fields)):
+            raise RuntimeError(
+                'worker player destructible contact is malformed')
+        player = message.get('player')
+        if (not isinstance(player, dict) or set(player) != {
+                'id', 'vehicle', 'vehicle_compact_descr',
+                'destructible_contacts'} or
+                not isinstance(player.get('destructible_contacts'), list) or
+                len(player['destructible_contacts']) != 1):
+            raise RuntimeError(
+                'worker player destructible contact body is malformed')
+        try:
+            authority_epoch = int(message['authority_epoch'])
+            player_id = int(player['id'])
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError(
+                'worker player destructible contact has invalid values')
+        if (message.get('round_id') != (self._start_message or {}).get(
+                'round_id') or
+                authority_epoch != int(self.client.authority_epoch) or
+                player_id <= 0):
+            raise RuntimeError(
+                'worker player destructible contact violates its contract')
+        return bool(self._resolve_player_destructible_contacts(
+            [dict(player)], self._clock()))
+
+    def on_player_destructible_contact_result(self, message):
+        """Correct one visible prediction after the worker rejects it."""
+        if self._worker_mode or not isinstance(message, dict):
+            return False
+        required = {
+            'type', 'round_id', 'contact_seq', 'accepted'}
+        pose_fields = {'x', 'y', 'z', 'yaw'}
+        transport_fields = {
+            '_client_received_time', '_client_dispatch_delay'}
+        fields = set(message) - transport_fields
+        if (fields not in (required, required | pose_fields) or
+                message.get('type') !=
+                'player_destructible_contact_result' or
+                message.get('round_id') !=
+                (self._start_message or {}).get('round_id') or
+                message.get('accepted') is not False):
+            return False
+        try:
+            sequence = int(message.get('contact_seq'))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if sequence <= 0:
+            return False
+        server_pose = None
+        if pose_fields.issubset(message):
+            try:
+                values = tuple(float(message[name]) for name in (
+                    'x', 'y', 'z', 'yaw'))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if any(math.isnan(value) or math.isinf(value)
+                   for value in values):
+                return False
+            server_pose = (values[:3], values[3])
+        changed = self._apply_local_destructible_rejection(
+            sequence, server_pose)
+        for seq in list(self._local_destructible_contacts):
+            if seq <= sequence:
+                self._local_destructible_contacts.pop(seq, None)
+                self._local_destructible_safe_poses.pop(seq, None)
+                changed = True
+        return changed
 
     def on_fire_intent_result(self, message):
         """Release the matching visible or worker trigger after rejection."""
@@ -10761,6 +10845,8 @@ class BattleRuntime(object):
     def _motion_is_clear(self, entity, position, yaw, speed, dt,
                          allow_crush_drive=False):
         """Thin tuple-to-Vector adapter around the copied 0.8.2 probe."""
+        if getattr(self, '_local_destructible_send_failed', False):
+            return False
         self._local_motion_soft_block = False
         self._local_motion_cap_crushed = False
         self._local_motion_kinds = '-'
@@ -10787,13 +10873,31 @@ class BattleRuntime(object):
                 self._local_motion_kinds = str(
                     proposal.get('kinds', '-'))
                 self._local_motion_status = 'kinetic'
+                previous_seq = self._local_destructible_contact_seq
                 if not self._queue_local_destructible_contact(
                         proposal, position, yaw, speed, dt):
                     return False
-                # Preserve real momentum outside the still-active native skin.
-                # The worker's canonical event makes the next frame clear.
-                self._local_motion_cap_crushed = True
-                return False
+                if self._local_destructible_contact_seq != previous_seq:
+                    sender = getattr(self._sender, 'send_current', None)
+                    if not callable(sender) or not sender():
+                        failed_seq = self._local_destructible_contact_seq
+                        self._local_destructible_contacts.pop(
+                            failed_seq, None)
+                        self._local_destructible_safe_poses.pop(
+                            failed_seq, None)
+                        self._local_destructible_contact_seq = previous_seq
+                        self._local_destructible_send_failed = True
+                        return False
+                    # The pre-advance pose and proposal now precede every
+                    # resulting pose in the transport FIFO.  Treat this as
+                    # this frame's periodic input too; otherwise a long frame
+                    # immediately emits a redundant post-advance sample.
+                    self._local_input_sent_during_drive = True
+                # This exact local proof owns movement prediction only. Keep
+                # advancing the copied vehicle pose while the server relays it
+                # to the worker; the worker remains the sole owner of the
+                # irreversible map mutation and its canonical LAN event.
+                return True
         world_status = world_collision.check_horizontal_collision(
             self._runtime.bigworld, self._runtime.math,
             self._avatar.spaceID, self._vector(position), yaw, speed,
@@ -11034,14 +11138,63 @@ class BattleRuntime(object):
                     math.isnan(damage_factor) or math.isinf(damage_factor)):
                 continue
             if damage_factor <= 0.0:
-                # Retail treats tracks/screens as an HE layer chain. We do not
-                # have the complete #1513 attenuation law at this boundary,
-                # so passing the full kinetic potential to the plate behind it
-                # would be invented behaviour. Fail closed for HP while still
-                # retaining ordinary OBB separation/impulse.
-                return None
+                # The documented ramming law resolves its impact as an HE-like
+                # explosion.  Match the existing #1513 HE collision adapter:
+                # tracks, side skirts and other external layers do not carry
+                # hull HP, so nominal armour comes from the first structural
+                # plate reached by the same native ray.
+                continue
             return {'armor': armor, 'screened': False}
         return None
+
+    def _bot_ram_contact_armor(self, first, second, unused_contact):
+        """Probe both real #1513 hit testers at one worker-owned contact."""
+        if not self._worker_mode:
+            return None
+        vehicles = []
+        for body in (first, second):
+            try:
+                bot_id = int(body['id'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+            record = self._records.get('bot:%s' % bot_id)
+            if (record is None or record.get('kind') != 'bot' or
+                    not record.get('ready') or record.get('tombstone')):
+                return None
+            vehicle = self._server_entity(record.get('engine_id'))
+            if getattr(vehicle, 'typeDescriptor', None) is None:
+                return None
+            vehicles.append(vehicle)
+        if int(first['id']) == int(second['id']):
+            return None
+        if not tank_collision.vertical_overlap(
+                first.get('y'), first['shape'],
+                second.get('y'), second['shape']):
+            return None
+        overlap_point = self._ram_obb_overlap_point(first, second)
+        if overlap_point is None:
+            return None
+        low = max(
+            float(first['y']) + float(first['shape'][2]),
+            float(second['y']) + float(second['shape'][2]))
+        high = min(
+            float(first['y']) + float(first['shape'][3]),
+            float(second['y']) + float(second['shape'][3]))
+        if high <= low:
+            return None
+        hit_point = self._vector((
+            overlap_point[0], (low + high) * 0.5, overlap_point[1]))
+        plates = []
+        for body, vehicle in zip((first, second), vehicles):
+            matrix = self._ram_pose_matrix(
+                (body['x'], body['y'], body['z']), body['yaw'],
+                _number(body.get('pitch')), _number(body.get('roll')))
+            plate = self._native_ram_vehicle_armor(
+                vehicle, matrix, hit_point)
+            if plate is None:
+                return None
+            plates.append(float(plate['armor']))
+        return tuple(plates)
 
     @staticmethod
     def _native_ram_velocity(vehicle):
@@ -11093,6 +11246,7 @@ class BattleRuntime(object):
             'native_contact_time_us': int(contact_time_us),
             'x': float(own_pose[0]), 'y': float(own_pose[1]),
             'z': float(own_pose[2]), 'yaw': float(own_pose[3]),
+            'pitch': float(own_pose[4]), 'roll': float(own_pose[5]),
             'local_matrix': self._ram_pose_matrix(
                 own_pose[:3], own_pose[3], own_pose[4], own_pose[5]),
             'bot_matrix': self._ram_pose_matrix(
@@ -11202,7 +11356,8 @@ class BattleRuntime(object):
             'contact_spall_player': proof['contact_spall_player'],
             'contact_bonus_player': proof['contact_bonus_player'],
             'x': proof['x'], 'y': proof['y'], 'z': proof['z'],
-            'yaw': proof['yaw'], 'vx': proof['vx'], 'vy': proof['vy'],
+            'yaw': proof['yaw'], 'pitch': proof['pitch'],
+            'roll': proof['roll'], 'vx': proof['vx'], 'vy': proof['vy'],
             'vz': proof['vz'],
             'bot_vx': proof['bot_vx'], 'bot_vy': proof['bot_vy'],
             'bot_vz': proof['bot_vz'],
@@ -11319,23 +11474,35 @@ class BattleRuntime(object):
             high = min(
                 float(own['y']) + float(own['shape'][3]),
                 float(other['y']) + float(other['shape'][3]))
-            vertical_penetration = high - low
-            if vertical_penetration <= contact[2]:
-                own_center_y = float(own['y']) + (
-                    float(own['shape'][2]) +
-                    float(own['shape'][3])) * 0.5
-                other_center_y = float(other['y']) + (
-                    float(other['shape'][2]) +
-                    float(other['shape'][3])) * 0.5
-                vertical_normal = (1.0 if own_center_y >= other_center_y
-                                   else -1.0)
-                relative_normal = (
-                    own.get('vy', 0.0) - other.get('vy', 0.0)) * \
-                    vertical_normal
-            else:
-                relative_normal = (
-                    (own['vx'] - other['vx']) * contact[0] +
-                    (own['vz'] - other['vz']) * contact[1])
+            own_center_y = float(own['y']) + (
+                float(own['shape'][2]) +
+                float(own['shape'][3])) * 0.5
+            other_center_y = float(other['y']) + (
+                float(other['shape'][2]) +
+                float(other['shape'][3])) * 0.5
+            center_delta = (
+                float(own['x']) - float(other['x']),
+                own_center_y - other_center_y,
+                float(own['z']) - float(other['z']))
+            center_distance_squared = sum(
+                value * value for value in center_delta)
+            if center_distance_squared <= 0.0:
+                # A coincident synthetic spawn has no geometrically provable
+                # approach side. Keep separation but do not invent HP.
+                continue
+            relative_velocity = (
+                own['vx'] - other['vx'],
+                own.get('vy', 0.0) - other.get('vy', 0.0),
+                own['vz'] - other['vz'])
+            # Use the real approach direction between the two hull centres.
+            # The SAT minimum-translation axis is for separation only: after
+            # a delayed snapshot leaves a deep front-to-rear overlap, that
+            # axis can rotate sideways (or vertical) even though the tanks
+            # are still closing along their travel direction.
+            relative_normal = sum(
+                relative_velocity[index] * center_delta[index]
+                for index in range(3)) / math.sqrt(
+                    center_distance_squared)
             if relative_normal >= 0.0 or bot_id in previous:
                 continue
             hit_point = self._vector((
@@ -11514,7 +11681,9 @@ class BattleRuntime(object):
 
     def local_ram_contacts(self):
         """Return every proof not yet admitted by the server."""
-        return [dict(value) for value in self._local_ram_receipts.values()]
+        return [
+            dict(value) for seq, value in self._local_ram_receipts.items()
+            if seq > self._local_ram_admitted_seq]
 
     def _ram_contacts_enqueued(self):
         """Require durable server acknowledgement for every contact proof."""
@@ -11528,6 +11697,7 @@ class BattleRuntime(object):
             return False
         local_id = int(self.client.player_id)
         admitted = None
+        resolved = None
         for raw in snapshot.get('players') or ():
             if not isinstance(raw, dict):
                 continue
@@ -11535,14 +11705,19 @@ class BattleRuntime(object):
                 if int(raw.get('id')) != local_id:
                     continue
                 admitted = int(raw.get('ram_contact_admitted_seq', 0))
+                resolved = int(raw.get('ram_contact_resolved_seq', 0))
             except (TypeError, ValueError, OverflowError):
                 admitted = None
+                resolved = None
             break
-        if admitted is None:
+        if (admitted is None or resolved is None or admitted < 0 or
+                resolved < 0 or resolved > admitted):
             return False
-        changed = False
+        changed = admitted > self._local_ram_admitted_seq
+        self._local_ram_admitted_seq = max(
+            self._local_ram_admitted_seq, admitted)
         for seq in list(self._local_ram_receipts):
-            if seq <= admitted:
+            if seq <= resolved:
                 self._local_ram_receipts.pop(seq, None)
                 changed = True
         self._local_ram_receipt = (
@@ -11608,6 +11783,9 @@ class BattleRuntime(object):
             'dt': round(contact_dt, 6),
             'token': [list(row) for row in token],
         }
+        self._local_destructible_safe_poses[seq] = (
+            tuple(float(position[index]) for index in range(3)),
+            float(yaw))
         return True
 
     def local_destructible_contacts(self):
@@ -11627,6 +11805,7 @@ class BattleRuntime(object):
             return False
         local_id = int(self.client.player_id)
         resolved = None
+        rejected = ()
         for raw in snapshot.get('players') or ():
             if not isinstance(raw, dict):
                 continue
@@ -11635,17 +11814,60 @@ class BattleRuntime(object):
                     continue
                 resolved = int(raw.get(
                     'destructible_contact_resolved_seq', 0))
+                raw_rejected = raw.get(
+                    'destructible_contact_rejected_seqs', ())
+                if (not isinstance(raw_rejected, (list, tuple)) or
+                        len(raw_rejected) > 16):
+                    return False
+                rejected = tuple(int(value) for value in raw_rejected)
             except (TypeError, ValueError, OverflowError):
                 resolved = None
             break
         if resolved is None:
             return False
         changed = False
+        rollback = [
+            seq for seq in self._local_destructible_contacts
+            if (seq <= resolved and seq in rejected and
+                seq in self._local_destructible_safe_poses)]
+        if rollback:
+            changed = self._apply_local_destructible_rejection(
+                min(rollback)) or changed
         for seq in list(self._local_destructible_contacts):
             if seq <= resolved:
                 self._local_destructible_contacts.pop(seq, None)
+                self._local_destructible_safe_poses.pop(seq, None)
                 changed = True
         return changed
+
+    def _apply_local_destructible_rejection(
+            self, sequence, server_pose=None):
+        """Roll back one still-pending speculative hull traversal once."""
+        if (sequence not in self._local_destructible_contacts or
+                sequence not in self._local_destructible_safe_poses):
+            return False
+        position, yaw = self._local_destructible_safe_poses[sequence]
+        if server_pose is not None:
+            position, yaw = server_pose
+        self._local_position = tuple(float(value) for value in position)
+        self._local_yaw = float(yaw)
+        self._local_speed = 0.0
+        self._local_vertical_speed = 0.0
+        self._local_turn_speed = 0.0
+        self._local_drive_turn = 0.0
+        self._local_push_x = 0.0
+        self._local_push_z = 0.0
+        self._local_grind = 0
+        if self._local_camera_velocity is not None:
+            self._local_camera_velocity = self._vector((0.0, 0.0, 0.0))
+        # Every later proposal was sampled from the now-rejected speculative
+        # path. Keep its ordered wire row until the server terminates it, but
+        # discard its unsafe rollback target so a delayed rejection cannot
+        # move this vehicle forward through the intact object again.
+        for seq in list(self._local_destructible_safe_poses):
+            if seq >= sequence:
+                self._local_destructible_safe_poses.pop(seq, None)
+        return True
 
     def _terrain_support(self, position, yaw, descriptor=None,
                          maximum_y=None):
@@ -11977,6 +12199,8 @@ class BattleRuntime(object):
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None or entity.typeDescriptor is None:
             return
+        self._local_input_sent_during_drive = False
+        self._local_destructible_send_failed = False
         is_alive = getattr(entity, 'isAlive', None)
         stopped = (self._battle_result is not None or
                    self._overturn_level == 2 or
@@ -12145,8 +12369,12 @@ class BattleRuntime(object):
             self._run_optional_feature(
                 'engine RPM presentation', self._publish_rpm,
                 (self._clock(),))
-        self._input_accumulator += dt
-        if self._input_accumulator >= NETWORK_INPUT_SECONDS:
+        if self._local_input_sent_during_drive:
+            self._input_accumulator = 0.0
+        else:
+            self._input_accumulator += dt
+        if (not self._local_input_sent_during_drive and
+                self._input_accumulator >= NETWORK_INPUT_SECONDS):
             # Preserve the nominal 30 Hz phase at render rates that are not a
             # multiple of 30.  Do not burst stale samples after a slow frame.
             self._input_accumulator %= NETWORK_INPUT_SECONDS

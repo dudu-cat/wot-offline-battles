@@ -939,15 +939,24 @@ class PortConfigTests(unittest.TestCase):
 
 
 class _Vector3(object):
-    def __init__(self, x, y, z):
+    def __init__(self, x=0.0, y=None, z=None):
+        if y is None and z is None and hasattr(x, 'x'):
+            x, y, z = x.x, x.y, x.z
+        elif y is None and z is None:
+            y = z = x
         self.x = x
         self.y = y
         self.z = z
 
+    @property
+    def length(self):
+        return (self.x * self.x + self.y * self.y +
+                self.z * self.z) ** 0.5
+
 
 class _Matrix(object):
-    def __init__(self):
-        self.translation = None
+    def __init__(self, other=None):
+        self.translation = getattr(other, 'translation', None)
 
     def setRotateYPR(self, value):
         self.rotation = value
@@ -2697,6 +2706,24 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def getSpeed(self):
                 return getattr(self, 'native_speed', 0.0)
 
+            def __collideSegment(self, start_point, end_point,
+                                 skip_gun=False, only_nearest=True):
+                unused_only_nearest = only_nearest
+                if not self.filter.segmentMayHitEntity(
+                        start_point, end_point, skip_gun):
+                    return None
+                return ('visible-hit',)
+
+            def collideSegment(self, start_point, end_point, skip_gun=False,
+                               optimized=True):
+                self.native_collide_args = (skip_gun, optimized)
+                return self.__collideSegment(
+                    start_point, end_point, skip_gun, True)
+
+            def collideSegmentExt(self, start_point, end_point):
+                return self.__collideSegment(
+                    start_point, end_point, False, False)
+
         class CompoundAppearance(object):
             def __init__(self, vehicle_filter):
                 self._CompoundAppearance__filter = vehicle_filter
@@ -2843,6 +2870,24 @@ class OfflineCompatibilityTests(unittest.TestCase):
             def getAvatarOwnVehicleStabilisedMatrix(self, vehicle):
                 return vehicle.filter.interpolateStabilisedMatrix(123.0)
 
+            def predictLockedTargetShotPoint(self):
+                target = bigworld.player().autoAimVehicle
+                return target.position, target.matrix
+
+        def segment_may_hit_entity(entity, start_point, end_point):
+            return entity.filter.segmentMayHitEntity(
+                start_point, end_point, 1)
+
+        def visible_vehicle_collision(
+                vehicle, matrix, start_point, end_point, math_module):
+            vehicle.visible_collision_calls.append(
+                (matrix, start_point, end_point, math_module))
+            return list(vehicle.visible_collisions)
+
+        remote_vehicle_module = __import__(
+            'gui.mods.offline_lan_0922.entities.remote_vehicle',
+            fromlist=['_RemoteFilter'])
+
         marker_damage_types = types.SimpleNamespace(
             FROM_UNKNOWN='from-unknown', FROM_PLAYER='from-player',
             FROM_SQUAD='from-squad', FROM_ALLY='from-ally',
@@ -2943,8 +2988,13 @@ class OfflineCompatibilityTests(unittest.TestCase):
             login_status=statuses,
             offline_map_creator=_OfflineMapCreator(operations),
             player_events=player_events,
+            projectile_mover_module=types.SimpleNamespace(
+                segmentMayHitEntity=segment_may_hit_entity),
             predefined_hosts=_Hosts(existing_hosts, host_failure),
             prb_loader=_PrbLoader(operations),
+            remote_filter_type=remote_vehicle_module._RemoteFilter,
+            segment_collision_result_type=(
+                remote_vehicle_module._SegmentCollisionResult),
             sound_groups_module=types.SimpleNamespace(
                 g_instance=sound_groups),
             sniper_camera_type=SniperCamera,
@@ -2954,12 +3004,13 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 SteadyVehicleMatrixCalculator),
             constants=types.SimpleNamespace(
                 AIMING_MODE=types.SimpleNamespace(TARGET_LOCK='target-lock')),
-            math=types.SimpleNamespace(Vector3=_Vector3),
+            math=types.SimpleNamespace(Vector3=_Vector3, Matrix=_Matrix),
             vehicle_module=types.SimpleNamespace(Vehicle=Vehicle),
             vehicle_marker_plugin_type=VehicleMarkerPlugin,
             vehicle_marker_damage_type=marker_damage_types,
             vehicle_gun_rotator=types.SimpleNamespace(
-                VehicleGunRotator=VehicleGunRotator))
+                VehicleGunRotator=VehicleGunRotator),
+            visible_vehicle_collision=visible_vehicle_collision)
         return runtime, operations
 
     def test_connects_account_in_native_event_order_and_disconnects_once(self):
@@ -3149,6 +3200,83 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual('native-matrix', vehicle.matrix)
         self.assertEqual(2.0, vehicle.getSpeed())
         compatibility.fini()
+
+    def test_native_remote_aim_collides_at_the_one_visible_pose(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        vehicle_type = runtime.vehicle_module.Vehicle
+        original_collide = vehicle_type.__dict__['collideSegment']
+        original_collide_ext = vehicle_type.__dict__['collideSegmentExt']
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+
+        vehicle = vehicle_type()
+        vehicle._offlineNativeRemote = True
+        native_filter = mock.Mock()
+        native_filter.segmentMayHitEntity.return_value = False
+        vehicle.filter = native_filter
+        vehicle.visible_collision_calls = []
+        visible_matrix = _Matrix()
+        visible_position = _Vector3(100.0, 2.0, 3.0)
+        visible_matrix.translation = visible_position
+        raw_position = _Vector3(0.0, 0.0, 0.0)
+        vehicle.position = raw_position
+        vehicle.matrix = _Matrix()
+        result_ext_type = __import__(
+            'gui.mods.offline_lan_0922.entities.remote_vehicle',
+            fromlist=['_SegmentCollisionResultExt']
+        )._SegmentCollisionResultExt
+        gun_material = types.SimpleNamespace(armor=25.0)
+        hull_material = types.SimpleNamespace(armor=75.0)
+        vehicle.visible_collisions = [
+            result_ext_type(0.8, 0.7, gun_material, 'vehicleGun'),
+            result_ext_type(0.4, 0.9, hull_material, 'vehicleHull')]
+        start = _Vector3(90.0, 2.0, 3.0)
+        end = _Vector3(110.0, 2.0, 3.0)
+
+        compatibility.configure_battle()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, raw_position, 0.0, visible_matrix, 0.0, 0.0,
+            _Vector3(0.0, 0.0, 0.0))
+
+        self.assertTrue(
+            runtime.projectile_mover_module.segmentMayHitEntity(
+                vehicle, start, end))
+        native_filter.segmentMayHitEntity.assert_not_called()
+        nearest = vehicle.collideSegment(
+            start, end, skipGun=True, optimized=False)
+        self.assertEqual((0.4, 0.9, 75.0), tuple(nearest))
+        extended = vehicle.collideSegmentExt(start, end)
+        self.assertEqual([0.4, 0.8], [item.dist for item in extended])
+        self.assertTrue(vehicle.visible_collision_calls)
+        self.assertTrue(all(
+            call[0] is visible_matrix
+            for call in vehicle.visible_collision_calls))
+
+        avatar = runtime.avatar_module.PlayerAvatar()
+        avatar.autoAimVehicle = vehicle
+        runtime.bigworld._player = avatar
+        rotator = runtime.vehicle_gun_rotator.VehicleGunRotator()
+        predicted_position, predicted_matrix = \
+            rotator.predictLockedTargetShotPoint()
+        self.assertIs(visible_position, predicted_position)
+        self.assertIs(visible_matrix, predicted_matrix)
+        self.assertIs(raw_position, vehicle.position)
+
+        vehicle._offlineNativeRemote = False
+        self.assertIsNone(vehicle.collideSegment(
+            start, end, skipGun=True, optimized=False))
+        self.assertEqual((True, False), vehicle.native_collide_args)
+        vehicle._offlineNativeRemote = True
+        vehicle.visible_collisions = []
+        self.assertIsNone(vehicle.collideSegment(start, end))
+        self.assertIsNone(vehicle.collideSegmentExt(start, end))
+
+        compatibility.fini()
+        self.assertIs(
+            original_collide, vehicle_type.__dict__['collideSegment'])
+        self.assertIs(
+            original_collide_ext, vehicle_type.__dict__['collideSegmentExt'])
 
     def test_offline_avatar_speed_boundary_uses_copied_pose_overlay(self):
         compatibility_module = _load_port_source('compat')
