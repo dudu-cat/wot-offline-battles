@@ -4456,6 +4456,86 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         self.assertEqual([37, 38], [call[2] for call in calls])
 
+    def test_catalog_commit_receipt_covers_swept_ahead_proposal(self):
+        destructibles_sensor.xrange = range
+        filename = 'content/GatesAndFences/test/normal/lod0/fence.model'
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-0.25, -0.2, -0.1, 0.25, 1.5, 0.1, None]],
+            },
+        }))
+        record = destructibles_sensor._destructible_catalog[
+            'resources'][filename.lower()]
+        boxes = destructibles_sensor._world_catalog_boxes(
+            record, _ItemMatrix(_Vector(0.0, 0.0, 4.0)), _Vector(),
+            types.SimpleNamespace(Vector3=_Vector))
+        instance = {
+            'filename': filename.lower(), 'kind': 'fragile',
+            'boxes': boxes, 'item_scale': 1.0,
+        }
+        destructibles_sensor.g_offh_destr_instances = {(22, 37): instance}
+        destructibles_sensor.g_offh_destr_contact_bins = {}
+        destructibles_sensor._index_catalog_instance_1513(
+            destructibles_sensor.g_offh_destr_contact_bins,
+            (22, 37), instance)
+
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = object()
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.DESTRUCTIBLE_HIDING_DELAY = 0.2
+        area.g_cache = types.SimpleNamespace(
+            unitVehicleMass=10000.0,
+            getDescByFilename=lambda unused: {
+                'type': 3, 'health': 5,
+                'kineticDamageCorrection': 1.0})
+        cache = types.ModuleType('DestructiblesCache')
+        cache.scaledDestructibleHealth = lambda scale, health: scale * health
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        descriptor = _Strict1513Component(
+            physics={'weight': 40000.0},
+            hull=_Strict1513Component(
+                hitTester=types.SimpleNamespace(bbox=(
+                    (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
+        destroyed = set()
+
+        def destroy_fragile(unused_space, chunk, item, unused_point,
+                             unused_is_shot):
+            destroyed.add((chunk, item, None))
+            return True
+
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda chunk, item, mat=None: (
+                (chunk, item, mat) in destroyed),
+            destroy_fragile=destroy_fragile)
+        destructibles_sensor.set_event_sink(lambda unused: True)
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'DestructiblesCache': cache,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            proposal = destructibles_sensor._catalog_motion_proposal(
+                1, _Vector(), 0.0, 20.0, descriptor, 10.0,
+                dt=0.001, kinetic_speed=20.0)
+            committed = destructibles_sensor._catalog_motion_blocked(
+                1, _Vector(), 0.0, 20.0, descriptor, 10.0,
+                dt=0.001, kinetic_speed=20.0, return_detail=True,
+                kinetic_commit=True, commit_enabled=True)
+
+        self.assertEqual('crushed', proposal['status'])
+        self.assertEqual(((22, 37, None),), proposal['token'])
+        self.assertTrue(proposal['requires_commit'])
+        self.assertEqual('crushed', committed['status'])
+        self.assertEqual(proposal['token'], committed['token'])
+        self.assertTrue(committed['accepted_now'])
+
     def test_remote_destroy_note_blocks_then_releases_synthetic_contact(self):
         area = types.ModuleType('AreaDestructibles')
         area.DESTRUCTIBLE_HIDING_DELAY = 0.2

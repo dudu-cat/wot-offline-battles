@@ -1864,6 +1864,13 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 				raise RuntimeError(
 					'native catalog contact destroy was not accepted: '
 					'chunk=%s item=%s' % (chunk_id, item_index))
+			# A proposal includes every candidate that it asks authority to
+			# commit, including the narrow swept-ahead strip beyond the exact
+			# leading-face box.  Return the same identity after a successful
+			# native commit: the mutation itself is the authoritative receipt.
+			# Without this, the worker destroys the prop but reports an empty or
+			# partial token and the visible client rolls back through the gap.
+			exact_token.add((chunk_id, item_index, mat_kind))
 			note_destroyed(
 				event_kind, chunk_id, item_index, mat_kind, now)
 			_publish_destroyed(

@@ -68,6 +68,9 @@ _DUMP_FILENAMES = {
 _SESSION_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 _CHUNK_BYTES = 64 * 1024
 _DUMP_MONITOR_SLOTS = 32
+_VISIBLE_CLIENT_CLEAN_EXIT_SUFFIX = (
+    b": INFO: PostProcessing.Phases.fini()")
+_VISIBLE_CLIENT_EXIT_TAIL_BYTES = 4096
 
 
 def _application_directory():
@@ -579,6 +582,44 @@ def _open_valid_source(session, role, source):
     except Exception:
         stream.close()
         return None
+
+
+def visible_client_exited_cleanly(session):
+    """Return whether this session's client log has a clean final trailer."""
+    if not isinstance(session, dict) or not _is_latest(session):
+        return False
+    try:
+        dump_directory, dump_paths = _recorded_dump_layout(session)
+        if (not _safe_dump_directory(dump_directory, create=False) or
+                os.path.lexists(dump_paths[ROLE_VISIBLE_CLIENT])):
+            return False
+    except (core.LauncherError, IOError, OSError):
+        return False
+    sources = session.get("sources")
+    if not isinstance(sources, dict):
+        return False
+    source = sources.get(ROLE_VISIBLE_CLIENT)
+    if not isinstance(source, dict):
+        return False
+    try:
+        opened = _open_valid_source(session, ROLE_VISIBLE_CLIENT, source)
+    except Exception:
+        return False
+    if opened is None:
+        return False
+    stream, length = opened
+    try:
+        tail_length = min(int(length), _VISIBLE_CLIENT_EXIT_TAIL_BYTES)
+        stream.seek(int(length) - tail_length, os.SEEK_CUR)
+        payload = stream.read(tail_length)
+        if len(payload) != tail_length:
+            return False
+        return payload.rstrip(b"\r\n\t ").endswith(
+            _VISIBLE_CLIENT_CLEAN_EXIT_SUFFIX)
+    except (IOError, OSError, ValueError):
+        return False
+    finally:
+        stream.close()
 
 
 def _open_valid_dump(session, role):

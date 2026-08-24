@@ -1042,8 +1042,21 @@ class LauncherWindow(object):
             exit_code = process.poll()
         except Exception:
             return None
-        if (exit_code not in (None, 0) and
-                role not in self._forced_stop_roles):
+        return self._remember_process_exit(exit_code, role)
+
+    def _remember_process_exit(self, exit_code, role):
+        if (exit_code in (None, 0) or
+                role in self._forced_stop_roles):
+            return exit_code
+        clean_visible_exit = False
+        if role == error_reports.ROLE_VISIBLE_CLIENT:
+            try:
+                clean_visible_exit = (
+                    error_reports.visible_client_exited_cleanly(
+                        self._active_report_session))
+            except Exception:
+                clean_visible_exit = False
+        if not clean_visible_exit:
             self._observed_crash_roles.add(role)
         return exit_code
 
@@ -1825,11 +1838,8 @@ class LauncherWindow(object):
         finally:
             self._game = None
             self._game_starter_root = None
-        if (exit_code not in (None, 0) and
-                error_reports.ROLE_VISIBLE_CLIENT not in
-                self._forced_stop_roles):
-            self._observed_crash_roles.add(
-                error_reports.ROLE_VISIBLE_CLIENT)
+        self._remember_process_exit(
+            exit_code, error_reports.ROLE_VISIBLE_CLIENT)
         crashed = (error_reports.ROLE_VISIBLE_CLIENT in
                    self._observed_crash_roles)
         if crashed:

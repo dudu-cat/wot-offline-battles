@@ -114,6 +114,40 @@ class ErrorReportTest(unittest.TestCase):
                 core.LauncherError, "No earlier session was included"):
             error_reports.create_report()
 
+    def test_clean_visible_exit_marker_must_end_this_session_log(self):
+        visible = self._game_log(error_reports.ROLE_VISIBLE_CLIENT)
+        marker = (
+            b"2026-08-24 13:38:12.444: INFO: "
+            b"PostProcessing.Phases.fini()\r\n")
+        self._write(visible, marker)
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+
+        self._write(visible, b"current session still running\r\n", "ab")
+        self.assertFalse(
+            error_reports.visible_client_exited_cleanly(session))
+
+        self._write(visible, marker, "ab")
+        self.assertTrue(
+            error_reports.visible_client_exited_cleanly(session))
+
+        self._write(visible, b"late failure\r\n", "ab")
+        self.assertFalse(
+            error_reports.visible_client_exited_cleanly(session))
+
+    def test_visible_dump_overrides_a_clean_exit_log_trailer(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT),
+            b"2026-08-24 13:38:12.444: INFO: "
+            b"PostProcessing.Phases.fini()\r\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), b"crash dump")
+
+        self.assertFalse(
+            error_reports.visible_client_exited_cleanly(session))
+
     def test_partial_single_player_report_names_missing_current_logs(self):
         session = error_reports.begin_session(
             self.game, needs_worker=True, local_server=True,

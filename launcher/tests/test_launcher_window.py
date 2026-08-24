@@ -1686,6 +1686,33 @@ class WindowTest(unittest.TestCase):
         self.assertIn("exit code 1", self._log_text())
         self.assertIn("The game closed.", self._log_text())
 
+    def test_paired_player_clean_log_makes_nonzero_starter_exit_normal(self):
+        boundary = wot_launcher.error_reports.begin_session(
+            self.settings_dir,
+            session_id="20260823T120000Z-444444444444")
+        self.window._active_report_session = boundary
+        game = _Process(exit_code=None)
+        worker = _Process(exit_code=None)
+        self.window._worker = worker
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(1, False)), \
+                mock.patch.object(
+                    wot_launcher.error_reports,
+                    "visible_client_exited_cleanly",
+                    return_value=True) as clean_exit:
+            self.assertFalse(self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True))
+
+        clean_exit.assert_called_once_with(boundary)
+        self.assertNotIn(
+            wot_launcher.error_reports.ROLE_VISIBLE_CLIENT,
+            self.window._observed_crash_roles)
+        self.assertNotIn("exit code 1", self._log_text())
+
     def test_paired_player_logs_worker_failure(self):
         game = _Process(exit_code=None)
         worker = _Process(exit_code=9)
