@@ -153,6 +153,10 @@ def _human_profiles(players):
         'vehicle': player['vehicle'],
         'mass': 25000.0,
         'shape': [1.5, 3.5, -0.8, 1.6],
+        'ram_profile': {
+            'spall_coefficient': 1.0,
+            'ramming_bonus': 0.0,
+        },
     } for player in players]
 
 

@@ -570,6 +570,10 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 {
                     'id': player.player_id, 'vehicle': player.vehicle,
                     'mass': 10000.0, 'shape': [3.0, 6.0, -1.0, 2.0],
+                    'ram_profile': {
+                        'spall_coefficient': 1.0,
+                        'ramming_bonus': 0.0,
+                    },
                 }
                 for player in state.players.values()
             ]}))
