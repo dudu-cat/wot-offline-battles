@@ -313,6 +313,30 @@ def _valid_player_siege_contract(player):
             (state in (0, 2) and time_left == 0))
 
 
+def _valid_stun_contract(vehicle):
+    if not isinstance(vehicle, dict):
+        return False
+    names = (
+        'stun_end_server_time_ms', 'stun_attacker_kind',
+        'stun_attacker_id')
+    present = tuple(name in vehicle for name in names)
+    if not any(present):
+        return True
+    if not all(present):
+        return False
+    end = _projectile_int_range(
+        vehicle.get('stun_end_server_time_ms'), 0, MAX_PROJECTILE_ID)
+    attacker_id = _projectile_int_range(
+        vehicle.get('stun_attacker_id'), 0, MAX_PROJECTILE_ID)
+    attacker_kind = vehicle.get('stun_attacker_kind')
+    if end is None or attacker_id is None:
+        return False
+    return bool(
+        (end == 0 and attacker_kind == '' and attacker_id == 0) or
+        (end > 0 and attacker_kind in ('player', 'bot') and
+         attacker_id > 0))
+
+
 def _exact_finite_float(value, default=None):
     if isinstance(value, bool):
         return default
@@ -720,9 +744,10 @@ def _strict_projectile_effect(value):
     critical_fields = frozenset((
         'critical', 'critical_target_base_revision',
         'critical_target_ack_seq', 'hull_damage'))
+    stun_fields = frozenset(('stun_end_server_time_ms',))
     keys = set(value)
     if not required.issubset(keys) or not keys.issubset(
-            required | critical_fields):
+            required | critical_fields | stun_fields):
         return None
     kind = value.get('target_kind')
     target_id = _projectile_int_range(
@@ -736,11 +761,14 @@ def _strict_projectile_effect(value):
             -1000.0 if axis == 'y' else -MAX_PROJECTILE_ORIGIN,
             3000.0 if axis == 'y' else MAX_PROJECTILE_ORIGIN))
     has_critical = 'critical' in value
+    has_stun = 'stun_end_server_time_ms' in value
+    expected = (required |
+                (critical_fields if has_critical else frozenset()) |
+                (stun_fields if has_stun else frozenset()))
     if (kind not in ('player', 'bot') or target_id is None or
             damage is None or shot_result is None or
             any(component is None for component in position) or
-            (has_critical and keys != required | critical_fields) or
-            (not has_critical and keys != required)):
+            keys != expected):
         return None
     result = {
         'target_kind': kind,
@@ -768,6 +796,12 @@ def _strict_projectile_effect(value):
         result['critical_target_base_revision'] = base_revision
         result['critical_target_ack_seq'] = ack_seq
         result['hull_damage'] = hull_damage
+    if has_stun:
+        stun_end = _projectile_int_range(
+            value.get('stun_end_server_time_ms'), 1, MAX_PROJECTILE_ID)
+        if stun_end is None:
+            return None
+        result['stun_end_server_time_ms'] = stun_end
     return result
 
 
@@ -3302,8 +3336,12 @@ class LANClient(object):
             player_gun_checkpoint_contract = all(
                 _valid_player_gun_checkpoint_contract(player)
                 for player in players or ())
+            player_stun_contract = all(
+                _valid_stun_contract(player) for player in players or ())
             bot_combat_contract = all(
                 _valid_bot_combat_contract(bot) for bot in bots or ())
+            bot_stun_contract = all(
+                _valid_stun_contract(bot) for bot in bots or ())
             ledger_required = self.has_projectile_ledger()
             previous_bot_state_revision = None
             previous_snapshot = None
@@ -3392,8 +3430,12 @@ class LANClient(object):
                 invalid_reasons.append('player_siege')
             if not player_gun_checkpoint_contract:
                 invalid_reasons.append('player_gun_checkpoint')
+            if not player_stun_contract:
+                invalid_reasons.append('player_stun')
             if not bot_combat_contract:
                 invalid_reasons.append('bot_combat')
+            if not bot_stun_contract:
+                invalid_reasons.append('bot_stun')
             if 'bot_manifest' in message and manifest is None:
                 invalid_reasons.append('bot_manifest')
             if ('bot_manifest' not in message and

@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 
 from gui.mods.offline_lan_0922.lan_client import (
     HUMAN_RAM_TIMELINE_CAPABILITY, LANClient,
-    LEAN_SNAPSHOT_MANIFEST_CAPABILITY, project_bot_state)
+    LEAN_SNAPSHOT_MANIFEST_CAPABILITY, _strict_projectile_effect,
+    project_bot_state)
 from gui.mods.offline_lan_0922.authority_worker import (
     AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
@@ -118,6 +119,20 @@ class LanProtocolTests(unittest.TestCase):
             [], human_ram_armors=[dict(result, unexpected=True)]))
         self.assertFalse(worker.send_projected_bot_state(
             [], human_ram_armors=[dict(result, first_id=2, second_id=1)]))
+
+    def test_projectile_effect_carries_only_an_exact_stun_end_time(self):
+        effect = {
+            'target_kind': 'bot', 'target_id': 7,
+            'damage': 0, 'shot_result': 2,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'stun_end_server_time_ms': 22000,
+        }
+
+        self.assertEqual(effect, _strict_projectile_effect(effect))
+        self.assertIsNone(_strict_projectile_effect(dict(
+            effect, stun_end_server_time_ms=True)))
+        self.assertIsNone(_strict_projectile_effect(dict(
+            effect, stun_duration_ms=7000)))
 
     def test_siege_request_is_an_exact_boolean_input_field(self):
         self.assertTrue(self.client.send_input(
@@ -524,7 +539,8 @@ class LanProtocolTests(unittest.TestCase):
             'actor_kind', 'actor_id', 'team', 'shots_fired', 'shots_hit',
             'shots_penetrated', 'damage_dealt', 'damage_received',
             'damage_blocked', 'damage_assisted_track',
-            'damage_assisted_radio', 'kills'}, set(rows[1]))
+            'damage_assisted_radio', 'damage_assisted_stun',
+            'kills'}, set(rows[1]))
         for row in rows.values():
             self.assertTrue(all(key == key.lower() and key.isidentifier()
                                 for key in row))

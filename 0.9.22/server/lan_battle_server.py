@@ -1422,6 +1422,9 @@ class Player(_EndpointSendMixin):
     team_killer: bool = False
     death_attacker_kind: str = ""
     death_attacker_id: int = 0
+    stun_end_server_time_ms: int = 0
+    stun_attacker_kind: str = ""
+    stun_attacker_id: int = 0
     client_position: bool = False
     ram_contact_seq: int = 0
     ram_contact_resolved_seq: int = 0
@@ -2434,6 +2437,9 @@ class BattleState:
             player.team_killer = False
             player.death_attacker_kind = ""
             player.death_attacker_id = 0
+            player.stun_end_server_time_ms = 0
+            player.stun_attacker_kind = ""
+            player.stun_attacker_id = 0
             player.participating = True
             player.forward = 0.0
             player.turn = 0.0
@@ -4339,6 +4345,15 @@ class BattleState:
                 "fire_attacker_kind", "")),
             "fire_attacker_id": int((previous or {}).get(
                 "fire_attacker_id", 0)),
+            # The hidden worker may resolve a canonical stun edge through the
+            # projectile ledger, but its periodic Bot publication never owns
+            # this durable state. Preserve only the server-admitted value.
+            "stun_end_server_time_ms": int((previous or {}).get(
+                "stun_end_server_time_ms", 0)),
+            "stun_attacker_kind": str((previous or {}).get(
+                "stun_attacker_kind", "")),
+            "stun_attacker_id": int((previous or {}).get(
+                "stun_attacker_id", 0)),
         }
         if reload_progress is not None:
             result["reload_time"], result["reload_duration"] = \
@@ -4489,7 +4504,9 @@ class BattleState:
                     "death_attacker_id", "combat_revision",
                     "combat_base_revision", "combat_ack_seq",
                     "combat_fire_elapsed", "combat_fire_timer",
-                    "fire_attacker_kind", "fire_attacker_id"):
+                    "fire_attacker_kind", "fire_attacker_id",
+                    "stun_end_server_time_ms", "stun_attacker_kind",
+                    "stun_attacker_id"):
             if key in source:
                 value = source[key]
                 target[key] = dict(value) if isinstance(value, dict) else value
@@ -5711,12 +5728,13 @@ class BattleState:
                 self.projectile_revision += 1
             return True
 
-    def _normalize_projectile_effect(self, raw, record, impact, splash):
+    def _normalize_projectile_effect(
+            self, raw, record, impact, splash, allow_stun=False):
         allowed = {
             "target_kind", "target_id", "damage", "shot_result",
             "x", "y", "z", "critical",
             "critical_target_base_revision", "critical_target_ack_seq",
-            "hull_damage", "potential_damage",
+            "hull_damage", "potential_damage", "stun_end_server_time_ms",
         }
         required = {
             "target_kind", "target_id", "damage", "shot_result",
@@ -5779,6 +5797,15 @@ class BattleState:
         elif set(raw) & {"critical_target_base_revision",
                          "critical_target_ack_seq", "hull_damage"}:
             raise ValueError("critical tokens without critical payload")
+        stun_end_server_time_ms = 0
+        if "stun_end_server_time_ms" in raw:
+            if not allow_stun:
+                raise ValueError("stun result needs internal authority")
+            stun_end_server_time_ms = _exact_int(
+                raw.get("stun_end_server_time_ms"),
+                self._server_time_ms() + 1,
+                int(round((PREBATTLE_SECONDS + BATTLE_DURATION_SECONDS) *
+                          1000.0)))
         return {
             "target_kind": target_kind, "target_id": target_id,
             "target": target, "target_team": target_team,
@@ -5788,6 +5815,7 @@ class BattleState:
             "critical": critical,
             "critical_accepted": critical_accepted,
             "hull_damage": hull_damage, "splash": bool(splash),
+            "stun_end_server_time_ms": stun_end_server_time_ms,
         }
 
     def _apply_projectile_effect(self, record, proposal):
@@ -5939,6 +5967,10 @@ class BattleState:
                 record["shooter_kind"], record["shooter_id"],
                 proposal["target_team"], target_kind, target_id,
                 attacker_team=int(record["team"]))
+            self._clear_vehicle_stun(victim)
+        elif proposal["stun_end_server_time_ms"]:
+            self._set_canonical_stun(
+                shooter, victim, proposal["stun_end_server_time_ms"])
 
     def resolve_projectile(self, player_id, message):
         """Validate one whole terminal effect batch before applying any HP."""
@@ -6064,11 +6096,14 @@ class BattleState:
                         (outcome != "impact" or not hit_vehicle or
                          direct_raw is not None)):
                     raise ValueError("wreck impact contract is inconsistent")
+                allow_stun = self._trusted_internal_projectile_authority(
+                    player_id)
                 direct = (self._normalize_projectile_effect(
-                    direct_raw, record, impact, False)
+                    direct_raw, record, impact, False, allow_stun)
                           if direct_raw is not None else None)
                 splash = [self._normalize_projectile_effect(
-                    raw, record, impact, True) for raw in splash_raw]
+                    raw, record, impact, True, allow_stun)
+                    for raw in splash_raw]
                 target_keys = []
                 if direct is not None:
                     target_keys.append((direct["target_kind"],
@@ -8182,6 +8217,115 @@ class BattleState:
         state = self.bot_states.get(int(vehicle_id))
         return int(state.get("team", 0)) if state is not None else 0
 
+    def _vehicle_stun_state(self, target):
+        kind, vehicle_id = str(target[0]), int(target[1])
+        if kind == "player":
+            vehicle = self.players.get(vehicle_id)
+            if vehicle is None:
+                return None
+            return {
+                "end": int(vehicle.stun_end_server_time_ms),
+                "attacker_kind": str(vehicle.stun_attacker_kind),
+                "attacker_id": int(vehicle.stun_attacker_id),
+                "alive": bool(vehicle.alive),
+            }
+        if kind != "bot":
+            return None
+        vehicle = self.bot_states.get(vehicle_id)
+        if vehicle is None:
+            return None
+        return {
+            "end": int(vehicle.get("stun_end_server_time_ms", 0)),
+            "attacker_kind": str(vehicle.get("stun_attacker_kind", "")),
+            "attacker_id": int(vehicle.get("stun_attacker_id", 0)),
+            "alive": bool(vehicle.get("alive")),
+        }
+
+    def _write_vehicle_stun(self, target, end, attacker):
+        kind, vehicle_id = str(target[0]), int(target[1])
+        attacker_kind = str(attacker[0]) if attacker is not None else ""
+        attacker_id = int(attacker[1]) if attacker is not None else 0
+        if kind == "player":
+            vehicle = self.players.get(vehicle_id)
+            if vehicle is None:
+                return False
+            vehicle.stun_end_server_time_ms = int(end)
+            vehicle.stun_attacker_kind = attacker_kind
+            vehicle.stun_attacker_id = attacker_id
+            return True
+        if kind != "bot":
+            return False
+        vehicle = self.bot_states.get(vehicle_id)
+        if vehicle is None:
+            return False
+        vehicle["stun_end_server_time_ms"] = int(end)
+        vehicle["stun_attacker_kind"] = attacker_kind
+        vehicle["stun_attacker_id"] = attacker_id
+        return True
+
+    def _set_canonical_stun(self, attacker, target, end_server_time_ms):
+        """Carry one internal projectile resolver's final stun state.
+
+        The resolver owns duration and overlap semantics. This layer only
+        stores the supplied round-relative end time and publishes it.
+        """
+        end_server_time_ms = _exact_int(
+            end_server_time_ms, self._server_time_ms() + 1,
+            int(round((PREBATTLE_SECONDS + BATTLE_DURATION_SECONDS) *
+                      1000.0)))
+        state = self._vehicle_stun_state(target)
+        if state is None or not state["alive"]:
+            return False
+        attacker = (str(attacker[0]), int(attacker[1]))
+        if self._vehicle_team(*attacker) not in (1, 2):
+            return False
+        if not self._write_vehicle_stun(target, end_server_time_ms, attacker):
+            return False
+        self.pending_events.append({
+            "kind": "stun", "active": True,
+            "target_kind": str(target[0]), "target_id": int(target[1]),
+            "attacker_kind": attacker[0], "attacker_id": attacker[1],
+            "stun_end_server_time_ms": end_server_time_ms,
+        })
+        return True
+
+    def _clear_vehicle_stun(self, target):
+        state = self._vehicle_stun_state(target)
+        if state is None or not state["end"]:
+            return False
+        if not self._write_vehicle_stun(target, 0, None):
+            return False
+        self.pending_events.append({
+            "kind": "stun", "active": False,
+            "target_kind": str(target[0]), "target_id": int(target[1]),
+            "stun_end_server_time_ms": 0,
+        })
+        return True
+
+    def _expire_stuns(self, now_ms=None):
+        now = (self._server_time_ms() if now_ms is None else
+               _exact_int(now_ms, 0))
+        targets = [("player", player_id)
+                   for player_id in sorted(self.players)]
+        targets.extend(("bot", bot_id) for bot_id in sorted(self.bot_states))
+        expired = 0
+        for target in targets:
+            state = self._vehicle_stun_state(target)
+            if (state is not None and state["end"] and
+                    (not state["alive"] or state["end"] <= now) and
+                    self._clear_vehicle_stun(target)):
+                expired += 1
+        return expired
+
+    def _active_stun_assister(self, target):
+        state = self._vehicle_stun_state(target)
+        if (state is None or not state["end"] or
+                state["end"] <= self._server_time_ms() or
+                state["attacker_kind"] not in ("player", "bot") or
+                state["attacker_id"] <= 0):
+            return None
+        return state["attacker_kind"], state["attacker_id"]
+
     def _statistics_row(self, kind, vehicle_id):
         """Return this round's mutable statistics row for one vehicle."""
         key = (str(kind), int(vehicle_id))
@@ -8193,7 +8337,8 @@ class BattleState:
                 "shots_fired": 0, "shots_hit": 0, "shots_penetrated": 0,
                 "damage_dealt": 0, "damage_received": 0,
                 "damage_blocked": 0, "damage_assisted_track": 0,
-                "damage_assisted_radio": 0, "kills": 0,
+                "damage_assisted_radio": 0, "damage_assisted_stun": 0,
+                "kills": 0,
             }
             self.vehicle_statistics[key] = row
         elif not row["team"]:
@@ -8342,6 +8487,10 @@ class BattleState:
                 self._vehicle_team(*holder) != target_team and
                 _destroyed_tracks(target_critical)):
             credits.append(("track", holder))
+        holder = self._active_stun_assister(target)
+        if (holder is not None and holder != attacker and
+                self._vehicle_team(*holder) != target_team):
+            credits.append(("stun", holder))
         credits.extend(
             ("radio", assister) for assister in
             self._radio_assisters(attacker, target, target_team))
@@ -9180,6 +9329,12 @@ class BattleState:
                     [self._public_player(p, include_outfits=False)
                      for p in self.players.values() if p.connected],
                     time.monotonic(), self._bot_defense_context())
+            tick_server_time_ms = None
+            if self.client_build == CLIENT_BUILD_0922:
+                # Freeze the one current clock sample shared by this tick's
+                # durable state, ordered events and expiration edges.
+                tick_server_time_ms = self._server_time_ms()
+                self._expire_stuns(tick_server_time_ms)
             events = []
             for ordinal, pending in enumerate(self.pending_events):
                 self._validate_combat_event_for_wire(pending)
@@ -9188,13 +9343,12 @@ class BattleState:
                     self.round_id, self.tick, ordinal)
                 events.append(event)
             self.pending_events = []
-            tick_server_time_ms = None
             if self.client_build == CLIENT_BUILD_0922:
                 # Events and the snapshot published by one simulation tick
-                # share one current clock sample.  Reusing a prior snapshot's
-                # time would make delayed projectile tracers start at the
-                # wrong point on their authoritative trajectory.
-                tick_server_time_ms = self._server_time_ms()
+                # share the current clock sample frozen above. Reusing a prior
+                # snapshot's time would make delayed projectile tracers start
+                # at the wrong point on their authoritative trajectory.
+                assert tick_server_time_ms is not None
             snapshot = {
                 "type": "snapshot",
                 "protocol": PROTOCOL_VERSION,
@@ -9406,6 +9560,10 @@ class BattleState:
             "team_killer": player.team_killer,
             "death_attacker_kind": player.death_attacker_kind,
             "death_attacker_id": player.death_attacker_id,
+            "stun_end_server_time_ms":
+                player.stun_end_server_time_ms,
+            "stun_attacker_kind": player.stun_attacker_kind,
+            "stun_attacker_id": player.stun_attacker_id,
             "critical_revision": player.critical_revision,
             "critical_base_revision":
                 player.critical_report_base_revision,

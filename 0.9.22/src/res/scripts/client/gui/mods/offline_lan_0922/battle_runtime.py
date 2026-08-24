@@ -116,7 +116,7 @@ _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
 # silently skipped authority event would desynchronise the battle.
 _SIMPLE_EVENT_KINDS = (
     'authority', 'bot_manifest', 'vehicle_statistics', 'destructible',
-    'projectile_impact', 'battle_result', 'assist')
+    'projectile_impact', 'battle_result', 'assist', 'stun')
 _COMBAT_EVENT_KINDS = (
     'health', 'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')
 _SHOT_OCCLUSION_EPSILON = 1.0e-3
@@ -6460,6 +6460,46 @@ class BattleRuntime(object):
         holder['state'] = self._combat_event_state(
             event, state, target_key)
 
+    @staticmethod
+    def _stun_entity_key(event):
+        kind = event.get('target_kind')
+        target = event.get('target_id')
+        if (kind not in ('player', 'bot') or isinstance(target, bool) or
+                not isinstance(target, _INTEGER_TYPES) or target <= 0):
+            raise RuntimeError('stun event has an invalid target identity')
+        return '%s:%d' % (kind, int(target))
+
+    def _merge_stun_event_state(self, event):
+        target_key = self._stun_entity_key(event)
+        holder, state = self._known_event_state(target_key)
+        active = event.get('active')
+        end = event.get('stun_end_server_time_ms')
+        if not isinstance(active, bool):
+            raise RuntimeError('stun event has an invalid active state')
+        if (isinstance(end, bool) or
+                not isinstance(end, _INTEGER_TYPES) or end < 0 or
+                active != (end > 0)):
+            raise RuntimeError('stun event has an invalid end time')
+        state = dict(state or {})
+        state['stun_end_server_time_ms'] = int(end)
+        if active:
+            attacker_kind = event.get('attacker_kind')
+            attacker_id = event.get('attacker_id')
+            if attacker_kind not in ('player', 'bot'):
+                raise RuntimeError(
+                    'stun event has an invalid attacker identity')
+            if (isinstance(attacker_id, bool) or
+                    not isinstance(attacker_id, _INTEGER_TYPES) or
+                    attacker_id <= 0):
+                raise RuntimeError(
+                    'stun event has an invalid attacker identity')
+            state['stun_attacker_kind'] = attacker_kind
+            state['stun_attacker_id'] = int(attacker_id)
+        else:
+            state['stun_attacker_kind'] = ''
+            state['stun_attacker_id'] = 0
+        holder['state'] = state
+
     def _prepare_ordered_event(self, event):
         kind = event.get('kind')
         if kind in _SHOT_EVENT_KINDS:
@@ -6470,6 +6510,8 @@ class BattleRuntime(object):
         elif kind in _COMBAT_EVENT_KINDS:
             self._validate_combat_event_contract(event)
             self._merge_combat_event_state(event)
+        elif kind == 'stun':
+            self._merge_stun_event_state(event)
         elif kind not in _SIMPLE_EVENT_KINDS:
             raise RuntimeError(
                 'ordered LAN event kind is unsupported: %s' % kind)
@@ -6517,6 +6559,15 @@ class BattleRuntime(object):
                     'ordered LAN event lost entity %s before apply' %
                     attacker_key)
             return self._record_is_event_ready(attacker_record)
+        if kind == 'stun':
+            target_key = self._stun_entity_key(event)
+            target_record = self._records.get(target_key)
+            if (target_record is None and
+                    target_key not in self._pending_bot_creates):
+                raise RuntimeError(
+                    'ordered LAN event lost entity %s before apply' %
+                    target_key)
+            return self._record_is_event_ready(target_record)
         return True
 
     _ASSIST_EVENT_TYPES = {
@@ -6589,6 +6640,11 @@ class BattleRuntime(object):
             self._apply_vehicle_statistics_event(event)
         elif kind == 'assist':
             self._apply_assist_event(event)
+        elif kind == 'stun':
+            target = self._records.get(self._stun_entity_key(event))
+            if target is None:
+                raise RuntimeError('stun event has no ready target')
+            self._apply_stun_state(target, target.get('state') or {})
         elif kind == 'destructible':
             self._apply_destructible_event(event)
         elif kind == 'projectile_impact':
@@ -14117,6 +14173,7 @@ class BattleRuntime(object):
         state = record.get('state') or {}
         if self._pending_combat_for_record(record):
             return True
+        self._apply_stun_state(record, state)
         critical = state.get('critical')
         if isinstance(critical, dict):
             self._apply_critical_state(record, critical, state)
@@ -14128,6 +14185,62 @@ class BattleRuntime(object):
         self._apply_health(
             record, state, self._death_attacker_engine_id(state),
             max(0, int(state.get('death_reason', 0) or 0)))
+        return True
+
+    def _apply_stun_state(self, record, state):
+        """Present the exact #1513 ``stunInfo`` absolute-time contract."""
+        end = state.get('stun_end_server_time_ms', 0)
+        if (isinstance(end, bool) or
+                not isinstance(end, _INTEGER_TYPES) or end < 0):
+            raise RuntimeError('LAN snapshot has an invalid stun end time')
+        attacker_kind = state.get('stun_attacker_kind', '')
+        attacker_id = state.get('stun_attacker_id', 0)
+        if end:
+            if (attacker_kind not in ('player', 'bot') or
+                    isinstance(attacker_id, bool) or
+                    not isinstance(attacker_id, _INTEGER_TYPES) or
+                    attacker_id <= 0):
+                raise RuntimeError(
+                    'LAN snapshot has an invalid stun attacker')
+        elif attacker_kind or attacker_id:
+            raise RuntimeError('cleared LAN stun retains an attacker')
+        signature = (int(end), str(attacker_kind), int(attacker_id))
+        # Vehicle construction already seeds stunInfo=0. Keep this additive
+        # snapshot field compatible with older peers and avoid replaying an
+        # initial no-op clear through the stock feedback adaptor.
+        if record.get('presented_stun_state') is None and not end:
+            record['presented_stun_state'] = signature
+            return False
+        if record.get('presented_stun_state') == signature:
+            return False
+        estimated = self._projectile_estimated_server_time(self._clock())
+        if end and estimated is None:
+            raise RuntimeError('LAN stun has no server-time anchor')
+        remaining = (max(0.0, (float(end) - float(estimated)) / 1000.0)
+                     if end else 0.0)
+        entity = self._server_entity(record['engine_id'])
+        if entity is None:
+            raise RuntimeError('stunned LAN vehicle is unavailable')
+        previous = getattr(entity, 'stunInfo', 0.0)
+        entity.stunInfo = (
+            self._server_clock() + remaining if remaining > 0.0 else 0.0)
+        if not self._worker_mode:
+            native_callback = getattr(entity, 'set_stunInfo', None)
+            if callable(native_callback):
+                # Stock Vehicle.updateStunInfo owns both attached-player HUD
+                # state and remote feedback in #1513.
+                native_callback(previous)
+            elif record.get('local'):
+                self._avatar.guiSessionProvider.invalidateVehicleState(
+                    self._runtime.vehicle_view_state.STUN, remaining)
+            else:
+                feedback = self._avatar.guiSessionProvider.shared.feedback
+                callback = getattr(feedback, 'invalidateStun', None)
+                if not callable(callback):
+                    raise RuntimeError(
+                        '#1513 remote stun feedback boundary is unavailable')
+                callback(record['engine_id'], remaining)
+        record['presented_stun_state'] = signature
         return True
 
     def _apply_siege_state(self, record, state):

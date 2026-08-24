@@ -909,6 +909,63 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID,
             dict(message, checked_distance=11.0)))
 
+    def test_internal_projectile_stun_is_durable_expires_and_assists(self):
+        state = _state(players=3)
+        self.assertTrue(_launch_authority(state, _launch()))
+        now = state._server_time_ms()
+        stun_end = now + 1500
+        message = _resolve(
+            '1:p:1:1', direct=_effect(
+                stun_end_server_time_ms=stun_end))
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+
+        target = state.players[2]
+        self.assertEqual(stun_end, target.stun_end_server_time_ms)
+        self.assertEqual(('player', 1), (
+            target.stun_attacker_kind, target.stun_attacker_id))
+        public = state._public_player(target)
+        self.assertEqual(stun_end, public['stun_end_server_time_ms'])
+        self.assertEqual('player', public['stun_attacker_kind'])
+        stun_events = [event for event in state.pending_events
+                       if event.get('kind') == 'stun']
+        self.assertEqual([True], [event['active'] for event in stun_events])
+
+        state._record_damage(
+            ('player', 3), ('player', 2), 240, target.critical)
+        self.assertEqual(
+            240, state._statistics_row('player', 1)[
+                'damage_assisted_stun'])
+        self.assertEqual(
+            240, state.vehicle_interactions[
+                ('player', 1)]['player:2']['assist_stun'])
+        assist = [event for event in state.pending_events
+                  if event.get('kind') == 'assist'][-1]
+        self.assertEqual('stun', assist['category'])
+
+        state.tick += int(round(1.5 * TICK_HZ))
+        self.assertEqual(1, state._expire_stuns())
+        self.assertEqual(0, target.stun_end_server_time_ms)
+        self.assertEqual('', target.stun_attacker_kind)
+        self.assertEqual(0, target.stun_attacker_id)
+        self.assertFalse([
+            event for event in state.pending_events
+            if event.get('kind') == 'stun'][-1]['active'])
+
+    def test_visible_projectile_authority_cannot_supply_stun_state(self):
+        state = _state()
+        self.assertTrue(_launch_authority(state, _launch()))
+        state.bot_authority_id = 1
+        message = _resolve(
+            '1:p:1:1', direct=_effect(
+                stun_end_server_time_ms=state._server_time_ms() + 1000))
+
+        self.assertFalse(state.resolve_projectile(1, message))
+        self.assertEqual(1000, state.players[2].health)
+        self.assertEqual(0, state.players[2].stun_end_server_time_ms)
+        self.assertIn('1:p:1:1', state.projectiles)
+
     def test_resolve_cannot_lower_the_launch_penetration_roll(self):
         state = _state()
         self.assertTrue(_launch_authority(state, _launch()))

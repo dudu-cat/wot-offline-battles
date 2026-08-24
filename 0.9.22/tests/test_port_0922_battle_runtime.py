@@ -799,6 +799,7 @@ class _Avatar(object):
                 feedback=types.SimpleNamespace(
                     _BattleFeedbackAdaptor__visible=set(),
                     setVehicleState=mock.Mock(),
+                    invalidateStun=mock.Mock(),
                     showVehicleDamagedDevices=mock.Mock(),
                     hideVehicleDamagedDevices=mock.Mock()),
                 vehicleState=types.SimpleNamespace()))
@@ -1827,7 +1828,7 @@ def _runtime():
         call_with_standard_gameplay_mask=call_with_standard_gameplay_mask,
         res_mgr=res_mgr,
         navigation_graph_loader=navigation_graph_loader,
-        vehicle_view_state=types.SimpleNamespace(RPM='rpm'),
+        vehicle_view_state=types.SimpleNamespace(RPM='rpm', STUN='stun'),
         feedback_event_id=types.SimpleNamespace(VEHICLE_DEAD=17),
         vehicles=types.SimpleNamespace(
             VehicleDescr=_VehicleDescr,
@@ -18560,6 +18561,96 @@ class ArenaIdentityTests(unittest.TestCase):
         self.assertIsNotNone(arena_type)
         self.assertEqual(0x10005, arena_type.id)
         self.assertEqual('ctf', arena_type.gameplayName)
+
+
+class StunStateTests(unittest.TestCase):
+    def _battle(self, local):
+        runtime = _runtime()
+        runtime.bigworld.now = 100.0
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        record = {
+            'engine_id': 10, 'kind': 'player' if local else 'bot',
+            'network_id': 1 if local else 7, 'local': bool(local),
+            'ready': True, 'state': {'health': 500, 'alive': True}}
+        battle._records = {
+            ('player:1' if local else 'bot:7'): record}
+        return battle, runtime, record, entity
+
+    def test_local_snapshot_uses_absolute_server_time_and_clears(self):
+        battle, runtime, record, entity = self._battle(True)
+        battle._projectile_server_time_ms = 15000
+        battle._projectile_server_local_time = 100.0
+        state = {
+            'stun_end_server_time_ms': 20000,
+            'stun_attacker_kind': 'bot', 'stun_attacker_id': 7}
+
+        self.assertTrue(battle._apply_stun_state(record, state))
+
+        self.assertEqual(105.0, entity.stunInfo)
+        runtime.bigworld.avatar.guiSessionProvider.invalidateVehicleState.\
+            assert_called_once_with('stun', 5.0)
+        self.assertFalse(battle._apply_stun_state(record, state))
+
+        self.assertTrue(battle._apply_stun_state(record, {
+            'stun_end_server_time_ms': 0,
+            'stun_attacker_kind': '', 'stun_attacker_id': 0}))
+        self.assertEqual(0.0, entity.stunInfo)
+        self.assertEqual(
+            mock.call('stun', 0.0),
+            runtime.bigworld.avatar.guiSessionProvider.
+            invalidateVehicleState.call_args)
+
+    def test_ordered_remote_stun_merges_before_native_feedback(self):
+        battle, runtime, record, entity = self._battle(False)
+        battle.state = 'running'
+        event = {
+            'event_id': '1:7:0', 'kind': 'stun', 'active': True,
+            'target_kind': 'bot', 'target_id': 7,
+            'attacker_kind': 'player', 'attacker_id': 1,
+            'stun_end_server_time_ms': 22000,
+        }
+
+        self.assertTrue(battle.on_events({
+            'server_time_ms': 15000, 'events': [event]}))
+
+        self.assertEqual(22000, record['state'][
+            'stun_end_server_time_ms'])
+        self.assertEqual(107.0, entity.stunInfo)
+        runtime.bigworld.avatar.guiSessionProvider.shared.feedback.\
+            invalidateStun.assert_called_once_with(10, 7.0)
+        self.assertIn('1:7:0', battle._applied_event_ids)
+
+    def test_stock_vehicle_stun_callback_remains_the_presentation_owner(self):
+        battle, runtime, record, entity = self._battle(True)
+        battle._projectile_server_time_ms = 15000
+        battle._projectile_server_local_time = 100.0
+        entity.set_stunInfo = mock.Mock()
+
+        self.assertTrue(battle._apply_stun_state(record, {
+            'stun_end_server_time_ms': 19000,
+            'stun_attacker_kind': 'bot', 'stun_attacker_id': 7}))
+
+        entity.set_stunInfo.assert_called_once_with(0.0)
+        runtime.bigworld.avatar.guiSessionProvider.invalidateVehicleState.\
+            assert_not_called()
+
+    def test_hidden_worker_tracks_stun_without_gui_feedback(self):
+        battle, runtime, record, entity = self._battle(False)
+        battle._worker_mode = True
+        battle._projectile_server_time_ms = 15000
+        battle._projectile_server_local_time = 100.0
+
+        self.assertTrue(battle._apply_stun_state(record, {
+            'stun_end_server_time_ms': 18000,
+            'stun_attacker_kind': 'player', 'stun_attacker_id': 1}))
+
+        self.assertEqual(103.0, entity.stunInfo)
+        runtime.bigworld.avatar.guiSessionProvider.shared.feedback.\
+            invalidateStun.assert_not_called()
 
 
 class AssistFeedTests(unittest.TestCase):

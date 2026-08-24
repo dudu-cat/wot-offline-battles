@@ -2601,6 +2601,7 @@ class VehicleStatisticsTest(unittest.TestCase):
             'shots_fired': 2, 'shots_hit': 2, 'shots_penetrated': 1,
             'damage_dealt': 50, 'damage_received': 0, 'damage_blocked': 0,
             'damage_assisted_track': 200, 'damage_assisted_radio': 0,
+            'damage_assisted_stun': 0,
             'kills': 0,
         }, rows[1])
         self.assertEqual(200, rows[3]['damage_dealt'])
@@ -2654,6 +2655,7 @@ class VehicleStatisticsTest(unittest.TestCase):
             'shots_fired': 1, 'shots_hit': 1, 'shots_penetrated': 1,
             'damage_dealt': 120, 'damage_received': 0, 'damage_blocked': 0,
             'damage_assisted_track': 0, 'damage_assisted_radio': 0,
+            'damage_assisted_stun': 0,
             'kills': 0,
         }, state.vehicle_statistics[('player', 3)])
 
