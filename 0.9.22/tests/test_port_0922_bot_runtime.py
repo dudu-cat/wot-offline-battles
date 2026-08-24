@@ -1076,7 +1076,7 @@ class BotRuntimeTests(unittest.TestCase):
         server, unused_manifest, unused_socket = \
             ServerBotStateRevisionTests._server()
         for name in ('shell_index', 'next_shell_index', 'ammo_remaining',
-                     'ammo_reload_pending'):
+                     'ammo_reload_pending', 'clip', 'clip_size'):
             server.bot_states[11][name] = projected[name]
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, {
@@ -3442,7 +3442,7 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertTrue(server.update_bot_states(1, {
                     'round_id': server.round_id,
                     'bots': message['bots'],
-                }))
+                }), server.last_bot_state_reject)
                 runtime.apply_snapshot({
                     'server_tick': frame,
                     'bots': [dict(server.bot_states[bot_id])
@@ -4399,7 +4399,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.update(.20, 1.72, players=[player])
         second = runtime.update(.04, 1.76, players=[player])[0]['bots'][0]
         self.assertEqual(2, second['fire_seq'])
-        self.assertEqual(2, runtime.states[11]['clip'])
+        self.assertEqual(0, runtime.states[11]['clip'])
         self.assertAlmostEqual(0.5, runtime.states[11]['reload_duration'])
 
         runtime.update(.20, 1.94, players=[player])
@@ -7906,6 +7906,91 @@ class BotRuntimeTests(unittest.TestCase):
             source, [player], 2.10)
         self.assertTrue(contacts[0]['visible'])
 
+    def test_hidden_human_and_bot_targets_keep_last_visible_pose(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor())
+        visible = [True]
+        runtime._visible = lambda *unused: visible[0]
+        source = {
+            'id': 11, 'team': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'view_range': 445.0,
+        }
+        player = _admit_player({
+            'id': 2, 'team': 2, 'alive': True,
+            'vehicle': 'ussr:R11_MS-1',
+            'x': 10.0, 'y': 1.0, 'z': 100.0,
+            'yaw': 0.2, 'speed': 4.0, 'health': 900,
+            'max_health': 1000,
+        })
+        unused_contacts, lookup = runtime._contacts_for(
+            source, [player], 1.0)
+        planner_id = self.module.HUMAN_TARGET_ID_BASE + 2
+        self.assertEqual((10.0, 1.0, 100.0),
+                         lookup[planner_id]['position'])
+
+        visible[0] = False
+        player.update(x=80.0, y=2.0, z=240.0, yaw=1.2,
+                      speed=20.0, health=700)
+        contacts, lookup = runtime._contacts_for(source, [player], 1.1)
+        hidden_human = lookup[planner_id]
+        self.assertFalse(contacts[0]['visible'])
+        self.assertEqual((10.0, 1.0, 100.0),
+                         hidden_human['position'])
+        refreshed_human = runtime._refresh_target_pose(
+            planner_id, hidden_human, runtime._index_live_players([player]))
+        self.assertEqual((10.0, 1.0, 100.0),
+                         refreshed_human['position'])
+        self.assertEqual((10.0, 1.0, 100.0, 0.2, 4.0), (
+            refreshed_human['x'], refreshed_human['y'],
+            refreshed_human['z'], refreshed_human['yaw'],
+            refreshed_human['speed']))
+        self.assertEqual(700, refreshed_human['health'])
+
+        bot = {
+            'id': 12, 'team': 2, 'alive': True,
+            'x': -20.0, 'y': 0.5, 'z': 90.0,
+            'yaw': -0.4, 'speed': 3.0,
+            'health': 800, 'max_health': 1000,
+            'profile': {'class_tag': 'mediumTank', 'armor': 80.0},
+        }
+        runtime.states = {12: bot}
+        visible[0] = True
+        runtime._contacts_for(source, [], 1.2)
+        visible[0] = False
+        bot.update(x=-90.0, y=3.0, z=260.0, yaw=-1.0,
+                   speed=18.0, health=600)
+        contacts, lookup = runtime._contacts_for(source, [], 1.3)
+        hidden_bot = lookup[12]
+        refreshed_bot = runtime._refresh_target_pose(12, hidden_bot, {})
+        self.assertFalse(contacts[0]['visible'])
+        self.assertEqual((-20.0, 0.5, 90.0),
+                         refreshed_bot['position'])
+        self.assertEqual((-20.0, 0.5, 90.0, -0.4, 3.0), (
+            refreshed_bot['x'], refreshed_bot['y'], refreshed_bot['z'],
+            refreshed_bot['yaw'], refreshed_bot['speed']))
+        self.assertEqual(600, refreshed_bot['health'])
+
+    def test_first_hidden_target_has_no_live_pose_in_local_lookup(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor())
+        runtime._visible = lambda *unused: False
+        source = {
+            'id': 11, 'team': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'view_range': 445.0,
+        }
+        player = _admit_player({
+            'id': 2, 'team': 2, 'alive': True,
+            'vehicle': 'ussr:R11_MS-1',
+            'x': 37.0, 'y': 2.0, 'z': 211.0,
+            'health': 1000, 'max_health': 1000,
+        })
+
+        contacts, lookup = runtime._contacts_for(source, [player], 1.0)
+
+        self.assertNotIn(self.module.HUMAN_TARGET_ID_BASE + 2, lookup)
+        self.assertFalse(contacts[0]['visible'])
+        self.assertEqual((0.0, 0.0, 0.0), contacts[0]['position'])
+
     def test_shot_camouflage_invalidates_every_observer_cache(self):
         descriptor = _combat_descriptor()
         descriptor.type = types.SimpleNamespace(
@@ -8462,7 +8547,7 @@ class BotRuntimeTests(unittest.TestCase):
         server, unused_manifest, unused_socket = \
             ServerBotStateRevisionTests._server()
         for name in ('shell_index', 'next_shell_index', 'ammo_remaining',
-                     'ammo_reload_pending'):
+                     'ammo_reload_pending', 'clip', 'clip_size'):
             server.bot_states[11][name] = publication['bots'][0][name]
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, {

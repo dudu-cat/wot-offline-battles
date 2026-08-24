@@ -49,14 +49,14 @@ def _shell(kind, penetration, damage, speed=900.0):
     }
 
 
-def _descriptor(max_ammo=60):
+def _descriptor(max_ammo=60, clip=(1,)):
     shots = (
         _shell('ARMOR_PIERCING', 180.0, 300.0),
         _shell('ARMOR_PIERCING_CR', 260.0, 300.0, 1100.0),
         _shell('HIGH_EXPLOSIVE', 60.0, 420.0, 700.0),
     )
     gun = types.SimpleNamespace(
-        shots=shots, maxAmmo=max_ammo, reloadTime=1.0, clip=(1,),
+        shots=shots, maxAmmo=max_ammo, reloadTime=1.0, clip=clip,
         shotDispersionAngle=0.03)
     return types.SimpleNamespace(
         gun=gun, turret=types.SimpleNamespace(maxAmmo=max_ammo),
@@ -129,6 +129,41 @@ class BotAmmunitionTests(unittest.TestCase):
         self.assertEqual((1, 2), (
             state['shell_index'], state['next_shell_index']))
         self.assertFalse(state['ammo_reload_pending'])
+
+    def test_autoloader_promotes_planned_shell_only_after_full_reload(self):
+        descriptor = _descriptor(6, clip=(3, 0.2))
+        ammo = self.runtime_module._BotAmmoState(descriptor, _profile())
+        gun = self.runtime_module._BotGunState(descriptor)
+        gun.elapsed = 10.0
+
+        boundary = gun.complete_reload()
+        ammo.stage(1, boundary is not None, boundary == 'full')
+        self.assertTrue(gun.fire())
+        self.assertTrue(ammo.consume_loaded())
+        self.assertEqual((0, 1, 2), (ammo.loaded, ammo.next, gun.clip))
+
+        gun.tick(0.21)
+        boundary = gun.complete_reload()
+        ammo.stage(2, boundary is not None, boundary == 'full')
+        self.assertEqual('intra', boundary)
+        self.assertEqual((0, 2, 2), (ammo.loaded, ammo.next, gun.clip))
+        self.assertTrue(ammo.can_fire())
+
+        self.assertTrue(gun.fire())
+        self.assertTrue(ammo.consume_loaded())
+        gun.tick(0.21)
+        boundary = gun.complete_reload()
+        ammo.stage(1, boundary is not None, boundary == 'full')
+        self.assertEqual((0, 1, 1), (ammo.loaded, ammo.next, gun.clip))
+
+        self.assertTrue(gun.fire())
+        self.assertTrue(ammo.consume_loaded())
+        self.assertEqual((0, 'full'), (gun.clip, gun.reload_kind))
+        gun.tick(1.01)
+        boundary = gun.complete_reload()
+        ammo.stage(2, boundary is not None, boundary == 'full')
+        self.assertEqual('full', boundary)
+        self.assertEqual((1, 2, 3), (ammo.loaded, ammo.next, gun.clip))
 
     def test_takeover_restores_inventory_without_consuming_again(self):
         ammo = self.runtime_module._BotAmmoState(
@@ -324,6 +359,65 @@ class BotAmmunitionTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 ValueError, 'planned shell changed before reload'):
             BattleState._validate_bot_ammo_transition(previous, changed)
+
+    def test_server_distinguishes_intra_clip_and_full_reload_edges(self):
+        identity = {
+            'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot',
+            'vehicle': 'ussr:R11_MS-1', 'max_health': 1000,
+            'profile': _profile(),
+        }
+        initial = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 0, 'shell_index': 0, 'next_shell_index': 1,
+            'ammo_remaining': [30, 20, 10],
+            'ammo_reload_pending': False, 'clip': 3, 'clip_size': 3,
+        }, identity, None)
+        intra_pending = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 1, 'shell_index': 0, 'next_shell_index': 1,
+            'ammo_remaining': [29, 20, 10],
+            'ammo_reload_pending': True, 'clip': 2, 'clip_size': 3,
+        }, identity, initial)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            initial, intra_pending))
+
+        intra_ready = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 1, 'shell_index': 0, 'next_shell_index': 2,
+            'ammo_remaining': [29, 20, 10],
+            'ammo_reload_pending': False, 'clip': 2, 'clip_size': 3,
+        }, identity, intra_pending)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            intra_pending, intra_ready))
+        wrong_loaded = dict(intra_ready, shell_index=1)
+        with self.assertRaisesRegex(
+                ValueError, 'intra-clip reload changed'):
+            BattleState._validate_bot_ammo_transition(
+                intra_pending, wrong_loaded)
+
+        full_pending = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 2, 'shell_index': 0, 'next_shell_index': 1,
+            'ammo_remaining': [28, 20, 10],
+            'ammo_reload_pending': True, 'clip': 0, 'clip_size': 3,
+        }, identity, None)
+        full_ready = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 2, 'shell_index': 1, 'next_shell_index': 2,
+            'ammo_remaining': [28, 20, 10],
+            'ammo_reload_pending': False, 'clip': 3, 'clip_size': 3,
+        }, identity, full_pending)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            full_pending, full_ready))
+
+        full_ready_and_fired = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 3, 'shell_index': 1, 'next_shell_index': 2,
+            'ammo_remaining': [28, 19, 10],
+            'ammo_reload_pending': True, 'clip': 2, 'clip_size': 3,
+        }, identity, full_pending)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            full_pending, full_ready_and_fired))
 
     def test_server_rejects_ready_exhausted_loaded_round(self):
         identity = {

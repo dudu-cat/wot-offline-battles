@@ -202,6 +202,8 @@ class LanClientQueueTests(unittest.TestCase):
                 'next_shell_index': 1,
                 'ammo_remaining': [28, 19, 9],
                 'ammo_reload_pending': True,
+                'reload_time': 0.25, 'reload_duration': 0.5,
+                'clip': 2, 'clip_size': 3,
                 'health': 700, 'alive': True,
                 'critical': {
                     'devices': [], 'destroyed': [], 'crew_ko': [],
@@ -241,6 +243,7 @@ class LanClientQueueTests(unittest.TestCase):
             'aim_yaw', 'gun_pitch', 'speed',
             'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
             'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
+            'reload_time', 'reload_duration', 'clip', 'clip_size',
             'health', 'alive', 'critical', 'combat_base_revision',
             'combat_seq', 'combat_fire_elapsed', 'combat_fire_timer',
             'death_reason', 'display_health', 'shot_yaw', 'shot_pitch',
@@ -286,6 +289,16 @@ class LanClientQueueTests(unittest.TestCase):
         state['ammo_reload_pending'] = 1
         self.assertFalse(client.send_bot_state([state]))
         self.assertEqual([], client._outbound_queue)
+
+    def test_bot_state_projection_rejects_partial_clip_checkpoint(self):
+        state = {
+            'id': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'health': 100, 'alive': True, 'fire_seq': 1,
+            'reload_time': 0.2, 'reload_duration': 0.5,
+            'clip': 1,
+        }
+
+        self.assertIsNone(lan_client_module.project_bot_state(state))
 
     def test_sender_owns_json_encoding_and_socket_write(self):
         client = self.activate()

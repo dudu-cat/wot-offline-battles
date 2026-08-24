@@ -101,7 +101,7 @@ _BOT_STATE_WIRE_FIELDS = (
     'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
     'speed', 'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
     'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
-    'reload_time', 'reload_duration',
+    'reload_time', 'reload_duration', 'clip', 'clip_size',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',
     'death_reason', 'display_health', 'world_pose')
@@ -449,6 +449,10 @@ def project_bot_state(state):
         return None
     if (all(present) and
             not isinstance(state.get('ammo_reload_pending'), bool)):
+        return None
+    clip_fields = ('clip', 'clip_size')
+    clip_present = tuple(name in state for name in clip_fields)
+    if any(clip_present) and not all(clip_present):
         return None
     reload_fields = ('reload_time', 'reload_duration')
     if not all(name in state for name in reload_fields):

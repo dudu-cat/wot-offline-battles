@@ -587,8 +587,8 @@ class _BotGunState(object):
     """The final 0.8.2 bot reload/clip and #1513 dispersion clocks.
 
     Inventory and loaded-shell selection live in ``_BotAmmoState``. A clip
-    starts full; rounds inside it use ``clip[1]`` and an empty clip is
-    immediately reset but held for the full reload time.
+    starts full; rounds inside it use ``clip[1]`` and an empty clip remains
+    empty until the full reload boundary completes.
     """
 
     def __init__(self, descriptor, fire_seq=0, dispersion_factor=1.0):
@@ -647,21 +647,50 @@ class _BotGunState(object):
         self.clip = self.clip_size
         self.elapsed = 0.0
         self.reload_duration = self.reload_full
+        self.reload_kind = 'full'
         self.reload_factor = 1.0
         self.restore_fire_seq(fire_seq, dispersion_factor)
 
     def restore_fire_seq(self, fire_seq, dispersion_factor=1.0,
                          reload_time=None, reload_duration=None,
-                         reload_factor=1.0):
+                         reload_factor=1.0, clip=None, clip_size=None):
         fire_seq = max(0, int(_number(fire_seq)))
-        if self.clip_size > 1:
+        has_clip = clip is not None
+        has_clip_size = clip_size is not None
+        if has_clip != has_clip_size:
+            raise ValueError('bot clip snapshot must be an atomic pair')
+        if has_clip:
+            raw_clip = clip
+            raw_clip_size = clip_size
+            try:
+                clip = int(clip)
+                clip_size = int(clip_size)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('bot clip snapshot is invalid')
+            if (isinstance(raw_clip, bool) or
+                    isinstance(raw_clip_size, bool) or
+                    float(raw_clip) != clip or
+                    float(raw_clip_size) != clip_size or
+                    clip_size != self.clip_size or
+                    clip < 0 or clip > clip_size):
+                raise ValueError(
+                    'bot clip snapshot disagrees with installed gun')
+            self.clip = clip
+            self.reload_kind = (
+                'intra' if 0 < clip < clip_size else 'full')
+            self.reload_duration = (
+                self.reload_intra if self.reload_kind == 'intra'
+                else self.reload_full)
+        elif self.clip_size > 1:
             used = fire_seq % self.clip_size
             self.clip = self.clip_size - used if used else self.clip_size
-            self.reload_duration = (
-                self.reload_intra if used else self.reload_full)
+            self.reload_kind = 'intra' if used else 'full'
+            self.reload_duration = (self.reload_intra if used
+                                    else self.reload_full)
         else:
             self.clip = 1
             self.reload_duration = self.reload_full
+            self.reload_kind = 'full'
         has_reload_time = reload_time is not None
         has_reload_duration = reload_duration is not None
         if has_reload_time != has_reload_duration:
@@ -773,22 +802,33 @@ class _BotGunState(object):
         return self.elapsed > (
             self.reload_duration * max(0.0, float(reload_factor)))
 
+    def complete_reload(self, reload_factor=1.0):
+        """Return the completed boundary and refill only an empty clip."""
+        if not self.ready(reload_factor):
+            return None
+        if self.reload_kind == 'full' and self.clip == 0:
+            self.clip = self.clip_size
+        return self.reload_kind
+
     def shell_index(self, requested):
         return max(0, min(int(_number(requested)), self.shell_count - 1))
 
     def fire(self, reload_factor=1.0):
         if not self.ready(reload_factor):
             return False
+        if self.clip <= 0:
+            self.complete_reload(reload_factor)
+        if self.clip <= 0:
+            return False
         self.elapsed = 0.0
-        if self.clip_size > 1:
-            self.clip -= 1
-            if self.clip <= 0:
-                self.clip = self.clip_size
-                self.reload_duration = self.reload_full
-            else:
-                self.reload_duration = self.reload_intra
-        else:
+        self.clip -= 1
+        if self.clip <= 0:
+            self.clip = 0
+            self.reload_kind = 'full'
             self.reload_duration = self.reload_full
+        else:
+            self.reload_kind = 'intra'
+            self.reload_duration = self.reload_intra
         return True
 
     def remaining(self, reload_factor=1.0):
@@ -986,16 +1026,17 @@ class _BotAmmoState(object):
         self.plan_pending = False
         return True
 
-    def stage(self, requested, ready):
+    def stage(self, requested, ready, full_reload=True):
         """Commit loaded/next choices only at one completed reload edge."""
         if not ready:
             return False
         changed = False
         if self.reload_pending:
-            selected = self._available(self.next)
-            if selected != self.loaded:
-                self.loaded = selected
-                changed = True
+            if full_reload:
+                selected = self._available(self.next)
+                if selected != self.loaded:
+                    self.loaded = selected
+                    changed = True
             self.reload_pending = False
             self.plan_pending = True
         if self.plan_pending:
@@ -1381,6 +1422,7 @@ class BotRuntime(object):
         self.finished = False
         self._visibility_cache = {}
         self._team_visibility_cache = {}
+        self._visible_target_poses = {}
         self._server_orders = {}
         self._server_order_tokens = {}
         self._order_revision = -1
@@ -1809,6 +1851,7 @@ class BotRuntime(object):
             self.finished = False
             self._visibility_cache = {}
             self._team_visibility_cache = {}
+            self._visible_target_poses = {}
             self._server_orders = {}
             self._server_order_tokens = {}
             self._order_revision = -1
@@ -1844,6 +1887,7 @@ class BotRuntime(object):
             self._friendly_repositions = {}
             self._visibility_cache = {}
             self._team_visibility_cache = {}
+            self._visible_target_poses = {}
             self._visibility_fire = {}
             self._visibility_still = {}
             self._shot_los_cache = {}
@@ -1917,7 +1961,8 @@ class BotRuntime(object):
                         _critical_factor(
                             raw, descriptor, 'dispersion'),
                         raw.get('reload_time'),
-                        raw.get('reload_duration'), reload_factor)
+                        raw.get('reload_duration'), reload_factor,
+                        raw.get('clip'), raw.get('clip_size'))
             self._physics_params[bot_id] = vehicle_physics.derive_params(
                 descriptor)
             self._turn_speeds[bot_id] = 0.0
@@ -2002,7 +2047,7 @@ class BotRuntime(object):
                         int(_number(raw.get('fire_seq', 0)))),
                     _critical_factor(raw, descriptor, 'dispersion'),
                     raw.get('reload_time'), raw.get('reload_duration'),
-                    reload_factor)
+                    reload_factor, raw.get('clip'), raw.get('clip_size'))
             ammo_state.publish(state)
             if authority_handoff:
                 self._apply_authority_takeover_motion(state, raw)
@@ -2489,7 +2534,8 @@ class BotRuntime(object):
                         _critical_factor(
                             state, descriptor, 'dispersion'),
                         raw.get('reload_time'), raw.get('reload_duration'),
-                        _critical_factor(state, descriptor, 'reload'))
+                        _critical_factor(state, descriptor, 'reload'),
+                        raw.get('clip'), raw.get('clip_size'))
                     reload_factor = _critical_factor(
                         state, descriptor, 'reload')
                     state['clip'] = gun_state.clip
@@ -2574,7 +2620,8 @@ class BotRuntime(object):
         keys = ('id', 'team', 'slot', 'name', 'vehicle', 'health',
                 'max_health', 'x', 'y', 'z', 'yaw', 'profile', 'fire_seq',
                 'shell_index', 'next_shell_index', 'ammo_remaining',
-                'ammo_reload_pending', 'reload_time', 'reload_duration')
+                'ammo_reload_pending', 'reload_time', 'reload_duration',
+                'clip', 'clip_size')
         result = dict((key, state[key]) for key in keys)
         # These coordinates were resolved against the loaded retail map by
         # the authority.  Consumers must not run the formation resolver a
@@ -2937,6 +2984,35 @@ class BotRuntime(object):
         lookup = {}
         source_team = int(source.get('team', 0))
 
+        def retain_team_known_pose(target):
+            key = (source_team, target.get('kind'),
+                   int(target.get('network_id', 0)))
+            if target['visible']:
+                remembered = {
+                    'position': _position(target),
+                    'x': _number(target.get('x')),
+                    'y': _number(target.get('y')),
+                    'z': _number(target.get('z')),
+                    'yaw': _number(target.get('yaw')),
+                    'speed': _number(target.get('speed')),
+                }
+                self._visible_target_poses[key] = remembered
+                target.update(remembered)
+                return True
+            remembered = self._visible_target_poses.get(key)
+            if remembered is None:
+                # The server treats a first hidden sample as a valid no-op.
+                # Publish a shape-complete neutral record, but never expose
+                # the worker's omniscient live pose to local targeting.
+                target.update({
+                    'position': (0.0, 0.0, 0.0),
+                    'x': 0.0, 'y': 0.0, 'z': 0.0,
+                    'yaw': 0.0, 'speed': 0.0,
+                })
+                return False
+            target.update(remembered)
+            return True
+
         def visible_to_team(target):
             if team_spotted is None:
                 return self._visible(source, target, now)
@@ -2972,7 +3048,8 @@ class BotRuntime(object):
             target['class_tag'] = vehicle_profile['class_tag']
             target['armor'] = vehicle_profile['armor']
             target['visible'] = visible_to_team(target)
-            lookup[planner_id] = target
+            if retain_team_known_pose(target):
+                lookup[planner_id] = target
             contacts.append(target)
         for bot_id, raw in self.states.items():
             if (bot_id == source.get('id') or not raw.get('alive', True) or
@@ -2983,7 +3060,8 @@ class BotRuntime(object):
             target['network_id'] = int(bot_id)
             target['position'] = _position(raw)
             target['visible'] = visible_to_team(target)
-            lookup[int(bot_id)] = target
+            if retain_team_known_pose(target):
+                lookup[int(bot_id)] = target
             contacts.append(target)
         return contacts, lookup
 
@@ -3001,15 +3079,19 @@ class BotRuntime(object):
         """Copy one cached contact and overlay one canonical live record."""
         target = dict(cached)
         if live is not None:
-            target['position'] = _position(live)
-            for name in ('alive', 'health', 'max_health', 'team',
-                         'x', 'y', 'z', 'yaw', 'speed'):
+            if target.get('visible') is True:
+                target['position'] = _position(live)
+                pose_fields = ('x', 'y', 'z', 'yaw', 'speed')
+            else:
+                pose_fields = ()
+            for name in (('alive', 'health', 'max_health', 'team') +
+                         pose_fields):
                 if name in live:
                     target[name] = live[name]
         return target
 
     def _refresh_target_pose(self, planner_id, cached, live_players):
-        """Copy one cached contact and overlay its current canonical pose."""
+        """Refresh state without replacing a hidden contact's known pose."""
         if cached.get('kind') == 'human':
             live = live_players.get(planner_id)
         else:
@@ -5622,9 +5704,10 @@ class BotRuntime(object):
                 state, descriptor, 'reload')
             gun_state.rescale_reload(reload_factor)
             gun_state.tick(step)
+            reload_kind = gun_state.complete_reload(reload_factor)
             ammo_state.stage(
                 gun_state.shell_index(command.get('shell_index', 0)),
-                gun_state.ready(reload_factor))
+                reload_kind is not None, reload_kind == 'full')
             ammo_state.publish(state)
             is_spg = str(profile.get('class_tag') or '') == 'SPG'
             pending_intent = None

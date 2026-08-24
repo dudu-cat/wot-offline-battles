@@ -4071,6 +4071,26 @@ class BattleState:
                 "pending": pending}
 
     @staticmethod
+    def _sanitize_bot_clip(raw, previous):
+        """Validate one optional exact Bot magazine checkpoint."""
+        has_clip = "clip" in raw
+        has_size = "clip_size" in raw
+        if has_clip != has_size:
+            raise ValueError("bot clip snapshot is incomplete")
+        if not has_clip:
+            return {
+                "clip": int((previous or {}).get("clip", 1)),
+                "clip_size": int((previous or {}).get("clip_size", 1)),
+            }
+        clip_size = _exact_int(
+            raw.get("clip_size"), 1, MAX_PLAYER_CLIP_SIZE)
+        clip = _exact_int(raw.get("clip"), 0, clip_size)
+        previous_size = (previous or {}).get("clip_size")
+        if previous_size is not None and int(previous_size) != clip_size:
+            raise ValueError("bot clip size changed mid-round")
+        return {"clip": clip, "clip_size": clip_size}
+
+    @staticmethod
     def _valid_hidden_observation(raw, known_targets):
         """Recognize a valid first hidden sample with no stored contact."""
         if (not isinstance(raw, dict) or raw.get("visible") is not False or
@@ -4252,6 +4272,7 @@ class BattleState:
         rotation = _finite_float(raw.get("rotation_dir"), 0.0)
         ammunition = BattleState._sanitize_bot_ammo(
             raw, identity, previous)
+        gun_clip = BattleState._sanitize_bot_clip(raw, previous)
         reload_progress = _validated_bot_reload_progress(raw)
         result = {
             "id": int(identity["id"]),
@@ -4282,6 +4303,8 @@ class BattleState:
             "next_shell_index": ammunition["next"],
             "ammo_remaining": ammunition["remaining"],
             "ammo_reload_pending": ammunition["pending"],
+            "clip": gun_clip["clip"],
+            "clip_size": gun_clip["clip_size"],
             "health": reported_health,
             "max_health": max_health,
             "alive": bool(raw.get("alive", reported_health > 0)) and reported_health > 0,
@@ -4345,7 +4368,7 @@ class BattleState:
 
     @staticmethod
     def _validate_bot_ammo_transition(previous, current):
-        """Require conserved inventory and explicit reload-boundary state."""
+        """Require conserved inventory and exact magazine boundaries."""
         if previous is None:
             return True
         before = previous.get("ammo_remaining") or []
@@ -4366,29 +4389,72 @@ class BattleState:
         previous_pending = bool(previous.get(
             "ammo_reload_pending", False))
         pending = bool(current.get("ammo_reload_pending", False))
+        clip_size = int(current.get("clip_size", 1))
+        previous_clip_size = int(previous.get("clip_size", 1))
+        clip = int(current.get("clip", clip_size))
+        previous_clip = int(previous.get(
+            "clip", previous_clip_size))
+        if clip_size != previous_clip_size:
+            raise ValueError("bot clip size changed mid-round")
+        if not 0 <= previous_clip <= clip_size or not 0 <= clip <= clip_size:
+            raise ValueError("bot clip checkpoint is invalid")
         expected = list(before)
         if fire_delta:
             if not pending:
                 raise ValueError("bot shot did not enter reload state")
-            expected_loaded = (previous_next if previous_pending else
-                               previous_loaded)
+            if previous_pending and (
+                    previous_clip == 0 or clip_size == 1):
+                expected_loaded = previous_next
+                expected_clip = clip_size - 1
+            else:
+                expected_loaded = previous_loaded
+                expected_clip = previous_clip - 1
+            if previous_clip <= 0 and not (
+                    previous_pending and previous_clip == 0):
+                raise ValueError("bot fired from an empty clip")
             if loaded != expected_loaded:
                 raise ValueError("bot loaded shell changed while firing")
+            if clip_size > 1 and clip != expected_clip:
+                raise ValueError(
+                    "bot clip did not consume one round (%d -> %d, "
+                    "expected %d)" % (
+                        previous_clip, clip, expected_clip))
             if loaded >= len(expected) or expected[loaded] <= 0:
                 raise ValueError("bot fired an exhausted shell")
             expected[loaded] -= 1
+            if not previous_pending and next_shell != previous_next:
+                raise ValueError(
+                    "bot planned shell changed outside reload")
         elif not previous_pending:
             if pending:
                 raise ValueError("bot reload started without a shot")
             if loaded != previous_loaded:
                 raise ValueError("bot loaded shell changed outside reload")
+            if clip_size > 1 and clip != previous_clip:
+                raise ValueError("bot clip changed outside reload")
+            if next_shell != previous_next:
+                raise ValueError(
+                    "bot planned shell changed outside reload")
         elif pending:
             if loaded != previous_loaded:
                 raise ValueError("bot loaded shell changed before reload")
             if next_shell != previous_next:
                 raise ValueError("bot planned shell changed before reload")
-        elif loaded != previous_next:
-            raise ValueError("bot loaded shell skipped its planned boundary")
+            if clip_size > 1 and clip != previous_clip:
+                raise ValueError("bot clip changed before reload")
+        elif previous_clip == 0 or clip_size == 1:
+            if loaded != previous_next:
+                raise ValueError(
+                    "bot loaded shell skipped its planned boundary")
+            if clip_size > 1 and clip != clip_size:
+                raise ValueError("bot full reload did not refill its clip")
+        else:
+            if loaded != previous_loaded:
+                raise ValueError(
+                    "bot intra-clip reload changed its loaded shell")
+            if clip_size > 1 and clip != previous_clip:
+                raise ValueError(
+                    "bot intra-clip reload changed its clip")
         if list(after) != expected:
             raise ValueError("bot ammunition inventory is not conserved")
         return True
