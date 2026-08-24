@@ -10939,6 +10939,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_crushed_destructible_costs_no_speed_and_names_the_path(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._CRUSH_DIAGNOSTICS = True
         battle.client = _Client()
         battle._avatar = runtime.bigworld.avatar
         entity = _Vehicle(

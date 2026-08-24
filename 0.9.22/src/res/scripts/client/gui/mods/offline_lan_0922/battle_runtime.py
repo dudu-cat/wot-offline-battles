@@ -10196,6 +10196,7 @@ class BattleRuntime(object):
 
     _CRUSH_REPORT_LIMIT = 80
     _CRUSH_REPORT_SECONDS = 0.1
+    _CRUSH_DIAGNOSTICS = False
     _BOT_CONTACT_PATHS = {
         'clear': 'advance',
         'crushed': 'advance',
@@ -10207,6 +10208,8 @@ class BattleRuntime(object):
     def _report_destructible_contact(self, who, kinds, status, path,
                                      before, after, now, extra=''):
         """Name the item and the code path that changed a contact speed."""
+        if not self._CRUSH_DIAGNOSTICS:
+            return False
         if not kinds or kinds == '-':
             return False
         if self._crush_reports >= self._CRUSH_REPORT_LIMIT:
@@ -10227,6 +10230,8 @@ class BattleRuntime(object):
         A crushed item must cost neither speed nor height, so the same line
         carries the contact seam's answer and what the ground probes did.
         """
+        if not self._CRUSH_DIAGNOSTICS:
+            return False
         reader = getattr(
             self._destructibles, 'take_ground_skip_count', None)
         skips = int(_number(reader())) if callable(reader) else 0
@@ -10244,6 +10249,8 @@ class BattleRuntime(object):
 
     def _report_bot_destructible_contact(self, bot_id, status, before, after):
         """Bot-side seam for the same contact-speed diagnostic."""
+        if not self._CRUSH_DIAGNOSTICS:
+            return False
         if status == 'clear':
             return False
         return self._report_destructible_contact(

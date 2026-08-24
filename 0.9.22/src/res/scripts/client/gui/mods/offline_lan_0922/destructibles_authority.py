@@ -21,6 +21,7 @@ import Math
 
 _state = {'spaceID': None, 'chunks': {}, 'entities': {}}
 
+_DESTRUCTIBLE_DIAGNOSTICS = False
 _APPLY_REPORT_LIMIT = 24
 _applies_reported = [0]
 
@@ -64,6 +65,8 @@ def reset(spaceID=None):
 
 def _report_chunk(event, spaceID, chunkID, pos, extra=''):
 	"""Say what each of the first chunk-scoped orders this round asked for."""
+	if not _DESTRUCTIBLE_DIAGNOSTICS:
+		return
 	if _chunks_reported[0] >= _CHUNK_REPORT_LIMIT:
 		return
 	_chunks_reported[0] += 1
@@ -210,6 +213,8 @@ def _ensure_chunk(spaceID, chunkID, pos):
 def _report_apply(spaceID, chunkID, pos, kind, destrData, ctrl,
 		applyShotImmediately):
 	"""Say what each of the first destructions this round asked the engine for."""
+	if not _DESTRUCTIBLE_DIAGNOSTICS:
+		return
 	if _applies_reported[0] >= _APPLY_REPORT_LIMIT:
 		return
 	_applies_reported[0] += 1
@@ -237,70 +242,35 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
 	_report_apply(spaceID, chunkID, pos, kind, destrData, ctrl,
 		applyShotImmediately)
 	prop = _PROP_BY_KIND[kind]
-	if ctrl is not None:
-		# Server-style push: update the entity property and fire its
-		# set_ callback; the entity diffs vs its prev-set and animates
-		# only the new entry.
-		values = getattr(ctrl, prop)
-		length = len(values)
-		prevName = _PREV_BY_PROP[prop]
-		previous = getattr(ctrl, prevName)
-		values.append(destrData)
-		try:
-			if applyShotImmediately:
-				# The #1513 property setter decodes the shot bit and always asks
-				# the native manager to synchronize with PlayerAvatar's later
-				# ``damagedDestructibles`` projectile payload.  The copied shell
-				# resolver has no such payload.  Preserve the encoded shot bit for
-				# hit effects and replicated state, but advance the controller's
-				# diff snapshot ourselves and issue the native order unsynchronized.
-				setattr(ctrl, prevName, frozenset(values))
-				dmgTypes = {
-					'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
-					'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
-					'fragile': AreaDestructibles._DAMAGE_TYPE_FRAGILE,
-					'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
-				}
-				AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(
-					chunkID, dmgTypes[kind], destrData, True, False)
-			else:
-				getattr(ctrl, 'set_' + prop)(None)
-		except Exception:
-			# A failed setter may not leave the replicated property claiming that
-			# native geometry changed.  Roll back only our own tail append; any
-			# other mutation means the controller contract is already corrupted.
-			if (len(values) != length + 1 or
-					values[-1] != destrData):
-				raise RuntimeError(
-					'destructible controller rollback is unsafe: '
-					'chunk=%s kind=%s' % (chunkID, kind))
-			try:
-				del values[-1]
-				setattr(ctrl, prevName, previous)
-			except Exception:
-				raise RuntimeError(
-					'destructible controller rollback failed: '
-					'chunk=%s kind=%s' % (chunkID, kind))
-			raise
-	else:
-		# Controller still spawning: order directly - the manager queues it
-		# per chunk until onChunkLoad and animates on flush.  #1513's fifth
-		# argument synchronises shot destruction with the projectile explosion;
-		# contact damage always passes False.
-		dmgTypes = {
-			'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
-			'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
-			'fragile': AreaDestructibles._DAMAGE_TYPE_FRAGILE,
-			'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
-		}
-		AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(
-			chunkID, dmgTypes[kind], destrData, True,
-			bool(syncWithProjectile))
+	# Use one native delivery boundary for both ready and spawning controllers.
+	# Calling set_* materializes and diffs the complete replicated collection on
+	# every break before it reaches this same manager method.  The authority
+	# ledger already supplies replay state, so deliver the single new item and
+	# mirror the accepted controller collection without firing its setter.
+	dmgTypes = {
+		'tree': AreaDestructibles._DAMAGE_TYPE_TREE,
+		'column': AreaDestructibles._DAMAGE_TYPE_COLUMN,
+		'fragile': AreaDestructibles._DAMAGE_TYPE_FRAGILE,
+		'module': AreaDestructibles._DAMAGE_TYPE_MODULE,
+	}
+	AreaDestructibles.g_destructiblesManager.orderDestructibleDestroy(
+		chunkID, dmgTypes[kind], destrData, True,
+		bool(syncWithProjectile))
 	# The native operation is irreversible.  Commit the replay/dedup ledger only
 	# after it has accepted the destroy; otherwise a transient ABI/engine failure
 	# would make every later canonical replay look like a successful duplicate.
 	c[prop].append(destrData)
 	c['keys'].add(dedupKey)
+	if ctrl is not None:
+		try:
+			values = getattr(ctrl, prop)
+			if destrData not in values:
+				values.append(destrData)
+			setattr(ctrl, _PREV_BY_PROP[prop], frozenset(values))
+		except Exception as error:
+			# Native destruction cannot be rolled back.  Keep the authoritative
+			# replay ledger committed and report only the optional local mirror.
+			_log('DestrAuth: controller ledger sync failed', chunkID, kind, error)
 	return True
 
 

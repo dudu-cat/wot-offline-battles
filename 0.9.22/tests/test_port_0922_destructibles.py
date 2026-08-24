@@ -348,41 +348,33 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(1, len(manager.orders))
         self.assertTrue(destructibles_authority.is_destroyed(22, 37))
 
-    def test_controller_setter_failure_rolls_back_only_its_append(self):
+    def test_controller_contact_uses_one_native_order_without_setter(self):
         class Controller(object):
             def __init__(self):
                 self.destroyedFragiles = []
                 self._AreaDestructibles__prevDestroyedFragiles = frozenset()
-                self.fail = True
+                self.setter_calls = 0
 
             def set_destroyedFragiles(self, unused_previous):
-                self._AreaDestructibles__prevDestroyedFragiles = frozenset(
-                    self.destroyedFragiles)
-                if self.fail:
-                    raise RuntimeError('setter failed')
+                self.setter_calls += 1
+                raise AssertionError('controller setter must not be called')
 
         manager = _Manager()
         manager.controller = Controller()
         area = _authority_environment(manager)
 
         with mock.patch.dict(sys.modules, {'AreaDestructibles': area}):
-            with self.assertRaisesRegex(RuntimeError, 'setter failed'):
-                destructibles_authority.destroy_fragile(
-                    1, 22, 37, (10.0, 2.0, 20.0), False)
-            chunk = destructibles_authority._state['chunks'][22]
-            self.assertEqual([], manager.controller.destroyedFragiles)
-            self.assertEqual(
-                frozenset(),
-                manager.controller._AreaDestructibles__prevDestroyedFragiles)
-            self.assertEqual([], chunk['destroyedFragiles'])
-            self.assertEqual(set(), chunk['keys'])
-
-            manager.controller.fail = False
             self.assertTrue(destructibles_authority.destroy_fragile(
                 1, 22, 37, (10.0, 2.0, 20.0), False))
 
+        encoded = 37 << 8
+        self.assertEqual([(22, 3, encoded, True, False)], manager.orders)
         self.assertEqual([(37 << 8)],
                          manager.controller.destroyedFragiles)
+        self.assertEqual(
+            frozenset([encoded]),
+            manager.controller._AreaDestructibles__prevDestroyedFragiles)
+        self.assertEqual(0, manager.controller.setter_calls)
         self.assertTrue(destructibles_authority.is_destroyed(22, 37))
 
     def test_failed_entity_creation_is_not_permanently_deduplicated(self):
