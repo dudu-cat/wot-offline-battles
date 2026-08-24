@@ -849,7 +849,8 @@ class ServerBattleAuthority(object):
             state = {}
             current_state = current.get(bot_id)
             if isinstance(current_state, dict):
-                for name in ('mass', 'collision_shape', 'vehicle', 'team'):
+                for name in ('mass', 'collision_shape', 'ram_profile',
+                             'vertical_speed', 'vehicle', 'team'):
                     if name in current_state:
                         state[name] = current_state[name]
             state.update(raw)

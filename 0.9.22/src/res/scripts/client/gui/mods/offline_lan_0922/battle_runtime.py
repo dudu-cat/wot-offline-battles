@@ -1133,6 +1133,13 @@ class BattleRuntime(object):
         self._local_ram_seq = 0
         self._local_ram_receipt = None
         self._local_ram_receipts = collections.OrderedDict()
+        self._native_ram_contact_hook = None
+        self._native_ram_contact_proofs = collections.OrderedDict()
+        self._native_ram_contact_failures = set()
+        self._native_ram_event_seq = 0
+        self._local_ram_episode_contacts = frozenset()
+        self._local_ram_profile_cache = None
+        self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
         self._ram_bot_history = {}
@@ -1362,6 +1369,9 @@ class BattleRuntime(object):
         self._local_ram_seq = 0
         self._local_ram_receipt = None
         self._local_ram_receipts = collections.OrderedDict()
+        self._local_ram_episode_contacts = frozenset()
+        self._local_ram_profile_cache = None
+        self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
         self._ram_bot_history = {}
@@ -1421,6 +1431,8 @@ class BattleRuntime(object):
         self._local_spotting_cache = None
         self._local_factors_cache = None
         self._remote_spotting_cache = {}
+        self._local_ram_profile_cache = None
+        self._remote_ram_profile_cache = {}
         self._local_still_since = None
         self._published_vision_radius = None
         self._published_still_devices = {}
@@ -1583,6 +1595,7 @@ class BattleRuntime(object):
                     self._avatar, '_offlineLANPlayerReady', False):
                 raise RuntimeError(
                     'stock OfflineMapCreator did not promote its Avatar')
+            self._install_native_ram_contact_hook()
             if self._destructibles is not None:
                 self._destructibles.reset(self._avatar.spaceID)
                 self._destructibles.set_event_sink(
@@ -2515,6 +2528,7 @@ class BattleRuntime(object):
             self._bots = BotRuntime(
                 self.client.player_id,
                 descriptor_resolver=self._resolve_descriptor,
+                player_descriptor_resolver=self._resolve_player_descriptor,
                 direction_probe=self._direction_probe,
                 vehicle_selector=self._select_bot_vehicle,
                 visibility_probe=self._bot_visibility,
@@ -5641,7 +5655,8 @@ class BattleRuntime(object):
             state = {}
             current_state = current.get(bot_id)
             if isinstance(current_state, dict):
-                for name in ('mass', 'collision_shape', 'vehicle', 'team'):
+                for name in ('mass', 'collision_shape', 'ram_profile',
+                             'vehicle', 'team'):
                     if name in current_state:
                         state[name] = current_state[name]
             state.update(raw)
@@ -5735,6 +5750,7 @@ class BattleRuntime(object):
         if left_time == right_time:
             result = dict(left_state)
             result['ram_vx'] = 0.0
+            result['ram_vy'] = 0.0
             result['ram_vz'] = 0.0
             if len(timeline) >= 2:
                 before_index, after_index = (
@@ -5752,6 +5768,9 @@ class BattleRuntime(object):
                     result['ram_vx'] = (
                         _number(after_state.get('x')) -
                         _number(before_state.get('x'))) / span
+                    result['ram_vy'] = (
+                        _number(after_state.get('y')) -
+                        _number(before_state.get('y'))) / span
                     result['ram_vz'] = (
                         _number(after_state.get('z')) -
                         _number(before_state.get('z'))) / span
@@ -5780,6 +5799,9 @@ class BattleRuntime(object):
         result['ram_vx'] = (
             _number(right_state.get('x')) -
             _number(left_state.get('x'))) * 1000000.0 / span_us
+        result['ram_vy'] = (
+            _number(right_state.get('y')) -
+            _number(left_state.get('y'))) * 1000000.0 / span_us
         result['ram_vz'] = (
             _number(right_state.get('z')) -
             _number(left_state.get('z'))) * 1000000.0 / span_us
@@ -10922,6 +10944,424 @@ class BattleRuntime(object):
         """Return the current 0.8.2 chassis hit-tester body."""
         return tank_collision.chassis_shape(descriptor)
 
+    def _install_native_ram_contact_hook(self):
+        """Observe #1513's real vehicle-collision callback without replacing it."""
+        if self._worker_mode or self._native_ram_contact_hook is not None:
+            return False
+        avatar_type = type(self._avatar)
+        method_name = 'handleVehicleCollidedVehicle'
+        raw_original = getattr(avatar_type, '__dict__', {}).get(method_name)
+        if not callable(raw_original):
+            raise RuntimeError(
+                '#1513 PlayerAvatar collision callback is unavailable')
+        owner = self
+
+        def observe_after_native(avatar, veh_a, veh_b, hit_point,
+                                 contact_time):
+            result = raw_original(
+                avatar, veh_a, veh_b, hit_point, contact_time)
+            if avatar is owner._avatar:
+                try:
+                    owner._observe_native_ram_contact(
+                        veh_a, veh_b, hit_point, contact_time)
+                except Exception as error:
+                    owner._warn_optional_failure(
+                        'native ram contact proof', error)
+            return result
+
+        setattr(avatar_type, method_name, observe_after_native)
+        self._native_ram_contact_hook = (
+            avatar_type, method_name, raw_original, observe_after_native)
+        return True
+
+    def _restore_native_ram_contact_hook(self):
+        hook = self._native_ram_contact_hook
+        self._native_ram_contact_hook = None
+        if hook is None:
+            return False
+        avatar_type, method_name, original, replacement = hook
+        if getattr(avatar_type, '__dict__', {}).get(method_name) is replacement:
+            setattr(avatar_type, method_name, original)
+        return True
+
+    def _native_ram_bot_record(self, vehicle):
+        try:
+            engine_id = int(vehicle.id)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        for record in self._records.values():
+            if (record.get('kind') == 'bot' and record.get('ready') and
+                    int(record.get('engine_id', 0)) == engine_id):
+                return record
+        return None
+
+    def _native_ram_vehicle_armor(self, vehicle, matrix, hit_point):
+        """Return the first real structural plate reached from the contact."""
+        descriptor = getattr(vehicle, 'typeDescriptor', None)
+        if descriptor is None or matrix is None:
+            return None
+        center = self._vector(_xyz(getattr(matrix, 'translation',
+                                       getattr(vehicle, 'position', None))))
+        hit = self._vector(hit_point)
+        outward = hit - center
+        if outward.length <= 0.000001:
+            return None
+        outward.normalise()
+        shape = self._collision_shape(descriptor)
+        reach = math.sqrt(shape[0] * shape[0] + shape[1] * shape[1])
+        start = hit + outward.scale(reach)
+        collisions = collide_vehicle_at_matrix(
+            vehicle, matrix, start, center, self._runtime.math)
+        if not collisions:
+            return None
+        for collision in sorted(
+                collisions, key=lambda item: float(item.dist)):
+            material = getattr(collision, 'matInfo', None)
+            try:
+                armor = float(getattr(material, 'armor'))
+                damage_factor = float(getattr(
+                    material, 'vehicleDamageFactor'))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return None
+            if (math.isnan(armor) or math.isinf(armor) or armor <= 0.0 or
+                    math.isnan(damage_factor) or math.isinf(damage_factor)):
+                continue
+            if damage_factor <= 0.0:
+                # Retail treats tracks/screens as an HE layer chain. We do not
+                # have the complete #1513 attenuation law at this boundary,
+                # so passing the full kinetic potential to the plate behind it
+                # would be invented behaviour. Fail closed for HP while still
+                # retaining ordinary OBB separation/impulse.
+                return None
+            return {'armor': armor, 'screened': False}
+        return None
+
+    @staticmethod
+    def _native_ram_velocity(vehicle):
+        velocity = getattr(getattr(vehicle, 'filter', None), 'velocity', None)
+        if velocity is None:
+            return None
+        values = _xyz(velocity)
+        if any(math.isnan(value) or math.isinf(value) for value in values):
+            return None
+        return values
+
+    def _ram_pose_matrix(self, position, yaw, pitch=0.0, roll=0.0):
+        matrix = self._runtime.math.Matrix()
+        matrix.setRotateYPR((float(yaw), float(pitch), float(roll)))
+        matrix.translation = self._vector(position)
+        return matrix
+
+    def _queue_ram_contact_proof(self, record, local_vehicle, bot_vehicle,
+                                 hit_point, player_velocity, bot_velocity,
+                                 contact_time_us, own_pose=None,
+                                 bot_pose=None, player_ram_profile=None):
+        """Queue one immutable contact episode without applying HP locally."""
+        if len(self._native_ram_contact_proofs) >= 16:
+            return False
+        bot_id = int(record['network_id'])
+        if own_pose is None:
+            own_pose = (
+                self._local_position[0], self._local_position[1],
+                self._local_position[2], self._local_yaw,
+                self._local_pitch, self._local_roll)
+        if bot_pose is None:
+            bot_position = _xyz(getattr(
+                bot_vehicle, 'position', (0.0, 0.0, 0.0)))
+            bot_matrix = getattr(bot_vehicle, 'matrix', None)
+            bot_pose = (
+                bot_position[0], bot_position[1], bot_position[2],
+                float(getattr(bot_matrix, 'yaw', 0.0)), 0.0, 0.0)
+        if player_ram_profile is None:
+            player_ram_profile = self._ram_profile(
+                local_vehicle.typeDescriptor, local=True)
+        player_spall = float(player_ram_profile['spall_coefficient'])
+        player_bonus = float(player_ram_profile['ramming_bonus'])
+        proof = {
+            'bot_id': bot_id,
+            'record': record,
+            'local_vehicle': local_vehicle,
+            'bot_vehicle': bot_vehicle,
+            'hit_point': _xyz(hit_point),
+            'native_contact_time_us': int(contact_time_us),
+            'x': float(own_pose[0]), 'y': float(own_pose[1]),
+            'z': float(own_pose[2]), 'yaw': float(own_pose[3]),
+            'local_matrix': self._ram_pose_matrix(
+                own_pose[:3], own_pose[3], own_pose[4], own_pose[5]),
+            'bot_matrix': self._ram_pose_matrix(
+                bot_pose[:3], bot_pose[3], bot_pose[4], bot_pose[5]),
+            'contact_spall_player': player_spall,
+            'contact_bonus_player': player_bonus,
+            'vx': float(player_velocity[0]),
+            'vy': float(player_velocity[1]),
+            'vz': float(player_velocity[2]),
+            'bot_vx': float(bot_velocity[0]),
+            'bot_vy': float(bot_velocity[1]),
+            'bot_vz': float(bot_velocity[2]),
+            'attempts': 0,
+        }
+        self._native_ram_event_seq += 1
+        event_seq = self._native_ram_event_seq
+        proof['event_seq'] = event_seq
+        self._native_ram_contact_proofs[event_seq] = proof
+        return self._retry_native_ram_contact_proof(event_seq)
+
+    def _observe_native_ram_contact(self, veh_a, veh_b, hit_point,
+                                    contact_time):
+        """Freeze one native callback for immediate or next-frame proof."""
+        local_id = int(self._server.vehicle_id)
+        local = veh_a if int(getattr(veh_a, 'id', 0)) == local_id else (
+            veh_b if int(getattr(veh_b, 'id', 0)) == local_id else None)
+        if local is None:
+            return False
+        other = veh_b if local is veh_a else veh_a
+        record = self._native_ram_bot_record(other)
+        if record is None:
+            return False
+        bot_id = int(record['network_id'])
+        if bot_id in self._local_ram_episode_contacts:
+            return False
+        try:
+            contact_time = float(contact_time)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if math.isnan(contact_time) or math.isinf(contact_time):
+            return False
+        velocity = self._native_ram_velocity(local)
+        bot_velocity = self._native_ram_velocity(other)
+        if velocity is None or bot_velocity is None:
+            return False
+        estimated = self._estimated_motion_time_us(self._clock())
+        if estimated is None:
+            return False
+        queued = self._queue_ram_contact_proof(
+            record, local, other, hit_point,
+            velocity, bot_velocity, estimated)
+        if queued or any(
+                proof.get('bot_id') == bot_id for proof in
+                self._native_ram_contact_proofs.values()):
+            self._local_ram_episode_contacts = frozenset(
+                set(self._local_ram_episode_contacts) | {bot_id})
+        return queued
+
+    def _retry_native_ram_contact_proof(self, event_seq):
+        proof = self._native_ram_contact_proofs.get(event_seq)
+        if proof is None:
+            return False
+        bot_id = proof['bot_id']
+        proof['attempts'] += 1
+        record = proof['record']
+        presentation_time_us = record.get('presentation_time_us')
+        revision = self._ram_bot_revision_at(bot_id, presentation_time_us)
+        local_matrix = proof['local_matrix']
+        bot_matrix = proof['bot_matrix']
+        player_plate = self._native_ram_vehicle_armor(
+            proof['local_vehicle'], local_matrix, proof['hit_point'])
+        bot_plate = self._native_ram_vehicle_armor(
+            proof['bot_vehicle'], bot_matrix, proof['hit_point'])
+        if (revision is None or presentation_time_us is None or
+                player_plate is None or bot_plate is None):
+            if proof['attempts'] < 2:
+                return False
+            self._native_ram_contact_proofs.pop(event_seq, None)
+            signature = (bot_id, player_plate is None, bot_plate is None)
+            if signature not in self._native_ram_contact_failures:
+                self._native_ram_contact_failures.add(signature)
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] RAM native contact unsupported '
+                    'bot_id=%d player_plate=%s bot_plate=%s\n' % (
+                        bot_id, player_plate, bot_plate))
+            return False
+        if len(self._local_ram_receipts) >= 16:
+            return False
+        self._local_ram_seq += 1
+        hit = proof['hit_point']
+        player_armor = player_plate['armor']
+        bot_armor = bot_plate['armor']
+        receipt = {
+            'seq': self._local_ram_seq,
+            'bot_id': bot_id,
+            'bot_state_revision': int(revision),
+            'presentation_time_us': int(presentation_time_us),
+            'native_contact_time_us': int(
+                proof['native_contact_time_us']),
+            'contact_x': float(hit[0]),
+            'contact_y': float(hit[1]),
+            'contact_z': float(hit[2]),
+            'contact_armor_player': float(player_armor),
+            'contact_armor_bot': float(bot_armor),
+            'contact_screened_player': bool(player_plate['screened']),
+            'contact_screened_bot': bool(bot_plate['screened']),
+            'contact_spall_player': proof['contact_spall_player'],
+            'contact_bonus_player': proof['contact_bonus_player'],
+            'x': proof['x'], 'y': proof['y'], 'z': proof['z'],
+            'yaw': proof['yaw'], 'vx': proof['vx'], 'vy': proof['vy'],
+            'vz': proof['vz'],
+            'bot_vx': proof['bot_vx'], 'bot_vy': proof['bot_vy'],
+            'bot_vz': proof['bot_vz'],
+        }
+        self._local_ram_receipt = receipt
+        self._local_ram_receipts[self._local_ram_seq] = dict(receipt)
+        self._native_ram_contact_proofs.pop(event_seq, None)
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] RAM native contact accepted '
+            'bot_id=%d player_armor=%.3f bot_armor=%.3f\n' % (
+                bot_id, player_armor, bot_armor))
+        return True
+
+    def _retry_native_ram_contact_proofs(self):
+        for event_seq in tuple(self._native_ram_contact_proofs):
+            self._retry_native_ram_contact_proof(event_seq)
+
+    @staticmethod
+    def _ram_obb_vertices(body):
+        shape = body['shape']
+        yaw = float(body['yaw'])
+        sine = math.sin(yaw)
+        cosine = math.cos(yaw)
+        right_x, right_z = cosine, -sine
+        forward_x, forward_z = sine, cosine
+        center_x, center_z = float(body['x']), float(body['z'])
+        half_width, half_length = float(shape[0]), float(shape[1])
+        return [
+            (center_x + sx * half_width * right_x +
+             sz * half_length * forward_x,
+             center_z + sx * half_width * right_z +
+             sz * half_length * forward_z)
+            for sx, sz in ((-1.0, -1.0), (1.0, -1.0),
+                           (1.0, 1.0), (-1.0, 1.0))]
+
+    @classmethod
+    def _ram_obb_overlap_point(cls, body_a, body_b):
+        """Return a point inside the exact convex overlap of two OBBs."""
+        polygon = cls._ram_obb_vertices(body_a)
+        clip = cls._ram_obb_vertices(body_b)
+        for index in range(4):
+            start = clip[index]
+            end = clip[(index + 1) % 4]
+            edge_x, edge_z = end[0] - start[0], end[1] - start[1]
+
+            def inside(point):
+                return (edge_x * (point[1] - start[1]) -
+                        edge_z * (point[0] - start[0])) >= -1.0e-7
+
+            def intersection(first, second):
+                segment_x = second[0] - first[0]
+                segment_z = second[1] - first[1]
+                denominator = segment_x * edge_z - segment_z * edge_x
+                if abs(denominator) <= 1.0e-12:
+                    return second
+                ratio = ((start[0] - first[0]) * edge_z -
+                         (start[1] - first[1]) * edge_x) / denominator
+                return (first[0] + ratio * segment_x,
+                        first[1] + ratio * segment_z)
+
+            output = []
+            if not polygon:
+                return None
+            previous = polygon[-1]
+            previous_inside = inside(previous)
+            for current in polygon:
+                current_inside = inside(current)
+                if current_inside != previous_inside:
+                    output.append(intersection(previous, current))
+                if current_inside:
+                    output.append(current)
+                previous = current
+                previous_inside = current_inside
+            polygon = output
+        if not polygon:
+            return None
+        count = float(len(polygon))
+        return (sum(point[0] for point in polygon) / count,
+                sum(point[1] for point in polygon) / count)
+
+    def _poll_local_ram_contact_episodes(self, entity, own, others):
+        """Turn exact OBB compression episodes into immutable RAM proofs.
+
+        Synthetic remote Vehicles do not participate in BigWorld's native
+        vehicle-collision callback. The copied collision solver is therefore
+        the authoritative contact fact for player-bot physics. It supplies
+        only geometry: plate thickness still comes from each live descriptor
+        hit tester in ``_retry_native_ram_contact_proof``.
+        """
+        previous = set(self._local_ram_episode_contacts)
+        overlapping = set()
+        newly_armed = set()
+        for other in others:
+            if (not other.get('alive', True) or
+                    other.get('kind') != 'bot'):
+                continue
+            if not tank_collision.vertical_overlap(
+                    own.get('y'), own['shape'],
+                    other.get('y'), other['shape']):
+                continue
+            contact = tank_collision.obb_contact(
+                own['x'], own['z'], own['yaw'], own['shape'],
+                other['x'], other['z'], other['yaw'], other['shape'])
+            if contact is None:
+                continue
+            bot_id = int(other['network_id'])
+            overlapping.add(bot_id)
+            overlap_point = self._ram_obb_overlap_point(own, other)
+            if overlap_point is None:
+                continue
+            low = max(
+                float(own['y']) + float(own['shape'][2]),
+                float(other['y']) + float(other['shape'][2]))
+            high = min(
+                float(own['y']) + float(own['shape'][3]),
+                float(other['y']) + float(other['shape'][3]))
+            vertical_penetration = high - low
+            if vertical_penetration <= contact[2]:
+                own_center_y = float(own['y']) + (
+                    float(own['shape'][2]) +
+                    float(own['shape'][3])) * 0.5
+                other_center_y = float(other['y']) + (
+                    float(other['shape'][2]) +
+                    float(other['shape'][3])) * 0.5
+                vertical_normal = (1.0 if own_center_y >= other_center_y
+                                   else -1.0)
+                relative_normal = (
+                    own.get('vy', 0.0) - other.get('vy', 0.0)) * \
+                    vertical_normal
+            else:
+                relative_normal = (
+                    (own['vx'] - other['vx']) * contact[0] +
+                    (own['vz'] - other['vz']) * contact[1])
+            if relative_normal >= 0.0 or bot_id in previous:
+                continue
+            hit_point = self._vector((
+                overlap_point[0],
+                (low + high) * 0.5,
+                overlap_point[1]))
+            estimated = self._estimated_motion_time_us(self._clock())
+            record = other.get('_record')
+            bot_vehicle = other.get('_vehicle')
+            if (estimated is None or record is None or bot_vehicle is None):
+                continue
+            queued = self._queue_ram_contact_proof(
+                record, entity, bot_vehicle, hit_point,
+                (own['vx'], own.get('vy', 0.0), own['vz']),
+                (other['vx'], other.get('vy', 0.0), other['vz']),
+                estimated,
+                own_pose=(own['x'], own['y'], own['z'], own['yaw'],
+                          self._local_pitch, self._local_roll),
+                bot_pose=(other['x'], other['y'], other['z'], other['yaw'],
+                          _number(other.get('pitch')),
+                          _number(other.get('roll'))),
+                player_ram_profile=own['ram_profile'])
+            # Queue admission, including one next-frame plate retry, owns the
+            # episode. A sustained overlap must never generate another HP
+            # proposal merely because rendering/polling continues.
+            if queued or any(
+                    proof.get('bot_id') == bot_id for proof in
+                    self._native_ram_contact_proofs.values()):
+                newly_armed.add(bot_id)
+        self._local_ram_episode_contacts = frozenset(
+            (previous & overlapping) | newly_armed)
+        return bool(newly_armed)
+
     def _contact_tanks(self):
         """Return current non-local chassis bodies for 0.8.2 contact physics."""
         result = []
@@ -10937,6 +11377,17 @@ class BattleRuntime(object):
                 if isinstance(presented_pose, dict):
                     state = dict(state)
                     state.update(presented_pose)
+                presentation_time_us = record.get('presentation_time_us')
+                revision = self._ram_bot_revision_at(
+                    record.get('network_id'), presentation_time_us)
+                historical = (self._ram_bot_state_at(
+                    record.get('network_id'), revision,
+                    presentation_time_us) if revision is not None else None)
+                if isinstance(historical, dict):
+                    state = dict(state)
+                    for name in ('ram_vx', 'ram_vy', 'ram_vz'):
+                        if name in historical:
+                            state[name] = historical[name]
             alive = bool(state.get('alive', True))
             remote = self._server_entity(record['engine_id'])
             descriptor = getattr(remote, 'typeDescriptor', None)
@@ -10953,6 +11404,8 @@ class BattleRuntime(object):
                 'network_id': int(record.get('network_id', 0)),
                 'engine_id': int(record.get('engine_id', 0)),
                 'kind': record.get('kind'),
+                '_record': record,
+                '_vehicle': remote,
                 'presentation_time_us': record.get(
                     'presentation_time_us'),
                 'alive': alive,
@@ -10969,13 +11422,21 @@ class BattleRuntime(object):
                 'yaw': yaw,
                 'mass': _number(mass, 25000.0),
                 'shape': shape,
-                'vx': math.sin(yaw) * speed,
-                'vz': math.cos(yaw) * speed,
+                'ram_profile': self._ram_profile(descriptor),
+                'vx': _number(
+                    state.get('ram_vx'), math.sin(yaw) * speed),
+                'vy': _number(state.get(
+                    'ram_vy', state.get('vertical_speed'))),
+                'vz': _number(
+                    state.get('ram_vz'), math.cos(yaw) * speed),
+                'pitch': _number(state.get('pitch')),
+                'roll': _number(state.get('roll')),
             })
         return result
 
     def _resolve_local_tank_contacts(self, entity, position, yaw, dt):
         """Apply chassis OBB separation without pushing a tank into walls."""
+        self._retry_native_ram_contact_proofs()
         others = self._contact_tanks()
         own_mass = _number(
             (self._local_physics or {}).get('mass'), 25000.0)
@@ -10985,9 +11446,13 @@ class BattleRuntime(object):
             'x': position[0], 'y': position[1], 'z': position[2],
             'yaw': yaw, 'mass': own_mass,
             'shape': self._collision_shape(entity.typeDescriptor),
+            'ram_profile': self._ram_profile(
+                entity.typeDescriptor, local=True),
             'vx': math.sin(yaw) * self._local_speed + self._local_push_x,
+            'vy': self._local_vertical_speed,
             'vz': math.cos(yaw) * self._local_speed + self._local_push_z,
         }
+        self._poll_local_ram_contact_episodes(entity, own, others)
         now = self._clock()
         contact = tank_collision.resolve_tank(
             own, others, now=now,
@@ -10995,38 +11460,6 @@ class BattleRuntime(object):
             active_ram_contacts=self._local_ram_contacts)
         self._local_ram_cooldowns = contact['cooldowns']
         self._local_ram_contacts = contact['contacts']
-        targets = dict((body['id'], body) for body in others
-                       if body.get('network_id') and
-                       body.get('kind') == 'bot')
-        for event in contact['ram_events']:
-            target = targets.get(event.get('other_id'))
-            presentation_time_us = (target or {}).get(
-                'presentation_time_us')
-            revision = self._ram_bot_revision_at(
-                (target or {}).get('network_id'), presentation_time_us)
-            if (target is None or revision is None or
-                    presentation_time_us is None):
-                continue
-            if len(self._local_ram_receipts) >= 16:
-                # Preserve older unadmitted proofs; replacing one would make
-                # a 15 Hz coalesced snapshot silently lose a real contact.
-                continue
-            velocity = event['velocity_self']
-            self._local_ram_seq += 1
-            receipt = {
-                'seq': self._local_ram_seq,
-                'bot_id': int(target['network_id']),
-                'bot_state_revision': revision,
-                'presentation_time_us': int(presentation_time_us),
-                'x': float(position[0]),
-                'y': float(position[1]),
-                'z': float(position[2]),
-                'yaw': float(yaw),
-                'vx': float(velocity[0]),
-                'vz': float(velocity[1]),
-            }
-            self._local_ram_receipt = receipt
-            self._local_ram_receipts[self._local_ram_seq] = dict(receipt)
         delta_x, delta_z = contact['delta_velocity']
         forward_impulse = (delta_x * math.sin(yaw) +
                            delta_z * math.cos(yaw))
@@ -13468,6 +13901,26 @@ class BattleRuntime(object):
                 equipments) or False
         return self._local_factors_cache or None
 
+    def _ram_profile(self, descriptor, local=False):
+        """Return the #1513 ram inputs for one mounted descriptor."""
+        if local:
+            if self._local_ram_profile_cache is None:
+                snapshot = self._garage_loadout_snapshot()
+                bonus = loadout_law.ramming_bonus(snapshot.get('crew'))
+                self._local_ram_profile_cache = (
+                    tank_collision.descriptor_ram_profile(
+                        descriptor, bonus))
+            return self._local_ram_profile_cache
+        key = (_field(descriptor, 'name', ''),
+               loadout_law.device_names(descriptor))
+        profile = self._remote_ram_profile_cache.get(key)
+        if profile is None:
+            # Non-local vehicles use the default untrained crew.  Their
+            # descriptor still carries any mounted Spall Liner and its weight.
+            profile = tank_collision.descriptor_ram_profile(descriptor)
+            self._remote_ram_profile_cache[key] = profile
+        return profile
+
     def _vision_radius(self, descriptor, entity=None, still_seconds=0.0,
                        local=False):
         turret = _field(descriptor, 'turret', {})
@@ -14688,6 +15141,12 @@ class BattleRuntime(object):
 
     def _cleanup(self):
         cleanup_error = None
+        try:
+            self._restore_native_ram_contact_hook()
+        except Exception as error:
+            cleanup_error = error
+        self._native_ram_contact_proofs.clear()
+        self._native_ram_contact_failures.clear()
         try:
             self._stop_authority_worker_probe('battle_cleanup')
         except Exception as error:

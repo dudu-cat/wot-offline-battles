@@ -15,6 +15,8 @@ from gui.mods.offline_lan_0922.prebaked_navigation import mod_dir
 FORMAT_NAME = 'offline-lan-0922-destructible-catalog'
 FORMAT_VERSION = 5
 MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
+_STRUCTURE_MAT_KIND_MIN_1513 = 73
+_STRUCTURE_MAT_KIND_MAX_1513 = 86
 try:
 	_STRING_TYPES = (basestring,)
 except NameError:
@@ -173,7 +175,8 @@ def _validate(data, map_name):
 				except (TypeError, ValueError):
 					raise ValueError(
 						'structure module material is invalid')
-				if mat_kind < 71 or mat_kind > 130:
+				if not (_STRUCTURE_MAT_KIND_MIN_1513 <= mat_kind <
+						_STRUCTURE_MAT_KIND_MAX_1513):
 					raise ValueError(
 						'structure module material is invalid')
 		locators = record.get('locators')

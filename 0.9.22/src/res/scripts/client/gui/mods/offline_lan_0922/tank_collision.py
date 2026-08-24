@@ -16,10 +16,10 @@ mapping with these fields::
 
 The retail body is sized from the native chassis ``hitTester.bbox`` and extended
 vertically to contain the mounted hull. ``resolve_tank`` uses yaw-aware OBB SAT
-and returns positional correction, the e=0 velocity impulse, ram events, and an
-updated cooldown mapping. Movement is never vetoed: existing spawn overlap is
-separated using inverse-mass weighting instead of becoming an "all directions
-blocked" local-avoidance deadlock.
+and returns positional correction, the e=0 velocity impulse, ram events, and a
+legacy-compatible event timestamp mapping. Movement is never vetoed: existing
+spawn overlap is separated using inverse-mass weighting instead of becoming an
+"all directions blocked" local-avoidance deadlock.
 """
 
 import math
@@ -28,10 +28,26 @@ import math
 DEFAULT_SHAPE = (1.5, 3.5, -0.8, 2.0)
 POSITION_SLOP = 0.01
 POSITION_PERCENT = 0.95
-RAM_SAFE_SPEED = 3.5
-RAM_COOLDOWN = 0.75
 _SHAPE_CACHE = {}
 SPATIAL_CELL_SIZE = 24.0
+
+# 0.9.22-era Wargaming Battle Mechanics defines a ram as an HE-like
+# explosion.  The page revision shipped alongside 9.22 is 270080:
+# https://wiki.wargaming.net/en/index.php?oldid=270080
+#
+#   potential = 0.5 * combined mass in tonnes * relative speed squared
+#   share     = 1 - individual mass / combined mass
+#   damage    = HE damage factor * share * potential
+#               - HE absorption factor * nominal armour * spall coefficient
+#
+# The 2018 Wiki formula uses 0.5 and 1.1. These are mechanics constants, not
+# feel-tuning controls. The client stores vehicle mass in kilograms, hence the
+# exact physics_shared WEIGHT_SCALE.
+WEIGHT_SCALE = 0.001
+RAM_KINETIC_FACTOR = 0.5
+RAM_HE_DAMAGE_FACTOR = 0.5
+RAM_ARMOR_ABSORPTION_FACTOR = 1.1
+RAMMING_BONUS_MAX = 0.15
 
 
 def build_spatial_index(bodies, cell_size=SPATIAL_CELL_SIZE):
@@ -77,6 +93,10 @@ def _coord(value, index, default=0.0):
             return float((value.x, value.y, value.z)[index])
         except Exception:
             return float(default)
+
+
+def _finite(value):
+    return value == value and abs(value) != float('inf')
 
 
 def _value(container, name, default=None):
@@ -193,6 +213,76 @@ def _axes(yaw):
     return ((cosine, -sine), (sine, cosine))
 
 
+def descriptor_ram_profile(type_descriptor, ramming_bonus=0.0):
+    """Return source-backed non-contact ram inputs from one descriptor.
+
+    Nominal armour is deliberately absent: ``hull.primaryArmor`` is only a
+    front/side/rear summary and cannot stand in for retail's armour at the
+    actual collision point. Callers must attach that per-contact scalar to the
+    body as ``contact_armor``. ``miscAttrs.antifragmentationLiningFactor``
+    starts at 1.0 and is multiplied by the mounted Spall Liner. Controlled
+    Impact contributes 0.0015 per trained percentage point and is bounded by
+    its documented 15 percent maximum.
+    """
+    misc = _value(type_descriptor, 'miscAttrs', {}) or {}
+    try:
+        spall = float(_value(
+            misc, 'antifragmentationLiningFactor', 1.0))
+    except (TypeError, ValueError):
+        raise RuntimeError('#1513 Spall Liner factor is invalid')
+    if spall < 1.0 or not _finite(spall):
+        raise RuntimeError('#1513 Spall Liner factor is invalid')
+    try:
+        bonus = float(ramming_bonus)
+    except (TypeError, ValueError):
+        raise RuntimeError('#1513 Controlled Impact bonus is invalid')
+    if not _finite(bonus):
+        raise RuntimeError('#1513 Controlled Impact bonus is invalid')
+    bonus = max(0.0, min(RAMMING_BONUS_MAX, bonus))
+    return {
+        'spall_coefficient': spall,
+        'ramming_bonus': bonus,
+    }
+
+
+def _ram_profile(tank):
+    profile = _tank_value(tank, 'ram_profile')
+    if profile is None:
+        descriptor = _tank_value(tank, 'descriptor')
+        profile = (descriptor_ram_profile(descriptor)
+                   if descriptor is not None else {})
+    try:
+        spall = float(profile.get('spall_coefficient', 1.0))
+        bonus = float(profile.get('ramming_bonus', 0.0))
+    except (AttributeError, TypeError, ValueError):
+        raise RuntimeError('tank ram profile is invalid')
+    if (spall < 1.0 or not _finite(spall) or
+            bonus < 0.0 or bonus > RAMMING_BONUS_MAX or
+            not _finite(bonus)):
+        raise RuntimeError('tank ram profile is invalid')
+    return spall, bonus
+
+
+def _contact_ram_inputs(tank):
+    """Return per-contact armour plus descriptor/crew ram modifiers.
+
+    A missing contact scalar fails closed. OBB orientation is insufficient to
+    reconstruct retail's contact point, nominal armour group and spaced-armour
+    handling, so it must never be silently replaced with primaryArmor.
+    """
+    armor = _tank_value(tank, 'contact_armor')
+    if armor is None:
+        return None
+    try:
+        armor = float(armor)
+    except (TypeError, ValueError):
+        raise RuntimeError('tank contact armor is invalid')
+    if armor < 0.0 or not _finite(armor):
+        raise RuntimeError('tank contact armor is invalid')
+    spall, bonus = _ram_profile(tank)
+    return armor, spall, bonus
+
+
 def obb_contact(x_a, z_a, yaw_a, shape_a,
                 x_b, z_b, yaw_b, shape_b):
     """Return ``(nx, nz, penetration)``, with the normal pointing B -> A."""
@@ -290,25 +380,51 @@ def _owner_oriented_contact(contact, center_dx, center_dz,
     return normal_x, normal_z, penetration
 
 
-def ram_damage(closing_speed, mass_self, mass_other):
-    """Return ``(damage_to_other, damage_to_self)`` for one ram event.
+def ram_damage(relative_speed, mass_self, mass_other,
+               armor_self, armor_other,
+               spall_self=1.0, spall_other=1.0,
+               bonus_self=0.0, bonus_other=0.0,
+               moving_self=True, moving_other=True):
+    """Return the documented 9.22 ``(damage_to_other, damage_to_self)``.
 
-    This remains an approximate local law: the proprietary server formula is
-    unavailable.  Keep it owner-invariant, however.  Swapping the two bodies
-    must only swap their damages; authority iteration order is not physics.
-    Impacts at or below 3.5 m/s are harmless.
+    Wargaming's 9.22-era Battle Mechanics first creates an HE-like explosion
+    from the pair's kinetic potential, distributes it by inverse mass share,
+    then applies the contemporaneous non-penetrating HE law at zero impact
+    distance.  There is no empirical threshold, ratio clamp, or damage cap.
     """
-    relative_speed = abs(closing_speed)
-    if relative_speed <= RAM_SAFE_SPEED:
+    relative_speed = abs(float(relative_speed))
+    self_tonnes = max(0.0, float(mass_self)) * WEIGHT_SCALE
+    other_tonnes = max(0.0, float(mass_other)) * WEIGHT_SCALE
+    combined = self_tonnes + other_tonnes
+    if combined <= 0.0 or relative_speed <= 0.0:
         return 0, 0
-    impulse = (relative_speed - RAM_SAFE_SPEED) ** 2
-    ratio_to_other = max(
-        0.1, min(4.0, mass_self / max(mass_other, 1.0)))
-    ratio_to_self = max(
-        0.1, min(4.0, mass_other / max(mass_self, 1.0)))
-    damage_other = min(350, int(impulse * ratio_to_other))
-    damage_self = min(350, int(impulse * ratio_to_self))
-    return damage_other, damage_self
+    potential = (RAM_KINETIC_FACTOR * combined *
+                 relative_speed * relative_speed)
+    alpha_self = potential * (other_tonnes / combined)
+    alpha_other = potential * (self_tonnes / combined)
+
+    raw_self = max(
+        0.0,
+        RAM_HE_DAMAGE_FACTOR * alpha_self -
+        RAM_ARMOR_ABSORPTION_FACTOR *
+        max(0.0, float(armor_self)) * max(1.0, float(spall_self)))
+    raw_other = max(
+        0.0,
+        RAM_HE_DAMAGE_FACTOR * alpha_other -
+        RAM_ARMOR_ABSORPTION_FACTOR *
+        max(0.0, float(armor_other)) * max(1.0, float(spall_other)))
+
+    # Controlled Impact modifies final received/inflicted ram damage and is
+    # active only while the corresponding vehicle is moving.
+    own_bonus = max(0.0, min(RAMMING_BONUS_MAX, float(bonus_self)))
+    other_bonus = max(0.0, min(RAMMING_BONUS_MAX, float(bonus_other)))
+    if moving_self:
+        raw_self *= 1.0 - own_bonus
+        raw_other *= 1.0 + own_bonus
+    if moving_other:
+        raw_other *= 1.0 - other_bonus
+        raw_self *= 1.0 + other_bonus
+    return int(raw_other), int(raw_self)
 
 
 def _tank_value(tank, name, default=None):
@@ -359,8 +475,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
     ``ram_events``
         One mapping per newly admitted ram damage event.
     ``cooldowns``
-        A copied and updated pair->time mapping.  The input mapping is never
-        mutated, so callers can publish the result atomically.
+        A copied pair->last-event mapping retained for adapter compatibility.
+        It is diagnostic only and never suppresses a separated new impact.
     ``contacts``
         The OBB pairs in a damaging compression episode. Feed the preceding
         complete frame back as ``active_ram_contacts`` so sustained pressure
@@ -378,6 +494,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
     mass_self = max(float(_tank_value(tank, 'mass', 1.0) or 1.0), 1.0)
     inverse_self = 1.0 / mass_self
     velocity_x = float(_tank_value(tank, 'vx', 0.0) or 0.0)
+    velocity_y = float(_tank_value(tank, 'vy', 0.0) or 0.0)
     velocity_z = float(_tank_value(tank, 'vz', 0.0) or 0.0)
     own_shape = _tank_shape(tank)
     own_radius = math.sqrt(
@@ -388,6 +505,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
     delta_velocity_x = 0.0
     delta_velocity_z = 0.0
     ram_events = []
+    ram_diagnostics = []
     cooldowns = dict(ram_cooldowns or {})
     previous_contacts = set(active_ram_contacts or ())
     overlap_pairs = set()
@@ -429,9 +547,10 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         overlap_pairs.add(pair)
 
         if other_is_wreck:
-            other_velocity_x = other_velocity_z = 0.0
+            other_velocity_x = other_velocity_y = other_velocity_z = 0.0
         else:
             other_velocity_x = float(_tank_value(other, 'vx', 0.0) or 0.0)
+            other_velocity_y = float(_tank_value(other, 'vy', 0.0) or 0.0)
             other_velocity_z = float(_tank_value(other, 'vz', 0.0) or 0.0)
         response = pair_response(
             contact, inverse_self, inverse_other,
@@ -453,12 +572,38 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         if normal_velocity >= 0.0:
             continue
 
-        if (other_is_wreck or now is None or
-                normal_velocity >= -RAM_SAFE_SPEED):
+        if other_is_wreck or now is None:
             continue
         closing_speed = -normal_velocity
+        own_ram_inputs = _contact_ram_inputs(tank)
+        other_ram_inputs = _contact_ram_inputs(other)
+        if own_ram_inputs is None or other_ram_inputs is None:
+            ram_diagnostics.append({
+                'pair': pair,
+                'reason': 'contact_armor_unavailable',
+                'missing_self': own_ram_inputs is None,
+                'missing_other': other_ram_inputs is None,
+            })
+            continue
+        armor_self, spall_self, bonus_self = own_ram_inputs
+        armor_other, spall_other, bonus_other = other_ram_inputs
+        relative_velocity_x = velocity_x - other_velocity_x
+        relative_velocity_y = velocity_y - other_velocity_y
+        relative_velocity_z = velocity_z - other_velocity_z
+        # #1513's native collision callback measures the full Vector3
+        # relative velocity. Keep the planar normal only as the test that the
+        # hulls are compressing; kinetic energy uses the complete magnitude.
+        relative_speed = math.sqrt(
+            relative_velocity_x * relative_velocity_x +
+            relative_velocity_y * relative_velocity_y +
+            relative_velocity_z * relative_velocity_z)
         damage_other, damage_self = ram_damage(
-            closing_speed, mass_self, mass_other)
+            relative_speed, mass_self, mass_other,
+            armor_self, armor_other,
+            spall_self, spall_other,
+            bonus_self, bonus_other,
+            bool(velocity_x or velocity_y or velocity_z),
+            bool(other_velocity_x or other_velocity_y or other_velocity_z))
         if not damage_other and not damage_self:
             continue
         newly_damaging_pairs.add(pair)
@@ -468,8 +613,6 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         # is not an impact and must not suppress a later acceleration into the
         # other hull.
         if pair in previous_contacts:
-            continue
-        if float(now) - float(cooldowns.get(pair, 0.0)) <= RAM_COOLDOWN:
             continue
         cooldowns[pair] = float(now)
         ram_events.append({
@@ -484,6 +627,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             'mass_other': mass_other,
             'velocity_self': (velocity_x, velocity_z),
             'velocity_other': (other_velocity_x, other_velocity_z),
+            'velocity_y_self': velocity_y,
+            'velocity_y_other': other_velocity_y,
             'yaw_self': yaw,
             'yaw_other': other_yaw,
             'shape_self': own_shape,
@@ -491,6 +636,13 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             'contact_normal': (contact[0], contact[1]),
             'contact_penetration': contact[2],
             'closing_speed': closing_speed,
+            'relative_speed': relative_speed,
+            'armor_self': armor_self,
+            'armor_other': armor_other,
+            'spall_self': spall_self,
+            'spall_other': spall_other,
+            'ramming_bonus_self': bonus_self,
+            'ramming_bonus_other': bonus_other,
             'damage_to_other': damage_other,
             'damage_to_self': damage_self,
         })
@@ -499,6 +651,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         'correction': (correction_x, correction_z),
         'delta_velocity': (delta_velocity_x, delta_velocity_z),
         'ram_events': tuple(ram_events),
+        'ram_diagnostics': tuple(ram_diagnostics),
         'cooldowns': cooldowns,
         'contacts': frozenset(
             (previous_contacts & overlap_pairs) | newly_damaging_pairs),

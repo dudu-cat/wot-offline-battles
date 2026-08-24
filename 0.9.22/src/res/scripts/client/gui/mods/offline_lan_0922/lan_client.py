@@ -20,7 +20,7 @@ TEAM_SELECTION_CAPABILITY = 'team_selection_v1'
 TEAM_SIZE_SELECTION_CAPABILITY = 'team_size_selection_v1'
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
-RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v1'
+RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v2'
 HUMAN_RAM_TIMELINE_CAPABILITY = 'human_ram_timeline_v1'
 PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v3'
 PLAYER_ENVIRONMENT_CAPABILITY = 'player_environment_v1'
@@ -2074,7 +2074,7 @@ class LANClient(object):
     def send_bot_ram(self, bot_id, target_kind, target_id, ram_seq,
                      damage_to_bot, damage_to_target,
                      ram_contact_player_id=None, ram_contact_seq=None):
-        """Report one mature cooldown-gated tank collision as authority."""
+        """Report one receipt-owned tank collision as authority."""
         if not self.is_bot_authority():
             return False
         kind = str(target_kind)
@@ -2084,9 +2084,8 @@ class LANClient(object):
             'type': 'bot_ram_report', 'round_id': self.round_id,
             'bot_id': int(bot_id), 'target_kind': kind,
             'target_id': int(target_id), 'ram_seq': max(1, int(ram_seq)),
-            'damage_to_bot': max(0, min(int(damage_to_bot or 0), 500)),
-            'damage_to_target': max(
-                0, min(int(damage_to_target or 0), 500)),
+            'damage_to_bot': max(0, int(damage_to_bot or 0)),
+            'damage_to_target': max(0, int(damage_to_target or 0)),
         }
         if (ram_contact_player_id is not None and
                 ram_contact_seq is not None):

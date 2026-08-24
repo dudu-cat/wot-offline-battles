@@ -607,6 +607,58 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertIs(hit_point, calls[0][4])
         self.assertFalse(calls[0][5])
 
+    def test_structure_hit_accepts_only_live_normal_descriptor_modules(self):
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = object()
+        area.DESTR_TYPE_TREE = 0
+        area.DESTR_TYPE_FALLING_ATOM = 1
+        area.DESTR_TYPE_FRAGILE = 2
+        area.DESTR_TYPE_STRUCTURE = 3
+        descriptors = {
+            'structure-wall': {
+                'type': 3, 'modules': {73: {'health': 19}}},
+            'unknown-type': {
+                'type': 99, 'modules': {73: {'health': 19}}},
+        }
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=descriptors.get)
+        authority = types.SimpleNamespace(
+            is_destroyed=mock.Mock(return_value=False),
+            destroy_module=mock.Mock(return_value=True))
+
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority):
+            for material in (71, 72, 74, 86, 87, 100, 128):
+                self.assertFalse(
+                    destructibles_sensor._try_destroy_destructible(
+                        1, _mat_info_1513(
+                            True, _Vector(), _Vector(0, 1, 0), material,
+                            'structure-wall', 22, 37),
+                        0.0, 6.0), material)
+            self.assertFalse(destructibles_sensor._try_destroy_destructible(
+                1, _mat_info_1513(
+                    True, _Vector(), _Vector(0, 1, 0), 73,
+                    'unknown-type', 22, 37),
+                0.0, 6.0))
+
+        authority.is_destroyed.assert_not_called()
+        authority.destroy_module.assert_not_called()
+
+    def test_catalog_rejects_non_normal_structure_material_namespaces(self):
+        filename = 'content/Environment/structure/normal/lod0/wall.model'
+        for material in (71, 72, 86, 87, 100, 128):
+            catalog = _catalog({
+                filename: {
+                    'kind': 'structure',
+                    'boxes': [[-1, 0, -1, 1, 2, 1, material]],
+                },
+            })
+            with self.assertRaisesRegex(
+                    ValueError, 'structure catalog material is invalid'):
+                destructibles_sensor.set_catalog(catalog)
+
     def test_destroy_ledger_does_not_claim_native_collision_is_clear(self):
         area = types.ModuleType('AreaDestructibles')
         area.g_destructiblesManager = object()
@@ -2765,6 +2817,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.DESTR_TYPE_FALLING_ATOM = 2
         area.DESTR_TYPE_FRAGILE = 3
         area.DESTR_TYPE_STRUCTURE = 4
+        area.DESTRUCTIBLE_MATKIND = types.SimpleNamespace(
+            NORMAL_MIN=73, NORMAL_MAX=86)
         area.chunkIDFromPosition = lambda unused: 22
         area.g_cache = types.SimpleNamespace(
             getDescByFilename=lambda value: ({
@@ -2797,7 +2851,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual('structure', instance['kind'])
         self.assertEqual([73, 74], sorted(box[2] for box in instance['boxes']))
         self.assertEqual(
-            [(1, 22, 0, 73), (1, 22, 0, 74)], category_calls)
+            [(1, 22, 0, 0), (1, 22, 0, 1)], category_calls)
 
     def test_falling_catalog_locator_uses_nonstructure_selection(self):
         filename = 'content/Environment/pole/normal/lod0/pole.model'
@@ -4054,6 +4108,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.DESTR_TYPE_FALLING_ATOM = 2
         area.DESTR_TYPE_FRAGILE = 3
         area.DESTR_TYPE_STRUCTURE = 4
+        area.DESTRUCTIBLE_MATKIND = types.SimpleNamespace(
+            NORMAL_MIN=73, NORMAL_MAX=86)
         area.g_cache = types.SimpleNamespace(
             unitVehicleMass=10000.0,
             getDescByFilename=lambda value: ({
@@ -4118,10 +4174,10 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             1, 33411, 13)
         self.assertEqual(
             [mock.call(1, 33411, 13, material)
-             for material in (73, 74, 75)],
+             for material in (0, 1, 2)],
             bigworld.wg_getDestructibleEffectCategory.call_args_list)
 
-    def test_malinovka_log_fence_streams_with_native_material_tokens(self):
+    def test_malinovka_log_fence_streams_with_native_module_indices(self):
         catalog_path = ROOT / '0.9.22' / 'destructibles' / '02_malinovka.json'
         catalog = json.loads(catalog_path.read_text())
         row = next(
@@ -4156,14 +4212,18 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         manager.set_chunk_count(32636, 26)
         area = types.ModuleType('AreaDestructibles')
         area.g_destructiblesManager = manager
-        area.DESTR_TYPE_TREE = 1
-        area.DESTR_TYPE_FALLING_ATOM = 2
-        area.DESTR_TYPE_FRAGILE = 3
-        area.DESTR_TYPE_STRUCTURE = 4
+        # Exact #1513 DestructiblesCache enum values.  The live failure returned
+        # native category 0, which means tree, for raw BSP material kind 73.
+        area.DESTR_TYPE_TREE = 0
+        area.DESTR_TYPE_FALLING_ATOM = 1
+        area.DESTR_TYPE_FRAGILE = 2
+        area.DESTR_TYPE_STRUCTURE = 3
+        area.DESTRUCTIBLE_MATKIND = types.SimpleNamespace(
+            NORMAL_MIN=73, NORMAL_MAX=86)
         area.g_cache = types.SimpleNamespace(
             unitVehicleMass=10000.0,
             getDescByFilename=lambda value: ({
-                'type': 4,
+                'type': 3,
                 'modules': {
                     73: {'health': 15}, 74: {'health': 15},
                 },
@@ -4183,7 +4243,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         def native_category(unused_space, unused_chunk, item, token):
             native_queries.append((item, token))
-            return -1 if token == 0 else 4
+            # The real #1513 API accepts the zero-based module index.  Passing
+            # raw BSP material kind 73 was observed live as category 0 (tree).
+            return 3 if token in (0, 1) else 0
 
         bigworld.wg_getDestructibleEffectCategory = native_category
         math_module = types.ModuleType('Math')
@@ -4220,9 +4282,39 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertTrue(detail['requires_commit'])
         self.assertEqual(((32636, 25, 74),), detail['token'])
         self.assertEqual(
-            [73, 74],
+            [0, 1],
             [token for item, token in native_queries if item == 25])
-        self.assertNotIn(0, [token for unused_item, token in native_queries])
+        self.assertFalse(any(
+            token in (73, 74) for unused_item, token in native_queries))
+
+    def test_streamed_structure_requires_every_live_descriptor_module(self):
+        area = types.SimpleNamespace(
+            DESTRUCTIBLE_MATKIND=types.SimpleNamespace(
+                NORMAL_MIN=73, NORMAL_MAX=86),
+            DESTR_TYPE_TREE=0,
+            DESTR_TYPE_FALLING_ATOM=1,
+            DESTR_TYPE_FRAGILE=2,
+            DESTR_TYPE_STRUCTURE=3)
+        record = {
+            'kind': 'structure',
+            'boxes': [
+                [-1, 0, -1, 0, 1, 1, 73],
+                [0, 0, -1, 1, 1, 1, 74],
+            ],
+        }
+        bigworld = types.SimpleNamespace(
+            wg_getDestructibleEffectCategory=mock.Mock())
+
+        with mock.patch.object(
+                sys, 'stdout', types.SimpleNamespace(write=lambda unused: None)):
+            self.assertFalse(
+                destructibles_sensor._validate_native_effect_categories_1513(
+                    bigworld, area, record,
+                    {'type': 3, 'modules': {73: {'health': 15}}},
+                    1, 32636, 25))
+
+        bigworld.wg_getDestructibleEffectCategory.assert_not_called()
+        self.assertTrue(destructibles_sensor.is_isolated_1513(32636, 25))
 
     def test_catalog_motion_destroys_distinct_adjacent_fragile_items(self):
         destructibles_sensor.xrange = range

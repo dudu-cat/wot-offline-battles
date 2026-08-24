@@ -34,6 +34,13 @@ _SHOT_THROUGH_MIN_REDUCTION_1513 = 25.0
 _SHOT_AP_KINDS_1513 = frozenset((
 	'ARMOR_PIERCING', 'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
 
+# Exact constants from pinned #1513 ``constants.DESTRUCTIBLE_MATKIND``.
+# ``NORMAL_MAX`` is an exclusive sentinel: DestructiblesCache allocates
+# structure modules from 73 through 85 and maps 87 through 99 to damaged BSP
+# materials.  Only a normal material may enter encodeDestructibleModule.
+_STRUCTURE_MAT_KIND_MIN_1513 = 73
+_STRUCTURE_MAT_KIND_MAX_1513 = 86
+
 try:
 	_STRING_TYPES = (basestring,)
 except NameError:
@@ -515,7 +522,8 @@ def set_catalog(catalog):
 					mat_kind = int(mat_kind)
 				except (TypeError, ValueError):
 					raise ValueError('structure catalog material is invalid')
-				if mat_kind < 71 or mat_kind > 130:
+				if not (_STRUCTURE_MAT_KIND_MIN_1513 <= mat_kind <
+						_STRUCTURE_MAT_KIND_MAX_1513):
 					raise ValueError('structure catalog material is invalid')
 			boxes.append(values + (mat_kind,))
 			for local_x in (values[0], values[3]):
@@ -902,34 +910,66 @@ def _instance_descriptor_filename_1513(instance):
 
 
 def _validate_native_effect_categories_1513(
-		bigworld, area_destructibles, record, spaceID, chunk_id, item_index):
-	"""Validate the live native kind using the exact #1513 material token.
+		bigworld, area_destructibles, record, descriptor,
+		spaceID, chunk_id, item_index):
+	"""Validate the live native kind using the exact #1513 module index.
 
-	Structures address their modules by BSP ``matKind`` (the same 71--130
-	token carried by ``destructibleModuleDestroyed``), not by a zero-based box
-	ordinal.  Passing ``0`` makes valid structures such as Malinovka's
-	``mil203_MilitaryDefences01`` report ``-1`` and isolates the whole item.
+	``destructibleModuleDestroyed`` carries the BSP ``matKind``, but stock
+	``AreaDestructibles.__destroyModule`` subtracts ``NORMAL_MIN`` before
+	calling the native effect-category API.  Passing the raw material kind makes
+	valid structures such as Malinovka's ``mil203_MilitaryDefences01`` report
+	the category for an unrelated native module.
 	"""
 	expected_kind = record['kind']
-	module_tokens = (-1,)
+	module_indices = (-1,)
 	if expected_kind == 'structure':
-		module_tokens = tuple(sorted(set(
+		try:
+			normal_min = int(area_destructibles.
+				DESTRUCTIBLE_MATKIND.NORMAL_MIN)
+			normal_max = int(area_destructibles.
+				DESTRUCTIBLE_MATKIND.NORMAL_MAX)
+		except Exception as error:
+			_isolate_destructible_1513(
+				'effect_contract', chunk_id, item_index,
+				detail='material range error=%s' % error)
+			return False
+		if (normal_min != _STRUCTURE_MAT_KIND_MIN_1513 or
+				normal_max != _STRUCTURE_MAT_KIND_MAX_1513):
+			_isolate_destructible_1513(
+				'effect_contract', chunk_id, item_index,
+				detail='normal_range=%s..%s' % (normal_min, normal_max))
+			return False
+		modules = descriptor.get('modules') if isinstance(
+			descriptor, dict) else None
+		raw_materials = tuple(sorted(set(
 			int(box[6]) for box in record['boxes'])))
-	for module_token in module_tokens:
+		if (not isinstance(modules, dict) or any(
+				raw_material < normal_min or raw_material >= normal_max or
+				modules.get(raw_material) is None
+				for raw_material in raw_materials)):
+			_isolate_destructible_1513(
+				'effect_contract', chunk_id, item_index,
+				detail='descriptor_modules=%r catalog_modules=%r' % (
+					tuple(sorted(modules)) if isinstance(modules, dict) else None,
+					raw_materials))
+			return False
+		module_indices = tuple(
+			raw_material - normal_min for raw_material in raw_materials)
+	for module_index in module_indices:
 		try:
 			native_type = bigworld.wg_getDestructibleEffectCategory(
-				spaceID, chunk_id, item_index, module_token)
+				spaceID, chunk_id, item_index, module_index)
 		except Exception as error:
 			_isolate_destructible_1513(
 				'effect_query', chunk_id, item_index,
-				detail='module=%s error=%s' % (module_token, error))
+				detail='module=%s error=%s' % (module_index, error))
 			return False
 		if _catalog_kind_for_type_1513(
 				area_destructibles, native_type) != expected_kind:
 			_isolate_destructible_1513(
 				'effect_category', chunk_id, item_index,
 				detail='module=%s expected=%s native=%r' % (
-					module_token, expected_kind, native_type))
+					module_index, expected_kind, native_type))
 			return False
 	return True
 
@@ -1035,7 +1075,7 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 	if expected_kind != record['kind']:
 		return None
 	if not _validate_native_effect_categories_1513(
-			BigWorld, AreaDestructibles, record,
+			BigWorld, AreaDestructibles, record, desc,
 			spaceID, chunk_id, item_index):
 		return None
 	try:
@@ -2255,10 +2295,9 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 		_dseen.add(_dkey)
 		LOG_DEBUG('Destr hit: matKind=', matKind, 'fname=', repr(fname),
 			'chunk=', chunkID, 'idx=', itemIndex)
-	# Widened band: the strict 71-100 range rejected spawn barriers/props at
-	# matKind 102. getDescByFilename below is the real filter, so a wider band
-	# only lets more candidates reach the authoritative desc check.
-	if matKind < 71 or matKind > 130:
+	# #1513's native material namespace ends at 100.  Do not feed arbitrary BSP
+	# material values into destructible encoders.
+	if matKind < 71 or matKind > 100:
 		return False
 	desc = AreaDestructibles.g_cache.getDescByFilename(fname)
 	if not desc:
@@ -2271,7 +2310,20 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 
 	# Data-driven vegetation gate: soft vegetation (bush/shrub/fern)
 	# ships with health <= 5; real fallable trees start at 10.
-	typ = desc['type']
+	typ = desc.get('type')
+	known_types = (
+		AreaDestructibles.DESTR_TYPE_TREE,
+		AreaDestructibles.DESTR_TYPE_FALLING_ATOM,
+		AreaDestructibles.DESTR_TYPE_FRAGILE,
+		AreaDestructibles.DESTR_TYPE_STRUCTURE)
+	if typ not in known_types:
+		return False
+	if typ == AreaDestructibles.DESTR_TYPE_STRUCTURE:
+		modules = desc.get('modules')
+		if (not (_STRUCTURE_MAT_KIND_MIN_1513 <= matKind <
+				_STRUCTURE_MAT_KIND_MAX_1513) or
+				not isinstance(modules, dict) or modules.get(matKind) is None):
+			return False
 	if _destructible_catalog is not None and typ in (
 			AreaDestructibles.DESTR_TYPE_FALLING_ATOM,
 			AreaDestructibles.DESTR_TYPE_FRAGILE,
@@ -2305,9 +2357,11 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 	elif typ == AreaDestructibles.DESTR_TYPE_FRAGILE:
 		_destr_ok = _auth.destroy_fragile(
 			spaceID, chunkID, itemIndex, hitPt, isShotDamage)
-	else:
+	elif typ == AreaDestructibles.DESTR_TYPE_STRUCTURE:
 		_destr_ok = _auth.destroy_module(
 			spaceID, chunkID, itemIndex, matKind, hitPt, isShotDamage)
+	else:
+		return False
 	if not _destr_ok:
 		raise RuntimeError(
 			'native destructible destroy was not accepted: chunk=%s item=%s' %
@@ -2603,6 +2657,7 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							if _located is not None:
 								if not _validate_native_effect_categories_1513(
 										BigWorld, AreaDestructibles, _catalog_record,
+										desc,
 										spaceID, cid, _ti):
 									_slot_diag['result'] = 'effect_mismatch'
 									continue

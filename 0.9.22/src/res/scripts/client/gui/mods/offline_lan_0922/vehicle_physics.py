@@ -88,8 +88,6 @@ SCROLL_CAP = 0.995
 # linear in the excess. 10 m fall ~ 17% HP, 20 m ~ 38%.
 FALL_SAFE_SPEED = 10.0
 FALL_DMG_PER_MS = 0.03
-# Ramming hurts beyond this closing speed (m/s).
-RAM_SAFE_SPEED = 3.5
 # Downhill slide on a slope the tracks cannot hold. The slide accelerates by the
 # grip-excess g*(sin-coh*cos) but a track drag SLIDE_DRAG*v pulls it to a natural,
 # terrain-dependent TERMINAL speed instead of ramping to a flat cap. SLIDE_MAX is
@@ -144,7 +142,6 @@ _TUNABLE = {
 	'coh_decay_bound':     'COH_DECAY_BOUND',
 	'fall_safe_speed':     'FALL_SAFE_SPEED',
 	'fall_dmg_per_ms':     'FALL_DMG_PER_MS',
-	'ram_safe_speed':      'RAM_SAFE_SPEED',
 }
 
 

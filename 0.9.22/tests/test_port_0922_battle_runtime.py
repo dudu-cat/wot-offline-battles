@@ -719,6 +719,10 @@ class _AdaptiveMatrixProvider(object):
 
 
 class _Avatar(object):
+    def handleVehicleCollidedVehicle(
+            self, veh_a, veh_b, hit_point, contact_time):
+        return None
+
     def __init__(self):
         self._offlineLANInitComplete = True
         self._offlineLANPlayerReady = True
@@ -4563,8 +4567,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'vehicle': 'ussr:T-34', 'team': 1,
         }})
         for revision, sample_time, z in (
-                (36, 100000, 6.0), (37, 200000, 7.0),
-                (38, 300000, 8.0)):
+                (36, 100000, 6.5), (37, 200000, 6.5),
+                (38, 300000, 6.5)):
             self.assertTrue(battle._remember_ram_bot_snapshot({
                 'bot_state_revision': revision,
                 'bot_state_time_us': sample_time,
@@ -4574,9 +4578,22 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._last_snapshot = {'bot_state_revision': 38}
         battle._local_physics = {'mass': 25000.0}
         battle._local_speed = 10.0
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_position = (0.0, 0.0, 0.0)
+        battle._local_yaw = 0.0
+        battle._local_matrix = local.matrix
+        battle._estimated_motion_time_us = mock.Mock(return_value=123000)
+        local.filter.velocity = _Vector(0.0, 0.0, 10.0)
+        remote.filter.velocity = _Vector(0.0, 0.0, 0.0)
+        battle._native_ram_vehicle_armor = mock.Mock(side_effect=[
+            {'armor': 20.0, 'screened': False},
+            {'armor': 30.0, 'screened': True},
+        ])
         battle._motion_is_clear = mock.Mock(return_value=True)
         battle._baked_pose_safe = mock.Mock(return_value=True)
 
+        self.assertTrue(battle._observe_native_ram_contact(
+            local, remote, _Vector(0.0, 0.0, 3.25), 10.0))
         corrected = battle._resolve_local_tank_contacts(
             local, (0.0, 0.0, 0.0), 0.0, 0.1)
         receipt = battle.local_ram_contact()
@@ -4585,10 +4602,120 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((11, 37), (
             receipt['bot_id'], receipt['bot_state_revision']))
         self.assertEqual(123000, receipt['presentation_time_us'])
+        self.assertEqual((20.0, 30.0), (
+            receipt['contact_armor_player'],
+            receipt['contact_armor_bot']))
+        self.assertTrue(receipt['contact_screened_bot'])
         self.assertEqual((0.0, 0.0, 0.0), (
             receipt['x'], receipt['y'], receipt['z']))
         self.assertGreater(receipt['vz'], 0.0)
         self.assertLess(battle._local_speed, 10.0)
+
+    def test_local_bot_ram_polling_emits_one_receipt_per_overlap_episode(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        local = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                         {'health': 500})
+        remote = _Vehicle(11, _Descriptor(), _Vector(0.0, 0.0, 6.5),
+                          (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities[11] = remote
+        record = {
+            'engine_id': 11, 'network_id': 11, 'kind': 'bot',
+            'local': False, 'ready': True, 'tombstone': False,
+            'presented_pose': {
+                'x': 0.0, 'y': 0.0, 'z': 6.5, 'yaw': math.pi},
+            'presentation_time_us': 200000,
+            'state': {'id': 11, 'x': 0.0, 'y': 0.0, 'z': 6.5,
+                      'yaw': math.pi, 'speed': 0.0, 'alive': True,
+                      'team': 1}}
+        battle._records = {'bot:11': record}
+        battle._bots = types.SimpleNamespace(states={11: {
+            'id': 11, 'mass': 25000.0, 'speed': 0.0,
+            'collision_shape': (1.5, 3.5, 0.0, 1.0),
+            'vehicle': 'ussr:T-34', 'team': 1,
+        }})
+        for revision, sample_time in (
+                (36, 100000), (37, 200000), (38, 300000)):
+            self.assertTrue(battle._remember_ram_bot_snapshot({
+                'bot_state_revision': revision,
+                'bot_state_time_us': sample_time,
+                'bots': [{'id': 11, 'x': 0.0, 'y': 0.0, 'z': 6.5,
+                          'yaw': math.pi, 'alive': True}],
+            }))
+        battle._last_snapshot = {'bot_state_revision': 38}
+        battle._local_physics = {'mass': 25000.0}
+        battle._local_speed = 10.0
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_position = (99.0, 0.0, 99.0)
+        battle._local_yaw = 1.0
+        battle._estimated_motion_time_us = mock.Mock(return_value=200000)
+        battle._native_ram_vehicle_armor = mock.Mock(side_effect=[
+            {'armor': 21.0, 'screened': False},
+            {'armor': 31.0, 'screened': False},
+            {'armor': 22.0, 'screened': False},
+            {'armor': 32.0, 'screened': False},
+        ])
+        battle._motion_is_clear = mock.Mock(return_value=True)
+        battle._baked_pose_safe = mock.Mock(return_value=True)
+
+        battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+        first = battle.local_ram_contact()
+        battle._local_speed = 10.0
+        battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+
+        self.assertEqual(1, first['seq'])
+        self.assertEqual((0.0, 0.0, 0.0),
+                         (first['x'], first['y'], first['z']))
+        self.assertEqual((21.0, 31.0), (
+            first['contact_armor_player'], first['contact_armor_bot']))
+        self.assertEqual(1, battle.local_ram_contact()['seq'])
+        self.assertEqual(2, battle._native_ram_vehicle_armor.call_count)
+
+        record['presented_pose']['z'] = 20.0
+        battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+        record['presented_pose']['z'] = 6.5
+        battle._local_speed = 10.0
+        battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+
+        second = battle.local_ram_contact()
+        self.assertEqual(2, second['seq'])
+        self.assertEqual((22.0, 32.0), (
+            second['contact_armor_player'], second['contact_armor_bot']))
+
+    def test_local_bot_ram_polling_accepts_vertical_drop_episode(self):
+        battle = BattleRuntime(_runtime())
+        battle._local_ram_episode_contacts = frozenset()
+        battle._estimated_motion_time_us = mock.Mock(return_value=200000)
+        battle._queue_ram_contact_proof = mock.Mock(return_value=True)
+        record = {'network_id': 11}
+        vehicle = object()
+        own = {
+            'x': 0.0, 'y': 0.8, 'z': 0.0, 'yaw': 0.0,
+            'vx': 0.0, 'vy': -12.0, 'vz': 0.0,
+            'shape': (1.5, 3.5, 0.0, 1.0),
+            'ram_profile': {
+                'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        }
+        other = {
+            'network_id': 11, 'kind': 'bot', 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
+            'shape': (1.5, 3.5, 0.0, 1.0),
+            '_record': record, '_vehicle': vehicle,
+        }
+
+        self.assertTrue(battle._poll_local_ram_contact_episodes(
+            object(), own, (other,)))
+
+        call = battle._queue_ram_contact_proof.call_args
+        self.assertEqual(-12.0, call.args[4][1])
+        self.assertAlmostEqual(0.9, call.args[3].y)
 
     def test_local_ram_ledger_retires_only_server_admitted_receipts(self):
         battle = BattleRuntime(_runtime())
@@ -4606,6 +4733,131 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([2], [
             value['seq'] for value in battle.local_ram_contacts()])
         self.assertEqual(2, battle.local_ram_contact()['seq'])
+
+    def test_native_ram_plate_uses_first_structural_material(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        structural = types.SimpleNamespace(
+            armor=73.0, vehicleDamageFactor=1.0)
+        descriptor.hull.hitTester = types.SimpleNamespace(
+            bbox=descriptor.hull.hitTester.bbox,
+            localHitTest=mock.Mock(return_value=[
+                (1.0, None, 1.0, 7)]))
+        descriptor.hull.materials = {7: structural}
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+
+        armor = battle._native_ram_vehicle_armor(
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5))
+
+        self.assertEqual({'armor': 73.0, 'screened': False}, armor)
+
+    def test_native_ram_plate_fails_closed_at_unmodelled_screen(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        screen = types.SimpleNamespace(
+            armor=20.0, vehicleDamageFactor=0.0)
+        hull = types.SimpleNamespace(
+            armor=73.0, vehicleDamageFactor=1.0)
+        descriptor.chassis.hitTester = types.SimpleNamespace(
+            bbox=descriptor.chassis.hitTester.bbox,
+            localHitTest=mock.Mock(return_value=[
+                (0.5, None, 1.0, 1)]))
+        descriptor.chassis.materials = {1: screen}
+        descriptor.hull.hitTester = types.SimpleNamespace(
+            bbox=descriptor.hull.hitTester.bbox,
+            localHitTest=mock.Mock(return_value=[
+                (1.0, None, 1.0, 7)]))
+        descriptor.hull.materials = {7: hull}
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+
+        armor = battle._native_ram_vehicle_armor(
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5))
+
+        self.assertIsNone(armor)
+
+    def test_native_ram_callbacks_dedupe_one_sustained_contact_episode(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_position = (0.0, 0.0, 0.0)
+        battle._local_yaw = 0.0
+        battle._estimated_motion_time_us = mock.Mock(return_value=100000)
+        battle._retry_native_ram_contact_proof = mock.Mock(return_value=True)
+        local = _Vehicle(
+            10, _Descriptor(), _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        local.filter.velocity = _Vector(0.0, 0.0, 10.0)
+        remote = _Vehicle(
+            11, _Descriptor(), _Vector(0.0, 0.0, 6.5),
+            (0.0, 0.0, 0.0), {'health': 500})
+        remote.filter.velocity = _Vector(0.0, 0.0, 0.0)
+        battle._records = {'bot:11': {
+            'engine_id': 11, 'network_id': 11, 'kind': 'bot',
+            'ready': True}}
+
+        battle._observe_native_ram_contact(
+            local, remote, _Vector(0.0, 0.0, 3.25), 10.0)
+        battle._observe_native_ram_contact(
+            local, remote, _Vector(0.0, 0.0, 3.25), 10.1)
+
+        self.assertEqual([mock.call(1)],
+                         battle._retry_native_ram_contact_proof.call_args_list)
+        self.assertEqual(1, len(battle._native_ram_contact_proofs))
+
+    def test_native_ram_plate_fails_closed_without_structure(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        screen = types.SimpleNamespace(
+            armor=20.0, vehicleDamageFactor=0.0)
+        descriptor.chassis.hitTester = types.SimpleNamespace(
+            bbox=descriptor.chassis.hitTester.bbox,
+            localHitTest=mock.Mock(return_value=[
+                (0.5, None, 1.0, 1)]))
+        descriptor.chassis.materials = {1: screen}
+        descriptor.hull.hitTester = types.SimpleNamespace(
+            bbox=descriptor.hull.hitTester.bbox,
+            localHitTest=mock.Mock(return_value=[]))
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+
+        armor = battle._native_ram_vehicle_armor(
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5))
+
+        self.assertIsNone(armor)
+
+    def test_native_ram_hook_preserves_and_restores_player_avatar_method(self):
+        calls = []
+
+        class Avatar(object):
+            def handleVehicleCollidedVehicle(
+                    self, veh_a, veh_b, hit_point, contact_time):
+                calls.append(('native', contact_time))
+                return 'native-result'
+
+        battle = BattleRuntime(_runtime())
+        battle._avatar = Avatar()
+        battle._worker_mode = False
+        battle._observe_native_ram_contact = mock.Mock()
+        original = Avatar.__dict__['handleVehicleCollidedVehicle']
+
+        self.assertTrue(battle._install_native_ram_contact_hook())
+        self.assertEqual('native-result',
+                         battle._avatar.handleVehicleCollidedVehicle(
+                             'a', 'b', 'hit', 4.0))
+        self.assertEqual([('native', 4.0)], calls)
+        battle._observe_native_ram_contact.assert_called_once_with(
+            'a', 'b', 'hit', 4.0)
+        self.assertTrue(battle._restore_native_ram_contact_hook())
+        self.assertIs(original,
+                      Avatar.__dict__['handleVehicleCollidedVehicle'])
 
     def test_ram_history_keeps_wire_pose_not_integrated_authority_pose(self):
         runtime = _runtime()

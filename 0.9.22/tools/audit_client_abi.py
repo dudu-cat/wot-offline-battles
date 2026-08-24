@@ -447,6 +447,8 @@ EXPECTED_ABI = {
         'PlayerAvatar.__setIsOnArena': ('self', 'onArena'),
         'PlayerAvatar.__onInitStepCompleted': ('self',),
         'PlayerAvatar.moveVehicle': ('self', 'flags', 'isKeyDown'),
+        'PlayerAvatar.handleVehicleCollidedVehicle': (
+            'self', 'vehA', 'vehB', 'hitPt', 'time'),
         'PlayerAvatar.enableOwnVehicleAutorotation': ('self', 'enable'),
         'PlayerAvatar.autoAim': ('self', 'target'),
         'PlayerAvatar.targetFocus': ('self', 'entity'),
@@ -1751,6 +1753,9 @@ EXPECTED_PACKED_XML_PATH_VALUES = {
 
 
 EXPECTED_GLOBALS = {
+    'scripts/common/physics_shared.pyc': {
+        'WEIGHT_SCALE': 0.001,
+    },
     'scripts/common/AccountCommands.pyc': {
         'RES_FAILURE': -1,
         'RES_SUCCESS': 0,
@@ -1793,6 +1798,14 @@ EXPECTED_CLASS_CONSTANTS = {
         },
     },
     'scripts/common/constants.pyc': {
+        'DESTRUCTIBLE_MATKIND': {
+            'MIN': 71,
+            'MAX': 100,
+            'NORMAL_MIN': 73,
+            'NORMAL_MAX': 86,
+            'DAMAGED_MIN': 87,
+            'DAMAGED_MAX': 100,
+        },
         'ARENA_PERIOD': {
             'PREBATTLE': 2,
             'BATTLE': 3,
@@ -1936,6 +1949,40 @@ EXPECTED_SUBSCRIPT_MUTATIONS = {
 # arithmetic between steps, but bounds each gap so dead or distant code cannot
 # accidentally satisfy a contract.
 EXPECTED_ORDERED_INSTRUCTION_PATTERNS = {
+    'scripts/common/DestructiblesCache.pyc': {
+        'encodeDestructibleModule': (
+            'module material occupies one seven-bit field', 4, (
+                ('LOAD_FAST', 'value', 'destrID'),
+                ('LOAD_CONST', 'value', 8),
+                ('BINARY_LSHIFT', None, None),
+                ('LOAD_FAST', 'value', 'matKind'),
+                ('LOAD_CONST', 'value', 1),
+                ('BINARY_LSHIFT', None, None),
+                ('BINARY_OR', None, None),
+                ('LOAD_GLOBAL', 'value', 'int'),
+                ('LOAD_FAST', 'value', 'isShotDamage'),
+                ('CALL_FUNCTION', 'argument', 1),
+                ('BINARY_OR', None, None),
+                ('RETURN_VALUE', None, None),
+            )),
+    },
+    'scripts/client/Avatar.pyc': {
+        'PlayerAvatar.handleVehicleCollidedVehicle': (
+            'vehicle collision uses full relative Vector3 speed', 5, (
+                ('LOAD_CONST', 'value', 0.2),
+                ('COMPARE_OP', 'argument', 0),
+                ('POP_JUMP_IF_FALSE', None, None),
+                ('LOAD_FAST', 'value', 'vehA'),
+                ('LOAD_ATTR', 'value', 'filter'),
+                ('LOAD_ATTR', 'value', 'velocity'),
+                ('LOAD_FAST', 'value', 'vehB'),
+                ('LOAD_ATTR', 'value', 'filter'),
+                ('LOAD_ATTR', 'value', 'velocity'),
+                ('BINARY_SUBTRACT', None, None),
+                ('LOAD_ATTR', 'value', 'length'),
+                ('STORE_FAST', 'value', 'vehSpeedSum'),
+            )),
+    },
     'scripts/client/AreaDestructibles.pyc': {
         'DestructiblesManager.__dropDestructible': (
             'animated falling callback', 16, (

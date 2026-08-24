@@ -70,7 +70,7 @@ class LanProtocolTests(unittest.TestCase):
         self.assertTrue(worker.send_bot_observation([{}] * 70, [{}] * 20))
         self.assertTrue(worker.send_bot_bot_hit(1, 2, 3, 120, 2))
         self.assertTrue(worker.send_bot_ram(
-            1, 'human', 2, 4, 20, 80))
+            1, 'human', 2, 4, 620, 880))
         self.assertTrue(worker.send_rules_state({'1': {'points': 10}}))
         self.assertFalse(self.client.send_destructible({
             'destructible_kind': 'tree', 'chunk_id': 17,
@@ -86,7 +86,8 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(64, len(self.sent[3]['contacts']))
         self.assertEqual(1, self.sent[4]['attacker_bot'])
         self.assertEqual('bot_ram_report', self.sent[5]['type'])
-        self.assertEqual(80, self.sent[5]['damage_to_target'])
+        self.assertEqual(620, self.sent[5]['damage_to_bot'])
+        self.assertEqual(880, self.sent[5]['damage_to_target'])
         self.assertEqual('rules_state', self.sent[6]['type'])
         self.assertEqual('destructible', self.sent[7]['type'])
         self.assertEqual('tree', self.sent[7]['destructible_kind'])

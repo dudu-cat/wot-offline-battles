@@ -63,7 +63,6 @@ PREBATTLE_SECONDS = 15.0
 BATTLE_DURATION_SECONDS = 900.0
 PLAYER_DROWNING_SECONDS = 10.0
 PLAYER_ENVIRONMENT_STALE_TICKS = int(round(TICK_HZ))
-RAM_COOLDOWN_SECONDS = 0.75
 BOT_FIRE_DURATION_SECONDS = 10.0
 BOT_FIRE_TICK_SECONDS = 1.0
 MAX_LINE_BYTES = 256 * 1024
@@ -203,7 +202,7 @@ PROJECTILE_WRECK_HIT_CAPABILITY = "projectile_wreck_hit_v1"
 RANDOM_MAP_CAPABILITY = "random_map_v1"
 DESTRUCTIBLE_CATALOG_V5_CAPABILITY = "destructible_catalog_v5"
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = "lean_snapshot_manifest_v1"
-RAM_CONTACT_LEDGER_CAPABILITY = "ram_contact_ledger_v1"
+RAM_CONTACT_LEDGER_CAPABILITY = "ram_contact_ledger_v2"
 HUMAN_RAM_TIMELINE_CAPABILITY = "human_ram_timeline_v1"
 PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v3"
 PLAYER_ENVIRONMENT_CAPABILITY = "player_environment_v1"
@@ -1461,7 +1460,6 @@ class BattleState:
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
         self.bot_reported_ram_fingerprints = {}
-        self.bot_ram_cooldowns = {}
         self.human_collision_profiles = {}
         self.human_collision_profile_authority_id = None
         self.human_collision_manifest_fingerprint = None
@@ -2387,7 +2385,6 @@ class BattleState:
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
         self.bot_reported_ram_fingerprints = {}
-        self.bot_ram_cooldowns = {}
         self.human_collision_profiles = {}
         self.human_collision_profile_authority_id = None
         self.human_collision_manifest_fingerprint = None
@@ -3034,11 +3031,17 @@ class BattleState:
 
     def _start_server_authority(self):
         authority = self.server_authority
+        participants = [
+            player for player in self.players.values()
+            if player.connected and player.participating]
         message = {
             "round_id": self.round_id,
             "map": self.map_name,
             "bots": list(self.bot_roster),
             "bot_manifest": [],
+            "players": [self._public_player(
+                player, include_outfits=False) for player in participants],
+            "human_ram_timeline": True,
             "bot_authority_id": SERVER_AUTHORITY_ID,
             "bot_order_revision": self.bot_orders["revision"],
             "bot_orders": list(self.bot_orders["orders"]),
@@ -3580,15 +3583,17 @@ class BattleState:
             return message
 
     def _human_ram_profiles_required(self):
-        """Require worker-donated human bodies for every modern client round."""
+        """Require authority-derived human bodies for every modern round."""
         worker = self.simulation_worker
         participants = [
             player for player in self.players.values()
             if player.connected and player.participating]
         return bool(
             self.client_build == CLIENT_BUILD_0922 and participants and
-            self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
-            worker is not None and worker.connected)
+            ((self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
+              worker is not None and worker.connected) or
+             (self.bot_authority_id == SERVER_AUTHORITY_ID and
+              self.server_authority is not None)))
 
     def _sanitize_human_collision_profiles(self, raw_profiles):
         """Bind worker-donated collision bodies to this exact player roster."""
@@ -3607,6 +3612,7 @@ class BattleState:
                 player_id = _exact_int(raw.get("id"), 1, PROJECTILE_MAX_ID)
                 mass = float(raw.get("mass"))
                 shape = raw.get("shape")
+                ram_profile = raw.get("ram_profile")
             except (TypeError, ValueError, OverflowError):
                 return None
             player = expected.get(player_id)
@@ -3625,11 +3631,25 @@ class BattleState:
                     not 0.75 <= shape[1] <= 30.0 or
                     not -20.0 <= shape[2] < shape[3] <= 30.0):
                 return None
+            if not isinstance(ram_profile, dict):
+                return None
+            try:
+                spall = float(ram_profile.get("spall_coefficient"))
+                bonus = float(ram_profile.get("ramming_bonus"))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (not math.isfinite(spall) or not 1.0 <= spall <= 1.5 or
+                    not math.isfinite(bonus) or not 0.0 <= bonus <= 0.15):
+                return None
             profiles[player_id] = {
                 "id": player_id,
                 "vehicle": vehicle,
                 "mass": round(mass, 3),
                 "shape": tuple(round(value, 4) for value in shape),
+                "ram_profile": {
+                    "spall_coefficient": round(spall, 4),
+                    "ramming_bonus": round(bonus, 6),
+                },
             }
         return profiles if set(profiles) == set(expected) else None
 
@@ -6212,7 +6232,7 @@ class BattleState:
                 if player.ram_contacts else {})
 
     def report_bot_ram(self, player_id, message):
-        """Apply one cooldown-gated authority tank collision atomically."""
+        """Apply one receipt-owned authority tank collision atomically."""
         with self.lock:
             if (not self._message_round_matches(message) or
                     not self._combat_accepting() or
@@ -6236,10 +6256,10 @@ class BattleState:
                 return False
             if target_kind not in ("bot", "human") or ram_seq <= 0:
                 return False
-            damage_to_bot = max(0, min(int(_finite_float(
-                message["damage_to_bot"])), 500))
-            damage_to_target = max(0, min(int(_finite_float(
-                message["damage_to_target"])), 500))
+            damage_to_bot = max(0, int(_finite_float(
+                message["damage_to_bot"])))
+            damage_to_target = max(0, int(_finite_float(
+                message["damage_to_target"])))
             has_contact_player = "ram_contact_player_id" in message
             has_contact_seq = "ram_contact_seq" in message
             if has_contact_player != has_contact_seq:
@@ -6319,50 +6339,14 @@ class BattleState:
             if (damage_to_bot <= 0 and damage_to_target <= 0 and
                     ram_contact is None):
                 return False
-            if target_kind == "bot":
-                first, second = sorted((bot_id, target_id))
-                pair = ("bot", first, "bot", second)
-            else:
-                pair = ("bot", bot_id, "human", target_id)
-            now = time.monotonic()
-            contact_time = (
-                float(ram_contact.get("presentation_time_us")) / 1000000.0
-                if ram_contact is not None else None)
-            previous_cooldown = self.bot_ram_cooldowns.get(pair)
-            if isinstance(previous_cooldown, tuple):
-                previous_arrival, previous_contact_time = previous_cooldown
-            else:
-                previous_arrival = (
-                    float(previous_cooldown)
-                    if previous_cooldown is not None else -1000.0)
-                previous_contact_time = None
-            expired_contact = False
-            if contact_time is not None and previous_contact_time is not None:
-                contact_delta = contact_time - previous_contact_time
-                expired_contact = contact_delta < 0.0
-                within_cooldown = (
-                    0.0 <= contact_delta <= RAM_COOLDOWN_SECONDS)
-            else:
-                within_cooldown = (
-                    now - previous_arrival <= RAM_COOLDOWN_SECONDS)
-            if expired_contact or within_cooldown:
-                if ram_contact is None:
-                    return False
-                # A delayed duplicate/same contact episode is terminal. Ack
-                # it without a second HP change so neither side retries it.
-                self.bot_reported_rams.add(key)
-                self.bot_reported_ram_fingerprints[key] = fingerprint
-                self._consume_player_ram_contact(target, contact_seq)
-                return True
             self.bot_reported_rams.add(key)
             self.bot_reported_ram_fingerprints[key] = fingerprint
             if ram_contact is not None:
-                # Consume the proof only after every identity, dedup and
-                # cooldown gate has reached a canonical terminal result.
+                # Consume the proof only after its operation identity and
+                # immutable fingerprint have reached a terminal result.
                 self._consume_player_ram_contact(target, contact_seq)
             if damage_to_bot <= 0 and damage_to_target <= 0:
                 return True
-            self.bot_ram_cooldowns[pair] = (now, contact_time)
             reason = 2
 
             bot_combat_before = self._bot_combat_signature(bot)
@@ -6791,7 +6775,7 @@ class BattleState:
         winner = next(iter(alive_teams)) if len(alive_teams) == 1 else 0
         return self._finish_battle(winner, "team_eliminated", 0)
 
-    def _validated_ram_contact(self, raw_ram):
+    def _validated_ram_contact(self, player, raw_ram):
         if not isinstance(raw_ram, dict):
             return None
         try:
@@ -6802,6 +6786,13 @@ class BattleState:
             presentation_time_us = _exact_int(
                 raw_ram.get("presentation_time_us"), 0,
                 MAX_MOTION_TIME_US)
+            native_contact_time_us = _exact_int(
+                raw_ram.get("native_contact_time_us"), 0,
+                MAX_MOTION_TIME_US)
+            player_armor = float(raw_ram.get("contact_armor_player"))
+            bot_armor = float(raw_ram.get("contact_armor_bot"))
+            player_spall = float(raw_ram.get("contact_spall_player"))
+            player_bonus = float(raw_ram.get("contact_bonus_player"))
         except (TypeError, ValueError, OverflowError):
             return None
         if (seq is None or bot_id not in self.bot_states or
@@ -6809,14 +6800,66 @@ class BattleState:
                 revision + 255 < self.bot_state_revision or
                 presentation_time_us is None or
                 presentation_time_us > self.bot_state_time_us or
+                native_contact_time_us is None or
+                abs(native_contact_time_us - presentation_time_us) >
+                int(HUMAN_POSE_HISTORY_SECONDS * 1000000.0) or
+                not math.isfinite(player_armor) or
+                not 0.0 < player_armor <= 5000.0 or
+                not math.isfinite(bot_armor) or
+                not 0.0 < bot_armor <= 5000.0 or
+                not math.isfinite(player_spall) or
+                not 1.0 <= player_spall <= 1.5 or
+                not math.isfinite(player_bonus) or
+                not 0.0 <= player_bonus <= 0.15 or
+                not isinstance(raw_ram.get("contact_screened_player"), bool) or
+                not isinstance(raw_ram.get("contact_screened_bot"), bool) or
+                raw_ram.get("contact_screened_player") or
+                raw_ram.get("contact_screened_bot") or
                 not _has_finite_fields(
-                    raw_ram, ("x", "y", "z", "yaw", "vx", "vz"))):
+                    raw_ram, ("x", "y", "z", "yaw", "vx", "vy", "vz",
+                              "bot_vx", "bot_vy", "bot_vz",
+                              "contact_x", "contact_y", "contact_z"))):
+            return None
+        profile = self.human_collision_profiles.get(player.player_id)
+        if (profile is None or abs(
+                player_spall - float(
+                    profile["ram_profile"]["spall_coefficient"])) > 0.0001):
+            return None
+        shape = profile["shape"]
+        center_x = _finite_float(raw_ram.get("x"))
+        center_y = _finite_float(raw_ram.get("y"))
+        center_z = _finite_float(raw_ram.get("z"))
+        yaw = _finite_float(raw_ram.get("yaw"))
+        hit_x = _finite_float(raw_ram.get("contact_x"))
+        hit_y = _finite_float(raw_ram.get("contact_y"))
+        hit_z = _finite_float(raw_ram.get("contact_z"))
+        delta_x = hit_x - center_x
+        delta_z = hit_z - center_z
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        local_x = delta_x * cosine - delta_z * sine
+        local_z = delta_x * sine + delta_z * cosine
+        slop = tank_collision.POSITION_SLOP
+        if (abs(local_x) > float(shape[0]) + slop or
+                abs(local_z) > float(shape[1]) + slop or
+                hit_y < center_y + float(shape[2]) - slop or
+                hit_y > center_y + float(shape[3]) + slop):
             return None
         return {
             "seq": seq,
             "bot_id": bot_id,
             "bot_state_revision": revision,
             "presentation_time_us": presentation_time_us,
+            "native_contact_time_us": native_contact_time_us,
+            "contact_x": round(_clamp(hit_x, -2000.0, 2000.0), 4),
+            "contact_y": round(_clamp(hit_y, -1000.0, 1000.0), 4),
+            "contact_z": round(_clamp(hit_z, -2000.0, 2000.0), 4),
+            "contact_armor_player": round(player_armor, 4),
+            "contact_armor_bot": round(bot_armor, 4),
+            "contact_screened_player": raw_ram["contact_screened_player"],
+            "contact_screened_bot": raw_ram["contact_screened_bot"],
+            "contact_spall_player": round(player_spall, 4),
+            "contact_bonus_player": round(player_bonus, 6),
             "x": round(_clamp(_finite_float(
                 raw_ram.get("x")), -2000.0, 2000.0), 4),
             "y": round(_clamp(_finite_float(
@@ -6826,8 +6869,16 @@ class BattleState:
             "yaw": round(_finite_float(raw_ram.get("yaw")), 5),
             "vx": round(_clamp(_finite_float(
                 raw_ram.get("vx")), -200.0, 200.0), 4),
+            "vy": round(_clamp(_finite_float(
+                raw_ram.get("vy")), -200.0, 200.0), 4),
             "vz": round(_clamp(_finite_float(
                 raw_ram.get("vz")), -200.0, 200.0), 4),
+            "bot_vx": round(_clamp(_finite_float(
+                raw_ram.get("bot_vx")), -200.0, 200.0), 4),
+            "bot_vy": round(_clamp(_finite_float(
+                raw_ram.get("bot_vy")), -200.0, 200.0), 4),
+            "bot_vz": round(_clamp(_finite_float(
+                raw_ram.get("bot_vz")), -200.0, 200.0), 4),
         }
 
     @staticmethod
@@ -7104,7 +7155,8 @@ class BattleState:
                         if len(player.ram_contacts) >= pending_limit:
                             break
                         contact = (None if seq in conflicting else
-                                   self._validated_ram_contact(raw_ram))
+                                   self._validated_ram_contact(
+                                       player, raw_ram))
                         if contact is None:
                             # A permanently invalid but identifiable head row
                             # still needs a terminal input decision. Otherwise
@@ -7985,12 +8037,14 @@ class BattleState:
                     "vehicle": first.vehicle,
                     "mass": first_profile["mass"],
                     "shape": first_profile["shape"],
+                    "ram_profile": first_profile["ram_profile"],
                 })
                 second_body = dict(second_pose, **{
                     "id": second.player_id, "alive": True,
                     "vehicle": second.vehicle,
                     "mass": second_profile["mass"],
                     "shape": second_profile["shape"],
+                    "ram_profile": second_profile["ram_profile"],
                 })
                 result = tank_collision.resolve_tank(
                     first_body, (second_body,),

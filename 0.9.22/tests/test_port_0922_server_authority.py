@@ -181,6 +181,37 @@ def _state_with_authority(ready_world=True, clock=None):
     return state
 
 
+def _valid_ram_receipt(state, bot_id, seq=1, **values):
+    """Build one native-contact receipt accepted by the #1513 server."""
+    player = state.players[1]
+    presentation_time_us = int(values.pop(
+        'presentation_time_us', state.bot_state_time_us))
+    result = {
+        'seq': seq,
+        'bot_id': bot_id,
+        'bot_state_revision': int(values.pop(
+            'bot_state_revision', state.bot_state_revision)),
+        'presentation_time_us': presentation_time_us,
+        'native_contact_time_us': int(values.pop(
+            'native_contact_time_us', presentation_time_us)),
+        'contact_x': float(values.get('x', player.x)),
+        'contact_y': float(values.get('y', player.y)),
+        'contact_z': float(values.get('z', player.z)),
+        'contact_armor_player': 40.0,
+        'contact_armor_bot': 40.0,
+        'contact_spall_player': 1.0,
+        'contact_bonus_player': 0.0,
+        'contact_screened_player': False,
+        'contact_screened_bot': False,
+        'x': float(player.x), 'y': float(player.y), 'z': float(player.z),
+        'yaw': float(player.yaw),
+        'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
+        'bot_vx': 0.0, 'bot_vy': 0.0, 'bot_vz': 0.0,
+    }
+    result.update(values)
+    return result
+
+
 class ServerCriticalProposalStateTest(unittest.TestCase):
     def test_destroyed_list_must_match_device_states_exactly(self):
         normal = {
@@ -403,6 +434,10 @@ class ServerAuthorityElectionTest(unittest.TestCase):
                 'id': participant.player_id,
                 'vehicle': participant.vehicle,
                 'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+                'ram_profile': {
+                    'spall_coefficient': 1.0,
+                    'ramming_bonus': 0.0,
+                },
             } for participant in state.players.values()
              if participant.connected and participant.participating]}))
         self.assertIsNone(state.mark_battle_ready(
@@ -430,6 +465,12 @@ class ServerAuthorityElectionTest(unittest.TestCase):
                          message['bot_authority_id'])
         self.assertTrue(state.bot_manifest)
         self.assertEqual(len(state.bot_roster), len(state.bot_manifest))
+        self.assertEqual(SERVER_AUTHORITY_ID,
+                         state.human_collision_profile_authority_id)
+        self.assertEqual({1}, set(state.human_collision_profiles))
+        self.assertEqual(
+            state.players[1].vehicle,
+            state.human_collision_profiles[1]['vehicle'])
         for entry in state.bot_manifest:
             self.assertEqual('ussr:R11_MS-1', entry['vehicle'])
 
@@ -578,6 +619,10 @@ class HumanRamTimelineTest(unittest.TestCase):
         profiles = [{
             'id': player.player_id, 'vehicle': player.vehicle,
             'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+            'ram_profile': {
+                'spall_coefficient': 1.0,
+                'ramming_bonus': 0.0,
+            },
         } for player in (first, second)]
         self.assertTrue(state.update_bot_manifest(
             SIMULATION_WORKER_AUTHORITY_ID, {
@@ -615,6 +660,10 @@ class HumanRamTimelineTest(unittest.TestCase):
                     'id': 1, 'vehicle': state.players[1].vehicle,
                     'mass': 8000.0,
                     'shape': [1.5, 3.5, -0.8, 2.0],
+                    'ram_profile': {
+                        'spall_coefficient': 1.0,
+                        'ramming_bonus': 0.0,
+                    },
                 }],
             }))
         self.assertEqual(
@@ -629,6 +678,10 @@ class HumanRamTimelineTest(unittest.TestCase):
             'player_collision_profiles': [{
                 'id': player.player_id, 'vehicle': player.vehicle,
                 'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+                'ram_profile': {
+                    'spall_coefficient': 1.0,
+                    'ramming_bonus': 0.0,
+                },
             } for player in (state.players[1], state.players[2])],
         }
         previous = copy.deepcopy(state.human_collision_profiles)
@@ -645,7 +698,7 @@ class HumanRamTimelineTest(unittest.TestCase):
             state.last_bot_manifest_reject_code)
         self.assertEqual(previous, state.human_collision_profiles)
 
-    def test_common_frontier_commits_one_atomic_two_sided_ram(self):
+    def test_common_frontier_without_contact_armor_fails_closed(self):
         state, clock = self._state()
         self._input(state, clock, 1, 1, 100000, -1.6, 16.0, 0.0)
         self._input(state, clock, 2, 1, 100000, 6.5, 0.0, math.pi)
@@ -653,18 +706,13 @@ class HumanRamTimelineTest(unittest.TestCase):
 
         self.assertEqual(0, state._resolve_human_rams())
         self._input(state, clock, 2, 2, 200000, 6.5, 0.0, math.pi)
-        self.assertEqual(1, state._resolve_human_rams())
+        self.assertEqual(0, state._resolve_human_rams())
 
-        self.assertLess(state.players[1].health, 1000)
-        self.assertEqual(state.players[1].health, state.players[2].health)
+        self.assertEqual((1000, 1000), (
+            state.players[1].health, state.players[2].health))
         hits = [event for event in state.pending_events
                 if event.get('kind') == 'hit']
-        self.assertEqual(2, len(hits))
-        self.assertEqual({'ram'}, set(event['source'] for event in hits))
-        self.assertEqual(1, len(set(
-            event['ram_operation_id'] for event in hits)))
-        for event in hits:
-            state._validate_combat_event_for_wire(event)
+        self.assertEqual([], hits)
 
     def test_input_retry_is_idempotent_and_identity_conflict_is_rejected(self):
         state, clock = self._state()
@@ -852,7 +900,7 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual(
             'human_collision_manifest', state.battle_result['reason'])
 
-    def test_sustained_overlap_rearms_only_after_observed_separation(self):
+    def test_sustained_overlap_without_contact_armor_never_damages(self):
         state, clock = self._state()
         sequence = {1: 0, 2: 0}
 
@@ -867,7 +915,7 @@ class HumanRamTimelineTest(unittest.TestCase):
             return state._resolve_human_rams()
 
         self.assertEqual(0, pair(100000, -1.6, 16.0))
-        self.assertEqual(1, pair(200000, 0.0, 16.0))
+        self.assertEqual(0, pair(200000, 0.0, 16.0))
         first_health = state.players[1].health
         for sample_time in (400000, 600000, 800000, 1000000):
             self.assertEqual(0, pair(sample_time, 0.0, 16.0))
@@ -875,10 +923,10 @@ class HumanRamTimelineTest(unittest.TestCase):
 
         self.assertEqual(0, pair(1200000, -5.0, 0.0))
         self.assertNotIn((1, 2), state.human_ram_contacts)
-        self.assertEqual(1, pair(1400000, 0.0, 16.0))
-        self.assertLess(state.players[1].health, first_health)
+        self.assertEqual(0, pair(1400000, 0.0, 16.0))
+        self.assertEqual(first_health, state.players[1].health)
 
-    def test_history_gap_cannot_replay_an_unresolved_overlap(self):
+    def test_history_gap_cannot_mint_damage_without_contact_armor(self):
         state, clock = self._state()
         sequence = {1: 0, 2: 0}
 
@@ -893,20 +941,20 @@ class HumanRamTimelineTest(unittest.TestCase):
             return state._resolve_human_rams()
 
         self.assertEqual(0, pair(100000, -1.6, 16.0))
-        self.assertEqual(1, pair(200000, 0.0, 16.0))
+        self.assertEqual(0, pair(200000, 0.0, 16.0))
         first_health = state.players[1].health
-        self.assertIn((1, 2), state.human_ram_contacts)
+        self.assertNotIn((1, 2), state.human_ram_contacts)
 
         # A 400 ms source-time hole clears both histories. The pair remains
         # armed until a later common frontier proves separation.
         self.assertEqual(0, pair(600000, 0.0, 16.0))
         self.assertEqual(0, pair(800000, 0.0, 16.0))
         self.assertEqual(first_health, state.players[1].health)
-        self.assertIn((1, 2), state.human_ram_contacts)
+        self.assertNotIn((1, 2), state.human_ram_contacts)
         self.assertEqual(0, pair(1000000, -5.0, 0.0))
         self.assertNotIn((1, 2), state.human_ram_contacts)
 
-    def test_simultaneous_fatal_ram_is_committed_before_battle_result(self):
+    def test_low_health_humans_survive_without_contact_armor(self):
         state, clock = self._state(health=100)
         for player_id, z, speed, yaw in (
                 (1, -1.6, 16.0, 0.0),
@@ -919,15 +967,15 @@ class HumanRamTimelineTest(unittest.TestCase):
             self._input(state, clock, player_id, 2, 200000,
                         z, speed, yaw)
 
-        self.assertEqual(1, state._resolve_human_rams())
+        self.assertEqual(0, state._resolve_human_rams())
 
-        self.assertEqual((0, 0), (
+        self.assertEqual((100, 100), (
             state.players[1].health, state.players[2].health))
-        self.assertEqual((False, False), (
+        self.assertEqual((True, True), (
             state.players[1].alive, state.players[2].alive))
-        self.assertEqual(0, state.battle_result['winner'])
-        self.assertEqual(2, state.players[1].death_attacker_id)
-        self.assertEqual(1, state.players[2].death_attacker_id)
+        self.assertIsNone(state.battle_result)
+        self.assertEqual(0, state.players[1].death_attacker_id)
+        self.assertEqual(0, state.players[2].death_attacker_id)
 
 
 class ServerAuthorityBattleTest(unittest.TestCase):
@@ -997,12 +1045,12 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             'round_id': state.round_id,
             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
             'speed': 16.0,
-            'ram_contacts': [{
-                'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 11,
-                'presentation_time_us': 110000,
-                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-                'vx': 0.0, 'vz': 16.0,
-            }],
+            'ram_contacts': [_valid_ram_receipt(
+                state, bot_id, bot_state_revision=11,
+                presentation_time_us=110000,
+                x=0.0, y=0.0, z=0.0, yaw=0.0,
+                vx=0.0, vy=0.0, vz=16.0,
+                contact_z=3.25)],
         })
 
         published = authority._players_payload()[0]
@@ -1046,12 +1094,12 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             'round_id': state.round_id,
             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
             'speed': 16.0,
-            'ram_contacts': [{
-                'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 21,
-                'presentation_time_us': 210000,
-                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-                'vx': 0.0, 'vz': 16.0,
-            }],
+            'ram_contacts': [_valid_ram_receipt(
+                state, bot_id, bot_state_revision=21,
+                presentation_time_us=210000,
+                x=0.0, y=0.0, z=0.0, yaw=0.0,
+                vx=0.0, vy=0.0, vz=16.0,
+                contact_z=3.25)],
         })
 
         reports = authority._bots._resolve_human_ram_receipts(
@@ -1104,13 +1152,13 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             # input pose outside the two 3.5 m half-lengths.
             'x': 0.0, 'y': 0.0, 'z': -0.75, 'yaw': 0.0,
             'speed': 8.0,
-            'ram_contacts': [{
-                'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 21,
-                'presentation_time_us': 210000,
+            'ram_contacts': [_valid_ram_receipt(
+                state, bot_id, bot_state_revision=21,
+                presentation_time_us=210000,
                 # The receipt freezes the pre-separation overlap and speed.
-                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-                'vx': 0.0, 'vz': 16.0,
-            }],
+                x=0.0, y=0.0, z=0.0, yaw=0.0,
+                vx=0.0, vy=0.0, vz=16.0,
+                contact_z=3.25)],
         })
 
         admitted = state.players[1].ram_contacts[1]
@@ -1146,12 +1194,11 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         bot_id = min(state.bot_states)
         state.bot_state_revision = 300
         state.bot_state_time_us = 3000000
-        valid = {
-            'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 299,
-            'presentation_time_us': 2900000,
-            'x': 1.25, 'y': 0.0, 'z': -2.5, 'yaw': 0.25,
-            'vx': 0.0, 'vz': 16.5,
-        }
+        valid = _valid_ram_receipt(
+            state, bot_id, bot_state_revision=299,
+            presentation_time_us=2900000,
+            x=1.25, y=0.0, z=-2.5, yaw=0.25,
+            vx=0.0, vy=0.0, vz=16.5)
 
         state.update_input(1, {
             'round_id': state.round_id,
@@ -1169,8 +1216,8 @@ class ServerAuthorityBattleTest(unittest.TestCase):
                 'presentation_time_us')})
         self.assertEqual((1.25, 0.0, -2.5, 0.25), tuple(
             accepted[key] for key in ('x', 'y', 'z', 'yaw')))
-        self.assertEqual((0.0, 16.5), (
-            accepted['vx'], accepted['vz']))
+        self.assertEqual((0.0, 0.0, 16.5), (
+            accepted['vx'], accepted['vy'], accepted['vz']))
         self.assertEqual(0, accepted['input_seq'])
         for rejected in (
                 dict(valid, seq=2, bot_state_revision=301),
@@ -1188,6 +1235,36 @@ class ServerAuthorityBattleTest(unittest.TestCase):
             'ram_contacts': [dict(valid, seq=8)]})
         self.assertEqual([1], list(state.players[1].ram_contacts))
 
+    def test_native_ram_receipt_binds_contact_point_armor_and_time(self):
+        state = self._live_state()
+        player = state.players[1]
+        bot_id = min(state.bot_states)
+        state.bot_state_revision = 300
+        state.bot_state_time_us = 3000000
+        self.assertIn(player.player_id, state.human_collision_profiles)
+        receipt = _valid_ram_receipt(
+            state, bot_id, bot_state_revision=299,
+            presentation_time_us=2900000,
+            native_contact_time_us=2950000,
+            contact_x=0.0, contact_y=0.0, contact_z=3.5,
+            contact_armor_player=73.0, contact_armor_bot=45.0,
+            contact_screened_player=False, contact_screened_bot=False,
+            x=0.0, y=0.0, z=0.0, yaw=0.0,
+            vx=0.0, vy=-3.0, vz=16.0)
+
+        accepted = state._validated_ram_contact(player, receipt)
+
+        self.assertEqual(73.0, accepted['contact_armor_player'])
+        self.assertEqual(45.0, accepted['contact_armor_bot'])
+        self.assertFalse(accepted['contact_screened_player'])
+        self.assertEqual(-3.0, accepted['vy'])
+        self.assertIsNone(state._validated_ram_contact(
+            player, dict(receipt, contact_z=3.6)))
+        self.assertIsNone(state._validated_ram_contact(
+            player, dict(receipt, native_contact_time_us=1)))
+        self.assertIsNone(state._validated_ram_contact(
+            player, dict(receipt, contact_screened_player=True)))
+
     def test_accepted_ram_receipt_cannot_reappear_after_authority_change(self):
         state = self._live_state()
         player = state.players[1]
@@ -1196,12 +1273,11 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         bot.update(x=player.x, z=player.z, health=1000, alive=True)
         state.bot_state_revision = 300
         state.bot_state_time_us = 3000000
-        receipt = {
-            'seq': 9, 'bot_id': bot_id, 'bot_state_revision': 299,
-            'presentation_time_us': 2900000,
-            'x': player.x, 'y': player.y, 'z': player.z,
-            'yaw': 0.0, 'vx': 0.0, 'vz': 16.0,
-        }
+        receipt = _valid_ram_receipt(
+            state, bot_id, seq=9, bot_state_revision=299,
+            presentation_time_us=2900000,
+            x=player.x, y=player.y, z=player.z,
+            yaw=0.0, vx=0.0, vy=0.0, vz=16.0)
         player.ram_contact_seq = 8
         state.update_input(1, {
             'round_id': state.round_id,
@@ -1241,13 +1317,11 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         state.bot_state_time_us = 3000000
 
         def receipt(seq, presentation_time_us):
-            return {
-                'seq': seq, 'bot_id': bot_id,
-                'bot_state_revision': 300,
-                'presentation_time_us': presentation_time_us,
-                'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-                'vx': 0.0, 'vz': 16.0,
-            }
+            return _valid_ram_receipt(
+                state, bot_id, seq=seq, bot_state_revision=300,
+                presentation_time_us=presentation_time_us,
+                x=0.0, y=0.0, z=0.0, yaw=0.0,
+                vx=0.0, vy=0.0, vz=16.0)
 
         state.update_input(1, {
             'round_id': state.round_id,
@@ -1299,12 +1373,10 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         state.bot_states[bot_id].update(health=1000, alive=True)
         state.bot_state_revision = 50
         state.bot_state_time_us = 500000
-        receipt = {
-            'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 50,
-            'presentation_time_us': 400000,
-            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-            'vx': 0.0, 'vz': 0.0,
-        }
+        receipt = _valid_ram_receipt(
+            state, bot_id, bot_state_revision=50,
+            presentation_time_us=400000,
+            x=0.0, y=0.0, z=0.0, yaw=0.0)
         state.update_input(1, {
             'round_id': state.round_id, 'ram_contacts': [receipt]})
         terminal = {
@@ -1336,15 +1408,14 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         state.bot_state_time_us = 100000
 
         def receipt(seq, **values):
-            result = {
-                'seq': seq, 'bot_id': bot_id,
+            fields = {
                 'bot_state_revision': 10,
                 'presentation_time_us': 100000,
                 'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-                'vx': 0.0, 'vz': 0.0,
             }
-            result.update(values)
-            return result
+            fields.update(values)
+            return _valid_ram_receipt(
+                state, bot_id, seq=seq, **fields)
 
         state.update_input(1, {
             'round_id': state.round_id,
@@ -1375,12 +1446,10 @@ class ServerAuthorityBattleTest(unittest.TestCase):
         state.bot_state_time_us = 100000
         for seq in range(100, 132):
             player.ram_contacts[seq] = {'seq': seq, 'bot_id': bot_id}
-        receipt = {
-            'seq': 1, 'bot_id': bot_id, 'bot_state_revision': 10,
-            'presentation_time_us': 100000,
-            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-            'vx': 0.0, 'vz': 0.0,
-        }
+        receipt = _valid_ram_receipt(
+            state, bot_id, bot_state_revision=10,
+            presentation_time_us=100000,
+            x=0.0, y=0.0, z=0.0, yaw=0.0)
 
         state.update_input(1, {
             'round_id': state.round_id, 'ram_contacts': [receipt]})

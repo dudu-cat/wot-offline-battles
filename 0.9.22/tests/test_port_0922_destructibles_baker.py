@@ -657,6 +657,18 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'box is invalid'):
                     loader._validate(bad, '06_ensk')
 
+                for material in (71, 72, 86, 87, 100, 128):
+                    bad_material = copy.deepcopy(loaded)
+                    target_resource = next(
+                        resource for resource in
+                        bad_material['resources'].values()
+                        if resource['kind'] == 'structure')
+                    target_resource['boxes'][0][6] = material
+                    with self.assertRaisesRegex(
+                            ValueError,
+                            'structure module material is invalid'):
+                        loader._validate(bad_material, '06_ensk')
+
                 ambiguous = json.loads(
                     (DATA_ROOT / '35_steppes.json').read_text())
                 bad_locator = copy.deepcopy(ambiguous)

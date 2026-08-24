@@ -446,6 +446,24 @@ def _skill_level(member, wanted):
     return 0.0
 
 
+def ramming_bonus(crew):
+    """Return #1513 Controlled Impact's active 0.0--0.15 bonus.
+
+    The pinned ``tankmen.xml`` stores 0.0015 per trained percentage point;
+    the contemporaneous Wargaming Crew page documents the same progressive
+    15 percent maximum.  Only the driver can own this named skill, so the
+    highest mounted value is the vehicle value.
+    """
+    level = 0.0
+    for member in (crew or ()):
+        if isinstance(member, tuple) and len(member) == 2:
+            member = member[1]
+        if member is None:
+            continue
+        level = max(level, _skill_level(member, 'driver_rammingmaster'))
+    return min(100.0, level) * 0.0015
+
+
 def intuition_chances(crew):
     """How many crewmen carry a finished ``loader_intuition`` perk.
 

@@ -1187,6 +1187,7 @@ class BotRuntime(object):
             'friendly lane probe must accept 2 or at least 5 arguments')
 
     def __init__(self, local_player_id, descriptor_resolver=None,
+                 player_descriptor_resolver=None,
                  direction_probe=None, adapter_factory=None,
                  vehicle_selector=None, visibility_probe=None,
                  firing_lane_probe=None, friendly_lane_probe=None,
@@ -1204,6 +1205,7 @@ class BotRuntime(object):
                  water_depth_probe=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
+        self.player_descriptor_resolver = player_descriptor_resolver
         self.direction_probe = self._adapt_direction_probe(
             direction_probe or (lambda *unused: True))
         self.adapter_factory = adapter_factory or BotAdapter
@@ -1889,6 +1891,8 @@ class BotRuntime(object):
                 'half_length': half_length, 'half_width': half_width,
                 'collision_shape': _collision_shape(descriptor),
                 'mass': self._physics_params[bot_id]['mass'],
+                'ram_profile': tank_collision.descriptor_ram_profile(
+                    descriptor),
                 'push_x': 0.0, 'push_z': 0.0,
                 'vertical_speed': 0.0, 'airborne': False,
                 'grounded_once': False, 'last_drive_pitch': 0.0,
@@ -2524,11 +2528,14 @@ class BotRuntime(object):
             if player_id <= 0 or player_id in seen or not vehicle_name:
                 raise ValueError('player collision manifest identity is invalid')
             seen.add(player_id)
-            descriptor = self.descriptor_resolver(vehicle_name)
+            descriptor = (self.player_descriptor_resolver(raw)
+                          if callable(self.player_descriptor_resolver)
+                          else self.descriptor_resolver(vehicle_name))
             params = vehicle_physics.derive_params(descriptor)
             mass = float(params['mass'])
             shape = tuple(float(value) for value in
                           tank_collision.chassis_shape(descriptor))
+            ram_profile = tank_collision.descriptor_ram_profile(descriptor)
             if (math.isnan(mass) or math.isinf(mass) or mass <= 0.0 or
                     len(shape) != 4 or
                     any(math.isnan(value) or math.isinf(value)
@@ -2539,6 +2546,11 @@ class BotRuntime(object):
                 'vehicle': vehicle_name,
                 'mass': mass,
                 'shape': list(shape),
+                'ram_profile': {
+                    'spall_coefficient': ram_profile[
+                        'spall_coefficient'],
+                    'ramming_bonus': ram_profile['ramming_bonus'],
+                },
             })
         result.sort(key=lambda value: value['id'])
         return result
@@ -3534,15 +3546,18 @@ class BotRuntime(object):
     def _player_vehicle_profile(self, raw):
         vehicle_name = raw.get('vehicle')
         camouflage_id = raw.get('camouflage_id')
-        cache_key = (vehicle_name or '', camouflage_id)
+        compact = raw.get('vehicle_compact_descr') or ''
+        cache_key = (vehicle_name or '', compact, camouflage_id)
         cached = self._player_vehicle_profiles.get(cache_key)
         if cached is not None:
             return cached
         descriptor = {}
         tactical = {}
         try:
-            descriptor = self.descriptor_resolver(
-                vehicle_name or 'ussr:R11_MS-1')
+            descriptor = (self.player_descriptor_resolver(raw)
+                          if callable(self.player_descriptor_resolver)
+                          else self.descriptor_resolver(
+                              vehicle_name or 'ussr:R11_MS-1'))
         except Exception:
             descriptor = {}
         if vehicle_name:
@@ -3563,7 +3578,8 @@ class BotRuntime(object):
         return cached
 
     def _player_collision_profile(self, raw):
-        cache_key = raw.get('vehicle') or ''
+        cache_key = (raw.get('vehicle') or '',
+                     raw.get('vehicle_compact_descr') or '')
         cached = self._player_collision_profiles.get(cache_key)
         if cached is not None:
             return cached
@@ -3572,9 +3588,33 @@ class BotRuntime(object):
         cached = {
             'mass': params.get('mass', 25000.0),
             'shape': _collision_shape(descriptor),
+            'ram_profile': tank_collision.descriptor_ram_profile(descriptor),
         }
         self._player_collision_profiles[cache_key] = cached
         return cached
+
+    @staticmethod
+    def _native_ram_hit_supported(body, hit):
+        """Require the native contact point to lie on the frozen OBB body."""
+        try:
+            shape = body['shape']
+            dx = float(hit[0]) - float(body['x'])
+            dy = float(hit[1]) - float(body['y'])
+            dz = float(hit[2]) - float(body['z'])
+            yaw = float(body['yaw'])
+            cosine = math.cos(yaw)
+            sine = math.sin(yaw)
+            local_x = dx * cosine - dz * sine
+            local_z = dx * sine + dz * cosine
+            slop = tank_collision.POSITION_SLOP
+            return bool(
+                abs(local_x) <= float(shape[0]) + slop and
+                abs(local_z) <= float(shape[1]) + slop and
+                float(shape[2]) - slop <= dy <=
+                float(shape[3]) + slop)
+        except (KeyError, TypeError, ValueError, IndexError,
+                OverflowError):
+            return False
 
     def _ram_reports(self, state, events, human_ram_receipt=None):
         reports = []
@@ -3791,7 +3831,11 @@ class BotRuntime(object):
                         player_z = float(receipt['z'])
                         player_yaw = float(receipt['yaw'])
                         player_vx = float(receipt['vx'])
+                        player_vy = float(receipt['vy'])
                         player_vz = float(receipt['vz'])
+                        bot_vx = float(receipt['bot_vx'])
+                        bot_vy = float(receipt['bot_vy'])
+                        bot_vz = float(receipt['bot_vz'])
                         contact_time = float(
                             receipt['presentation_time_us']) / 1000000.0
                     except (KeyError, TypeError, ValueError, OverflowError):
@@ -3814,12 +3858,8 @@ class BotRuntime(object):
                             'mass': _number(
                                 historical.get('mass'), 25000.0),
                             'shape': historical.get('collision_shape'),
-                            'vx': _number(historical.get(
-                                'ram_vx', math.sin(bot_yaw) * bot_speed +
-                                _number(historical.get('push_x')))),
-                            'vz': _number(historical.get(
-                                'ram_vz', math.cos(bot_yaw) * bot_speed +
-                                _number(historical.get('push_z')))),
+                            'ram_profile': historical.get('ram_profile'),
+                            'vx': bot_vx, 'vy': bot_vy, 'vz': bot_vz,
                         }
                         player = {
                             'id': HUMAN_TARGET_ID_BASE + player_id,
@@ -3830,26 +3870,125 @@ class BotRuntime(object):
                             'yaw': player_yaw,
                             'mass': profile['mass'],
                             'shape': profile['shape'],
-                            'vx': player_vx, 'vz': player_vz,
+                            'ram_profile': profile['ram_profile'],
+                            'vx': player_vx, 'vy': player_vy,
+                            'vz': player_vz,
                         }
-                        result = tank_collision.resolve_tank(
-                            # tank_collision uses zero as its no-prior-contact
-                            # sentinel; preserve deltas behind a positive base.
-                            bot, (player,), now=contact_time + 1.0,
-                            ram_cooldowns=self._human_ram_cooldowns,
-                            active_ram_contacts=frozenset())
-                        self._human_ram_cooldowns = result['cooldowns']
-                        if result['ram_events'] and step is not None:
-                            # Apply the bot half once. Cached retries below
-                            # resend the exact operation without another push.
-                            self._apply_tank_contact_response(
-                                current, result, step, advance_push=False,
-                                apply_correction=False)
-                        receipt_reports = self._ram_reports(
-                            current, result['ram_events'], {
-                                'player_id': player_id, 'seq': seq,
-                            }) or [self._terminal_human_ram_report(
-                                bot_id, player_id, seq)]
+                        try:
+                            hit = (
+                                float(receipt['contact_x']),
+                                float(receipt['contact_y']),
+                                float(receipt['contact_z']))
+                            player_armor = float(
+                                receipt['contact_armor_player'])
+                            bot_armor = float(receipt['contact_armor_bot'])
+                        except (KeyError, TypeError, ValueError,
+                                OverflowError):
+                            native_supported = False
+                        else:
+                            player_spall = _number(
+                                receipt.get('contact_spall_player'))
+                            player_bonus = _number(
+                                receipt.get('contact_bonus_player'), -1.0)
+                            native_supported = bool(
+                                player_armor > 0.0 and bot_armor > 0.0 and
+                                not math.isnan(player_armor) and
+                                not math.isinf(player_armor) and
+                                not math.isnan(bot_armor) and
+                                not math.isinf(bot_armor) and
+                                1.0 <= player_spall <= 1.5 and
+                                0.0 <= player_bonus <= 0.15 and
+                                not receipt.get('contact_screened_player') and
+                                not receipt.get('contact_screened_bot') and
+                                self._native_ram_hit_supported(player, hit) and
+                                self._native_ram_hit_supported(bot, hit))
+                        if not native_supported:
+                            sys.stdout.write(
+                                '[Offline LAN 0.9.22] RAM native receipt '
+                                'rejected player_id=%d bot_id=%d seq=%d\n' % (
+                                    player_id, bot_id, seq))
+                            receipt_reports = [
+                                self._terminal_human_ram_report(
+                                    bot_id, player_id, seq)]
+                        else:
+                            # The immutable receipt already proves one contact
+                            # episode and its real armour layers. Do not ask a
+                            # second, independently interpolated planar SAT
+                            # normal to admit HP again: that drops valid glancing
+                            # and vertical impacts. OBB remains validation and
+                            # presentation response only.
+                            bot_profile = bot.get('ram_profile') or {}
+                            bot_spall = _number(bot_profile.get(
+                                'spall_coefficient'), -1.0)
+                            bot_bonus = _number(bot_profile.get(
+                                'ramming_bonus'), -1.0)
+                            if (not 1.0 <= bot_spall <= 1.5 or
+                                    not 0.0 <= bot_bonus <= 0.15):
+                                receipt_reports = [
+                                    self._terminal_human_ram_report(
+                                        bot_id, player_id, seq)]
+                            else:
+                                relative_x = bot_vx - player_vx
+                                relative_y = bot_vy - player_vy
+                                relative_z = bot_vz - player_vz
+                                relative_speed = math.sqrt(
+                                    relative_x * relative_x +
+                                    relative_y * relative_y +
+                                    relative_z * relative_z)
+                                damage_player, damage_bot = (
+                                    tank_collision.ram_damage(
+                                        relative_speed,
+                                        bot['mass'], player['mass'],
+                                        bot_armor, player_armor,
+                                        bot_spall, player_spall,
+                                        bot_bonus, player_bonus,
+                                        bool(bot_vx or bot_vy or bot_vz),
+                                        bool(player_vx or player_vy or
+                                             player_vz)))
+                                response = tank_collision.resolve_tank(
+                                    bot, (player,), now=None)
+                                if step is not None:
+                                    self._apply_tank_contact_response(
+                                        current, response, step,
+                                        advance_push=False,
+                                        apply_correction=False)
+                                normal_x = bot['x'] - player['x']
+                                normal_z = bot['z'] - player['z']
+                                normal_length = math.sqrt(
+                                    normal_x * normal_x +
+                                    normal_z * normal_z)
+                                if normal_length > 0.000001:
+                                    normal_x /= normal_length
+                                    normal_z /= normal_length
+                                else:
+                                    normal_x, normal_z = 0.0, 0.0
+                                event = {
+                                    'self_id': bot['id'],
+                                    'other_id': player['id'],
+                                    'self_vehicle': bot['vehicle'],
+                                    'other_vehicle': player['vehicle'],
+                                    'mass_self': bot['mass'],
+                                    'mass_other': player['mass'],
+                                    'velocity_self': (bot_vx, bot_vz),
+                                    'velocity_other': (player_vx, player_vz),
+                                    'yaw_self': bot['yaw'],
+                                    'yaw_other': player['yaw'],
+                                    'shape_self': bot['shape'],
+                                    'shape_other': player['shape'],
+                                    'contact_normal': (
+                                        normal_x, normal_z),
+                                    'contact_penetration': 0.0,
+                                    'closing_speed': relative_speed,
+                                    'damage_to_self': damage_bot,
+                                    'damage_to_other': damage_player,
+                                }
+                                receipt_reports = self._ram_reports(
+                                    current, ((event,) if
+                                              (damage_bot or damage_player)
+                                              else ()), {
+                                        'player_id': player_id, 'seq': seq,
+                                    }) or [self._terminal_human_ram_report(
+                                        bot_id, player_id, seq)]
                 if processed_pairs is not None:
                     processed_pairs.add(pair)
                 frozen = [dict(report) for report in receipt_reports]
@@ -3877,6 +4016,7 @@ class BotRuntime(object):
                 'z': _number(state.get('z')), 'yaw': yaw,
                 'mass': _number(state.get('mass'), 25000.0),
                 'shape': state.get('collision_shape'),
+                'ram_profile': state.get('ram_profile'),
                 'vx': (math.sin(yaw) * speed +
                        _number(state.get('push_x'))),
                 'vz': (math.cos(yaw) * speed +
@@ -3905,6 +4045,7 @@ class BotRuntime(object):
                 'x': _number(raw.get('x')), 'y': _number(raw.get('y')),
                 'z': _number(raw.get('z')), 'yaw': yaw,
                 'mass': profile['mass'], 'shape': profile['shape'],
+                'ram_profile': profile['ram_profile'],
                 'vx': math.sin(yaw) * speed,
                 'vz': math.cos(yaw) * speed,
             })
