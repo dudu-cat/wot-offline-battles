@@ -556,11 +556,14 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual({
             'type': 'fire_intent', 'round_id': 7,
             'intent_seq': 1, 'input_seq': 1, 'shell_index': 0,
+            'shot_origin': [1.0, 2.0, 3.0],
+            'shot_direction': [1.0, 0.0, 0.0],
+            'dispersion_angle': 0.0,
         }, self.sent[-1])
-        self.assertFalse(any(
-            field in self.sent[-1]
-            for field in ('position', 'origin', 'velocity', 'gravity',
-                          'source_shot', 'damage')))
+        self.assertFalse(any(field in self.sent[-1]
+                             for field in ('position', 'origin', 'velocity',
+                                           'gravity', 'source_shot',
+                                           'damage')))
 
     def test_worker_sends_hello_before_exposing_connected_socket(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')

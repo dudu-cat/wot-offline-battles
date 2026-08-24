@@ -28,6 +28,7 @@ import random
 
 from gui.mods.offline_lan_0922 import combat_rules
 from gui.mods.offline_lan_0922 import critical_damage
+from gui.mods.offline_lan_0922 import gun_mechanics
 from gui.mods.offline_lan_0922 import vehicle_physics
 from gui.mods.offline_lan_0922.destructibles_sensor import (
     _SHOT_AP_KINDS_1513, _SHOT_THROUGH_MAX_HP_1513,
@@ -509,28 +510,25 @@ class ServerBattleAuthority(object):
             input_seq = int(intent['input_seq'])
             shot_seq = int(intent['shot_seq'])
             shell_index = int(intent['shell_index'])
-            aim_yaw = float(intent['aim_yaw'])
-            # BigWorld gun pitch is negative-up. The projectile protocol is
-            # positive-up, matching the hidden native worker's launch vector.
-            shot_pitch = -float(intent['gun_pitch'])
             player = self.state.players[player_id]
             descriptor = self.descriptors.get(player.vehicle)
             shot = _descriptor_shot(descriptor, shell_index)
             speed = _number(_field(shot, 'speed'), -1.0)
             gravity = _number(_field(shot, 'gravity'), -1.0)
             maximum = _number(_field(shot, 'maxDistance'), -1.0)
-            origin = _muzzle_origin(intent, descriptor, aim_yaw)
+            origin = tuple(float(value) for value in intent['shot_origin'])
+            direction = Vector3(tuple(
+                float(value) for value in intent['shot_direction']))
+            dispersion_angle = float(intent['dispersion_angle'])
+            direction.normalise()
             if (descriptor is None or origin is None or speed <= 0.0 or
                     gravity <= 0.0 or maximum <= 0.0 or
-                    not all(math.isfinite(value) for value in (
-                        aim_yaw, shot_pitch))):
+                    direction.length <= 0.0 or
+                    not math.isfinite(dispersion_angle)):
                 return False
-            horizontal = math.cos(shot_pitch)
-            velocity = (
-                math.sin(aim_yaw) * horizontal * speed,
-                math.sin(shot_pitch) * speed,
-                math.cos(aim_yaw) * horizontal * speed,
-            )
+            gun_mechanics.GunState(descriptor).scatter(
+                direction, False, dispersion_angle=dispersion_angle)
+            velocity = tuple(value * speed for value in direction)
             is_he = combat_rules.is_he(shot)
             message = {
                 'type': 'projectile_launch',

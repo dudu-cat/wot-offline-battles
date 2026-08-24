@@ -127,10 +127,10 @@ _SERVER_PROBES = {
         "capabilities": (
             "projectile_ledger_v2", "destructible_catalog_v5",
             "ram_contact_ledger_v1", "human_ram_timeline_v1",
-            "player_fire_intent_v1"),
+            "player_fire_intent_v2"),
         "server_capabilities": (
             "destructible_catalog_v5", "ram_contact_ledger_v1",
-            "human_ram_timeline_v1", "player_fire_intent_v1"),
+            "human_ram_timeline_v1", "player_fire_intent_v2"),
     },
 }
 

@@ -181,6 +181,7 @@ PLAYER_FIRE_INTENT_LIFETIME_MS = 5000
 PLAYER_FIRE_INTENT_MAX_PENDING = 1
 PLAYER_FIRE_INTENT_HISTORY = 64
 PLAYER_FIRE_ORIGIN_RADIUS = 25.0
+MAX_PLAYER_DISPERSION_ANGLE = 0.5
 PROJECTILE_MAX_GRAVITY = 500.0
 PROJECTILE_MAX_VELOCITY = 3000.0
 PROJECTILE_MAX_DISTANCE = 10000.0
@@ -198,7 +199,7 @@ DESTRUCTIBLE_CATALOG_V5_CAPABILITY = "destructible_catalog_v5"
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = "lean_snapshot_manifest_v1"
 RAM_CONTACT_LEDGER_CAPABILITY = "ram_contact_ledger_v1"
 HUMAN_RAM_TIMELINE_CAPABILITY = "human_ram_timeline_v1"
-PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v1"
+PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v2"
 TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
 CLIENT_VERDICT_FIELDS = frozenset((
     "reported_health", "reported_critical", "reported_reason",
@@ -371,9 +372,19 @@ def _server_event_log_message(event, players, bot_states):
     """Format only battle events that help diagnose a reported failure."""
     kind = event.get("kind")
     if kind == "shot":
-        return "SHOT attacker=%s seq=%s shell=%s" % (
-            event.get("attacker"), event.get("shot_seq"),
-            event.get("shell_index"))
+        origin = event.get("origin") or (0.0, 0.0, 0.0)
+        velocity = event.get("velocity") or (0.0, 0.0, 0.0)
+        speed = math.sqrt(sum(float(value) ** 2 for value in velocity))
+        direction = tuple(
+            float(value) / speed for value in velocity) if speed > 0.0 else (
+                0.0, 0.0, 0.0)
+        return (
+            "SHOT attacker=%s seq=%s shell=%s input=%s "
+            "origin=(%.2f,%.2f,%.2f) direction=(%.5f,%.5f,%.5f)" % (
+                event.get("attacker"), event.get("shot_seq"),
+                event.get("shell_index"), event.get("fire_input_seq"),
+                float(origin[0]), float(origin[1]), float(origin[2]),
+                direction[0], direction[1], direction[2]))
     if kind == "hit":
         return "HIT attacker=%s target=%s damage=%s health=%s dead=%s" % (
             event.get("attacker"), event.get("target"),
@@ -4438,7 +4449,8 @@ class BattleState:
                     self.battle_result is not None or
                     set(message) != {
                         "type", "round_id", "intent_seq", "input_seq",
-                        "shell_index"}):
+                        "shell_index", "shot_origin", "shot_direction",
+                        "dispersion_angle"}):
                 return False
             player = self.players.get(player_id)
             worker = self.simulation_worker
@@ -4457,13 +4469,37 @@ class BattleState:
                 input_seq = _exact_int(
                     message.get("input_seq"), 1, PROJECTILE_MAX_ID)
                 shell_index = _exact_int(message.get("shell_index"), 0, 9)
+                shot_origin = _bounded_vector(
+                    message.get("shot_origin"),
+                    [-5000.0, -1000.0, -5000.0],
+                    [5000.0, 3000.0, 5000.0])
+                shot_direction = _bounded_vector(
+                    message.get("shot_direction"),
+                    [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0])
+                dispersion_angle = _bounded_float(
+                    message.get("dispersion_angle"), 0.0,
+                    MAX_PLAYER_DISPERSION_ANGLE)
             except (TypeError, ValueError, OverflowError):
+                return False
+            direction_length = math.sqrt(sum(
+                component * component for component in shot_direction))
+            if not 0.999 <= direction_length <= 1.001:
+                return False
+            if sum((shot_origin[index] - coordinate) ** 2
+                   for index, coordinate in enumerate(
+                       (player.x, player.y, player.z))) > \
+                    PLAYER_FIRE_ORIGIN_RADIUS ** 2:
                 return False
             normalized = {
                 "player_id": int(player_id),
                 "intent_seq": intent_seq,
                 "input_seq": input_seq,
                 "shell_index": shell_index,
+                "shot_origin": list(shot_origin),
+                "shot_direction": [round(
+                    component / direction_length, 8)
+                    for component in shot_direction],
+                "dispersion_angle": round(dispersion_angle, 8),
             }
             fingerprint = _message_fingerprint(normalized)
             previous = player.fire_intent_fingerprints.get(intent_seq)
@@ -4490,6 +4526,9 @@ class BattleState:
                 "input_seq": input_seq,
                 "pose_time_us": int(player.pose_time_us),
                 "shell_index": shell_index,
+                "shot_origin": list(normalized["shot_origin"]),
+                "shot_direction": list(normalized["shot_direction"]),
+                "dispersion_angle": normalized["dispersion_angle"],
                 "aim_yaw": round(float(player.aim_yaw), 6),
                 "gun_pitch": round(float(player.gun_pitch), 6),
                 "x": round(float(player.x), 4),
@@ -4766,15 +4805,29 @@ class BattleState:
 
             if shooter_kind == "player":
                 intent = shooter.pending_fire_intents.get(fire_intent_seq)
+                if intent is None:
+                    return False
+                launch_direction = tuple(
+                    component / speed for component in velocity)
+                trigger_direction = tuple(float(component) for component in
+                                          intent["shot_direction"])
+                cone_dot = sum(
+                    launch_direction[index] * trigger_direction[index]
+                    for index in range(3))
                 if (not shooter.participating or
                         not shooter.alive or
                         shooter.siege_state in (
                             SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF) or
                         shot_seq != shooter.fire_seq + 1 or
-                        intent is None or
                         int(intent["shot_seq"]) != shot_seq or
                         int(intent["input_seq"]) != fire_input_seq or
                         int(intent["shell_index"]) != shell_index or
+                        sum((float(origin[index]) - float(
+                            intent["shot_origin"][index])) ** 2
+                            for index in range(3)) >
+                        PROJECTILE_TOLERANCE ** 2 or
+                        cone_dot < math.cos(float(
+                            intent["dispersion_angle"]) + 0.0001) or
                         math.sqrt(sum(
                             (float(origin[index]) - float(intent[name])) ** 2
                             for index, name in enumerate(("x", "y", "z")))) >

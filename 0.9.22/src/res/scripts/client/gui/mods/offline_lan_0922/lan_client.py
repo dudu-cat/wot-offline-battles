@@ -22,7 +22,7 @@ DESTRUCTIBLE_CATALOG_V5_CAPABILITY = 'destructible_catalog_v5'
 LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
 RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v1'
 HUMAN_RAM_TIMELINE_CAPABILITY = 'human_ram_timeline_v1'
-PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v1'
+PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v2'
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
     PROJECTILE_LEDGER_CAPABILITY,
@@ -57,6 +57,7 @@ MAX_PROJECTILE_GRAVITY = 500.0
 MAX_PROJECTILE_DISTANCE = 10000.0
 MAX_PROJECTILE_TIME_MS = 20000
 MAX_PROJECTILE_SPLASH_RADIUS = 100.0
+MAX_PLAYER_DISPERSION_ANGLE = 0.5
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
 PROJECTILE_SHELL_KINDS = frozenset((
     'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
@@ -1405,13 +1406,20 @@ class LANClient(object):
                   aim_yaw=None, gun_pitch=None, velocity=None, gravity=None,
                   max_distance=None, max_time_ms=None, is_he=False,
                   splash_radius=0.0, penetration_factor=1.0,
-                  source_shot=None):
+                  source_shot=None, dispersion_angle=0.0):
         """Compatibility wrapper that submits only a player trigger intent."""
+        parsed_velocity = _strict_launch_velocity(velocity)
+        if parsed_velocity is None:
+            return None
+        speed = math.sqrt(sum(
+            component * component for component in parsed_velocity))
         return self.send_fire_intent(
-            shell_index, 0.0 if aim_yaw is None else aim_yaw,
-            0.0 if gun_pitch is None else gun_pitch)
+            shell_index, position,
+            [component / speed for component in parsed_velocity],
+            dispersion_angle)
 
-    def send_fire_intent(self, shell_index, aim_yaw, gun_pitch):
+    def send_fire_intent(self, shell_index, shot_origin, shot_direction,
+                         dispersion_angle):
         """Queue one ordered trigger input without damage or ballistics."""
         if (not self.ready or self.phase != 'battle' or
                 self.is_bot_authority()):
@@ -1420,14 +1428,28 @@ class LANClient(object):
                 self._input_seq <= 0):
             return None
         parsed_shell = _projectile_int_range(shell_index, 0, 9)
-        if parsed_shell is None:
+        parsed_origin = _strict_world_position(shot_origin)
+        parsed_direction = _strict_vector3(shot_direction, 1.0)
+        parsed_dispersion = _projectile_float_range(
+            dispersion_angle, 0.0, MAX_PLAYER_DISPERSION_ANGLE)
+        direction_length = (math.sqrt(sum(
+            component * component for component in parsed_direction))
+            if parsed_direction is not None else 0.0)
+        if (parsed_shell is None or parsed_origin is None or
+                parsed_direction is None or parsed_dispersion is None or
+                direction_length <= 0.000001):
             return None
+        parsed_direction = [
+            component / direction_length for component in parsed_direction]
         with self._projectile_lock:
             sequence = self._fire_intent_seq + 1
             message = {
                 'type': 'fire_intent', 'round_id': self.round_id,
                 'intent_seq': sequence, 'shell_index': parsed_shell,
                 'input_seq': self._input_seq,
+                'shot_origin': parsed_origin,
+                'shot_direction': parsed_direction,
+                'dispersion_angle': parsed_dispersion,
             }
             if not self._send(message):
                 return None

@@ -126,11 +126,17 @@ def _launch_player_as_authority(state, authority_id, message):
     intent_seq = player.fire_intent_seq + 1
     player.input_seq = input_seq
     player.fire_intent_seq = intent_seq
+    speed = math.sqrt(sum(
+        float(component) ** 2 for component in message['velocity']))
     player.pending_fire_intents[intent_seq] = {
         'shot_seq': int(message['shot_seq']),
         'input_seq': input_seq,
         'shell_index': int(message['shell_index']),
         'x': float(player.x), 'y': float(player.y), 'z': float(player.z),
+        'shot_origin': list(message['origin']),
+        'shot_direction': [
+            float(component) / speed for component in message['velocity']],
+        'dispersion_angle': 0.0,
         'deadline_server_time_ms': state._server_time_ms() + 5000,
     }
     message.update({
@@ -375,6 +381,9 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         self.assertTrue(state.submit_fire_intent(1, {
             'type': 'fire_intent', 'round_id': state.round_id,
             'intent_seq': 1, 'input_seq': 1, 'shell_index': 0,
+            'shot_origin': [player.x, player.y + 1.0, player.z],
+            'shot_direction': [0.0, 0.0, 1.0],
+            'dispersion_angle': 0.0,
         }))
 
         projectile_id = '%d:p:1:1' % state.round_id
@@ -383,6 +392,11 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         self.assertEqual(1, launch['fire_intent_seq'])
         self.assertEqual(1, launch['fire_input_seq'])
         self.assertEqual(SERVER_AUTHORITY_ID, state.bot_authority_id)
+        self.assertEqual(
+            [player.x, player.y + 1.0, player.z], launch['origin'])
+        self.assertAlmostEqual(0.0, launch['velocity'][0])
+        self.assertAlmostEqual(0.0, launch['velocity'][1])
+        self.assertGreater(launch['velocity'][2], 0.0)
 
     def test_loading_snapshot_returns_the_canonical_lineup(self):
         state = _state_with_authority()

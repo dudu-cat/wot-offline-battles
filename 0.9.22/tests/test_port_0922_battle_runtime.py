@@ -1505,12 +1505,16 @@ class _Client(object):
         self.sent.append(('input', values, kwargs))
         return True
 
-    def send_fire_intent(self, shell_index, aim_yaw, gun_pitch):
+    def send_fire_intent(self, shell_index, shot_origin, shot_direction,
+                         dispersion_angle):
         self._fire_intent_seq += 1
         self.sent.append((
             'fire_intent', (shell_index,),
             {'input_seq': self._input_seq,
-             'intent_seq': self._fire_intent_seq}))
+             'intent_seq': self._fire_intent_seq,
+             'shot_origin': list(shot_origin),
+             'shot_direction': list(shot_direction),
+             'dispersion_angle': float(dispersion_angle)}))
         return self._fire_intent_seq
 
 
@@ -4236,8 +4240,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'state': {'id': 11, 'x': 0.0, 'y': 0.0, 'z': 30.0,
                       'yaw': math.pi, 'speed': 0.0, 'alive': True,
                       'team': 1}}}
-        battle._bots = types.SimpleNamespace(states={})
-        battle._last_snapshot = {'bot_state_revision': 37}
+        battle._bots = types.SimpleNamespace(states={11: {
+            'id': 11, 'mass': 25000.0,
+            'collision_shape': (1.5, 3.5, 0.0, 1.0),
+            'vehicle': 'ussr:T-34', 'team': 1,
+        }})
+        for revision, sample_time, z in (
+                (36, 100000, 6.0), (37, 200000, 7.0),
+                (38, 300000, 8.0)):
+            self.assertTrue(battle._remember_ram_bot_snapshot({
+                'bot_state_revision': revision,
+                'bot_state_time_us': sample_time,
+                'bots': [{'id': 11, 'x': 0.0, 'y': 0.0, 'z': z,
+                          'yaw': math.pi, 'alive': True}],
+            }))
+        battle._last_snapshot = {'bot_state_revision': 38}
         battle._local_physics = {'mass': 25000.0}
         battle._local_speed = 10.0
         battle._motion_is_clear = mock.Mock(return_value=True)
@@ -4322,6 +4339,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.8, battle._ram_bot_state_at(11, 36, 150000)['z'])
         self.assertIsNone(battle._ram_bot_state_at(11, 37, 250000))
+        self.assertEqual(37, battle._ram_bot_revision_at(11, 150000))
+        self.assertEqual(37, battle._ram_bot_revision_at(11, 200000))
+        self.assertIsNone(battle._ram_bot_revision_at(11, 50000))
+        self.assertIsNone(battle._ram_bot_revision_at(11, 250000))
 
     def test_ram_history_caches_repeated_receipt_decoration(self):
         class IterationForbiddenHistory(list):
@@ -13358,7 +13379,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         intent = next(item for item in client.sent
                       if item[0] == 'fire_intent')
         self.assertEqual((0,), intent[1])
-        self.assertEqual({'input_seq': 1, 'intent_seq': 1}, intent[2])
+        self.assertEqual({
+            'input_seq': 1, 'intent_seq': 1,
+            'shot_origin': [0.0, 2.0, 0.0],
+            'shot_direction': [0.0, 0.0, 1.0],
+            'dispersion_angle': 0.25,
+        }, intent[2])
         current_input = next(item for item in client.sent
                              if item[0] == 'input')
         self.assertAlmostEqual(0.55, current_input[1][2])
@@ -13468,7 +13494,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertFalse(battle.shoot(0.2, -0.1))
         self.assertEqual([], battle._avatar.dispersion_queries)
-        client.send_fire_intent.assert_called_once_with(0, 0.2, -0.1)
+        client.send_fire_intent.assert_called_once_with(
+            0, [0.0, 2.0, 0.0], [0.0, 0.0, 1.0], 0.25)
 
     def test_fire_intent_result_releases_visible_pending_trigger(self):
         battle = BattleRuntime(_runtime())
@@ -13498,6 +13525,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'shell_index': 0, 'aim_yaw': 0.2, 'gun_pitch': -0.1,
             'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.0,
             'pitch': 0.0, 'roll': 0.0, 'speed': 4.0,
+            'shot_origin': [1.0, 3.0, 3.0],
+            'shot_direction': [0.0, 0.0, 1.0],
+            'dispersion_angle': 0.02,
             'deadline_server_time_ms': 9000,
             '_client_received_time': 10.0,
             '_client_dispatch_delay': 0.01,
@@ -13516,6 +13546,63 @@ class BattleRuntimeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 RuntimeError, 'worker fire intent is malformed'):
             battle.on_fire_intent(dict(intent, unexpected='wire field'))
+
+    def test_worker_launch_uses_visible_trigger_ray_not_model_node(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._start_message = {'round_id': 7}
+        battle._projectile_is_authority = lambda: True
+        battle._config = {'perfect_accuracy': True}
+        client = _Client()
+        client.authority_epoch = 4
+        client.send_projectile_launch = mock.Mock(
+            side_effect=lambda *args, **unused_kwargs: args[2])
+        battle.client = client
+        entity = _Vehicle(
+            11, _Descriptor(), _Vector(50.0, 0.0, 50.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[11] = entity
+        battle._records = {'player:2': {
+            'engine_id': 11, 'network_id': 2, 'kind': 'player',
+            'local': False, 'ready': True, 'tombstone': False,
+            'state': {
+                'alive': True, 'shell_index': 0, 'speed': 0.0,
+                'turn': 0.0,
+            },
+        }}
+        gun = gun_mechanics.GunState(entity.typeDescriptor)
+        gun.reload_time = 0.0
+        gun.clip = 1
+        battle._player_authority_guns = {2: gun}
+        intent = {
+            'type': 'fire_intent', 'round_id': 7,
+            'authority_epoch': 4, 'player_id': 2, 'intent_seq': 3,
+            'shot_seq': 5, 'input_seq': 8, 'pose_time_us': 1000,
+            'shell_index': 0, 'aim_yaw': 0.2, 'gun_pitch': -0.1,
+            'x': 50.0, 'y': 0.0, 'z': 50.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0, 'speed': 0.0,
+            'shot_origin': [4.0, 2.0, 8.0],
+            'shot_direction': [0.6, 0.0, 0.8],
+            'dispersion_angle': 0.02,
+            'deadline_server_time_ms': 9000,
+        }
+
+        with mock.patch.object(
+                type(entity.model), 'node',
+                side_effect=AssertionError(
+                    'stale model node must not be read')) as node:
+            self.assertTrue(battle.on_fire_intent(intent))
+            self.assertTrue(
+                battle._advance_player_fire_authority(0.1, 10.0))
+            node.assert_not_called()
+
+        call = client.send_projectile_launch.call_args
+        self.assertEqual(['player', 2, 5, 0], list(call.args[:4]))
+        self.assertEqual([4.0, 2.0, 8.0], call.args[4])
+        self.assertEqual([480.0, 0.0, 640.0], call.args[5])
 
     def test_fire_intent_result_releases_worker_launch_pending(self):
         battle = BattleRuntime(_runtime())

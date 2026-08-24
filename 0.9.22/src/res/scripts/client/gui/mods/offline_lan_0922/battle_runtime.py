@@ -5689,6 +5689,23 @@ class BattleRuntime(object):
         self._ram_bot_lookup_cache[cache_key] = dict(result)
         return result
 
+    def _ram_bot_revision_at(self, bot_id, sample_time_us):
+        """Return the wire revision that right-brackets a presented Bot."""
+        try:
+            bot_id = int(bot_id)
+            sample_time_us = int(sample_time_us)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        timeline = self._ram_bot_history_index.get(bot_id)
+        if not timeline:
+            return None
+        right_index = bisect.bisect_left(timeline, (sample_time_us, -1))
+        if right_index >= len(timeline):
+            return None
+        if right_index > 0 or timeline[right_index][0] == sample_time_us:
+            return int(timeline[right_index][1])
+        return None
+
     def on_roster(self, message):
         """Apply authority changes that can arrive before live snapshots.
 
@@ -5809,7 +5826,7 @@ class BattleRuntime(object):
             'type', 'round_id', 'authority_epoch', 'player_id', 'intent_seq',
             'shot_seq', 'input_seq', 'pose_time_us', 'shell_index',
             'aim_yaw', 'gun_pitch', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',
-            'speed',
+            'speed', 'shot_origin', 'shot_direction', 'dispersion_angle',
             'deadline_server_time_ms'}
         transport_fields = {
             '_client_received_time', '_client_dispatch_delay'}
@@ -5829,16 +5846,29 @@ class BattleRuntime(object):
             aim_yaw = float(message['aim_yaw'])
             gun_pitch = float(message['gun_pitch'])
             values = tuple(float(message[name]) for name in (
-                'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'speed'))
+                'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'speed',
+                'dispersion_angle'))
+            shot_origin = tuple(float(value) for value in
+                                message['shot_origin'])
+            shot_direction = tuple(float(value) for value in
+                                   message['shot_direction'])
         except (TypeError, ValueError, OverflowError):
             raise RuntimeError('worker fire intent has invalid values')
-        values += (aim_yaw, gun_pitch)
+        values += (aim_yaw, gun_pitch) + shot_origin + shot_direction
+        direction_length = math.sqrt(sum(
+            value * value for value in shot_direction))
         if (message.get('round_id') != (self._start_message or {}).get(
                 'round_id') or
                 authority_epoch != int(self.client.authority_epoch) or
                 player_id <= 0 or intent_seq <= 0 or shot_seq <= 0 or
                 input_seq <= 0 or pose_time_us < 0 or
                 not 0 <= shell_index <= 9 or deadline < 0 or
+                not isinstance(message['shot_origin'], list) or
+                len(message['shot_origin']) != 3 or
+                not isinstance(message['shot_direction'], list) or
+                len(message['shot_direction']) != 3 or
+                not 0.999 <= direction_length <= 1.001 or
+                not 0.0 <= float(message['dispersion_angle']) <= 0.5 or
                 any(math.isnan(value) or math.isinf(value)
                     for value in values)):
             raise RuntimeError('worker fire intent violates its contract')
@@ -10751,15 +10781,12 @@ class BattleRuntime(object):
         targets = dict((body['id'], body) for body in others
                        if body.get('network_id') and
                        body.get('kind') == 'bot')
-        try:
-            revision = int((self._last_snapshot or {}).get(
-                'bot_state_revision'))
-        except (TypeError, ValueError, OverflowError):
-            revision = None
         for event in contact['ram_events']:
             target = targets.get(event.get('other_id'))
             presentation_time_us = (target or {}).get(
                 'presentation_time_us')
+            revision = self._ram_bot_revision_at(
+                (target or {}).get('network_id'), presentation_time_us)
             if (target is None or revision is None or
                     presentation_time_us is None):
                 continue
@@ -12044,42 +12071,23 @@ class BattleRuntime(object):
             if speed <= 0.0 or gravity <= 0.0 or maximum <= 0.0:
                 raise RuntimeError(
                     'worker player gun has invalid projectile parameters')
-            current_position, current_yaw = self._state_world_pose(state)
-            frozen_yaw = float(intent['yaw'])
             try:
-                self._binding.set_vehicle_pose(
-                    record['engine_id'], self._vector((
-                        float(intent['x']), float(intent['y']),
-                        float(intent['z']))), _engine_rotation(
-                            frozen_yaw, float(intent['pitch']),
-                            float(intent['roll'])), now=now)
-                self._binding.update_vehicle_aim(
-                    record['engine_id'], frozen_yaw,
-                    float(intent['aim_yaw']), float(intent['gun_pitch']))
-                node = entity.model.node('HP_gunFire')
-                matrix = self._runtime.math.Matrix(node)
-                origin = _xyz(matrix.translation)
-                direction = self._vector(_xyz(matrix.applyToAxis(2)))
-            except Exception:
+                origin = tuple(float(value) for value in
+                               intent['shot_origin'])
+                direction = self._vector(tuple(
+                    float(value) for value in intent['shot_direction']))
+                dispersion_angle = float(intent['dispersion_angle'])
+            except (KeyError, TypeError, ValueError, OverflowError):
                 raise RuntimeError(
-                    'worker player muzzle transform is unavailable')
-            finally:
-                self._binding.set_vehicle_pose(
-                    record['engine_id'], self._vector(current_position),
-                    _engine_rotation(
-                        current_yaw, _number(state.get('pitch')),
-                        _number(state.get('roll'))), now=now)
-                self._binding.update_vehicle_aim(
-                    record['engine_id'], current_yaw,
-                    _number(state.get('aim_yaw', current_yaw)),
-                    _number(state.get('gun_pitch')))
+                    'worker player trigger ray is unavailable')
             direction.normalise()
             if direction.length <= 0.0:
                 raise RuntimeError('worker player muzzle direction is empty')
             gun.scatter(
                 direction,
                 bool(self._config and self._config.get(
-                    'perfect_accuracy', False)))
+                    'perfect_accuracy', False)),
+                dispersion_angle=dispersion_angle)
             velocity = tuple(
                 value * speed for value in _xyz(direction))
             shot_seq = int(intent['shot_seq'])
@@ -13743,9 +13751,16 @@ class BattleRuntime(object):
         aim_yaw = float(hull_yaw) + turret_yaw
         self._sender.aim_yaw = aim_yaw
         self._sender.gun_pitch = gun_pitch
+        try:
+            shot_origin, shot_direction = self._mutable_shot_ray()
+            dispersion_angle = self._native_dispersion_angle()
+        except RuntimeError:
+            return False
         if not self._sender.send_current():
             return False
-        intent_seq = sender(shell_index, aim_yaw, gun_pitch)
+        intent_seq = sender(
+            shell_index, list(_xyz(shot_origin)),
+            list(_xyz(shot_direction)), dispersion_angle)
         if not intent_seq:
             return False
         self._local_fire_intent = {

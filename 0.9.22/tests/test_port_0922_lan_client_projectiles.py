@@ -206,28 +206,37 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertTrue(self.send_player_input(client))
         client._send = lambda unused_message: False
 
-        self.assertIsNone(client.send_fire_intent(2, 0.3, -0.1))
+        self.assertIsNone(client.send_fire_intent(
+            2, [1.0, 2.0, 3.0], [0.0, 0.0, 1.0], 0.01))
         self.assertEqual(0, client._fire_intent_seq)
 
         client._send = lambda unused_message: True
-        self.assertEqual(1, client.send_fire_intent(2, 0.3, -0.1))
+        self.assertEqual(1, client.send_fire_intent(
+            2, [1.0, 2.0, 3.0], [0.0, 0.0, 1.0], 0.01))
         self.assertEqual(1, client._fire_intent_seq)
 
     def test_visible_fire_intent_requires_input_and_sequences_monotonically(self):
         client = self.active_client()
 
-        self.assertIsNone(client.send_fire_intent(2, 0.3, -0.1))
+        self.assertIsNone(client.send_fire_intent(
+            2, [1.0, 2.0, 3.0], [0.0, 0.0, 1.0], 0.01))
         self.assertTrue(self.send_player_input(client))
-        self.assertEqual(1, client.send_fire_intent(2, 0.3, -0.1))
+        self.assertEqual(1, client.send_fire_intent(
+            2, [1.0, 2.0, 3.0], [0.0, 0.0, 1.0], 0.01))
         self.assertTrue(self.send_player_input(client, shell_index=1))
-        self.assertEqual(2, client.send_fire_intent(1, 0.4, -0.2))
+        self.assertEqual(2, client.send_fire_intent(
+            1, [1.0, 2.0, 3.0], [1.0, 0.0, 0.0], 0.02))
         message = wire_copy(client._outbound_queue[-1][1])
         self.assertEqual({
             'type', 'round_id', 'intent_seq', 'input_seq', 'shell_index',
+            'shot_origin', 'shot_direction', 'dispersion_angle',
         }, set(message))
         self.assertEqual('fire_intent', message['type'])
         self.assertEqual(2, message['intent_seq'])
         self.assertEqual(2, message['input_seq'])
+        self.assertEqual([1.0, 2.0, 3.0], message['shot_origin'])
+        self.assertEqual([1.0, 0.0, 0.0], message['shot_direction'])
+        self.assertEqual(0.02, message['dispersion_angle'])
 
     def test_visible_client_cannot_publish_player_projectile_launch(self):
         client = self.active_client()
@@ -311,6 +320,7 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual('fire_intent', message['type'])
         self.assertEqual({
             'type', 'round_id', 'intent_seq', 'input_seq', 'shell_index',
+            'shot_origin', 'shot_direction', 'dispersion_angle',
         }, set(message))
 
     def test_progress_shape_is_exact_and_duplicate_ids_fail_closed(self):

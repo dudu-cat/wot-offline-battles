@@ -78,6 +78,20 @@ def _update_player_input(state, player_id, **changes):
     return state.update_input(player_id, message)
 
 
+def _fire_intent(state, player_id=1, **changes):
+    player = state.players[player_id]
+    message = {
+        'type': 'fire_intent', 'round_id': state.round_id,
+        'intent_seq': player.fire_intent_seq + 1,
+        'input_seq': player.input_seq, 'shell_index': player.shell_index,
+        'shot_origin': [player.x, player.y + 1.0, player.z],
+        'shot_direction': [0.0, 0.0, 1.0],
+        'dispersion_angle': 0.01,
+    }
+    message.update(changes)
+    return message
+
+
 def _source_shot(speed, gravity, maximum, is_he=False, radius=0.0,
                  damage=(390.0, 150.0), deadeye=False):
     return {
@@ -139,10 +153,17 @@ def _launch_authority(state, message):
                 'shell_index': message['shell_index']}):
             return False
         intent_seq = player.fire_intent_seq + 1
-        if not state.submit_fire_intent(player_id, {
-                'type': 'fire_intent', 'round_id': state.round_id,
-                'intent_seq': intent_seq, 'input_seq': input_seq,
-                'shell_index': message['shell_index']}):
+        launch_speed = math.sqrt(sum(
+            component * component for component in message['velocity']))
+        if not state.submit_fire_intent(player_id, _fire_intent(
+                state, player_id, intent_seq=intent_seq,
+                input_seq=input_seq,
+                shell_index=message['shell_index'],
+                shot_origin=list(message['origin']),
+                shot_direction=[
+                    component / launch_speed
+                    for component in message['velocity']],
+                dispersion_angle=0.0)):
             return False
         relay = player.pending_fire_intents[intent_seq]
         message.update({
@@ -315,11 +336,8 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertTrue(_update_player_input(
             state, 1, x=3.25, y=1.5, z=-4.75, yaw=0.25,
             aim_yaw=-0.5, gun_pitch=0.125))
-        message = {
-            'type': 'fire_intent', 'round_id': state.round_id,
-            'intent_seq': 1, 'input_seq': player.input_seq,
-            'shell_index': 0,
-        }
+        message = _fire_intent(
+            state, 1, shot_origin=[3.25, 2.5, -4.75])
 
         self.assertTrue(state.submit_fire_intent(1, message))
         self.assertEqual(1, len(relayed))
@@ -334,6 +352,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                          (relay['x'], relay['y'], relay['z']))
         self.assertEqual((-0.5, 0.125),
                          (relay['aim_yaw'], relay['gun_pitch']))
+        self.assertEqual([3.25, 2.5, -4.75], relay['shot_origin'])
+        self.assertEqual([0.0, 0.0, 1.0], relay['shot_direction'])
+        self.assertEqual(0.01, relay['dispersion_angle'])
         self.assertGreaterEqual(
             relay['deadline_server_time_ms'], state._server_time_ms())
 
@@ -343,17 +364,41 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             1, dict(message, shell_index=1)))
         self.assertFalse(state.submit_fire_intent(
             1, dict(message, intent_seq=3)))
+        self.assertFalse(state.submit_fire_intent(
+            1, dict(message, shot_direction=[1.0, 0.0, 0.0])))
         self.assertEqual([1], list(player.pending_fire_intents))
+        launch = _launch(
+            origin=list(relay['shot_origin']), velocity=[100.0, 0.0, 0.0],
+            authority_epoch=state.authority_epoch,
+            fire_intent_seq=relay['intent_seq'],
+            fire_input_seq=relay['input_seq'])
+        self.assertFalse(state.launch_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, launch))
+
+    def test_player_fire_intent_rejects_untrusted_trigger_rays(self):
+        state = _state()
+        self.assertTrue(_update_player_input(state, 1))
+        invalid = (
+            {'shot_origin': (0.0, 1.0, 0.0)},
+            {'shot_origin': [100.0, 1.0, 0.0]},
+            {'shot_direction': [0.0, 0.0, 0.0]},
+            {'shot_direction': [0.0, 0.0, 0.5]},
+            {'shot_direction': [float('nan'), 0.0, 1.0]},
+            {'dispersion_angle': float('inf')},
+            {'dispersion_angle': 0.5001},
+        )
+
+        for changes in invalid:
+            self.assertFalse(state.submit_fire_intent(
+                1, _fire_intent(state, **changes)), changes)
+        self.assertEqual(0, state.players[1].fire_intent_seq)
 
     def test_worker_fire_rejection_is_committed_after_visible_delivery(self):
         state = _state()
         player = state.players[1]
         self.assertTrue(_update_player_input(state, 1))
-        self.assertTrue(state.submit_fire_intent(1, {
-            'type': 'fire_intent', 'round_id': state.round_id,
-            'intent_seq': 1, 'input_seq': player.input_seq,
-            'shell_index': 0,
-        }))
+        self.assertTrue(state.submit_fire_intent(
+            1, _fire_intent(state)))
         delivered = []
         player.offer_reliable = lambda message: (
             delivered.append(dict(message)) or True)
@@ -383,11 +428,8 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         state = _state()
         player = state.players[1]
         self.assertTrue(_update_player_input(state, 1))
-        self.assertTrue(state.submit_fire_intent(1, {
-            'type': 'fire_intent', 'round_id': state.round_id,
-            'intent_seq': 1, 'input_seq': player.input_seq,
-            'shell_index': 0,
-        }))
+        self.assertTrue(state.submit_fire_intent(
+            1, _fire_intent(state)))
         player.offer_reliable = lambda unused_message: False
 
         self.assertFalse(state.resolve_fire_intent(
@@ -412,11 +454,8 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         worker.offer_reliable = lambda message: (
             worker_messages.append(dict(message)) or True)
         self.assertTrue(_update_player_input(state, 1))
-        self.assertTrue(state.submit_fire_intent(1, {
-            'type': 'fire_intent', 'round_id': state.round_id,
-            'intent_seq': 1, 'input_seq': player.input_seq,
-            'shell_index': 0,
-        }))
+        self.assertTrue(state.submit_fire_intent(
+            1, _fire_intent(state)))
         relay = worker_messages.pop()
         launch = _launch(origin=[100.0, 1.0, 0.0])
         launch.update({
