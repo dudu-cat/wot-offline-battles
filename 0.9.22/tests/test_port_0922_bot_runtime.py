@@ -752,6 +752,14 @@ class ServerBotObservationRelayTests(unittest.TestCase):
             2, guest_socket, ('127.0.0.1', 2), team=1, slot=1)
         server.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
         server.bot_manifest_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        server.bot_manifest = [{
+            'id': 11, 'team': 2, 'slot': 0, 'name': 'Enemy',
+            'vehicle': 'ussr:R11_MS-1', 'max_health': 1000,
+        }]
+        server.bot_states[11] = {
+            'id': 11, 'team': 2, 'alive': True,
+            'health': 1000, 'max_health': 1000,
+        }
         return server, authority_socket, guest_socket
 
     @staticmethod
@@ -762,8 +770,25 @@ class ServerBotObservationRelayTests(unittest.TestCase):
                 'observing_team': 2, 'target_kind': 'human',
                 'target_id': target_id, 'target_team': 1,
                 'visible': bool(visible),
+                'visible_by_player_ids': [],
                 'shootable_by_bot_ids': [],
                 'x': 10.0, 'y': 0.0, 'z': 20.0,
+                'health': 1000, 'max_health': 1000,
+            }],
+            'affordances': [],
+        }
+
+    @staticmethod
+    def _human_message(round_id, observer_ids=(1,), visible=True):
+        return {
+            'type': 'bot_observation', 'round_id': round_id,
+            'contacts': [{
+                'observing_team': 1, 'target_kind': 'bot',
+                'target_id': 11, 'target_team': 2,
+                'visible': bool(visible),
+                'visible_by_player_ids': list(observer_ids),
+                'shootable_by_bot_ids': [],
+                'x': 20.0, 'y': 0.0, 'z': 20.0,
                 'health': 1000, 'max_health': 1000,
             }],
             'affordances': [],
@@ -799,6 +824,60 @@ class ServerBotObservationRelayTests(unittest.TestCase):
 
         self.assertEqual([], authority_socket.payloads)
         self.assertEqual([], guest_socket.payloads)
+
+    def test_worker_human_spot_is_idempotent_and_earns_assist(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        message = self._human_message(server.round_id)
+
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, message), dict)
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, message), dict)
+        self.assertEqual(frozenset((('bot', 11),)),
+                         server.player_spotted[1])
+        self.assertEqual(1, server._statistics_row('player', 1)['spotted'])
+
+        server._record_damage(('player', 2), ('bot', 11), 75, {})
+        self.assertEqual(
+            75, server._statistics_row(
+                'player', 1)['damage_assisted_radio'])
+
+    def test_worker_human_spot_rejects_forged_observers(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        malformed = self._human_message(server.round_id)
+        malformed['contacts'][0].pop('visible_by_player_ids')
+        duplicate = self._human_message(server.round_id, (1, 1))
+        wrong_team = self._human_message(server.round_id, (1,))
+        server.players[1].team = 2
+
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, malformed))
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, duplicate))
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, wrong_team))
+        self.assertNotIn(1, server.player_spotted)
+
+    def test_disconnect_and_complete_worker_batch_converge_spot_ledger(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        message = self._human_message(server.round_id)
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, message), dict)
+
+        removed, unused_changed = server.remove_player(1)
+        self.assertIsNotNone(removed)
+        self.assertNotIn(1, server.player_spotted)
+        server.players[1] = Player(
+            1, _CaptureSocket(), ('127.0.0.1', 10), team=1, slot=0)
+
+        self.assertIsInstance(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, message), dict)
+        self.assertEqual(frozenset((('bot', 11),)),
+                         server.player_spotted[1])
+        hidden = self._human_message(server.round_id, (), visible=False)
+        self.assertTrue(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, hidden))
+        self.assertEqual(frozenset(), server.player_spotted[1])
 
     def test_modern_human_direct_spot_does_not_override_worker_observation(self):
         server, unused_authority_socket, unused_guest_socket = self._server()
@@ -7670,7 +7749,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime.update(.04, 1.0, players=players)
         self.runtime.update(.04, 1.04, players=players)
 
-        self.assertEqual([(11, 2)], calls)
+        self.assertEqual(set(((2, 11), (11, 2))), set(calls))
+        self.assertEqual(2, len(calls))
 
     def test_visibility_upper_bound_skips_only_impossible_native_probes(self):
         descriptor = _combat_descriptor()
@@ -8921,9 +9001,20 @@ class BotRuntimeTests(unittest.TestCase):
 
         observation = [value for value in outgoing
                        if value['type'] == 'bot_observation'][0]
-        self.assertEqual(1, len(observation['contacts']))
-        self.assertEqual('human', observation['contacts'][0]['target_kind'])
-        self.assertEqual(2, observation['contacts'][0]['target_id'])
+        self.assertEqual(2, len(observation['contacts']))
+        identities = set((
+            contact['observing_team'], contact['target_kind'],
+            contact['target_id']) for contact in observation['contacts'])
+        self.assertEqual(
+            set(((1, 'bot', 11), (2, 'human', 2))), identities)
+        human_direct = next(
+            contact for contact in observation['contacts']
+            if contact['target_kind'] == 'bot')
+        self.assertTrue(human_direct['visible'])
+        self.assertEqual([2], human_direct['visible_by_player_ids'])
+        self.assertTrue(all(
+            'visible_by_player_ids' in contact
+            for contact in observation['contacts']))
 
     def test_human_vehicle_profiles_drive_server_shell_selection_once(self):
         descriptor_calls = []
@@ -9109,8 +9200,10 @@ class BotRuntimeTests(unittest.TestCase):
                           if message['type'] == 'bot_state')
         observation = next(message for message in outgoing
                            if message['type'] == 'bot_observation')
-        self.assertEqual(1, len(observation['contacts']))
-        contact = observation['contacts'][0]
+        self.assertEqual(3, len(observation['contacts']))
+        contact = next(
+            value for value in observation['contacts']
+            if value['target_kind'] == 'human')
         self.assertTrue(contact['visible'])
         self.assertEqual([12], contact['shootable_by_bot_ids'])
         self.assertEqual([(11, 2), (12, 2)], lane_calls)

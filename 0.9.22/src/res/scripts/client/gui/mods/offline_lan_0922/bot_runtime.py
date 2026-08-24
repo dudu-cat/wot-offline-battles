@@ -2692,7 +2692,29 @@ class BotRuntime(object):
         return moving
 
     def _source_view_range(self, source, now):
-        """A bot earns its own stereoscope after it stands still, like the player."""
+        """Return one trusted observer's live #1513 view range."""
+        if source.get('kind') == 'human':
+            player_id = int(source.get('network_id', source.get('id', 0)))
+            snapshot = _player_effective_params(source)
+            profile = snapshot['spotting']
+            descriptor = self._player_vehicle_profile(source)['descriptor']
+            turret = _value(descriptor, 'turret', {}) or {}
+            misc = _value(descriptor, 'miscAttrs', {}) or {}
+            since = self._source_still.get(('human', player_id))
+            binocular_active = bool(
+                profile['has_binoculars'] and since is not None and
+                loadout.still_device_active(
+                    _number(now) - since, profile['binocular_delay']))
+            return spotting.effective_view_range(
+                _value(turret, 'circularVisionRadius', 330.0),
+                misc_factor=_value(
+                    misc, 'circularVisionRadiusFactor', 1.0),
+                crew_factor=profile['vision_factor'],
+                binocular_factor=profile['binocular_factor'],
+                binocular_active=binocular_active)
+
+        # A bot earns its own stereoscope after it stands still, like the
+        # player.
         bot_id = int(source.get('id', 0))
         cached = self._vision_ranges.get(bot_id)
         if cached is None:
@@ -2717,6 +2739,16 @@ class BotRuntime(object):
             self._source_still.pop(bot_id, None)
         elif bot_id not in self._source_still:
             self._source_still[bot_id] = _number(now)
+        return True
+
+    def _note_human_source_stillness(self, source, now):
+        """Track a human observer's stationary-device clock by owner id."""
+        player_id = int(source.get('network_id', source.get('id', 0)))
+        key = ('human', player_id)
+        if abs(_number(source.get('speed'))) > spotting.MOVING_SPEED_EPSILON:
+            self._source_still.pop(key, None)
+        elif key not in self._source_still:
+            self._source_still[key] = _number(now)
         return True
 
     def _target_still_seconds(self, key, moving, now):
@@ -2752,12 +2784,14 @@ class BotRuntime(object):
 
     def _visible(self, source, target, now):
         target_id = target.get('network_id', target.get('id', 0))
-        key = (int(source.get('id', 0)), target.get('kind'), int(target_id))
+        source_kind = source.get('kind', 'bot')
+        key = (source_kind, int(source.get('id', 0)),
+               target.get('kind'), int(target_id))
         fired_recently, fire_changed, fire_seq = self._target_fired_recently(
             target, now)
         cached = self._visibility_cache.get(key)
         ttl = (VISIBILITY_MIN_SECONDS +
-               ((key[0] * 31 + key[2] * 17) % 11) *
+               ((key[1] * 31 + key[3] * 17) % 11) *
                VISIBILITY_JITTER_SECONDS)
         if (not fire_changed and cached is not None and
                 cached[2] == fire_seq and
@@ -2824,6 +2858,79 @@ class BotRuntime(object):
     @staticmethod
     def _human_planner_id(player_id):
         return HUMAN_TARGET_ID_BASE + int(player_id)
+
+    @staticmethod
+    def _observer_target_key(target):
+        return (target.get('kind'),
+                int(target.get('network_id', target.get('id', 0))))
+
+    def _human_observation_target(self, raw):
+        target = dict(raw)
+        player_id = int(raw.get('network_id', raw.get('id', 0)))
+        if player_id <= 0:
+            raise ValueError('human observation identity is invalid')
+        target['kind'] = 'human'
+        target['network_id'] = player_id
+        target['id'] = self._human_planner_id(player_id)
+        target['position'] = _position(raw)
+        vehicle_profile = self._player_vehicle_profile(raw)
+        target['class_tag'] = vehicle_profile['class_tag']
+        target['armor'] = vehicle_profile['armor']
+        return target
+
+    @staticmethod
+    def _bot_observation_target(bot_id, raw):
+        target = dict(raw)
+        target['kind'] = 'bot'
+        target['network_id'] = int(bot_id)
+        target['id'] = int(bot_id)
+        target['position'] = _position(raw)
+        return target
+
+    def _append_human_observations(
+            self, players, now, aggregate, team_visibility):
+        """Merge hidden-worker human LOS into the canonical contact batch."""
+        human_targets = [
+            self._human_observation_target(raw)
+            for raw in players or ()
+            if (isinstance(raw, dict) and raw.get('id') is not None and
+                raw.get('alive', True))]
+        bot_targets = [
+            self._bot_observation_target(bot_id, raw)
+            for bot_id, raw in self.states.items()
+            if raw.get('alive', True)]
+        targets = human_targets + bot_targets
+
+        for raw in players or ():
+            if (not isinstance(raw, dict) or raw.get('id') is None or
+                    not raw.get('alive', True)):
+                continue
+            source = dict(raw)
+            source['kind'] = 'human'
+            source['network_id'] = int(raw.get('id'))
+            source['id'] = source['network_id']
+            source_team = int(source.get('team', 0))
+            if source_team not in (1, 2) or source['id'] <= 0:
+                raise ValueError('human observer identity is invalid')
+            self._note_human_source_stillness(source, now)
+            for target in targets:
+                if int(target.get('team', 0)) == source_team:
+                    continue
+                target_key = self._observer_target_key(target)
+                key = (source_team, target_key[0], target_key[1])
+                direct_visible = self._visible(source, target, now)
+                entry = aggregate.get(key)
+                if entry is None:
+                    # visible, bot firing lanes, target, human observers
+                    entry = [False, set(), target, set()]
+                    aggregate[key] = entry
+                entry[0] = bool(entry[0] or direct_visible)
+                entry[2] = target
+                if not direct_visible:
+                    continue
+                entry[3].add(source['id'])
+                team_visibility[key] = True
+        return True
 
     def _contacts_for(self, source, players, now, team_spotted=None):
         contacts = []
@@ -4791,7 +4898,9 @@ class BotRuntime(object):
         """
         packed = []
         for key in sorted(aggregate):
-            target_visible, shootable, observed_target = aggregate[key]
+            row = aggregate[key]
+            target_visible, shootable, observed_target = row[:3]
+            visible_by_players = row[3] if len(row) > 3 else ()
             profile = observed_target.get('profile')
             profile = profile if isinstance(profile, dict) else {}
             packed.append({
@@ -4799,6 +4908,10 @@ class BotRuntime(object):
                 'target_id': key[2],
                 'target_team': int(observed_target.get('team', 0)),
                 'visible': bool(target_visible),
+                # These identities are produced only by the hidden worker's
+                # native LOS probes. Visible clients cannot submit this
+                # authority message.
+                'visible_by_player_ids': sorted(visible_by_players),
                 # Current clients always publish this field. An empty list
                 # means team-spotted without a local firing lane; the server
                 # rejects omission rather than guessing.
@@ -5283,6 +5396,9 @@ class BotRuntime(object):
         observation_entries = {}
         observation_pairs = []
         team_visibility = {}
+        if collect_observation:
+            self._append_human_observations(
+                players, now, observation_entries, team_visibility)
         cover_jobs = []
         tick_poses = {}
         tick_safe = {}
@@ -5470,7 +5586,7 @@ class BotRuntime(object):
                 if collect_observation:
                     entry = observation_entries.get(key)
                     if entry is None:
-                        entry = [False, set(), observed_target]
+                        entry = [False, set(), observed_target, set()]
                         observation_entries[key] = entry
                     entry[0] = bool(target_visible or entry[0])
                     entry[2] = observed_target

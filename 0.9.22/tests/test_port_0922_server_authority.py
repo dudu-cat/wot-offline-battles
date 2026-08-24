@@ -1805,6 +1805,7 @@ class ServerAuthorityBattleTest(unittest.TestCase):
                 'target_id': 1,
                 'target_team': 1,
                 'visible': True,
+                'visible_by_player_ids': [],
                 'shootable_by_bot_ids': [],
                 'x': state.players[1].x,
                 'y': state.players[1].y,
