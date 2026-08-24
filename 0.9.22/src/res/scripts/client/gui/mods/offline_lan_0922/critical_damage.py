@@ -1415,6 +1415,11 @@ def tick_repair(vehicle, dt, repair_skill=100.0, has_big_kit=False,
     destroyed = set(getattr(vehicle, '_destroyed_devices', None) or ())
     critical = set(getattr(vehicle, '_critical_devices', None) or ())
     for name in list(devices):
+        # Retail automatic repair starts only after a module is destroyed.
+        # Hidden HP loss and a functional yellow module persist until a repair
+        # kit or another explicit recovery event changes them.
+        if name not in destroyed:
+            continue
         cap = _device_damage.device_regen_hp(descriptor, name)
         if cap is None or devices[name] >= cap:
             continue

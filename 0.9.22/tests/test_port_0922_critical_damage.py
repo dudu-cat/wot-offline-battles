@@ -1019,6 +1019,21 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertEqual('destroyed', payload['events'][0]['old_state'])
         self.assertEqual('critical', payload['events'][0]['state'])
 
+    def test_functional_yellow_module_does_not_auto_repair(self):
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500,
+            devices_hp={'engineHealth': 40.0},
+            _destroyed_devices=set(),
+            _critical_devices=set(['engineHealth']),
+            _crew_ko=set(), is_on_fire=False)
+
+        payload = critical_damage.tick_repair(
+            vehicle, 100.0, repair_skill=100.0)
+
+        self.assertEqual(40.0, vehicle.devices_hp['engineHealth'])
+        self.assertIn('engineHealth', vehicle._critical_devices)
+        self.assertIsNone(payload)
+
     def test_auto_repair_stays_explicitly_critical_above_half_health(self):
         descriptor = _descriptor()
         descriptor.chassis = {'maxHealth': 100, 'maxRegenHealth': 80}
