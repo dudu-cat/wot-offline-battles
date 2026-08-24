@@ -652,6 +652,20 @@ class NativeRemoteVehicleFactory(object):
             return False
         return state.set_interpolate_motion(enabled)
 
+    def projectile_collision_matrix(self, entity_id):
+        """Return the canonical pose, never the authority-only render blend.
+
+        The simulation worker eases its own compounds between copied-physics
+        samples so its hidden renderer stays smooth.  Projectile authority is
+        already swept against the copied pose timeline and must therefore use
+        the state's unblended matrix.  Visible clients do not call this seam;
+        their reticle and tracer continue to follow the rendered provider.
+        """
+        state = self._states.get(int(entity_id))
+        if state is None or state.entity is None:
+            return None
+        return state.matrix
+
     def request_wreck(self, unused_entity_id):
         # Vehicle.onHealthChanged owns stock damaged-model replacement.
         return False

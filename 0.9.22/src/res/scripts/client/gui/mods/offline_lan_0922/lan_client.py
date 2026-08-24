@@ -1401,6 +1401,52 @@ class LANClient(object):
         self._input_seq = next_input_seq
         return True
 
+    def send_track_repair(self, tracks, base_revision, repair_seq):
+        """Publish one versioned, track-only repair checkpoint.
+
+        Damage remains server/worker authoritative.  The visible #1513
+        process alone owns the mounted crew/loadout repair timer, so this
+        narrow message donates only monotonic left/right-track repair facts.
+        """
+        if not self.ready or self.phase != 'battle':
+            return False
+        base_revision = _projectile_int_range(
+            base_revision, 0, MAX_PROJECTILE_ID)
+        repair_seq = _projectile_int_range(
+            repair_seq, 1, MAX_PROJECTILE_ID)
+        if (base_revision is None or repair_seq is None or
+                not isinstance(tracks, (list, tuple)) or
+                not 1 <= len(tracks) <= 2):
+            return False
+        rows = []
+        seen = set()
+        for raw in tracks:
+            if (not isinstance(raw, dict) or
+                    set(raw) != set(('name', 'hp', 'max_hp', 'state'))):
+                return False
+            name = str(raw.get('name', ''))
+            state = str(raw.get('state', ''))
+            hp = _finite_float(raw.get('hp'), -1.0)
+            maximum = _finite_float(raw.get('max_hp'), -1.0)
+            if (name not in ('leftTrackHealth', 'rightTrackHealth') or
+                    name in seen or state not in ('destroyed', 'critical') or
+                    maximum <= 0.0 or hp < 0.0 or hp > maximum):
+                return False
+            seen.add(name)
+            rows.append({
+                'name': name,
+                'hp': round(hp, 3),
+                'max_hp': round(maximum, 3),
+                'state': state,
+            })
+        return self._send({
+            'type': 'track_repair',
+            'round_id': self.round_id,
+            'critical_base_revision': base_revision,
+            'repair_seq': repair_seq,
+            'tracks': rows,
+        })
+
     def send_player_environment(self, observations, sample_seq):
         """Publish bounded water observations from the hidden worker only."""
         sequence = _projectile_int_range(

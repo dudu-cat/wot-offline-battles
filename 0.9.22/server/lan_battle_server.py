@@ -166,12 +166,14 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "player_destructible_contact_result",
     "battle_result", "leave_battle", "battle_ready", "simulation_progress",
     "player_environment",
+    "track_repair",
 ))
 MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
     "input", "fire_intent", "start_battle", "battle_ready", "leave_battle",
     "battle_receipt_ack", "descriptor_catalog", "descriptor_bundle",
     "destructible_map", "select_vehicle", "select_team", "set_team_size",
     "ping", "leave",
+    "track_repair",
 ))
 # The elected #1513 authority uses the same bounded in-process manager.  The
 # server must never admit more durable launches than a takeover client can
@@ -962,6 +964,36 @@ def _critical_damage_transition(previous, current):
              not bool(previous.get("ammo_rack_death"))))
 
 
+def _track_repair_rows(value):
+    """Validate one track-only repair checkpoint without widening authority."""
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 2:
+        raise ValueError("invalid track repair rows")
+    result = []
+    seen = set()
+    keys = {"name", "hp", "max_hp", "state"}
+    for raw in value:
+        if not isinstance(raw, dict) or set(raw) != keys:
+            raise ValueError("invalid track repair row")
+        name = str(raw.get("name", ""))
+        state = str(raw.get("state", ""))
+        if (name not in TRACK_DEVICE_NAMES or name in seen or
+                state not in ("destroyed", "critical") or
+                not _has_finite_fields(raw, ("hp", "max_hp"))):
+            raise ValueError("invalid track repair state")
+        hp = _finite_float(raw.get("hp"), -1.0)
+        maximum = _finite_float(raw.get("max_hp"), -1.0)
+        if maximum <= 0.0 or hp < 0.0 or hp > maximum:
+            raise ValueError("invalid track repair health")
+        seen.add(name)
+        result.append({
+            "name": name,
+            "hp": round(hp, 3),
+            "max_hp": round(maximum, 3),
+            "state": state,
+        })
+    return tuple(sorted(result, key=lambda row: row["name"]))
+
+
 def _destroyed_tracks(critical):
     """Return the track devices one critical payload reports as destroyed."""
     if not isinstance(critical, dict):
@@ -1321,6 +1353,8 @@ class Player(_EndpointSendMixin):
     critical_revision: int = 0
     critical_report_base_revision: int = 0
     critical_ack_seq: int = 0
+    track_repair_fingerprints: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
     death_reason: int = 0
     display_health: Optional[int] = None
     frags: int = 0
@@ -2310,6 +2344,7 @@ class BattleState:
             player.critical_revision = 0
             player.critical_report_base_revision = 0
             player.critical_ack_seq = 0
+            player.track_repair_fingerprints.clear()
             player.death_reason = 0
             player.display_health = None
             player.frags = 0
@@ -7447,6 +7482,7 @@ class BattleState:
         player.critical_revision += 1
         player.critical_report_base_revision = player.critical_revision
         player.critical_ack_seq = 0
+        player.track_repair_fingerprints.clear()
         return {
             "critical_revision": player.critical_revision,
             "critical_base_revision":
@@ -7488,6 +7524,97 @@ class BattleState:
                 player.critical_report_base_revision,
             "critical_ack_seq": player.critical_ack_seq,
         }, True
+
+    def report_track_repair(self, player_id, message):
+        """CAS one owner-timed destroyed-track repair into canonical state."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    not self._combat_accepting() or
+                    self.battle_result is not None or player is None or
+                    not player.connected or not player.participating or
+                    not player.alive):
+                return False
+            base_revision = _exact_int(
+                message.get("critical_base_revision"), 0,
+                PROJECTILE_MAX_ID)
+            repair_seq = _exact_int(
+                message.get("repair_seq"), 1, PROJECTILE_MAX_ID)
+            try:
+                rows = _track_repair_rows(message.get("tracks"))
+            except ValueError:
+                return False
+            if (base_revision is None or repair_seq is None or
+                    base_revision != player.critical_report_base_revision):
+                return False
+            fingerprint = tuple(
+                (row["name"], row["hp"], row["max_hp"], row["state"])
+                for row in rows)
+            if repair_seq <= player.critical_ack_seq:
+                return (player.track_repair_fingerprints.get(repair_seq) ==
+                        fingerprint)
+
+            current = (player.critical
+                       if isinstance(player.critical, dict) else {})
+            devices = [dict(record)
+                       for record in current.get("devices") or ()
+                       if isinstance(record, dict)]
+            by_name = {
+                str(record.get("name")): (index, record)
+                for index, record in enumerate(devices)
+                if record.get("name") is not None
+            }
+            destroyed = set(current.get("destroyed") or ())
+            events = []
+            improved = False
+            for row in rows:
+                pair = by_name.get(row["name"])
+                if pair is None:
+                    return False
+                index, previous = pair
+                old_hp = _finite_float(previous.get("hp"), -1.0)
+                old_maximum = _finite_float(
+                    previous.get("max_hp"), -1.0)
+                if (previous.get("state") != "destroyed" or
+                        row["name"] not in destroyed or old_hp < 0.0 or
+                        abs(old_maximum - row["max_hp"]) > 0.001 or
+                        row["hp"] + 0.001 < old_hp):
+                    return False
+                if (row["hp"] > old_hp + 0.001 or
+                        row["state"] == "critical"):
+                    improved = True
+                devices[index] = dict(row)
+                if row["state"] == "critical":
+                    destroyed.discard(row["name"])
+                    events.append({
+                        "kind": "device",
+                        "name": row["name"],
+                        "old_state": "destroyed",
+                        "state": "critical",
+                        "cause": "repair",
+                    })
+            if not improved:
+                return False
+            candidate = dict(current)
+            candidate["devices"] = devices
+            candidate["destroyed"] = sorted(destroyed)
+            candidate["events"] = events
+            try:
+                candidate = _critical_payload(candidate)
+            except ValueError:
+                return False
+            commit, accepted = self._commit_reported_player_critical(
+                player, candidate, {
+                    "reported_critical_base_revision": base_revision,
+                    "reported_critical_seq": repair_seq,
+                })
+            if not accepted or int(commit["critical_ack_seq"]) != repair_seq:
+                return False
+            player.track_repair_fingerprints[repair_seq] = fingerprint
+            while len(player.track_repair_fingerprints) > 64:
+                player.track_repair_fingerprints.popitem(last=False)
+            return True
 
     def _apply_reported_health(self, player, message):
         """Relay legacy 0.8.2 client-simulated damage.
@@ -9303,6 +9430,14 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 "player-input:%d" % player.player_id,
                                 "PLAYER INPUT rejected sender=%d" %
                                 player.player_id)
+                    elif message_type == "track_repair":
+                        if not server.state.report_track_repair(
+                                player.player_id, message):
+                            _server_log_limited(
+                                "track-repair:%d" % player.player_id,
+                                "TRACK REPAIR rejected sender=%d seq=%s" % (
+                                    player.player_id,
+                                    message.get("repair_seq")))
                     elif message_type == "fire_intent":
                         if not server.state.submit_fire_intent(
                                 player.player_id, message):

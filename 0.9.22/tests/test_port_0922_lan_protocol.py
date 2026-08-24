@@ -112,6 +112,29 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(0.25, message['pitch'])
         self.assertEqual(-0.3, message['roll'])
 
+    def test_track_repair_is_a_narrow_versioned_message(self):
+        self.assertTrue(self.client.send_track_repair([{
+            'name': 'leftTrackHealth', 'hp': 25.0,
+            'max_hp': 100.0, 'state': 'destroyed',
+        }], 4, 2))
+
+        self.assertEqual({
+            'type': 'track_repair', 'round_id': 7,
+            'critical_base_revision': 4, 'repair_seq': 2,
+            'tracks': [{
+                'name': 'leftTrackHealth', 'hp': 25.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }],
+        }, self.sent[-1])
+        self.assertFalse(self.client.send_track_repair([{
+            'name': 'engineHealth', 'hp': 25.0,
+            'max_hp': 100.0, 'state': 'destroyed',
+        }], 4, 3))
+        self.assertFalse(self.client.send_track_repair([{
+            'name': 'leftTrackHealth', 'hp': 100.0,
+            'max_hp': 100.0, 'state': 'normal',
+        }], 4, 3))
+
     def test_timeline_input_has_round_sequence_and_server_pose_time(self):
         self.client.capabilities = (HUMAN_RAM_TIMELINE_CAPABILITY,)
         self.client.server_capabilities = (HUMAN_RAM_TIMELINE_CAPABILITY,)
@@ -999,7 +1022,11 @@ class OrderedEventVocabularyTests(unittest.TestCase):
 
     def _server_kinds(self):
         source = self.SERVER.read_text()
-        return set(re.findall(r'"kind":\s*"([a-z_]+)"', source))
+        kinds = set(re.findall(r'"kind":\s*"([a-z_]+)"', source))
+        # Critical-damage records have their own nested ``kind`` vocabulary;
+        # they are payload rows inside a top-level hit/repair event and never
+        # enter the ordered battle-event dispatcher directly.
+        return kinds - {'device'}
 
     def _client_kinds(self):
         namespace = {}

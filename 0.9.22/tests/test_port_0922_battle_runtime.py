@@ -1512,6 +1512,11 @@ class _Client(object):
         self.sent.append(('input', values, kwargs))
         return True
 
+    def send_track_repair(self, tracks, base_revision, repair_seq):
+        self.sent.append((
+            'track_repair', tracks, base_revision, repair_seq))
+        return True
+
     def send_fire_intent(self, shell_index, shot_origin, shot_direction,
                          dispersion_angle):
         self._fire_intent_seq += 1
@@ -8133,13 +8138,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
                           {'health': 500})
         runtime.bigworld.entities[10] = entity
         live = {
-            'devices': [{'name': 'engineHealth', 'hp': 35.0,
+            'devices': [{'name': 'leftTrackHealth', 'hp': 35.0,
                          'max_hp': 100.0, 'state': 'destroyed'}],
-            'destroyed': ['engineHealth'], 'crew_ko': [],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [],
             'fire': False, 'ammo_rack_death': False, 'events': []}
         echoed = dict(live)
-        echoed['devices'] = [dict(live['devices'][0], hp=10.0)]
-        entity.devices_hp = {'engineHealth': 35.0}
+        entity.devices_hp = {'leftTrackHealth': 35.0}
         record = {
             'engine_id': 10, 'state': {
                 'health': 500, 'alive': True, 'critical': live},
@@ -8149,16 +8153,18 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._local_critical_base_revision = 0
         battle._local_critical_next_seq = 1
         battle._local_damage_report = {
-            'critical': live, 'critical_base_revision': 0,
+            'tracks': [dict(live['devices'][0])],
+            'critical_base_revision': 0,
             'critical_seq': 1}
 
         self.assertFalse(battle._apply_critical_state(record, echoed, {
             'critical_revision': 1, 'critical_base_revision': 0,
             'critical_ack_seq': 1}))
 
-        self.assertEqual(35.0, entity.devices_hp['engineHealth'])
+        self.assertEqual(35.0, entity.devices_hp['leftTrackHealth'])
         self.assertEqual(live, record['state']['critical'])
         self.assertIsNone(battle._local_damage_report)
+        self.assertTrue(battle._local_critical_owned)
 
     def test_duplicate_ordered_event_is_presented_once(self):
         runtime = _runtime()
@@ -8370,6 +8376,107 @@ class BattleRuntimeContractTests(unittest.TestCase):
             battle._tick_critical_states(0.1)
 
         self.assertIsNone(battle._local_damage_report)
+
+    def test_destroyed_track_repair_queues_only_versioned_track_facts(self):
+        battle = BattleRuntime(_runtime())
+        battle._local_critical_base_revision = 4
+        payload = {
+            'devices': [
+                {'name': 'leftTrackHealth', 'hp': 20.0,
+                 'max_hp': 100.0, 'state': 'destroyed'},
+                {'name': 'engineHealth', 'hp': 10.0,
+                 'max_hp': 100.0, 'state': 'destroyed'},
+            ],
+            'destroyed': ['leftTrackHealth', 'engineHealth'],
+            'crew_ko': ['driver'], 'fire': True,
+            'ammo_rack_death': False, 'events': [],
+        }
+
+        report = battle._queue_local_track_repair(payload)
+
+        self.assertEqual({
+            'tracks': [{
+                'name': 'leftTrackHealth', 'hp': 20.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }],
+            'critical_base_revision': 4, 'critical_seq': 1,
+        }, report)
+        self.assertTrue(battle._local_critical_owned)
+
+        payload['devices'][0]['hp'] = 50.0
+        payload['devices'][0]['state'] = 'critical'
+        payload['destroyed'].remove('leftTrackHealth')
+        payload['events'] = [{
+            'kind': 'device', 'name': 'leftTrackHealth',
+            'old_state': 'destroyed', 'state': 'critical',
+            'cause': 'repair',
+        }]
+        self.assertEqual(2, battle._queue_local_track_repair(
+            payload)['critical_seq'])
+        self.assertTrue(battle.acknowledge_local_damage_report(4, 2, 2))
+        self.assertIsNone(battle._local_damage_report)
+        self.assertFalse(battle._local_critical_owned)
+
+    def test_input_sender_retries_pending_track_repair_separately(self):
+        battle = BattleRuntime(_runtime())
+        battle.client = _Client()
+        battle._sender = _LANInputSender(battle)
+        battle._local_damage_report = {
+            'tracks': [{
+                'name': 'leftTrackHealth', 'hp': 25.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }],
+            'critical_base_revision': 4, 'critical_seq': 2,
+        }
+
+        self.assertTrue(battle._sender.send_current())
+
+        self.assertEqual('input', battle.client.sent[-2][0])
+        self.assertEqual((
+            'track_repair', battle._local_damage_report['tracks'], 4, 2),
+            battle.client.sent[-1])
+
+        pending = dict(battle._local_damage_report)
+        battle.client.send_track_repair = mock.Mock(return_value=False)
+        self.assertTrue(battle._sender.send_current())
+        self.assertEqual(pending, battle._local_damage_report)
+        battle.client.send_track_repair.assert_called_once_with(
+            pending['tracks'], 4, 2)
+
+    def test_new_critical_lineage_retires_stale_local_track_repair(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        old = {
+            'devices': [{'name': 'leftTrackHealth', 'hp': 25.0,
+                         'max_hp': 100.0, 'state': 'destroyed'}],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False, 'events': []}
+        newer = dict(old)
+        newer['devices'] = [dict(old['devices'][0], hp=0.0)]
+        record = {
+            'engine_id': 10, 'state': {
+                'health': 500, 'alive': True, 'critical': old},
+            'critical_state': old, 'critical_revision': 1,
+            'kind': 'player', 'network_id': 1, 'local': True}
+        battle._present_critical = mock.Mock(return_value=True)
+        battle._local_critical_base_revision = 1
+        battle._local_critical_server_revision = 1
+        battle._local_critical_owned = True
+        battle._local_damage_report = {
+            'tracks': [dict(old['devices'][0])],
+            'critical_base_revision': 1, 'critical_seq': 1}
+
+        self.assertTrue(battle._apply_critical_state(record, newer, {
+            'critical_revision': 2, 'critical_base_revision': 2,
+            'critical_ack_seq': 0}))
+
+        self.assertIsNone(battle._local_damage_report)
+        self.assertFalse(battle._local_critical_owned)
+        self.assertEqual(0.0, entity.devices_hp['leftTrackHealth'])
 
     def test_dead_local_vehicle_stops_repair_and_fire_ticks(self):
         runtime = _runtime()
@@ -14743,6 +14850,104 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'worker player destructible contact body is malformed'):
             battle.on_player_destructible_contact(dict(
                 message, player=dict(player, unexpected='wire field')))
+
+    def test_worker_accepts_visible_destructible_token_inside_cluster(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._avatar = runtime.bigworld.avatar
+        battle.client = _Client()
+        battle.client.send_player_destructible_contact_result = mock.Mock(
+            return_value=True)
+        requested = [[22, 37, None]]
+        worker_token = ((22, 37, None), (22, 38, None))
+        battle._destructibles = types.SimpleNamespace(
+            _catalog_motion_proposal=mock.Mock(return_value={
+                'status': 'crushed', 'token': worker_token,
+                'requires_commit': True,
+            }),
+            _catalog_motion_blocked=mock.Mock(return_value={
+                'status': 'crushed', 'token': worker_token,
+            }))
+        battle._resolve_player_descriptor = mock.Mock(
+            return_value=_Descriptor())
+        player = {
+            'id': 2, 'vehicle': 'ussr:R11_MS-1',
+            'vehicle_compact_descr': 'dGVzdA==',
+            'destructible_contacts': [{
+                'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+                'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
+                'forward': 1.0, 'token': requested,
+            }],
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.derive_params', return_value={
+                    'speedFwd': 20.0, 'speedBwd': 8.0}):
+            self.assertEqual(
+                1, battle._resolve_player_destructible_contacts(
+                    [player], 12.5))
+
+        battle._destructibles._catalog_motion_blocked.assert_called_once()
+        battle.client.send_player_destructible_contact_result.\
+            assert_called_once_with(2, 3, True, requested)
+
+    def test_worker_hard_destructible_block_still_rolls_visible_pose_back(self):
+        runtime = _runtime()
+        worker = BattleRuntime(runtime)
+        worker._worker_mode = True
+        worker._avatar = runtime.bigworld.avatar
+        worker.client = _Client()
+        worker.client.send_player_destructible_contact_result = mock.Mock(
+            return_value=True)
+        worker._destructibles = types.SimpleNamespace(
+            _catalog_motion_proposal=mock.Mock(return_value={
+                'status': 'hard',
+                'token': ((22, 37, None), (22, 38, None)),
+                'requires_commit': False,
+            }),
+            _catalog_motion_blocked=mock.Mock())
+        worker._resolve_player_descriptor = mock.Mock(
+            return_value=_Descriptor())
+        requested = [[22, 37, None]]
+        player = {
+            'id': 2, 'vehicle': 'ussr:R11_MS-1',
+            'vehicle_compact_descr': 'dGVzdA==',
+            'destructible_contacts': [{
+                'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+                'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
+                'forward': 1.0, 'token': requested,
+            }],
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.derive_params', return_value={
+                    'speedFwd': 20.0, 'speedBwd': 8.0}):
+            self.assertEqual(
+                1, worker._resolve_player_destructible_contacts(
+                    [player], 12.5))
+
+        worker._destructibles._catalog_motion_blocked.assert_not_called()
+        worker.client.send_player_destructible_contact_result.\
+            assert_called_once_with(2, 3, False, requested)
+
+        visible = BattleRuntime(_runtime())
+        visible.client = _Client()
+        visible._start_message = {'round_id': 7}
+        self.assertTrue(visible._queue_local_destructible_contact(
+            {'requires_commit': True, 'token': requested},
+            (1.0, 2.0, 3.0), 0.25, 8.0, 0.04))
+        visible._local_position = (1.0, 2.0, 3.5)
+        visible._local_speed = 8.0
+        self.assertTrue(visible.on_player_destructible_contact_result({
+            'type': 'player_destructible_contact_result',
+            'round_id': 7, 'contact_seq': 1, 'accepted': False,
+            'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.25,
+        }))
+        self.assertEqual((1.0, 2.0, 3.0), visible._local_position)
+        self.assertEqual(0.0, visible._local_speed)
 
     def test_worker_launch_uses_visible_trigger_ray_not_model_node(self):
         runtime = _runtime()

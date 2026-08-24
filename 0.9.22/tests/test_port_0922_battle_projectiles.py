@@ -11,6 +11,8 @@ CLIENT_SCRIPTS = ROOT / '0.9.22' / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.battle_runtime import BattleRuntime
+from gui.mods.offline_lan_0922.entities.native_remote_vehicle import \
+    NativeRemoteVehicleFactory
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922 import combat_rules, critical_damage
 
@@ -164,6 +166,21 @@ def _event():
 
 
 class BattleProjectileTests(unittest.TestCase):
+    def test_native_factory_exposes_unblended_projectile_matrix(self):
+        canonical_matrix = object()
+        rendered_provider = object()
+        factory = object.__new__(NativeRemoteVehicleFactory)
+        factory._states = {
+            42: types.SimpleNamespace(
+                entity=object(), matrix=canonical_matrix,
+                provider=rendered_provider),
+        }
+
+        result = factory.projectile_collision_matrix(42)
+
+        self.assertIs(canonical_matrix, result)
+        self.assertIsNot(rendered_provider, result)
+
     def test_vehicle_trace_counts_spaced_layer_against_ten_calibre_budget(self):
         collisions = [
             types.SimpleNamespace(dist=0.20),
@@ -712,6 +729,52 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(0, battle._projectile_candidate_count)
         self.assertTrue(queried)
         self.assertFalse(set(target_ids).intersection(queried))
+
+    def test_worker_projectile_uses_canonical_pose_not_render_blend(self):
+        battle, unused_bigworld = _battle()
+        battle._worker_mode = True
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        rendered_matrix = object()
+        canonical_matrix = object()
+        target = types.SimpleNamespace(
+            id=42, isStarted=True, matrix=rendered_matrix,
+            position=_Vector((5.0, 1.0, 0.0)), isAlive=lambda: True)
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'native_remote': True, 'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else target if entity_id == 42 else None)
+        battle._remote_factory = types.SimpleNamespace(
+            projectile_collision_matrix=mock.Mock(
+                return_value=canonical_matrix))
+        battle._projectile_current_positions = {
+            'player:7': (0.0, 0.0, 0.0),
+            'bot:8': (5.0, 1.0, 0.0),
+        }
+        battle._projectile_position_history = []
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+        collision = types.SimpleNamespace(dist=5.0)
+        module = sys.modules[BattleRuntime.__module__]
+        state = battle._projectiles.get('player:7:1')
+
+        with mock.patch.object(
+                module, 'collide_vehicle_at_matrix',
+                return_value=(collision,)) as collide:
+            terminal = battle._projectile_chord(
+                state, (0.0, 1.0, 0.0), (10.0, 1.0, 0.0),
+                0.0, 0.1)
+
+        self.assertEqual({'reason': 'impact', 'fraction': 0.5}, terminal)
+        battle._remote_factory.projectile_collision_matrix.\
+            assert_called_once_with(42)
+        self.assertIs(canonical_matrix, collide.call_args.args[1])
+        self.assertIsNot(rendered_matrix, collide.call_args.args[1])
 
     def test_destroyed_vehicle_still_owns_projectile_collision(self):
         battle, unused_bigworld = _battle()

@@ -1046,6 +1046,18 @@ class _LANInputSender(object):
                 self.owner, '_destructible_contacts_enqueued', None)
             if destructible_contacts and callable(enqueued):
                 enqueued()
+            report_getter = getattr(
+                self.owner, 'local_damage_report', None)
+            report = (report_getter()
+                      if callable(report_getter) else None)
+            repair_sender = getattr(
+                self.owner.client, 'send_track_repair', None)
+            if (isinstance(report, dict) and report.get('tracks') and
+                    callable(repair_sender)):
+                repair_sender(
+                    report['tracks'],
+                    report.get('critical_base_revision'),
+                    report.get('critical_seq'))
         return result
 
 
@@ -3337,19 +3349,80 @@ class BattleRuntime(object):
         report = self._local_damage_report
         if (report is not None and
                 ack_seq >= int(report.get('critical_seq', 0))):
+            repair_complete = bool(report.get('tracks')) and all(
+                row.get('state') == 'critical'
+                for row in report.get('tracks') or ())
             self._local_damage_report = None
+            self._local_critical_owned = not repair_complete
             return True
         return False
+
+    def _queue_local_track_repair(self, critical):
+        """Queue only monotonic repair facts for a canonically damaged track."""
+        if (not isinstance(critical, dict) or
+                self._local_critical_base_revision <= 0):
+            return None
+        repaired = set()
+        for event in critical.get('events') or ():
+            if (isinstance(event, dict) and
+                    event.get('kind') == 'device' and
+                    event.get('name') in (
+                        'leftTrackHealth', 'rightTrackHealth') and
+                    event.get('old_state') == 'destroyed' and
+                    event.get('state') == 'critical' and
+                    event.get('cause') == 'repair'):
+                repaired.add(event.get('name'))
+        destroyed = set(critical.get('destroyed') or ())
+        rows = []
+        for raw in critical.get('devices') or ():
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get('name')
+            if (name not in ('leftTrackHealth', 'rightTrackHealth') or
+                    (name not in destroyed and name not in repaired)):
+                continue
+            state = raw.get('state')
+            if state not in ('destroyed', 'critical'):
+                continue
+            try:
+                hp = max(0.0, float(raw.get('hp')))
+                maximum = max(1.0, float(raw.get('max_hp')))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if state == 'destroyed' and hp <= 0.001:
+                continue
+            rows.append({
+                'name': name,
+                'hp': round(min(hp, maximum), 3),
+                'max_hp': round(maximum, 3),
+                'state': state,
+            })
+        rows.sort(key=lambda row: row['name'])
+        if not rows:
+            return None
+        report = dict(self._local_damage_report or {})
+        if rows != report.get('tracks'):
+            self._local_critical_next_seq += 1
+        report = {
+            'tracks': rows,
+            'critical_base_revision': self._local_critical_base_revision,
+            'critical_seq': self._local_critical_next_seq,
+        }
+        self._local_damage_report = report
+        self._local_critical_owned = True
+        return report
 
     def _queue_local_damage_report(self, critical=None, reason=None,
                                    display_health=None,
                                    attribute_attacker=True):
-        # These callbacks may still drive immediate native presentation, but
-        # a visible #1513 process never opens a canonical damage lineage. The
-        # next server snapshot always wins until the corresponding hazard law
-        # moves behind the worker/server boundary.
-        self._local_damage_report = None
-        self._local_critical_owned = False
+        # These hazard callbacks may still drive immediate native
+        # presentation, but a visible #1513 process never opens a canonical
+        # damage lineage.  Do not discard a separately validated track-repair
+        # checkpoint while an unrelated local presentation callback runs.
+        if not (isinstance(self._local_damage_report, dict) and
+                self._local_damage_report.get('tracks')):
+            self._local_damage_report = None
+            self._local_critical_owned = False
         return None
 
     def _resolve_descriptor(self, vehicle_name):
@@ -5260,7 +5333,7 @@ class BattleRuntime(object):
         record['state'] = state
         self._present_critical(
             record, payload.get('events'), record['engine_id'])
-        self._queue_local_damage_report(critical=payload)
+        self._queue_local_track_repair(payload)
         self._present_equipments()
         return True
 
@@ -7743,7 +7816,7 @@ class BattleRuntime(object):
                 record, payload.get('events'), record['engine_id'])
             if (payload.get('events') or
                     now >= self._next_critical_report_time):
-                self._queue_local_damage_report(critical=payload)
+                self._queue_local_track_repair(payload)
                 self._next_critical_report_time = (
                     now + CRITICAL_REPAIR_NETWORK_SECONDS)
         fire_reason = self._attack_reason('FIRE', 1)
@@ -8699,6 +8772,26 @@ class BattleRuntime(object):
                     entity, 'position', record.get('state', {})))
         return result
 
+    def _projectile_vehicle_matrix(self, record, vehicle):
+        """Return the pose matching the projectile position timeline.
+
+        A hidden worker interpolates native Bot compounds for presentation,
+        but ``_projectile_record_positions`` intentionally records the
+        canonical copied-physics position.  Mixing that position with the
+        render-blended matrix makes broad phase and exact hit testing disagree
+        for a moving target.  Use the factory's unblended matrix on the worker
+        and retain the visible provider everywhere else.
+        """
+        if (self._worker_mode and record.get('native_remote') and
+                self._remote_factory is not None):
+            getter = getattr(
+                self._remote_factory, 'projectile_collision_matrix', None)
+            if callable(getter):
+                matrix = getter(record.get('engine_id'))
+                if matrix is not None:
+                    return matrix
+        return vehicle.matrix
+
     def _sample_projectile_positions(self, now, positions):
         """Keep enough pose history for budgeted projectile catch-up."""
         sample = (float(now), dict(positions or {}))
@@ -8870,7 +8963,8 @@ class BattleRuntime(object):
                     self._runtime.math)
             elif record.get('native_remote'):
                 collisions = collide_vehicle_at_matrix(
-                    target, target.matrix, query_start, query_end,
+                    target, self._projectile_vehicle_matrix(record, target),
+                    query_start, query_end,
                     self._runtime.math)
             else:
                 collisions = target.collideSegmentExt(
@@ -9060,7 +9154,9 @@ class BattleRuntime(object):
                         self._runtime.math)
                 elif record.get('native_remote'):
                     extended = collide_vehicle_at_matrix(
-                        target, target.matrix, query[0], trace_end,
+                        target,
+                        self._projectile_vehicle_matrix(record, target),
+                        query[0], trace_end,
                         self._runtime.math)
                 else:
                     extended = target.collideSegmentExt(
@@ -9131,7 +9227,9 @@ class BattleRuntime(object):
             try:
                 if record.get('native_remote'):
                     collisions = tuple(collide_vehicle_at_matrix(
-                        target, target.matrix, burst, aim,
+                        target,
+                        self._projectile_vehicle_matrix(record, target),
+                        burst, aim,
                         self._runtime.math) or ())
                 else:
                     collisions = tuple(
@@ -9437,10 +9535,18 @@ class BattleRuntime(object):
             actual_token = (
                 self._destructible_contact_token(proposal.get('token'))
                 if isinstance(proposal, dict) else None)
+            # The visible endpoint streams only the identities intersecting
+            # its current hull bins.  The hidden worker can already have an
+            # adjacent tile from the same fence/prop cluster registered, so
+            # its exact native proposal may legitimately contain a strict
+            # superset.  The worker remains authoritative: every identity the
+            # visible endpoint requested must be present in its exact contact,
+            # and any hard member makes the whole proposal non-crushable.
             accepted = bool(
                 isinstance(proposal, dict) and
                 proposal.get('status') == 'crushed' and
-                actual_token == token)
+                actual_token is not None and
+                set(token).issubset(set(actual_token)))
             if accepted and bool(proposal.get('requires_commit', False)):
                 committed = self._destructibles._catalog_motion_blocked(
                     self._avatar.spaceID, self._vector(position), yaw,
@@ -9454,7 +9560,8 @@ class BattleRuntime(object):
                 accepted = bool(
                     isinstance(committed, dict) and
                     committed.get('status') == 'crushed' and
-                    committed_token == token)
+                    committed_token is not None and
+                    set(token).issubset(set(committed_token)))
             if sender(
                     player_id, seq, accepted,
                     [list(row) for row in token]):

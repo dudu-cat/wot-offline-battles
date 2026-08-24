@@ -2280,6 +2280,72 @@ class VehicleStatisticsTest(unittest.TestCase):
             target.critical, target.critical_ack_seq,
             target.critical_report_base_revision))
 
+    def test_versioned_track_repair_accepts_only_monotonic_red_to_yellow(self):
+        state = self._live_state()
+        target = state.players[2]
+        self._shoot(state, 1, 2, 0, critical=_TRACK_CRITICAL)
+        base = target.critical_report_base_revision
+
+        def report(seq, hp, phase='destroyed', revision=base,
+                   name='leftTrackHealth'):
+            return {
+                'type': 'track_repair', 'round_id': state.round_id,
+                'critical_base_revision': revision, 'repair_seq': seq,
+                'tracks': [{
+                    'name': name, 'hp': hp, 'max_hp': 100.0,
+                    'state': phase,
+                }],
+            }
+
+        self.assertTrue(state.report_track_repair(
+            2, report(1, 25.0)))
+        self.assertEqual(1, target.critical_ack_seq)
+        self.assertEqual(25.0, target.critical['devices'][0]['hp'])
+        self.assertEqual(['leftTrackHealth'], target.critical['destroyed'])
+
+        # An exact retry is idempotent; a same-sequence mutation is not.
+        before = copy.deepcopy(target.critical)
+        self.assertTrue(state.report_track_repair(
+            2, report(1, 25.0)))
+        self.assertFalse(state.report_track_repair(
+            2, report(1, 26.0)))
+        self.assertEqual(before, target.critical)
+
+        # Stale lineage, decreasing HP and a non-track device all fail closed.
+        self.assertFalse(state.report_track_repair(
+            2, report(2, 30.0, revision=base - 1)))
+        self.assertFalse(state.report_track_repair(
+            2, report(2, 24.0)))
+        self.assertFalse(state.report_track_repair(
+            2, report(2, 30.0, name='engineHealth')))
+        self.assertEqual(before, target.critical)
+        self.assertEqual(1, target.critical_ack_seq)
+
+        self.assertTrue(state.report_track_repair(
+            2, report(2, 50.0, phase='critical')))
+        self.assertEqual(2, target.critical_ack_seq)
+        self.assertEqual([], target.critical['destroyed'])
+        self.assertEqual('critical', target.critical['devices'][0]['state'])
+        self.assertEqual([], target.critical['events'])
+
+        # Yellow is functional but remains damaged; the owner cannot promote
+        # it to normal or continue rewriting it after the red->yellow edge.
+        self.assertFalse(state.report_track_repair(
+            2, report(3, 100.0, phase='normal')))
+        self.assertFalse(state.report_track_repair(
+            2, report(3, 60.0, phase='critical')))
+        self.assertEqual(2, target.critical_ack_seq)
+
+        # A later hit opens a new lineage; an old in-flight repair cannot
+        # overwrite that newer canonical damage.
+        self._shoot(state, 1, 2, 0, shot_seq=2,
+                    critical=_TRACK_CRITICAL)
+        newer = copy.deepcopy(target.critical)
+        self.assertGreater(target.critical_report_base_revision, base)
+        self.assertFalse(state.report_track_repair(
+            2, report(3, 75.0, phase='critical', revision=base)))
+        self.assertEqual(newer, target.critical)
+
     def test_ammo_rack_death_clamps_health_and_terminal_retry_is_idempotent(self):
         state = self._live_state()
         target = state.players[2]
