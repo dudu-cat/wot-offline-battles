@@ -5,6 +5,7 @@ import sys
 import threading
 import types
 import unittest
+from unittest import mock
 
 
 PORT_ROOT = Path(__file__).resolve().parents[1]
@@ -952,6 +953,26 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertFalse([
             event for event in state.pending_events
             if event.get('kind') == 'stun'][-1]['active'])
+
+    def test_stun_batch_uses_one_frozen_resolution_clock(self):
+        state = _state(players=3)
+        self.assertTrue(_launch_authority(state, _launch(
+            is_he=True, splash_radius=20.0)))
+        message = _resolve(
+            '1:p:1:1',
+            direct=_effect(stun_end_server_time_ms=101),
+            splash=[_effect(
+                target_id=3, damage=50, x=20.0,
+                stun_end_server_time_ms=101)])
+
+        with mock.patch.object(
+                state, '_server_time_ms', side_effect=[100]) as clock:
+            self.assertTrue(state.resolve_projectile(
+                SIMULATION_WORKER_AUTHORITY_ID, message))
+
+        self.assertEqual(1, clock.call_count)
+        self.assertEqual(101, state.players[2].stun_end_server_time_ms)
+        self.assertEqual(101, state.players[3].stun_end_server_time_ms)
 
     def test_visible_projectile_authority_cannot_supply_stun_state(self):
         state = _state()

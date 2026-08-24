@@ -5729,7 +5729,8 @@ class BattleState:
             return True
 
     def _normalize_projectile_effect(
-            self, raw, record, impact, splash, allow_stun=False):
+            self, raw, record, impact, splash, allow_stun=False,
+            stun_now_ms=None):
         allowed = {
             "target_kind", "target_id", "damage", "shot_result",
             "x", "y", "z", "critical",
@@ -5799,11 +5800,11 @@ class BattleState:
             raise ValueError("critical tokens without critical payload")
         stun_end_server_time_ms = 0
         if "stun_end_server_time_ms" in raw:
-            if not allow_stun:
+            if not allow_stun or stun_now_ms is None:
                 raise ValueError("stun result needs internal authority")
             stun_end_server_time_ms = _exact_int(
                 raw.get("stun_end_server_time_ms"),
-                self._server_time_ms() + 1,
+                int(stun_now_ms) + 1,
                 int(round((PREBATTLE_SECONDS + BATTLE_DURATION_SECONDS) *
                           1000.0)))
         return {
@@ -6015,8 +6016,9 @@ class BattleState:
                 resolved_time_ms = _exact_int(
                     message.get("resolved_time_ms"), base_checked_ms,
                     record["max_time_ms"])
+                resolution_server_time_ms = self._server_time_ms()
                 now_elapsed = max(
-                    0, self._server_time_ms() -
+                    0, resolution_server_time_ms -
                     record["launch_server_time_ms"])
                 if resolved_time_ms > now_elapsed + PROJECTILE_CLOCK_LEEWAY_MS:
                     raise ValueError("resolution is ahead of server time")
@@ -6099,10 +6101,12 @@ class BattleState:
                 allow_stun = self._trusted_internal_projectile_authority(
                     player_id)
                 direct = (self._normalize_projectile_effect(
-                    direct_raw, record, impact, False, allow_stun)
+                    direct_raw, record, impact, False, allow_stun,
+                    resolution_server_time_ms)
                           if direct_raw is not None else None)
                 splash = [self._normalize_projectile_effect(
-                    raw, record, impact, True, allow_stun)
+                    raw, record, impact, True, allow_stun,
+                    resolution_server_time_ms)
                     for raw in splash_raw]
                 target_keys = []
                 if direct is not None:
@@ -8274,7 +8278,7 @@ class BattleState:
         stores the supplied round-relative end time and publishes it.
         """
         end_server_time_ms = _exact_int(
-            end_server_time_ms, self._server_time_ms() + 1,
+            end_server_time_ms, 1,
             int(round((PREBATTLE_SECONDS + BATTLE_DURATION_SECONDS) *
                       1000.0)))
         state = self._vehicle_stun_state(target)
