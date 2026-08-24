@@ -1152,6 +1152,27 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(['shot', 'projectile_impact', 'hit'],
                          [event['kind'] for event in events])
 
+    def test_disconnected_shooter_projectile_keeps_stun_attribution(self):
+        state = _state()
+        for player in state.players.values():
+            player.account_key = 'player-%d' % player.player_id
+        state._freeze_round_participants(list(state.players.values()))
+        self.assertTrue(_launch_authority(state, _launch()))
+        stun_end = state._server_time_ms() + 1500
+
+        state.remove_player(1)
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve(
+                '1:p:1:1', direct=_effect(
+                    stun_end_server_time_ms=stun_end))))
+        target = state.players[2]
+        self.assertEqual(stun_end, target.stun_end_server_time_ms)
+        self.assertEqual(
+            ('player', 1),
+            (target.stun_attacker_kind, target.stun_attacker_id))
+
     def test_disconnected_shooter_enemy_frag_uses_frozen_launch_identity(self):
         state = _state()
         for player in state.players.values():

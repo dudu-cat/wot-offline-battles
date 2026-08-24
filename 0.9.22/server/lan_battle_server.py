@@ -8213,7 +8213,11 @@ class BattleState:
     def _vehicle_team(self, kind, vehicle_id):
         if kind == "player":
             player = self.players.get(int(vehicle_id))
-            return int(player.team) if player is not None else 0
+            if player is not None:
+                return int(player.team)
+            participant = self._frozen_player_participant(vehicle_id)
+            return (int(participant.get("team", 0))
+                    if participant is not None else 0)
         state = self.bot_states.get(int(vehicle_id))
         return int(state.get("team", 0)) if state is not None else 0
 
