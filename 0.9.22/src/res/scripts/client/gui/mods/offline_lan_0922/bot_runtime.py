@@ -593,9 +593,13 @@ class _BotGunState(object):
 
     def __init__(self, descriptor, fire_seq=0, dispersion_factor=1.0):
         gun = _value(descriptor, 'gun', {}) or {}
+        gun_modifiers = loadout.modifiers(
+            descriptor, factors=loadout.attribute_factors(descriptor))
         raw_dispersion = _value(gun, 'shotDispersionAngle')
         try:
-            self.fully_aimed_dispersion = float(raw_dispersion)
+            self.fully_aimed_dispersion = (
+                float(raw_dispersion) *
+                float(gun_modifiers['dispersion_factor']))
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 'installed gun shotDispersionAngle is unavailable')
@@ -611,7 +615,8 @@ class _BotGunState(object):
         self.turret_dispersion_factor = max(
             0.0, _number(_value(factors, 'turretRotation'), 0.0))
         self.aiming_time = max(
-            0.1, _number(_value(gun, 'aimingTime'), 2.0))
+            0.1, _number(_value(gun, 'aimingTime'), 2.0) *
+            float(gun_modifiers['aim_time_factor']))
         chassis_factors = _value(
             _value(descriptor, 'chassis', {}) or {},
             'shotDispersionFactors', (0.0, 0.0)) or (0.0, 0.0)
@@ -629,7 +634,8 @@ class _BotGunState(object):
         self.dispersion = self.fully_aimed_dispersion
         self.motion_dispersion_squared = 0.0
         self.reload_full = max(
-            0.01, _number(_value(gun, 'reloadTime', 3.0), 3.0))
+            0.01, _number(_value(gun, 'reloadTime', 3.0), 3.0) *
+            float(gun_modifiers['reload_factor']))
         self.clip_size = 1
         self.reload_intra = 0.0
         clip = _value(gun, 'clip')
@@ -713,7 +719,7 @@ class _BotGunState(object):
                     reload_factor <= 0.0 or reload_duration <= 0.0 or
                     reload_time < 0.0 or reload_time > reload_duration):
                 raise ValueError('bot reload progress is invalid')
-            expected_duration = self.reload_duration * reload_factor
+            expected_duration = self.duration(reload_factor)
             tolerance = max(1.0, expected_duration) * 1.0e-9
             if abs(reload_duration - expected_duration) > tolerance:
                 raise ValueError(
@@ -783,8 +789,8 @@ class _BotGunState(object):
         reload_factor = max(0.0, float(reload_factor))
         if abs(reload_factor - self.reload_factor) <= 1.0e-9:
             return False
-        old_duration = self.reload_duration * self.reload_factor
-        new_duration = self.reload_duration * reload_factor
+        old_duration = self.duration(self.reload_factor)
+        new_duration = self.duration(reload_factor)
         if old_duration > 0.0:
             if self.elapsed < old_duration:
                 completed_fraction = max(
@@ -798,9 +804,18 @@ class _BotGunState(object):
         self.reload_factor = reload_factor
         return True
 
+    def duration(self, reload_factor=1.0):
+        """Return the current #1513 reload interval.
+
+        Crew, equipment and critical-state factors affect a full reload.
+        ``gun.clip[1]`` is already the final intra-clip interval.
+        """
+        factor = (1.0 if self.reload_kind == 'intra' else
+                  max(0.0, float(reload_factor)))
+        return self.reload_duration * factor
+
     def ready(self, reload_factor=1.0):
-        return self.elapsed > (
-            self.reload_duration * max(0.0, float(reload_factor)))
+        return self.elapsed > self.duration(reload_factor)
 
     def complete_reload(self, reload_factor=1.0,
                         available_rounds=None):
@@ -842,8 +857,7 @@ class _BotGunState(object):
         return True
 
     def remaining(self, reload_factor=1.0):
-        duration = self.reload_duration * max(
-            0.0, float(reload_factor))
+        duration = self.duration(reload_factor)
         return max(0.0, duration - self.elapsed)
 
 
@@ -2078,8 +2092,7 @@ class BotRuntime(object):
             state['clip_size'] = gun_state.clip_size
             state['clip'] = gun_state.clip
             state['reload_time'] = gun_state.remaining(reload_factor)
-            state['reload_duration'] = (
-                gun_state.reload_duration * reload_factor)
+            state['reload_duration'] = gun_state.duration(reload_factor)
         if self._manifest_sent:
             return []
         bots = [self._manifest_entry(state)
@@ -2560,8 +2573,8 @@ class BotRuntime(object):
                         state, descriptor, 'reload')
                     state['clip'] = gun_state.clip
                     state['reload_time'] = gun_state.remaining(reload_factor)
-                    state['reload_duration'] = (
-                        gun_state.reload_duration * reload_factor)
+                    state['reload_duration'] = gun_state.duration(
+                        reload_factor)
             ammo_contract = all(name in raw for name in (
                 'ammo_remaining', 'shell_index', 'next_shell_index',
                 'ammo_reload_pending'))
@@ -5431,8 +5444,7 @@ class BotRuntime(object):
             _critical_factor(state, descriptor, 'dispersion'))
         state['clip'] = gun_state.clip
         state['reload_time'] = gun_state.remaining(reload_factor)
-        state['reload_duration'] = (
-            gun_state.reload_duration * reload_factor)
+        state['reload_duration'] = gun_state.duration(reload_factor)
         ammo_state.publish(state)
         return True
 
@@ -6037,8 +6049,7 @@ class BotRuntime(object):
             state['clip_size'] = gun_state.clip_size
             state['clip'] = gun_state.clip
             state['reload_time'] = gun_state.remaining(reload_factor)
-            state['reload_duration'] = (
-                gun_state.reload_duration * reload_factor)
+            state['reload_duration'] = gun_state.duration(reload_factor)
             fire_range = max(0.0, _number(command.get('fire_range'), 0.0))
             target_distance = (_distance(_position(state), target['position'])
                                if target is not None else 0.0)

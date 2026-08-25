@@ -90,7 +90,7 @@ class GunMechanicsParityTests(unittest.TestCase):
         self.assertAlmostEqual(0.08 * 0.8, state.base_dispersion)
         self.assertAlmostEqual(1.4 * 0.9, state.aim_time)
         self.assertAlmostEqual(4.0 * 0.75, state.reload)
-        self.assertAlmostEqual(0.8 * 0.75, state.clip_reload)
+        self.assertAlmostEqual(0.8, state.clip_reload)
 
     def test_siege_descriptor_rejects_an_ammunition_contract_change(self):
         state = GunState(_descriptor())
@@ -183,6 +183,20 @@ class GunMechanicsParityTests(unittest.TestCase):
             math.sqrt(before * before + jump * jump), state.dispersion)
         self.assertAlmostEqual(state.reload * 2.0, state.reload_time)
         self.assertAlmostEqual(state.reload_time, state.reload_duration)
+
+    def test_intra_clip_interval_ignores_reload_factors(self):
+        state = GunState(
+            _descriptor(clip=(3, 1.0)),
+            loadout_modifiers={'reload_factor': 0.5})
+        state.reload_time = 0.0
+        state.clip = 3
+
+        self.assertTrue(state.commit_fire(2.0))
+
+        self.assertEqual(2, state.clip)
+        self.assertEqual(1.0, state.clip_reload)
+        self.assertEqual(1.0, state.reload_time)
+        self.assertEqual(1.0, state.reload_duration)
 
     def test_manual_shell_change_empties_clip_for_full_reload(self):
         state = GunState(_descriptor())

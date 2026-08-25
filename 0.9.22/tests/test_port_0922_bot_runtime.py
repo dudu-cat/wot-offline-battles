@@ -4400,14 +4400,23 @@ class BotRuntimeTests(unittest.TestCase):
         second = runtime.update(.04, 1.76, players=[player])[0]['bots'][0]
         self.assertEqual(2, second['fire_seq'])
         self.assertEqual(0, runtime.states[11]['clip'])
-        self.assertAlmostEqual(0.5, runtime.states[11]['reload_duration'])
+        full_reload = runtime._gun_states[11].reload_full
+        self.assertAlmostEqual(
+            full_reload, runtime.states[11]['reload_duration'])
 
-        runtime.update(.20, 1.94, players=[player])
-        runtime.update(.20, 2.14, players=[player])
-        early = runtime.update(.09, 2.23, players=[player])[0]['bots'][0]
+        now = 1.76
+        for fraction in (0.4, 0.4):
+            step = full_reload * fraction
+            now += step
+            runtime.update(step, now, players=[player])
+        step = full_reload * 0.19
+        now += step
+        early = runtime.update(step, now, players=[player])[0]['bots'][0]
         self.assertEqual(2, early['fire_seq'])
-        third = runtime.update(.04, 2.27, players=[player])[0]['bots'][0]
-        self.assertEqual(3, third['fire_seq'])
+        step = max(full_reload * 0.02, 0.04)
+        now += step
+        runtime.update(step, now, players=[player])
+        self.assertEqual(3, runtime.states[11]['fire_seq'])
 
     def test_ballistic_aim_leads_a_moving_target_and_matches_barrel_pitch(self):
         descriptor = _combat_descriptor()
@@ -5421,7 +5430,8 @@ class BotRuntimeTests(unittest.TestCase):
             turret_speed=0.4)
 
         self.assertAlmostEqual(
-            0.01 * math.sqrt(1.0 + 1.0 ** 2 + 0.1 ** 2 + 0.2 ** 2),
+            gun_state.fully_aimed_dispersion *
+            math.sqrt(1.0 + 1.0 ** 2 + 0.1 ** 2 + 0.2 ** 2),
             gun_state.dispersion)
 
     def test_bot_first_high_fps_tick_keeps_exact_turret_angular_speed(self):
@@ -5479,14 +5489,16 @@ class BotRuntimeTests(unittest.TestCase):
         gun_state.current_dispersion_factor = 8.0
         gun_state.aiming_start_factor = 8.0
         gun_state.aiming_elapsed = 0.0
-        gun_state.dispersion = 0.08
+        gun_state.dispersion = gun_state.fully_aimed_dispersion * 8.0
 
         gun_state.tick_dispersion(
             0.5, move_speed=0.0, rotation_speed=0.0,
             turret_speed=0.0)
 
         self.assertAlmostEqual(
-            max(0.01, 0.08 * math.exp(-0.5 / 2.0)),
+            max(gun_state.fully_aimed_dispersion,
+                gun_state.fully_aimed_dispersion * 8.0 *
+                math.exp(-0.5 / gun_state.aiming_time)),
             gun_state.dispersion)
 
     def test_bot_shot_bloom_expands_to_after_shot_ideal_without_stacking(self):
@@ -5498,7 +5510,8 @@ class BotRuntimeTests(unittest.TestCase):
         descriptor.gun.aimingTime = 2.0
         descriptor.gun.burst = (1, 0.0)
         gun_state = self.module._BotGunState(descriptor)
-        expected = 0.01 * math.sqrt(1.0 + 3.0 ** 2)
+        expected = (gun_state.fully_aimed_dispersion *
+                    math.sqrt(1.0 + 3.0 ** 2))
 
         gun_state.commit_shot_bloom()
         self.assertAlmostEqual(expected, gun_state.dispersion)
@@ -5564,11 +5577,11 @@ class BotRuntimeTests(unittest.TestCase):
             'gun_pitch': -0.1, 'critical': critical,
         }
 
-        # Installed 0.012 rad x a dead gunner x a damaged gun 2.0.
+        # Default-crew base x a dead gunner x a damaged gun 2.0.
         from gui.mods.offline_lan_0922 import device_damage
-        self.assertAlmostEqual(0.012, gun_state.fully_aimed_dispersion)
+        effective_base = gun_state.fully_aimed_dispersion
         self.assertAlmostEqual(
-            0.012 * device_damage.CREW_KO_TIME_FACTOR * 2.0,
+            effective_base * device_damage.CREW_KO_TIME_FACTOR * 2.0,
             self.module._effective_shot_dispersion(
                 gun_state, state, descriptor))
 
@@ -5602,7 +5615,7 @@ class BotRuntimeTests(unittest.TestCase):
         for mean, sigma in sigmas:
             self.assertEqual(0.0, mean)
             self.assertAlmostEqual(
-                0.012 * device_damage.CREW_KO_TIME_FACTOR, sigma)
+                effective_base * device_damage.CREW_KO_TIME_FACTOR, sigma)
         self.assertEqual([(0.0, 2.0 * math.pi)], uniform_calls)
         self.assertAlmostEqual(0.4, state['shot_yaw'])
         self.assertAlmostEqual(0.1, state['shot_pitch'])
@@ -5641,6 +5654,64 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertTrue(gun_state.rescale_reload(2.0))
         self.assertAlmostEqual(9.0, gun_state.elapsed)
         self.assertTrue(gun_state.ready(2.0))
+
+    def test_bot_intra_clip_interval_ignores_live_reload_penalty(self):
+        gun_state = self.module._BotGunState(
+            _combat_descriptor(reload_time=4.0, clip=(3, 0.2)))
+        gun_state.elapsed = 20.0
+
+        self.assertTrue(gun_state.fire(2.0))
+        self.assertEqual(2, gun_state.clip)
+        self.assertEqual('intra', gun_state.reload_kind)
+        self.assertEqual(0.2, gun_state.duration(2.0))
+
+        gun_state.tick(0.1)
+        self.assertTrue(gun_state.rescale_reload(3.0))
+        self.assertEqual(0.1, gun_state.elapsed)
+        self.assertAlmostEqual(0.1, gun_state.remaining(3.0))
+
+    def test_bot_gun_applies_default_loadout_to_base_values_only(self):
+        descriptor = _combat_descriptor(
+            reload_time=4.0, clip=(3, 0.2), dispersion=0.03)
+        descriptor.gun.aimingTime = 2.0
+        factor_calls = []
+        modifier_calls = []
+        original_attribute_factors = self.module.loadout.attribute_factors
+        original_modifiers = self.module.loadout.modifiers
+
+        def attribute_factors(value):
+            factor_calls.append(value)
+            return {'source': '1513-default-crew'}
+
+        def modifiers(value, factors=None):
+            modifier_calls.append((value, factors))
+            return {
+                'dispersion_factor': 0.8,
+                'aim_time_factor': 0.75,
+                'reload_factor': 0.5,
+            }
+
+        self.module.loadout.attribute_factors = attribute_factors
+        self.module.loadout.modifiers = modifiers
+        try:
+            gun_state = self.module._BotGunState(descriptor)
+        finally:
+            self.module.loadout.attribute_factors = original_attribute_factors
+            self.module.loadout.modifiers = original_modifiers
+
+        self.assertEqual([descriptor], factor_calls)
+        self.assertEqual(
+            [(descriptor, {'source': '1513-default-crew'})],
+            modifier_calls)
+        self.assertAlmostEqual(
+            0.03 * 0.8, gun_state.fully_aimed_dispersion)
+        self.assertAlmostEqual(2.0 * 0.75, gun_state.aiming_time)
+        self.assertAlmostEqual(4.0 * 0.5, gun_state.reload_full)
+
+        gun_state.elapsed = 10.0
+        self.assertTrue(gun_state.fire())
+        self.assertAlmostEqual(0.2, gun_state.reload_intra)
+        self.assertAlmostEqual(0.2, gun_state.duration(7.0))
 
     def test_friendly_lane_is_checked_on_each_final_fire_attempt(self):
         probes = []
@@ -6258,7 +6329,9 @@ class BotRuntimeTests(unittest.TestCase):
         player = _admit_player(player)
 
         from gui.mods.offline_lan_0922 import device_damage
-        expected_reload = 0.5 * device_damage.CREW_KO_TIME_FACTOR
+        expected_reload = (
+            runtime._gun_states[11].reload_full *
+            device_damage.CREW_KO_TIME_FACTOR)
         last = None
         for index in range(4):
             last = runtime.update(.20, 1.0 + index * .20,
@@ -6741,6 +6814,7 @@ class BotRuntimeTests(unittest.TestCase):
 
     def test_authority_handoff_preserves_fire_duration_and_tick_phase(self):
         descriptor = _critical_descriptor()
+        reload_duration = self.module._BotGunState(descriptor).reload_full
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *args, **kwargs: _Adapter(*args),
@@ -6754,8 +6828,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=800, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, reload_time=0.5,
-            reload_duration=0.5, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=reload_duration,
+            reload_duration=reload_duration, critical=burning,
             combat_revision=22, combat_base_revision=1,
             combat_ack_seq=21, combat_fire_elapsed=4.4,
             combat_fire_timer=0.4)
@@ -6779,6 +6853,7 @@ class BotRuntimeTests(unittest.TestCase):
 
     def test_authority_handoff_resets_to_same_base_server_ack_ahead(self):
         descriptor = _critical_descriptor()
+        reload_duration = self.module._BotGunState(descriptor).reload_full
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *args, **kwargs: _Adapter(*args),
@@ -6792,8 +6867,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, reload_time=0.5,
-            reload_duration=0.5, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=reload_duration,
+            reload_duration=reload_duration, critical=burning,
             combat_revision=4, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6828,6 +6903,7 @@ class BotRuntimeTests(unittest.TestCase):
 
     def test_authority_handoff_resets_same_sequence_signature_collision(self):
         descriptor = _critical_descriptor()
+        reload_duration = self.module._BotGunState(descriptor).reload_full
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *args, **kwargs: _Adapter(*args),
@@ -6841,8 +6917,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, reload_time=0.5,
-            reload_duration=0.5, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=reload_duration,
+            reload_duration=reload_duration, critical=burning,
             combat_revision=4, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6877,6 +6953,7 @@ class BotRuntimeTests(unittest.TestCase):
 
     def test_authority_handoff_new_base_ack_ahead_drops_old_lineage(self):
         descriptor = _critical_descriptor()
+        reload_duration = self.module._BotGunState(descriptor).reload_full
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *args, **kwargs: _Adapter(*args),
@@ -6890,8 +6967,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, reload_time=0.5,
-            reload_duration=0.5, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=reload_duration,
+            reload_duration=reload_duration, critical=burning,
             combat_revision=3, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -6925,6 +7002,7 @@ class BotRuntimeTests(unittest.TestCase):
 
     def test_authority_handoff_new_base_same_sequence_does_not_replay(self):
         descriptor = _critical_descriptor()
+        reload_duration = self.module._BotGunState(descriptor).reload_full
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: descriptor,
             adapter_factory=lambda *args, **kwargs: _Adapter(*args),
@@ -6938,8 +7016,8 @@ class BotRuntimeTests(unittest.TestCase):
         takeover_bot = dict(
             self.start['bots'][0], health=900, max_health=1000,
             alive=True, x=0.0, y=0.0, z=100.0, yaw=math.pi,
-            fire_seq=0, shell_index=0, reload_time=0.5,
-            reload_duration=0.5, critical=burning,
+            fire_seq=0, shell_index=0, reload_time=reload_duration,
+            reload_duration=reload_duration, critical=burning,
             combat_revision=3, combat_base_revision=1,
             combat_ack_seq=3, combat_fire_elapsed=2.0,
             combat_fire_timer=0.0)
@@ -8630,19 +8708,21 @@ class BotRuntimeTests(unittest.TestCase):
         descriptor = self.runtime._descriptors[11]
         expected_factor = self.module._critical_factor(
             self.runtime.states[11], descriptor, 'dispersion')
+        gun_state = self.runtime._gun_states[11]
         expected_dispersion = (
-            descriptor.gun.shotDispersionAngle * expected_factor *
+            gun_state.fully_aimed_dispersion * expected_factor *
             math.sqrt(1.0 + 1.5 ** 2))
         self.assertAlmostEqual(
             expected_dispersion,
-            self.runtime._gun_states[11].dispersion)
-        self.assertAlmostEqual(0.1, self.runtime._gun_states[11].elapsed)
+            gun_state.dispersion)
+        self.assertAlmostEqual(0.1, gun_state.elapsed)
         self.assertAlmostEqual(
-            0.1, self.runtime._gun_states[11].remaining(1.0))
+            0.1, gun_state.remaining(1.0))
         self.runtime.apply_snapshot({'bots': [dict(
             snapshot_bot, fire_seq=8, shell_index=0,
             ammo_remaining=[37], ammo_reload_pending=True,
-            reload_time=0.3, reload_duration=0.5)]})
+            reload_time=gun_state.reload_full - 0.2,
+            reload_duration=gun_state.reload_full)]})
         self.assertEqual(8, self.runtime.states[11]['fire_seq'])
         self.assertEqual(0, self.runtime.states[11]['shell_index'])
         self.assertEqual([37], self.runtime.states[11]['ammo_remaining'])
@@ -8655,7 +8735,9 @@ class BotRuntimeTests(unittest.TestCase):
     def test_mid_reload_progress_survives_server_takeover_manifest(self):
         self.runtime.battle_start(self.start)
         publication = self.runtime.update(.20, 1.0)[0]
-        self.assertAlmostEqual(0.30, publication['bots'][0]['reload_time'])
+        expected_remaining = self.runtime._gun_states[11].reload_full - 0.20
+        self.assertAlmostEqual(
+            expected_remaining, publication['bots'][0]['reload_time'])
 
         server, unused_manifest, unused_socket = \
             ServerBotStateRevisionTests._server()
@@ -8684,7 +8766,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         gun = takeover._gun_states[11]
         self.assertAlmostEqual(0.20, gun.elapsed)
-        self.assertAlmostEqual(0.30, gun.remaining(1.0))
+        self.assertAlmostEqual(expected_remaining, gun.remaining(1.0))
 
     def test_new_round_discards_previous_bot_and_terminal_state(self):
         self.runtime.battle_start(self.start)
@@ -8734,12 +8816,13 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime._turn_speeds[11] = 0.8
         self.assertEqual([], self.runtime.battle_start(dict(
             self.start, bot_authority_id=2)))
+        reload_duration = self.runtime._gun_states[11].reload_full
         takeover = dict(
             self.start['bots'][0], x=200.0, y=4.0, z=300.0,
             yaw=1.0, aim_yaw=1.4, gun_pitch=-0.25,
             movement_dir=-1, rotation_dir=1, health=900,
             max_health=1000, alive=True,
-            reload_time=0.5, reload_duration=0.5)
+            reload_time=reload_duration, reload_duration=reload_duration)
 
         resumed = self.runtime.battle_start(dict(
             self.start, bot_manifest=[takeover]))

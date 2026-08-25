@@ -92,7 +92,6 @@ class GunState(object):
         self.base_dispersion *= self._dispersion_factor
         self.aim_time *= self._aim_time_factor
         self.reload *= self._reload_factor
-        self.clip_reload *= self._reload_factor
         self.clip = 0
         self.reload_time = self.reload
         self.reload_duration = self.reload
@@ -138,9 +137,9 @@ class GunState(object):
                        self._reload_factor)
         clip = _field(gun, 'clip', (1, 2.0)) or (1, 2.0)
         try:
-            clip_reload = _positive(clip[1], 2.0) * self._reload_factor
+            clip_reload = _positive(clip[1], 2.0)
         except (TypeError, ValueError, IndexError):
-            clip_reload = 2.0 * self._reload_factor
+            clip_reload = 2.0
         previous = (self.base_dispersion, self.after_shot, self.aim_time,
                     self.reload, self.clip_reload)
         self.shots = shots
