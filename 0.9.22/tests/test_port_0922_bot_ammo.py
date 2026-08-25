@@ -336,10 +336,10 @@ class BotAmmunitionTests(unittest.TestCase):
 
         last_round = dict(
             previous, shell_index=2, next_shell_index=2,
-            ammo_remaining=[0, 0, 1])
+            burst_shell_index=2, ammo_remaining=[0, 0, 1])
         empty = dict(
             fallback, shell_index=2, next_shell_index=0,
-            ammo_remaining=[0, 0, 0])
+            burst_shell_index=2, ammo_remaining=[0, 0, 0])
         self.assertTrue(BattleState._validate_bot_ammo_transition(
             last_round, empty))
 
@@ -405,6 +405,7 @@ class BotAmmunitionTests(unittest.TestCase):
             'fire_seq': 1, 'shell_index': 0, 'next_shell_index': 1,
             'ammo_remaining': [29, 20, 10],
             'ammo_reload_pending': True,
+            'reload_time': 0.1, 'reload_duration': 1.0,
         }, identity, None)
         ready = BattleState._sanitize_bot_state({
             'id': 11, 'health': 1000, 'alive': True,
@@ -436,12 +437,14 @@ class BotAmmunitionTests(unittest.TestCase):
             'fire_seq': 1, 'shell_index': 0, 'next_shell_index': 1,
             'ammo_remaining': [29, 20, 10],
             'ammo_reload_pending': True,
+            'reload_time': 0.1, 'reload_duration': 1.0,
         }, identity, None)
         current = BattleState._sanitize_bot_state({
             'id': 11, 'health': 1000, 'alive': True,
             'fire_seq': 2, 'shell_index': 1, 'next_shell_index': 2,
             'ammo_remaining': [29, 19, 10],
             'ammo_reload_pending': True,
+            'reload_time': 1.0, 'reload_duration': 1.0,
         }, identity, previous)
 
         self.assertTrue(BattleState._validate_bot_ammo_transition(
@@ -533,12 +536,14 @@ class BotAmmunitionTests(unittest.TestCase):
             'fire_seq': 2, 'shell_index': 0, 'next_shell_index': 1,
             'ammo_remaining': [28, 20, 10],
             'ammo_reload_pending': True, 'clip': 0, 'clip_size': 3,
+            'reload_time': 1.0, 'reload_duration': 1.0,
         }, identity, None)
         full_ready = BattleState._sanitize_bot_state({
             'id': 11, 'health': 1000, 'alive': True,
             'fire_seq': 2, 'shell_index': 1, 'next_shell_index': 2,
             'ammo_remaining': [28, 20, 10],
             'ammo_reload_pending': False, 'clip': 3, 'clip_size': 3,
+            'reload_time': 0.0, 'reload_duration': 1.0,
         }, identity, full_pending)
         self.assertTrue(BattleState._validate_bot_ammo_transition(
             full_pending, full_ready))
@@ -548,6 +553,7 @@ class BotAmmunitionTests(unittest.TestCase):
             'fire_seq': 3, 'shell_index': 1, 'next_shell_index': 2,
             'ammo_remaining': [28, 19, 10],
             'ammo_reload_pending': True, 'clip': 2, 'clip_size': 3,
+            'reload_time': 0.2, 'reload_duration': 0.2,
         }, identity, full_pending)
         self.assertTrue(BattleState._validate_bot_ammo_transition(
             full_pending, full_ready_and_fired))
