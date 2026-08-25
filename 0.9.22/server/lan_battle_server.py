@@ -10785,7 +10785,7 @@ class BattleState:
         return changed
 
     def _bot_defense_context(self):
-        """Return only the own-base pressure facts needed by BotPlanner."""
+        """Return own-base pressure facts and authoritative capture targets."""
         contributors = {}
         for team in (1, 2):
             values = []
@@ -10799,6 +10799,26 @@ class BattleState:
                     continue
                 values.append({"kind": kind, "id": vehicle_id})
             contributors[str(team)] = values
+        capture_bases = {}
+        for team in (1, 2):
+            values = []
+            for index, point in enumerate(
+                    self.capture_bases.get(team,
+                                           self.capture_bases.get(str(team), ())) or ()):
+                try:
+                    if isinstance(point, dict):
+                        x = float(point['x'])
+                        z = float(point['z'])
+                    else:
+                        x = float(point[0])
+                        z = float(point[1])
+                except (KeyError, TypeError, ValueError, IndexError):
+                    continue
+                values.append({
+                    "id": "%d:%d" % (team, index),
+                    "x": round(x, 3), "y": 0.0, "z": round(z, 3),
+                })
+            capture_bases[str(team)] = values
         return {
             "bases": dict((str(team), [dict(point) for point in
                                         self.capture_threat_bases.get(
@@ -10808,6 +10828,7 @@ class BattleState:
                 self.rules_state["bases"][str(team)]))
                 for team in (1, 2)),
             "contributors": contributors,
+            "capture_bases": capture_bases,
         }
 
     def tick_once(self, dt):

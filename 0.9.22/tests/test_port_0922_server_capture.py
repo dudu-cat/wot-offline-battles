@@ -134,6 +134,15 @@ class ServerCaptureTests(unittest.TestCase):
         }], context['bases']['1'])
         self.assertEqual([{'kind': 'human', 'id': 2}],
                          context['contributors']['1'])
+        self.assertEqual({
+            '1': [
+                {'id': '1:0', 'x': 0.0, 'y': 0.0, 'z': 0.0},
+                {'id': '1:1', 'x': 400.0, 'y': 0.0, 'z': 0.0},
+            ],
+            '2': [
+                {'id': '2:0', 'x': 500.0, 'y': 0.0, 'z': 0.0},
+            ],
+        }, context['capture_bases'])
 
     def test_first_live_bot_publication_preserves_manifest_world_pose(self):
         state = self._state()

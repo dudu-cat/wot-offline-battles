@@ -313,6 +313,8 @@ class BotPlanner(object):
         self._cover_reservations = set()
         team_axes = dict((team, self._team_base_axis(team, bots))
                          for team in (1, 2))
+        capture_targets = dict((team, self._capture_target(defense, team))
+                               for team in (1, 2))
         orders = []
         for team in (1, 2):
             team_bots = sorted((bot for bot in bots if bot["team"] == team),
@@ -330,7 +332,8 @@ class BotPlanner(object):
                     bot, index, len(team_bots), assignments.get(bot["id"]),
                     contacts[team], now,
                     defenders.get(team, {}).get(bot["id"]), team_axis,
-                    team_bots)
+                    team_bots, capture_targets[team],
+                    not bool(contacts[team]))
                 base = defenders.get(team, {}).get(bot["id"])
                 orders.append(order)
         orders.sort(key=lambda value: value["id"])
@@ -686,6 +689,48 @@ class BotPlanner(object):
         order["route_join"] = False
         if order.get("target_id") is None:
             order["face_position"] = dict(base["point"])
+
+    @staticmethod
+    def _capture_target(defense, team):
+        """Return the exact opposing CTF circle supplied by BattleState."""
+        if not isinstance(defense, dict):
+            return None
+        bases = defense.get("capture_bases")
+        if not isinstance(bases, dict):
+            return None
+        enemy_team = 3 - int(team)
+        values = bases.get(str(enemy_team), bases.get(enemy_team))
+        if not isinstance(values, (list, tuple)):
+            return None
+        for index, raw in enumerate(values):
+            if not isinstance(raw, dict):
+                continue
+            try:
+                x = float(raw["x"])
+                z = float(raw["z"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(x) or not math.isfinite(z):
+                continue
+            return {
+                "id": str(raw.get("id") or "%d:%d" %
+                          (enemy_team, index)),
+                "point": _point(raw),
+            }
+        return None
+
+    def _apply_base_capture_order(self, order, bot, target):
+        """Send an unengaged vehicle to the opposing CTF capture circle."""
+        self._engage_anchors.pop(bot["id"], None)
+        self._cover_states.pop(bot["id"], None)
+        point = dict(target["point"])
+        order["combat_mode"] = "base_capture"
+        order["capture_base_id"] = str(target["id"])
+        order["aim_position"] = point
+        order["face_position"] = point
+        order["move_position"] = point
+        order["throttle_override"] = None
+        order["route_join"] = False
 
     def _prioritize_base_invaders(self, team, bots, contacts, assignments,
                                   defenders, defense):
@@ -1640,7 +1685,8 @@ class BotPlanner(object):
         order["hull_angle_degrees"] = degrees
 
     def _order_for(self, bot, index, count, focus, contacts, now,
-                   travel_override=None, team_axis=None, team_bots=None):
+                   travel_override=None, team_axis=None, team_bots=None,
+                   capture_target=None, no_known_enemies=False):
         route_id, route_index, move, route_anchor, route_join = self._route(bot, now)
         retreat_point = self._retreat_point(bot, route_anchor)
         profile = dict(bot["profile"])
@@ -1684,6 +1730,9 @@ class BotPlanner(object):
                     bool(focus.get("visible") and
                          bot["id"] in (observers or ())))
             self._apply_base_defense_order(order, bot, travel_override)
+            return order
+        if no_known_enemies and capture_target is not None:
+            self._apply_base_capture_order(order, bot, capture_target)
             return order
         if str(profile.get("class_tag") or "") == "SPG":
             if focus is not None:

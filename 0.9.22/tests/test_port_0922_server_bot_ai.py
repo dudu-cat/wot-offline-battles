@@ -178,6 +178,42 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual({'x': 0.0, 'y': 0.0, 'z': -100.0},
                          order['move_position'])
 
+    def test_contact_free_bots_capture_the_authoritative_enemy_base(self):
+        planner = BotPlanner()
+        defense = {
+            'capture_bases': {
+                '1': [{'id': '1:0', 'x': 0.0, 'y': 0.0, 'z': -100.0}],
+                '2': [{'id': '2:0', 'x': 123.5, 'y': 0.0, 'z': 456.25}],
+            },
+        }
+
+        order = planner.build_orders(
+            self.manifest, self.states, [], 1.0, defense)['orders'][0]
+
+        self.assertEqual('base_capture', order['combat_mode'])
+        self.assertEqual('2:0', order['capture_base_id'])
+        self.assertEqual({'x': 123.5, 'y': 0.0, 'z': 456.25},
+                         order['move_position'])
+        self.assertEqual(order['move_position'], order['aim_position'])
+        self.assertEqual(order['move_position'], order['face_position'])
+
+    def test_known_enemy_keeps_the_route_instead_of_starting_base_capture(self):
+        planner = BotPlanner()
+        contact = _contact(2, 0, 400, [])
+        players = self._report(planner, [contact])
+        defense = {
+            'capture_bases': {
+                '1': [{'id': '1:0', 'x': 0.0, 'y': 0.0, 'z': -100.0}],
+                '2': [{'id': '2:0', 'x': 123.5, 'y': 0.0, 'z': 456.25}],
+            },
+        }
+
+        order = planner.build_orders(
+            self.manifest, self.states, players, 1.0, defense)['orders'][0]
+
+        self.assertEqual('route', order['combat_mode'])
+        self.assertNotIn('capture_base_id', order)
+
     def test_two_wide_enemy_lanes_trigger_crossfire_withdrawal(self):
         planner = BotPlanner()
         contacts = [
