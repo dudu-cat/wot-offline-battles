@@ -13833,6 +13833,48 @@ class BattleRuntimeContractTests(unittest.TestCase):
             11, 0.75, 0.9, -0.1)
         battle._remote_factory.get.assert_not_called()
 
+    def test_hidden_worker_scans_human_tree_contacts(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._avatar = runtime.bigworld.avatar
+        battle.client = types.SimpleNamespace(
+            is_bot_authority=lambda: True)
+        battle._destructibles = mock.Mock()
+        descriptor = _Descriptor()
+        battle._resolve_player_descriptor = mock.Mock(
+            return_value=descriptor)
+        battle._player_tree_destructible_scan_due = mock.Mock(
+            return_value=True)
+        state = {
+            'id': 3, 'world_pose': True, 'alive': True,
+            'x': 7.0, 'y': 2.0, 'z': 9.0,
+            'yaw': 0.75, 'speed': 6.5}
+
+        self.assertEqual(
+            1, battle._scan_authority_player_trees([state], 10.0))
+
+        battle._resolve_player_descriptor.assert_called_once_with(state)
+        call = battle._destructibles._fell_trees_near.call_args[0]
+        self.assertEqual(7, call[0])
+        self.assertEqual((7.0, 2.0, 9.0), tuple(call[1]))
+        self.assertEqual(0.75, call[2])
+        self.assertEqual(6.5, call[3])
+        self.assertIs(descriptor, call[4])
+
+    def test_visible_client_never_commits_human_tree_contacts(self):
+        battle = BattleRuntime(_runtime())
+        battle._worker_mode = False
+        battle.client = types.SimpleNamespace(
+            is_bot_authority=lambda: False)
+        battle._destructibles = mock.Mock()
+
+        self.assertEqual(0, battle._scan_authority_player_trees([{
+            'id': 3, 'world_pose': True, 'alive': True,
+            'x': 7.0, 'y': 2.0, 'z': 9.0,
+            'yaw': 0.75, 'speed': 6.5}], 10.0))
+        battle._destructibles._fell_trees_near.assert_not_called()
+
     def test_authority_bot_motion_notifies_destructibles_before_pose(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

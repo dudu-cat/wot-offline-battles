@@ -235,7 +235,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.6.0-alpha.3</version></root>')
+            '<version>0.6.0-alpha.4</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -2755,6 +2755,16 @@ class OfflineCompatibilityTests(unittest.TestCase):
                 if getattr(self, 'fail_deactivate', False):
                     raise RuntimeError('compound deactivate failed')
 
+        class CrashedTrackController(object):
+            def __init__(self, entity=None):
+                self.entity = entity
+
+            def __setupTrackAssembler(self, entity):
+                return entity.filter.groundPlacingMatrix
+
+            def __onModelLoaded(self, unused_resources):
+                return self.entity.filter.groundPlacingMatrix
+
         class AvatarInputHandler(object):
             def __init__(self):
                 self._AvatarInputHandler__ctrlModeName = None
@@ -2984,6 +2994,7 @@ class OfflineCompatibilityTests(unittest.TestCase):
             chat_manager=chat_manager,
             compound_appearance_module=types.SimpleNamespace(
                 CompoundAppearance=CompoundAppearance),
+            crashed_tracks_controller_type=CrashedTrackController,
             connection_manager=manager,
             login_status=statuses,
             offline_map_creator=_OfflineMapCreator(operations),
@@ -3693,6 +3704,36 @@ class OfflineCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             'native-stabilised-123.0',
             vehicle.filter.interpolateStabilisedMatrix(123.0))
+        compatibility.fini()
+
+    def test_crashed_track_models_read_the_copied_live_pose(self):
+        compatibility_module = _load_port_source('compat')
+        runtime, unused_operations = self._runtime()
+        compatibility = compatibility_module.OfflineCompatibility(runtime)
+        compatibility.install()
+
+        native_filter = types.SimpleNamespace(
+            groundPlacingMatrix='spawn-matrix')
+        vehicle = runtime.vehicle_module.Vehicle()
+        vehicle.filter = native_filter
+        controller = runtime.crashed_tracks_controller_type(vehicle)
+
+        setup = getattr(
+            controller,
+            '_CrashedTrackController__setupTrackAssembler')
+        loaded = getattr(
+            controller,
+            '_CrashedTrackController__onModelLoaded')
+        self.assertEqual('spawn-matrix', setup(vehicle))
+        self.assertEqual('spawn-matrix', loaded({}))
+
+        compatibility.configure_battle()
+        compatibility.set_vehicle_pose_overlay(
+            vehicle, 'copied-position', 1.5, 'render-matrix', 7.5, 0.25)
+
+        self.assertEqual('render-matrix', setup(vehicle))
+        self.assertEqual('render-matrix', loaded({}))
+        self.assertIs(native_filter, vehicle.filter)
         compatibility.fini()
 
     def test_offline_vehicle_physics_skips_only_initial_native_gun_sync(self):
@@ -5593,7 +5634,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.6.0-alpha.3'
+        package.PORT_VERSION = '0.6.0-alpha.4'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []

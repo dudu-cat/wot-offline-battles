@@ -654,6 +654,10 @@ EXPECTED_ABI = {
         'CompoundAppearance.addCrashedTrack': ('self', 'isLeft'),
         'CompoundAppearance.delCrashedTrack': ('self', 'isLeft'),
     },
+    'scripts/client/vehicle_systems/components/CrashedTracks.pyc': {
+        'CrashedTrackController.__setupTrackAssembler': ('self', 'entity'),
+        'CrashedTrackController.__onModelLoaded': ('self', 'resources'),
+    },
     'scripts/client/gui/battle_control/controllers/consumables/'
     'equipment_ctrl.pyc': {
         '_ExpandedItem.getActivationCode': (
@@ -1497,6 +1501,12 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'player', 'inputHandler',
             'removeVehicleFromCameraCollider', 'arena',
             'onPeriodChange', 'onCameraChanged'),
+    },
+    'scripts/client/vehicle_systems/components/CrashedTracks.pyc': {
+        'CrashedTrackController.__setupTrackAssembler': (
+            'filter', 'groundPlacingMatrix'),
+        'CrashedTrackController.__onModelLoaded': (
+            'filter', 'groundPlacingMatrix'),
     },
     'scripts/client/VehicleGunRotator.pyc': {
         'VehicleGunRotator.start': (

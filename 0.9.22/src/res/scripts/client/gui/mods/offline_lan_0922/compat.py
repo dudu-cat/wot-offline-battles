@@ -231,6 +231,8 @@ def _load_runtime():
     import AvatarInputHandler.AimingSystems.steady_vehicle_matrix as \
         SteadyVehicleMatrix
     import vehicle_systems.CompoundAppearance as CompoundAppearanceModule
+    from vehicle_systems.components.CrashedTracks import \
+        CrashedTrackController
     import constants
     from OfflineMapCreator import g_offlineMapCreator
     from PlayerEvents import g_playerEvents
@@ -261,6 +263,7 @@ def _load_runtime():
     runtime.bigworld = BigWorld
     runtime.chat_manager = ChatManager.chatManager
     runtime.compound_appearance_module = CompoundAppearanceModule
+    runtime.crashed_tracks_controller_type = CrashedTrackController
     runtime.constants = constants
     runtime.connection_manager = dependency.instance(IConnectionManager)
     runtime.debug_panel_type = DebugPanel
@@ -434,6 +437,13 @@ class _OfflineVehicleFilterSyncProxy(object):
             return self._acceleration
         return self._vehicle_filter.acceleration
 
+    @property
+    def groundPlacingMatrix(self):
+        """Place detached presentation models at the copied live pose."""
+        if self._pose_matrix is not None:
+            return self._pose_matrix
+        return self._vehicle_filter.groundPlacingMatrix
+
     def interpolateStabilisedMatrix(self, timestamp):
         """Expose the canonical copied pose to the fixed-turret aim path."""
         if self._pose_matrix is not None:
@@ -529,6 +539,8 @@ class OfflineCompatibility(object):
         self._camera_acceleration_update_code = None
         self._arcade_oscillator_acceleration_code = None
         self._sniper_oscillator_acceleration_code = None
+        self._crashed_track_setup_assembler_code = None
+        self._crashed_track_model_loaded_code = None
         self._original_compound_getattribute = None
         self._original_compound_deactivate = None
         self._original_compound_models_refresh = None
@@ -634,6 +646,8 @@ class OfflineCompatibility(object):
             runtime, 'acceleration_smoother_type', None)
         arcade_camera_type = getattr(runtime, 'arcade_camera_type', None)
         sniper_camera_type = getattr(runtime, 'sniper_camera_type', None)
+        crashed_tracks_controller_type = getattr(
+            runtime, 'crashed_tracks_controller_type', None)
         strategic_camera_type = getattr(runtime, 'strategic_camera_type', None)
         self._original_strategic_camera_update = getattr(
             strategic_camera_type, '_StrategicCamera__cameraUpdate', None)
@@ -811,6 +825,28 @@ class OfflineCompatibility(object):
         (self._camera_acceleration_update_code,
          self._arcade_oscillator_acceleration_code,
          self._sniper_oscillator_acceleration_code) = camera_motion_codes
+        if crashed_tracks_controller_type is None:
+            raise RuntimeError('#1513 crashed-track controller is unavailable')
+        crashed_track_setup_assembler = getattr(
+            crashed_tracks_controller_type,
+            '_CrashedTrackController__setupTrackAssembler', None)
+        crashed_track_model_loaded = getattr(
+            crashed_tracks_controller_type,
+            '_CrashedTrackController__onModelLoaded', None)
+        if (not callable(crashed_track_setup_assembler) or
+                not callable(crashed_track_model_loaded)):
+            raise RuntimeError(
+                '#1513 crashed-track pose boundaries are unavailable')
+        self._crashed_track_setup_assembler_code = getattr(
+            crashed_track_setup_assembler, 'func_code', getattr(
+                crashed_track_setup_assembler, '__code__', None))
+        self._crashed_track_model_loaded_code = getattr(
+            crashed_track_model_loaded, 'func_code', getattr(
+                crashed_track_model_loaded, '__code__', None))
+        if (self._crashed_track_setup_assembler_code is None or
+                self._crashed_track_model_loaded_code is None):
+            raise RuntimeError(
+                '#1513 crashed-track pose code is unavailable')
         if vehicle_type is not None:
             self._original_vehicle_getattribute = vehicle_type.__dict__.get(
                 '__getattribute__', vehicle_type.__getattribute__)
@@ -1596,6 +1632,11 @@ class OfflineCompatibility(object):
                     compatibility._arcade_oscillator_acceleration_code,
                     compatibility._sniper_oscillator_acceleration_code) and
                 overlay is not None and overlay.get('_pose_active'))
+            direct_crashed_track_pose = (
+                caller_code in (
+                    compatibility._crashed_track_setup_assembler_code,
+                    compatibility._crashed_track_model_loaded_code) and
+                overlay is not None and overlay.get('_pose_active'))
             direct_visible_collision = (
                 caller_code is
                 compatibility._projectile_segment_may_hit_code and
@@ -1625,12 +1666,14 @@ class OfflineCompatibility(object):
             if (name == 'filter' and compatibility._battle_active and
                     (direct_start_filter or direct_gun_sync or
                      direct_avatar_aux_sync or direct_avatar_pose_init or
-                     direct_fixed_turret_pose or direct_camera_motion)):
+                     direct_fixed_turret_pose or direct_camera_motion or
+                     direct_crashed_track_pose)):
                 vehicle_filter = (
                     compatibility._original_vehicle_getattribute(
                         vehicle, name))
                 pose_matrix = (overlay['matrix']
-                               if direct_fixed_turret_pose else None)
+                               if (direct_fixed_turret_pose or
+                                   direct_crashed_track_pose) else None)
                 velocity = (overlay.get('velocity')
                             if direct_camera_motion else None)
                 acceleration = (overlay.get('acceleration')

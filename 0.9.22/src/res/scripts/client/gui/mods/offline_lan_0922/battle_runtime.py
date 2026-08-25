@@ -1154,6 +1154,7 @@ class BattleRuntime(object):
         self._local_descriptor = None
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
+        self._player_tree_destructible_samples = {}
         self._bot_pose_times = {}
         self._bot_yaw_rates = {}
         self._track_report_time = None
@@ -1394,6 +1395,7 @@ class BattleRuntime(object):
         self._local_descriptor = None
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
+        self._player_tree_destructible_samples = {}
         self._bot_pose_times = {}
         self._bot_yaw_rates = {}
         self._track_report_time = None
@@ -6642,6 +6644,8 @@ class BattleRuntime(object):
             'bot_assignments': len(self._bot_vehicle_assignments),
             'bot_fire_seen': len(self._bot_fire_seen),
             'bot_destr_samples': len(self._bot_destructible_samples),
+            'player_tree_destr_samples': len(
+                self._player_tree_destructible_samples),
         }
         try:
             counts['projectiles'] = len(self._projectiles)
@@ -6671,6 +6675,8 @@ class BattleRuntime(object):
         ('start_message', '_start_message'),
         ('health', '_last_health'),
         ('bot_destr_samples', '_bot_destructible_samples'),
+        ('player_tree_destr_samples',
+         '_player_tree_destructible_samples'),
         ('spawn_planner', '_spawn_planner'),
         ('projectiles', '_projectiles'),
         ('projectile_meta', '_projectile_meta'),
@@ -10093,6 +10099,7 @@ class BattleRuntime(object):
                 self._advance_artillery_arcs(now)
                 players = self._authority_players()
                 if self._worker_mode:
+                    self._scan_authority_player_trees(players, now)
                     self._resolve_player_destructible_contacts(players, now)
                 probe_totals = getattr(self._bots, 'probe_totals', None)
                 probe_duration_totals = getattr(
@@ -12909,6 +12916,61 @@ class BattleRuntime(object):
             return False
         self._bot_destructible_samples[bot_id] = (deadline, position)
         return True
+
+    def _player_tree_destructible_scan_due(self, state, now):
+        """Rate-limit hidden-worker tree scans for one human vehicle."""
+        player_id = int(state['id'])
+        position = (_number(state.get('x')), _number(state.get('y')),
+                    _number(state.get('z')))
+        previous = self._player_tree_destructible_samples.get(player_id)
+        if previous is not None:
+            deadline, sampled_position = previous
+            if (float(now) < float(deadline) and
+                    _distance_2d(position, sampled_position) <
+                    BOT_DESTRUCTIBLE_TRAVEL_METRES):
+                return False
+            interval = (0.50 if abs(_number(state.get('speed'))) < 1.0
+                        else BOT_DESTRUCTIBLE_SECONDS)
+            deadline = float(now) + interval
+        else:
+            phase = (((abs(player_id) * 19 + 7 * 11) % 29) + 1) / 29.0
+            deadline = float(now) + BOT_DESTRUCTIBLE_SECONDS * phase
+            self._player_tree_destructible_samples[player_id] = (
+                deadline, position)
+            return False
+        self._player_tree_destructible_samples[player_id] = (
+            deadline, position)
+        return True
+
+    def _scan_authority_player_trees(self, states, now):
+        """Resolve human/tree contacts in the hidden native authority.
+
+        The #1513 hull collision probe does not report tree materials.  Bots
+        already use the native chunk enumerator below; human world poses must
+        cross the same worker-owned seam so visible clients never mutate the
+        shared map directly.
+        """
+        if (not self._worker_mode or self._destructibles is None or
+                self.client is None or
+                not self.client.is_bot_authority()):
+            return 0
+        scanned = 0
+        for state in states or ():
+            if (not isinstance(state, dict) or state.get('id') is None or
+                    not bool(state.get('world_pose', False)) or
+                    not bool(state.get('alive', True)) or
+                    not self._player_tree_destructible_scan_due(state, now)):
+                continue
+            descriptor = self._resolve_player_descriptor(state)
+            self._destructibles._fell_trees_near(
+                self._avatar.spaceID,
+                self._vector((_number(state.get('x')),
+                              _number(state.get('y')),
+                              _number(state.get('z')))),
+                _number(state.get('yaw')), _number(state.get('speed')),
+                descriptor)
+            scanned += 1
+        return scanned
 
     def _bot_pose_relax(self, state, pose, now):
         """Return how long the compound should take to reach this pose.
@@ -16161,6 +16223,7 @@ class BattleRuntime(object):
         self._vehicle_ready_deadline = 0.0
         self._bot_fire_seen = {}
         self._bot_destructible_samples = {}
+        self._player_tree_destructible_samples = {}
         self._bot_pose_times = {}
         self._bot_yaw_rates = {}
         self._track_report_time = None
