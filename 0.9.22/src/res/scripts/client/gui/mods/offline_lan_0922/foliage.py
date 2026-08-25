@@ -285,9 +285,6 @@ class FoliageMap(object):
 		profile = self.fallen_tree_profiles.get(identity)
 		if profile is None:
 			return False
-		unused_bounds, standing_instance_id = profile
-		if standing_instance_id is not None:
-			self.inactive_instances.add(int(standing_instance_id))
 		self.activated_fallen_trees.add(identity)
 		self.refreshing_fallen_trees.add(identity)
 		return True
@@ -324,6 +321,10 @@ class FoliageMap(object):
 		if identity not in self.refreshing_fallen_trees:
 			return False
 		row, bounds = _dynamic_instance(center, half_axes)
+		unused_bounds, standing_instance_id = self.fallen_tree_profiles[
+			identity]
+		if standing_instance_id is not None:
+			self.inactive_instances.add(int(standing_instance_id))
 		instance_id = self.fallen_tree_instances.get(identity)
 		if instance_id is None:
 			instance_id = len(self.instances)

@@ -163,11 +163,12 @@ class FoliageTests(unittest.TestCase):
         self.assertEqual(
             0.15, foliage_map.camouflage_bonus(observer, target))
         self.assertTrue(foliage_map.activate_fallen_tree(7, 3))
-        self.assertIn(0, foliage_map.inactive_instances)
+        self.assertNotIn(0, foliage_map.inactive_instances)
         self.assertEqual(
-            0.0, foliage_map.camouflage_bonus(observer, target))
+            0.15, foliage_map.camouflage_bonus(observer, target))
         self.assertTrue(foliage_map.update_fallen_tree_pose(
             7, 3, *_fallen_pose_x()))
+        self.assertIn(0, foliage_map.inactive_instances)
         self.assertEqual(
             0.15, foliage_map.camouflage_bonus(observer, target))
         dynamic_id = foliage_map.fallen_tree_instances[(7, 3)]
