@@ -6947,6 +6947,14 @@ class BattleRuntime(object):
             return False
         self._clear_local_destructible_prediction(
             ((chunk_id, item_index, mat_kind),))
+        validate_tree = getattr(
+            self._destructibles, 'validate_tree_identity_1513', None)
+        if (kind == 'tree' and callable(validate_tree) and
+                not validate_tree(
+                    self._avatar.spaceID, chunk_id, item_index)):
+            # The native object remains solid.  A nullable tree identity is a
+            # local streamed-data boundary, not a fatal LAN protocol failure.
+            return False
         if destructibles_authority.is_destroyed(
                 chunk_id, item_index, mat_kind):
             return False
@@ -6966,6 +6974,10 @@ class BattleRuntime(object):
                 space_id, chunk_id, item_index, mat_kind, position, is_shot)
         if (not applied and not destructibles_authority.is_destroyed(
                 chunk_id, item_index, mat_kind)):
+            if (kind == 'tree' and callable(validate_tree) and
+                    not validate_tree(
+                        space_id, chunk_id, item_index)):
+                return False
             raise RuntimeError(
                 '#1513 failed to apply canonical destructible event')
         note_destroyed = getattr(

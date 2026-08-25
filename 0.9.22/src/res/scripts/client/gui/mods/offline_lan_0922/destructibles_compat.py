@@ -27,14 +27,16 @@ def reset_safe_descriptor_cache(space_id=None):
     _SAFE_DESC_BY_WIRE.clear()
 
 
-def resolve_destructible_desc(cache, space_id, chunk_id, item_index):
-    """Resolve one streamed descriptor without the nullable scalar wrapper.
+def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
+    """Inspect one streamed descriptor without the nullable scalar wrapper.
 
     On pinned #1513 ``wg_getChunkDestrFilenames`` is a named SpeedTree prefix,
     not the native slot count.  That is exactly sufficient for the only two
     stock callers of ``getDestructibleDesc``: tree fracture/touchdown effects
     and the tree animator.  Non-tree identities keep their existing native
-    paths and are deliberately not inferred here.
+    paths and are deliberately not inferred here. ``pending`` is reserved for
+    the legal stream boundary where the chunk list is not available yet;
+    malformed, unnamed and unresolved entries are definitively ``invalid``.
     """
     import BigWorld
 
@@ -46,19 +48,28 @@ def resolve_destructible_desc(cache, space_id, chunk_id, item_index):
     key = (chunk_id, item_index)
     cached = _SAFE_DESC_BY_WIRE.get(key)
     if cached is not None:
-        return cached
+        return 'resolved', cached
     filenames = BigWorld.wg_getChunkDestrFilenames(space_id, chunk_id)
+    if filenames is None:
+        return 'pending', None
     if not isinstance(filenames, (list, tuple)):
-        return None
+        return 'invalid', None
     if item_index < 0 or item_index >= len(filenames):
-        return None
+        return 'invalid', None
     filename = filenames[item_index]
     if not isinstance(filename, _STRING_TYPES) or not filename:
-        return None
+        return 'invalid', None
     desc = cache.getDescByFilename(filename)
     if desc is not None:
         _SAFE_DESC_BY_WIRE[key] = desc
-    return desc
+        return 'resolved', desc
+    return 'invalid', None
+
+
+def resolve_destructible_desc(cache, space_id, chunk_id, item_index):
+    """Return the safe descriptor, or ``None`` at pending/invalid boundaries."""
+    return inspect_destructible_desc(
+        cache, space_id, chunk_id, item_index)[1]
 
 
 def _safe_get_destructible_desc(self, space_id, chunk_id, item_index):

@@ -308,7 +308,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(1, bigworld.wg_getChunkDestrFilenames.call_count)
         self.assertIn('chunk: 22, id: 9', logs[0])
 
-    def test_missing_tree_descriptor_fails_before_native_destroy(self):
+    def test_missing_tree_descriptor_stays_solid_before_native_destroy(self):
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 1)
@@ -323,13 +323,98 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         with mock.patch.dict(
                 sys.modules, {'AreaDestructibles': area,
                               'BigWorld': destructibles_authority.BigWorld}):
-            with self.assertRaisesRegex(
-                    RuntimeError, 'tree descriptor is unavailable'):
-                destructibles_authority.destroy_tree(
-                    1, 22, 0, 0.0, 6.0, (10.0, 2.0, 20.0))
+            self.assertFalse(destructibles_authority.destroy_tree(
+                1, 22, 0, 0.0, 6.0, (10.0, 2.0, 20.0)))
 
         fall_pitch.assert_not_called()
         self.assertEqual([], manager.attempts)
+
+    def test_loaded_missing_tree_identity_is_isolated_nonfatally(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = _authority_environment(manager)
+        destructibles_authority.BigWorld.wg_getChunkDestrFilenames = (
+            lambda *unused: ())
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': destructibles_authority.BigWorld}), \
+                mock.patch.object(sys, 'stdout', mock.Mock()):
+            self.assertFalse(
+                destructibles_sensor.validate_tree_identity_1513(1, 22, 0))
+            self.assertFalse(
+                destructibles_sensor.validate_tree_identity_1513(1, 22, 0))
+
+        self.assertEqual(
+            {(22, 0)}, destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual(
+            {'tree_descriptor'},
+            destructibles_sensor.g_offh_destr_isolation_logs)
+
+    def test_pending_tree_filename_list_retries_without_isolation(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = _authority_environment(manager)
+        destructibles_authority.BigWorld.wg_getChunkDestrFilenames = (
+            mock.Mock(return_value=None))
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': destructibles_authority.BigWorld}):
+            self.assertFalse(
+                destructibles_sensor.validate_tree_identity_1513(1, 22, 0))
+            self.assertNotIn(
+                'g_offh_destr_isolated_slots', destructibles_sensor.__dict__)
+            destructibles_authority.BigWorld.wg_getChunkDestrFilenames.return_value = (
+                'tree',)
+            self.assertTrue(
+                destructibles_sensor.validate_tree_identity_1513(1, 22, 0))
+
+        self.assertNotIn(
+            'g_offh_destr_isolation_logs', destructibles_sensor.__dict__)
+
+    def test_registry_isolates_only_named_slots_without_descriptors(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 2)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.chunkIDFromPosition = lambda unused: 22
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda unused: None)
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getChunkDestrFilenames = (
+            lambda *unused: ('missing-tree', ''))
+        bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
+            translation=_Vector())
+        bigworld.wg_getDestructibleMatrix = lambda *unused: _ItemMatrix()
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        descriptor = _Strict1513Component(
+            hull=_Strict1513Component(
+                hitTester=types.SimpleNamespace(bbox=(
+                    (-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None))))
+        destructibles_sensor.xrange = range
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': bigworld, 'Math': math_module}), \
+                mock.patch.object(sys, 'stdout', mock.Mock()):
+            destructibles_sensor._fell_trees_near(
+                1, _Vector(), 0.0, 6.0, descriptor)
+
+        self.assertEqual(
+            {(22, 0)}, destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertNotIn((22, 1),
+                         destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
 
     def test_sensor_publishes_normalized_client_report(self):
         events = []

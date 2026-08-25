@@ -14215,6 +14215,40 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._destructibles.clear_local_prediction.assert_called_once_with(
             ((3, 9, None),))
 
+    def test_canonical_tree_with_unsafe_descriptor_is_nonfatal(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = mock.Mock()
+        battle._destructibles.is_isolated_1513.return_value = False
+        battle._destructibles.validate_tree_identity_1513.return_value = False
+        event = {
+            'destructible_kind': 'tree',
+            'chunk_id': 3, 'item_index': 9,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.0, 'speed': 6.0,
+            'is_shot': False}
+        authority = types.ModuleType(
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority.is_destroyed = mock.Mock(return_value=False)
+        authority.destroy_tree = mock.Mock(return_value=True)
+        package = sys.modules['gui.mods.offline_lan_0922']
+
+        with mock.patch.dict(sys.modules, {
+                'gui.mods.offline_lan_0922.destructibles_authority':
+                authority}), mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
+            self.assertFalse(battle._apply_destructible_event(event))
+
+        battle._destructibles.validate_tree_identity_1513.assert_called_once_with(
+            7, 3, 9)
+        authority.is_destroyed.assert_not_called()
+        authority.destroy_tree.assert_not_called()
+        battle._destructibles.note_destroyed.assert_not_called()
+        battle._destructibles.clear_local_prediction.assert_called_once_with(
+            ((3, 9, None),))
+
     def test_server_disabled_destructibles_stop_the_sensor_once(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

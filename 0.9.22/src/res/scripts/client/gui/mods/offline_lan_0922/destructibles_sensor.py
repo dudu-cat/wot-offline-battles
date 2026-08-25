@@ -74,6 +74,40 @@ def is_isolated_1513(chunk_id, item_index):
 	return _destructible_isolated_1513(chunk_id, item_index)
 
 
+def validate_tree_identity_1513(space_id, chunk_id, item_index):
+	"""Prove a loaded #1513 slot has a safe named tree descriptor.
+
+	An unloaded chunk retains the stock queued-order behavior.  Once loaded,
+	the nullable scalar filename wrapper is never a legal probe: the safe chunk
+	list must name this slot and resolve it to a tree descriptor first.
+	"""
+	chunk_id = int(chunk_id)
+	item_index = int(item_index)
+	if _destructible_isolated_1513(chunk_id, item_index):
+		return False
+	import AreaDestructibles
+	manager = getattr(
+		AreaDestructibles, 'g_destructiblesManager', None)
+	if manager is None:
+		raise RuntimeError('destructibles manager is unavailable')
+	if not manager.isChunkLoaded(chunk_id):
+		return True
+	from gui.mods.offline_lan_0922 import destructibles_compat
+	status, desc = destructibles_compat.inspect_destructible_desc(
+		AreaDestructibles.g_cache, space_id, chunk_id, item_index)
+	if status == 'pending':
+		# ``game.wg_onChunkLoad`` and the chunk filename list can settle on
+		# adjacent frames. Keep the object solid for this attempt and retry.
+		return False
+	if (desc is None or
+			desc.get('type') != AreaDestructibles.DESTR_TYPE_TREE):
+		_isolate_destructible_1513(
+			'tree_descriptor', chunk_id, item_index,
+			detail='safe named tree descriptor is unavailable')
+		return False
+	return True
+
+
 def _drop_isolated_destructible_1513(chunk_id, item_index=None):
 	"""Remove synthetic collision state without touching native authority."""
 	chunk_id = int(chunk_id)
@@ -2491,6 +2525,9 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 		_hp_gate = desc.get('health', 0)
 		if _hp_gate < 10 or _hp_gate > 1000:
 			return False
+		if not validate_tree_identity_1513(
+				spaceID, chunkID, itemIndex):
+			return False
 	# All bookkeeping (chunk bootstrap, dedup, encoding) lives in
 	# the authority - this path is now just a contact sensor.
 	_auth = _get_destr_authority()
@@ -2516,6 +2553,10 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 	else:
 		return False
 	if not _destr_ok:
+		if (typ == AreaDestructibles.DESTR_TYPE_TREE and
+				not validate_tree_identity_1513(
+					spaceID, chunkID, itemIndex)):
+			return False
 		raise RuntimeError(
 			'native destructible destroy was not accepted: chunk=%s item=%s' %
 			(chunkID, itemIndex))
@@ -2795,6 +2836,17 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						desc = AreaDestructibles.g_cache.getDescByFilename(
 							_filename)
 						if desc is None:
+							# A non-empty raw name is the only safe evidence that this
+							# #1513 prefix slot is a tree. Quarantine that invalid tree;
+							# blank/later slots can be real non-tree objects and remain
+							# solid and available to catalog recovery.
+							if (_raw_normalized and
+									_catalog_record is None):
+								_isolate_destructible_1513(
+									'tree_descriptor', cid, _ti,
+									detail='named filename has no descriptor')
+								_slot_diag['result'] = 'isolated'
+								continue
 							_slot_diag['result'] = 'desc_missing'
 							continue
 						typ = desc['type']
@@ -2974,12 +3026,19 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					_ok = _auth.destroy_module(
 						spaceID, cid, _ti, _mat_kind, _object_pos, False)
 				elif _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
+					if not validate_tree_identity_1513(
+							spaceID, cid, _ti):
+						continue
 					_ok = _auth.destroy_tree(
 						spaceID, cid, _ti, fall_yaw, vel, _object_pos)
 				else:
 					_ok = _auth.destroy_column(
 						spaceID, cid, _ti, fall_yaw, vel, _object_pos)
 				if not _ok:
+					if (_ttyp == AreaDestructibles.DESTR_TYPE_TREE and
+							not validate_tree_identity_1513(
+								spaceID, cid, _ti)):
+						continue
 					raise RuntimeError(
 						'native proximity destroy was not accepted: '
 						'chunk=%s item=%s' % (cid, _ti))

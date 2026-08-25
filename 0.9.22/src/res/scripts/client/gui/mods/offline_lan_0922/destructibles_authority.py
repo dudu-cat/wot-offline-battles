@@ -292,9 +292,10 @@ def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 			AreaDestructibles.g_cache, spaceID, chunkID, itemIndex)
 		if (desc is None or
 				desc.get('type') != AreaDestructibles.DESTR_TYPE_TREE):
-			raise RuntimeError(
-				'#1513 tree descriptor is unavailable: chunk=%s item=%s' %
-				(chunkID, itemIndex))
+			# A streamed slot without a safe named tree descriptor must remain
+			# solid.  Do not enter the stock animation path: its scalar filename
+			# wrapper dereferences NULL before Python can handle it.
+			return False
 	pitch = math.pi / 2.0
 	pc = BigWorld.wg_getDestructibleFallPitchConstr(
 		spaceID, chunkID, itemIndex, fallYaw)
