@@ -15174,6 +15174,51 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(record['world_marker_started'])
         self.assertTrue(record['minimap_started'])
 
+    def test_friendly_vehicle_beyond_aoi_keeps_only_its_minimap_entry(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._local_position = (0.0, 0.0, 0.0)
+        ally = RemoteVehicle(
+            1000, _Descriptor(), {
+                'publicInfo': {'team': 1, 'name': 'Ally'},
+                'health': 500, 'isCrewActive': True,
+                'gunAnglesPacked': 0},
+            _Vector(600.0, 0.0, 0.0), (0.0, 0.0, 0.0), runtime.math)
+        ally.model = _Model()
+        ally.appearance.attach(ally.model)
+        ally.isStarted = True
+        ally.inWorld = True
+        runtime.bigworld.entities[1000] = ally
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: ally if entity_id == 1000 else None)
+        battle._spotting_observers = lambda: ()
+        record = {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'tombstone': False, 'native_remote': False,
+            'world_marker_started': True, 'minimap_started': True,
+            'spot_visible': True, 'spot_marker_visible': True,
+            'state': {'team': 1, 'health': 500, 'alive': True}}
+        battle._records = {'bot:17': record}
+
+        self.assertTrue(battle._update_spotting(10.0))
+        self.assertFalse(record['spot_visible'])
+        self.assertTrue(record['spot_marker_visible'])
+        self.assertFalse(record['world_marker_started'])
+        self.assertTrue(record['minimap_started'])
+        battle._binding.stop_vehicle_marker.assert_called_once_with(1000)
+        battle._binding.stop_vehicle_minimap.assert_not_called()
+
+        ally.position = _Vector(560.0, 0.0, 0.0)
+        self.assertTrue(battle._update_spotting(10.1))
+        self.assertTrue(record['spot_visible'])
+        self.assertTrue(record['world_marker_started'])
+        battle._binding.start_vehicle_marker.assert_called_once_with(1000)
+        battle._binding.start_vehicle_minimap.assert_not_called()
+
     def test_strategic_spg_view_draws_team_spotted_target_beyond_aoi(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

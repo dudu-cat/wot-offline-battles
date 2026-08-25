@@ -15186,14 +15186,29 @@ class BattleRuntime(object):
             return False
         changed = False
         spotted_records = []
+        local_team = int(self.client.team)
         for record in self._records.values():
             state = record.get('state') or {}
             if (record.get('local') or not record.get('presentation') or
-                    not record.get('ready') or record.get('tombstone') or
-                    int(state.get('team', 0)) == int(self.client.team)):
+                    not record.get('ready') or record.get('tombstone')):
                 continue
             entity = self._server_entity(record['engine_id'])
             if entity is None:
+                continue
+            if int(state.get('team', 0)) == local_team:
+                # Synthetic allies never leave BigWorld.entities, so enforce
+                # the stock #1513 vehicle AOI here as well.  Team knowledge
+                # remains permanent: only the world model and 3D marker leave
+                # at 565 m, while the minimap entry stays available.
+                previous = (
+                    bool(record.get('spot_visible', True)),
+                    bool(record.get(
+                        'spot_marker_visible',
+                        record.get('spot_visible', True))))
+                visible, marker_visible = self._apply_spot_presentation(
+                    record, entity, True)
+                if (visible, marker_visible) != previous:
+                    changed = True
                 continue
             alive = self._record_alive(record, entity)
             direct_seen = False
