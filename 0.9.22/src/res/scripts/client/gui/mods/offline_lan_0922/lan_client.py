@@ -12,6 +12,7 @@ from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
 from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import siege_mechanics
+from gui.mods.offline_lan_0922 import spotting
 
 
 PROTOCOL_VERSION = 5
@@ -4288,7 +4289,41 @@ class LANClient(object):
                 _exact_int(contact.get('target_id')) > 0 and
                 _safe_text(contact.get('target_kind'), '') in
                 ('human', 'bot') and
-                isinstance(contact.get('visible'), bool)
+                isinstance(contact.get('visible'), bool) and
+                isinstance(contact.get('fresh'), bool) and
+                _projectile_float_range(
+                    contact.get('time_left'), 0.0,
+                    spotting.DESIGNATED_SPOT_MEMORY_SECONDS) is not None and
+                bool(contact.get('visible')) == (
+                    float(contact.get('time_left')) > 0.0) and
+                isinstance(contact.get('visible_by_bot_ids'),
+                           (list, tuple)) and
+                isinstance(contact.get('visible_by_player_ids'),
+                           (list, tuple)) and
+                isinstance(contact.get('shootable_by_bot_ids'),
+                           (list, tuple)) and
+                all(_projectile_int_range(value, 1, MAX_PROJECTILE_ID)
+                    is not None for value in
+                    contact.get('visible_by_bot_ids')) and
+                all(_projectile_int_range(value, 1, MAX_PROJECTILE_ID)
+                    is not None for value in
+                    contact.get('visible_by_player_ids')) and
+                all(_projectile_int_range(value, 1, MAX_PROJECTILE_ID)
+                    is not None for value in
+                    contact.get('shootable_by_bot_ids')) and
+                len(set(contact.get('visible_by_bot_ids'))) ==
+                len(contact.get('visible_by_bot_ids')) and
+                len(set(contact.get('visible_by_player_ids'))) ==
+                len(contact.get('visible_by_player_ids')) and
+                len(set(contact.get('shootable_by_bot_ids'))) ==
+                len(contact.get('shootable_by_bot_ids')) and
+                bool(contact.get('fresh')) == bool(
+                    contact.get('visible_by_bot_ids') or
+                    contact.get('visible_by_player_ids')) and
+                (not bool(contact.get('fresh')) or
+                 bool(contact.get('visible'))) and
+                (bool(contact.get('fresh')) or
+                 not contact.get('shootable_by_bot_ids'))
                 for contact in (contacts or ()))
             if self.phase != 'battle' or not valid_contacts:
                 self.last_error = 'invalid bot observation message'

@@ -2925,6 +2925,7 @@ class BattleRuntime(object):
             record['spot_visible'] = False
             record['spot_marker_visible'] = False
             record['spot_until'] = 0.0
+            record['radio_spot_until'] = 0.0
             record['direct_spot_visible'] = False
             vehicle._spot_visible = False
             vehicle._offlineNativeDrawVisible = False
@@ -12025,18 +12026,18 @@ class BattleRuntime(object):
     def _apply_team_observation(self, message, now):
         """Apply server-validated team radio spotting to presentation.
 
-        Each client performs native LOS only for its own tank.  The server
-        merges those human reports with the elected bot authority's contacts
-        and relays one canonical team view here.  Ten-second memory and the
-        local 565 m presentation AOI remain client-side stock behaviour.
+        The hidden worker performs native LOS for both bot and player
+        observers; the server validates and relays one canonical team view
+        here.  The worker owns the relative visibility clock, while the local
+        565 m presentation AOI remains stock client behaviour.
         """
         if message.get('type') != 'bot_observation' or self.client is None:
             return False
         local_team = int(self.client.team)
         now = float(now)
+        deadlines = {}
         for contact in message.get('contacts') or ():
             if (not isinstance(contact, dict) or
-                    not bool(contact.get('visible')) or
                     int(contact.get('observing_team', 0)) != local_team):
                 continue
             kind = contact.get('target_kind')
@@ -12047,15 +12048,27 @@ class BattleRuntime(object):
                 target_id = int(contact.get('target_id'))
             except (TypeError, ValueError):
                 continue
-            record = self._records.get('%s:%s' % (
-                record_kind, target_id))
-            if (record is None or record.get('local') or
+            try:
+                time_left = float(contact.get('time_left'))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('team spot memory time is invalid')
+            if (math.isnan(time_left) or math.isinf(time_left) or
+                    time_left < 0.0 or
+                    time_left > spotting.DESIGNATED_SPOT_MEMORY_SECONDS or
+                    bool(contact.get('visible')) != (time_left > 0.0)):
+                raise ValueError('team spot memory time is invalid')
+            deadlines[(record_kind, target_id)] = now + time_left
+
+        # This is a complete worker-owned relative snapshot.  Replace its
+        # radio clock, including zero/absent contacts, so a remembered
+        # positive can never renew itself at each relay.
+        for record in self._records.values():
+            if (record.get('local') or
                     int((record.get('state') or {}).get('team', 0)) ==
                     local_team):
                 continue
-            record['spot_until'] = max(
-                float(record.get('spot_until', 0.0)),
-                now + spotting.SPOT_MEMORY_SECONDS)
+            key = (record.get('kind'), int(record.get('network_id', 0)))
+            record['radio_spot_until'] = float(deadlines.get(key, 0.0))
 
         changed = False
         for record in self._records.values():
@@ -12067,7 +12080,9 @@ class BattleRuntime(object):
             entity = self._server_entity(record['engine_id'])
             if entity is None:
                 continue
-            remembered = now < float(record.get('spot_until', 0.0))
+            remembered = now < max(
+                float(record.get('spot_until', 0.0)),
+                float(record.get('radio_spot_until', 0.0)))
             previous = (
                 bool(record.get('spot_visible', False)),
                 bool(record.get(
@@ -12090,7 +12105,7 @@ class BattleRuntime(object):
             contact.get('target_kind') == 'human' and
             int(contact.get('target_id', -1)) == local_id and
             int(contact.get('observing_team', 0)) != local_team and
-            bool(contact.get('visible'))
+            bool(contact.get('fresh'))
             for contact in (message.get('contacts') or ())
             if isinstance(contact, dict))
         self._sixth_sense.observe(visible, now)
@@ -15434,7 +15449,8 @@ class BattleRuntime(object):
             'spot_marker_visible': bot_planner.bot_initially_visible(
                 int(state.get('team', 1)),
                 int(getattr(self.client, 'team', 1)), True),
-            'spot_until': 0.0, 'spot_next': 0.0,
+            'spot_until': 0.0, 'radio_spot_until': 0.0,
+            'spot_next': 0.0,
             'shot_penalty_until': float(
                 state.get('shot_penalty_until', 0.0) or 0.0),
             'ready_deadline': self._clock() + float(
@@ -16674,7 +16690,9 @@ class BattleRuntime(object):
             # A destroyed vehicle stops earning new spots but keeps the memory
             # it already has, so its marker survives long enough to show the
             # destroyed style instead of vanishing the frame it dies.
-            remembered = now < float(record.get('spot_until', 0.0))
+            remembered = now < max(
+                float(record.get('spot_until', 0.0)),
+                float(record.get('radio_spot_until', 0.0)))
             # Team memory owns the marker.  The ordinary 565 m vehicle AOI
             # owns the model except while an SPG is using strategic view.
             previous = (

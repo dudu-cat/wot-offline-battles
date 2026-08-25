@@ -47,6 +47,7 @@ from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import player_critical_mechanics
 from gui.mods.offline_lan_0922 import siege_mechanics
+from gui.mods.offline_lan_0922 import spotting
 from gui.mods.offline_lan_0922 import vehicle_physics
 from gui.mods.offline_lan_0922.ai import planner as bot_planner
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
@@ -1719,6 +1720,7 @@ class BattleState:
         self.round_participants = {}
         self.track_immobilisers = {}
         self.player_spotted = {}
+        self.bot_spotted = {}
         self.player_environment = {}
         self.player_environment_seq = -1
         self.player_environment_authority_epoch = -1
@@ -2753,6 +2755,7 @@ class BattleState:
         self.round_participants = {}
         self.track_immobilisers = {}
         self.player_spotted = {}
+        self.bot_spotted = {}
         self.player_environment = {}
         self.player_environment_seq = -1
         self.player_environment_authority_epoch = -1
@@ -4080,8 +4083,11 @@ class BattleState:
             known_players = dict(
                 (int(player.player_id), player)
                 for player in self.players.values()
-                if (player.connected and player.participating and
-                    player.alive))
+                if player.connected and player.participating)
+            known_bots = self.bot_planner.known_bots(
+                self.bot_manifest, list(self.bot_states.values()))
+            direct_bot_spots = dict(
+                (bot_id, set()) for bot_id in known_bots)
             direct_player_spots = dict(
                 (reporter_id, set()) for reporter_id in known_players)
             human_visible = set()
@@ -4101,8 +4107,15 @@ class BattleState:
                 contact = dict(raw) if isinstance(raw, dict) else raw
                 if (not isinstance(contact, dict) or
                         not isinstance(contact.get("visible"), bool) or
+                        not isinstance(contact.get("fresh"), bool) or
+                        not isinstance(contact.get(
+                            "visible_by_bot_ids"), (list, tuple)) or
                         not isinstance(contact.get(
                             "visible_by_player_ids"), (list, tuple)) or
+                        not isinstance(contact.get(
+                            "shootable_by_bot_ids"), (list, tuple)) or
+                        len(contact.get("visible_by_bot_ids")) >
+                        len(known_bots) or
                         len(contact.get("visible_by_player_ids")) >
                         len(known_players)):
                     return False
@@ -4113,6 +4126,9 @@ class BattleState:
                         contact.get("target_id"), 1, PROJECTILE_MAX_ID)
                     target_team = _exact_int(
                         contact.get("target_team"), 1, 2)
+                    time_left = _bounded_float(
+                        contact.get("time_left"), 0.0,
+                        spotting.DESIGNATED_SPOT_MEMORY_SECONDS)
                 except ValueError:
                     return False
                 target_kind = contact.get("target_kind")
@@ -4122,6 +4138,21 @@ class BattleState:
                         target_team != int(target.get("team", 0)) or
                         not bool(target.get("alive", True))):
                     return False
+                bot_observer_ids = []
+                for raw_bot_id in contact.get("visible_by_bot_ids"):
+                    try:
+                        bot_id = _exact_int(
+                            raw_bot_id, 1, PROJECTILE_MAX_ID)
+                    except ValueError:
+                        return False
+                    bot = known_bots.get(bot_id)
+                    if (bot is None or not bot.get("alive") or
+                            int(bot.get("team", 0)) != observing_team or
+                            bot_id in bot_observer_ids):
+                        return False
+                    bot_observer_ids.append(bot_id)
+                contact["visible_by_bot_ids"] = sorted(bot_observer_ids)
+
                 observer_ids = []
                 for raw_observer_id in contact.get(
                         "visible_by_player_ids"):
@@ -4139,8 +4170,32 @@ class BattleState:
                 if observer_ids and not contact["visible"]:
                     return False
                 contact["visible_by_player_ids"] = sorted(observer_ids)
+                shooter_ids = []
+                for raw_bot_id in contact.get("shootable_by_bot_ids"):
+                    try:
+                        bot_id = _exact_int(
+                            raw_bot_id, 1, PROJECTILE_MAX_ID)
+                    except ValueError:
+                        return False
+                    bot = known_bots.get(bot_id)
+                    if (bot is None or not bot.get("alive") or
+                            int(bot.get("team", 0)) != observing_team or
+                            bot_id in shooter_ids):
+                        return False
+                    shooter_ids.append(bot_id)
+                contact["shootable_by_bot_ids"] = sorted(shooter_ids)
+                fresh = bool(bot_observer_ids or observer_ids)
+                if (contact["fresh"] != fresh or
+                        contact["visible"] != (time_left > 0.0) or
+                        (fresh and not contact["visible"]) or
+                        (not fresh and shooter_ids)):
+                    return False
+                contact["time_left"] = time_left
                 result_kind = ("player" if target_kind == "human"
                                else target_kind)
+                for bot_id in bot_observer_ids:
+                    direct_bot_spots[bot_id].add(
+                        (result_kind, target_id))
                 for observer_id in observer_ids:
                     direct_player_spots[observer_id].add(
                         (result_kind, target_id))
@@ -4163,10 +4218,9 @@ class BattleState:
             valid_hidden = any(
                 self._valid_hidden_observation(contact, known_targets)
                 for contact in contacts)
-            known_bots = self.bot_planner.known_bots(
-                self.bot_manifest, list(self.bot_states.values()))
             accepted_affordances = self.bot_planner.report_affordances(
                 message.get("affordances"), known_bots, known_targets, now)
+            self._replace_bot_spotted(direct_bot_spots)
             self._replace_player_spotted(direct_player_spots)
             if (self.client_build == CLIENT_BUILD_0922 and
                     accepted_visibility):
@@ -4184,6 +4238,24 @@ class BattleState:
             return bool(
                 accepted_contacts > 0 or accepted_affordances > 0 or
                 valid_hidden)
+
+    def _replace_bot_spotted(self, direct_spots):
+        """Commit one complete validated Bot direct-spot batch."""
+        for bot_id in tuple(self.bot_spotted):
+            if bot_id not in direct_spots:
+                self.bot_spotted.pop(bot_id, None)
+        for bot_id in sorted(direct_spots):
+            spotted = frozenset(direct_spots[bot_id])
+            self.bot_spotted[int(bot_id)] = spotted
+            reporter = ("bot", int(bot_id))
+            for target in spotted:
+                interaction = self._statistics_interaction(reporter, target)
+                if interaction["spotted"]:
+                    continue
+                interaction["spotted"] = 1
+                row = self._statistics_row(*reporter)
+                row["spotted"] = int(row.get("spotted", 0)) + 1
+        return True
 
     def _replace_player_spotted(self, direct_spots):
         """Commit a complete human direct-spot batch from the worker."""
@@ -9787,7 +9859,7 @@ class BattleState:
             return True
 
     def _radio_assisters(self, attacker, target, target_team):
-        """Return live players whose own spotted set contains this target."""
+        """Return live direct observers whose set contains this target."""
         result = []
         for reporter_id in sorted(self.player_spotted):
             reporter = self.players.get(reporter_id)
@@ -9797,6 +9869,15 @@ class BattleState:
                     target not in self.player_spotted[reporter_id]):
                 continue
             result.append(("player", reporter_id))
+        for bot_id in sorted(self.bot_spotted):
+            bot = self.bot_states.get(bot_id)
+            reporter = ("bot", int(bot_id))
+            if (bot is None or not bot.get("alive") or
+                    int(bot.get("team", 0)) == target_team or
+                    reporter == attacker or
+                    target not in self.bot_spotted[bot_id]):
+                continue
+            result.append(reporter)
         return result
 
     def _vehicle_statistics_payload(self):

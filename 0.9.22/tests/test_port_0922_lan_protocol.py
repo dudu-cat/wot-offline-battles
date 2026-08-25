@@ -764,6 +764,10 @@ class LanProtocolTests(unittest.TestCase):
             'contacts': [{
                 'observing_team': 2, 'target_kind': 'human',
                 'target_id': 1, 'target_team': 1, 'visible': True,
+                'fresh': True, 'time_left': 10.0,
+                'visible_by_bot_ids': [11],
+                'visible_by_player_ids': [],
+                'shootable_by_bot_ids': [],
             }],
         }
 

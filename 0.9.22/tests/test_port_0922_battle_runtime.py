@@ -6600,9 +6600,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             observe=lambda visible, now: observed.append((visible, now)))
         message = {'type': 'bot_observation', 'contacts': [
             {'target_kind': 'human', 'target_id': 7,
-             'observing_team': 1, 'visible': True},
+             'observing_team': 1, 'visible': True, 'fresh': True},
             {'target_kind': 'human', 'target_id': 7,
-             'observing_team': 2, 'visible': True},
+             'observing_team': 2, 'visible': True, 'fresh': True},
         ]}
 
         self.assertTrue(battle._observe_local_vehicle(message, 12.5))
@@ -6627,7 +6627,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'contacts': [{
                 'target_kind': 'human', 'target_id': 1,
                 'target_team': 1, 'observing_team': 2,
-                'visible': True,
+                'visible': True, 'fresh': True, 'time_left': 10.0,
+                'visible_by_bot_ids': [11],
+                'visible_by_player_ids': [],
+                'shootable_by_bot_ids': [],
             }],
         }
 
@@ -6644,7 +6647,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         hidden = dict(guest_target)
         hidden['contacts'] = [dict(
-            guest_target['contacts'][0], visible=False)]
+            guest_target['contacts'][0], visible=False, fresh=False,
+            time_left=0.0, visible_by_bot_ids=[])]
         self.assertFalse(guest.on_bot_observation(hidden))
         self.assertEqual(1, sum(1 for visible, unused_now in guest_observed
                                 if visible))
@@ -15796,7 +15800,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'engine_id': 12, 'network_id': 17, 'kind': 'bot',
             'ready': True, 'local': False, 'presentation': True,
             'tombstone': False, 'spot_visible': False,
-            'spot_until': 0.0, 'spot_next': 10.0,
+            'spot_until': 0.0, 'radio_spot_until': 0.0,
+            'spot_next': 10.0,
             'state': {'team': 2, 'health': 500, 'alive': True}}
         battle._records = {'bot:17': record}
         sightings = iter((False, True))
@@ -16157,12 +16162,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'contacts': [{
                 'observing_team': 1, 'target_team': 2,
                 'target_kind': 'bot', 'target_id': 17,
-                'visible': True,
+                'visible': True, 'fresh': True, 'time_left': 10.0,
+                'visible_by_bot_ids': [11],
+                'visible_by_player_ids': [],
+                'shootable_by_bot_ids': [],
             }],
         }, 10.0))
 
         self.assertTrue(target['spot_visible'])
-        self.assertEqual(20.0, target['spot_until'])
+        self.assertEqual(0.0, target['spot_until'])
+        self.assertEqual(20.0, target['radio_spot_until'])
         battle._spot_line_of_sight.assert_not_called()
         self.assertNotIn('spot_feedback_sent', target)
         self.assertEqual([], battle._avatar.battle_events)

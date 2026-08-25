@@ -281,6 +281,24 @@ def _player_dynamic_spotting(snapshot, state):
     return key, row
 
 
+def _player_spotting_perk(snapshot, state, wanted):
+    """Return whether a living projected crewman carries one finished perk."""
+    wanted = str(wanted).lower()
+    critical = state.get('critical')
+    critical = critical if isinstance(critical, dict) else {}
+    knocked_out = set(str(name) for name in
+                      (critical.get('crew_ko') or ()))
+    for member in (snapshot.get('crew') or {}).get('members') or ():
+        if str(member.get('instance')) in knocked_out:
+            continue
+        for skill in member.get('skills') or ():
+            if (str(skill.get('name')).lower() == wanted and
+                    skill.get('active') is True and
+                    _number(skill.get('level')) >= 100.0):
+                return True
+    return False
+
+
 def _forward_speed(descriptor):
     physics = _value(descriptor, 'physics', {}) or {}
     limits = _value(physics, 'speedLimits', (14.0, 7.0))
@@ -1762,6 +1780,11 @@ class BotRuntime(object):
         self._visibility_cache = {}
         self._team_visibility_cache = {}
         self._visible_target_poses = {}
+        self._spot_until = {}
+        self._human_observer_alive = {}
+        self._human_last_alive_critical = {}
+        self._human_direct_targets = {}
+        self._human_vengeance_until = {}
         self._server_orders = {}
         self._server_order_tokens = {}
         self._order_revision = -1
@@ -2417,6 +2440,11 @@ class BotRuntime(object):
             self._visibility_cache = {}
             self._team_visibility_cache = {}
             self._visible_target_poses = {}
+            self._spot_until = {}
+            self._human_observer_alive = {}
+            self._human_last_alive_critical = {}
+            self._human_direct_targets = {}
+            self._human_vengeance_until = {}
             self._server_orders = {}
             self._server_order_tokens = {}
             self._order_revision = -1
@@ -2456,6 +2484,11 @@ class BotRuntime(object):
             self._visibility_cache = {}
             self._team_visibility_cache = {}
             self._visible_target_poses = {}
+            self._spot_until = {}
+            self._human_observer_alive = {}
+            self._human_last_alive_critical = {}
+            self._human_direct_targets = {}
+            self._human_vengeance_until = {}
             self._visibility_fire = {}
             self._visibility_still = {}
             self._shot_los_cache = {}
@@ -3714,6 +3747,83 @@ class BotRuntime(object):
         return (target.get('kind'),
                 int(target.get('network_id', target.get('id', 0))))
 
+    def _renew_team_spot(self, key, now, duration=None):
+        """Renew one worker-owned team visibility lease monotonically."""
+        if duration is None:
+            duration = spotting.SPOT_MEMORY_SECONDS
+        duration = max(
+            0.0, min(spotting.DESIGNATED_SPOT_MEMORY_SECONDS,
+                     _number(duration)))
+        deadline = _number(now) + duration
+        self._spot_until[key] = max(
+            float(self._spot_until.get(key, 0.0)), deadline)
+        return True
+
+    def _team_spot_time_left(self, key, now):
+        remaining = float(self._spot_until.get(key, 0.0)) - _number(now)
+        if remaining <= 0.0:
+            self._spot_until.pop(key, None)
+            return 0.0
+        return min(spotting.DESIGNATED_SPOT_MEMORY_SECONDS, remaining)
+
+    def _track_human_observer_lifecycle(self, players, now):
+        """Open Last Effort only on one observed alive-to-dead edge."""
+        present = set()
+        for raw in players or ():
+            if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            player_id = int(raw.get('id'))
+            present.add(player_id)
+            alive = bool(raw.get('alive', True))
+            previous = self._human_observer_alive.get(player_id)
+            if previous is True and not alive:
+                snapshot = _player_effective_params(raw)
+                prior = {
+                    'critical': self._human_last_alive_critical.get(
+                        player_id, {})}
+                if _player_spotting_perk(
+                        snapshot, prior, 'radioman_lasteffort'):
+                    self._human_vengeance_until[player_id] = (
+                        _number(now) + spotting.LAST_EFFORT_SECONDS)
+            elif alive:
+                critical = raw.get('critical')
+                self._human_last_alive_critical[player_id] = dict(
+                    critical if isinstance(critical, dict) else {})
+                self._human_vengeance_until.pop(player_id, None)
+            self._human_observer_alive[player_id] = alive
+        for player_id in tuple(self._human_observer_alive):
+            if player_id in present:
+                continue
+            self._human_observer_alive.pop(player_id, None)
+            self._human_last_alive_critical.pop(player_id, None)
+            self._human_direct_targets.pop(player_id, None)
+            self._human_vengeance_until.pop(player_id, None)
+            self._source_still.pop(('human', player_id), None)
+        for player_id, deadline in tuple(
+                self._human_vengeance_until.items()):
+            if _number(now) >= float(deadline):
+                self._human_vengeance_until.pop(player_id, None)
+                self._human_direct_targets.pop(player_id, None)
+        return True
+
+    @staticmethod
+    def _designated_spot_duration(source, target, snapshot):
+        """Apply Designated Target only inside its proved five-degree sector."""
+        if not _player_spotting_perk(
+                snapshot, source, 'gunner_rancorous'):
+            return spotting.SPOT_MEMORY_SECONDS
+        source_position = _position(source)
+        target_position = target.get('position') or _position(target)
+        dx = _number(target_position[0]) - _number(source_position[0])
+        dz = _number(target_position[2]) - _number(source_position[2])
+        if dx * dx + dz * dz <= 0.000001:
+            return spotting.DESIGNATED_SPOT_MEMORY_SECONDS
+        bearing = math.atan2(dx, dz)
+        gun_yaw = _number(source.get('aim_yaw'), source.get('yaw'))
+        if abs(_angle_delta(bearing, gun_yaw)) <= math.radians(5.0) + 1e-9:
+            return spotting.DESIGNATED_SPOT_MEMORY_SECONDS
+        return spotting.SPOT_MEMORY_SECONDS
+
     def _human_observation_target(self, raw):
         target = dict(raw)
         player_id = int(raw.get('network_id', raw.get('id', 0)))
@@ -3739,7 +3849,7 @@ class BotRuntime(object):
 
     def _append_human_observations(
             self, players, now, aggregate, team_visibility):
-        """Merge hidden-worker human LOS into the canonical contact batch."""
+        """Merge trusted human direct observers into the contact batch."""
         human_targets = [
             self._human_observation_target(raw)
             for raw in players or ()
@@ -3752,8 +3862,7 @@ class BotRuntime(object):
         targets = human_targets + bot_targets
 
         for raw in players or ():
-            if (not isinstance(raw, dict) or raw.get('id') is None or
-                    not raw.get('alive', True)):
+            if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
             source = dict(raw)
             source['kind'] = 'human'
@@ -3762,17 +3871,34 @@ class BotRuntime(object):
             source_team = int(source.get('team', 0))
             if source_team not in (1, 2) or source['id'] <= 0:
                 raise ValueError('human observer identity is invalid')
-            self._note_human_source_stillness(source, now)
+            alive = bool(source.get('alive', True))
+            if alive:
+                self._note_human_source_stillness(source, now)
+                direct_targets = set()
+                for target in targets:
+                    if int(target.get('team', 0)) == source_team:
+                        continue
+                    if self._visible(source, target, now):
+                        direct_targets.add(self._observer_target_key(target))
+                self._human_direct_targets[source['id']] = direct_targets
+            elif _number(now) < float(self._human_vengeance_until.get(
+                    source['id'], 0.0)):
+                direct_targets = set(self._human_direct_targets.get(
+                    source['id'], ()))
+            else:
+                direct_targets = set()
+
+            snapshot = _player_effective_params(source)
             for target in targets:
                 if int(target.get('team', 0)) == source_team:
                     continue
                 target_key = self._observer_target_key(target)
                 key = (source_team, target_key[0], target_key[1])
-                direct_visible = self._visible(source, target, now)
+                direct_visible = target_key in direct_targets
                 entry = aggregate.get(key)
                 if entry is None:
-                    # visible, bot firing lanes, target, human observers
-                    entry = [False, set(), target, set()]
+                    # visible, firing lanes, target, human and bot observers
+                    entry = [False, set(), target, set(), set()]
                     aggregate[key] = entry
                 entry[0] = bool(entry[0] or direct_visible)
                 entry[2] = target
@@ -3780,6 +3906,21 @@ class BotRuntime(object):
                     continue
                 entry[3].add(source['id'])
                 team_visibility[key] = True
+                remembered = {
+                    'position': _position(target),
+                    'x': _number(target.get('x')),
+                    'y': _number(target.get('y')),
+                    'z': _number(target.get('z')),
+                    'yaw': _number(target.get('yaw')),
+                    'speed': _number(target.get('speed')),
+                }
+                self._visible_target_poses[key] = remembered
+                entry[2].update(remembered)
+                duration = spotting.SPOT_MEMORY_SECONDS
+                if alive:
+                    duration = self._designated_spot_duration(
+                        source, target, snapshot)
+                self._renew_team_spot(key, now, duration)
         return True
 
     def _contacts_for(self, source, players, now, team_spotted=None):
@@ -3790,7 +3931,7 @@ class BotRuntime(object):
         def retain_team_known_pose(target):
             key = (source_team, target.get('kind'),
                    int(target.get('network_id', 0)))
-            if target['visible']:
+            if target['fresh_visible']:
                 remembered = {
                     'position': _position(target),
                     'x': _number(target.get('x')),
@@ -3812,29 +3953,25 @@ class BotRuntime(object):
                     'x': 0.0, 'y': 0.0, 'z': 0.0,
                     'yaw': 0.0, 'speed': 0.0,
                 })
+                target['visible'] = False
                 return False
             target.update(remembered)
-            return True
+            return bool(target.get('visible'))
 
         def visible_to_team(target):
-            if team_spotted is None:
-                return self._visible(source, target, now)
             key = (source_team, target.get('kind'),
                    int(target.get('network_id', 0)))
-            # A positive direct spot is relayed to the whole team in the same
-            # authority tick.  Never share a negative result: another observer
-            # may have a clear angle and must still run its own exact probe.
-            team_sample = self._team_visibility_cache.get(key)
-            if (team_spotted.get(key, False) or
-                    (team_sample is not None and
-                     _number(now) - team_sample < VISIBILITY_MIN_SECONDS)):
+            direct_visible = self._visible(source, target, now)
+            if direct_visible:
+                self._renew_team_spot(key, now)
+            if direct_visible and team_spotted is not None:
                 team_spotted[key] = True
-                return True
-            value = self._visible(source, target, now)
-            if value:
-                team_spotted[key] = True
-                self._team_visibility_cache[key] = _number(now)
-            return value
+            remembered = self._team_spot_time_left(key, now) > 0.0
+            fresh_shared = bool(
+                team_spotted is not None and team_spotted.get(key, False))
+            return (bool(direct_visible or remembered or fresh_shared),
+                    bool(direct_visible),
+                    bool(direct_visible or fresh_shared))
 
         for raw in players or ():
             if (not isinstance(raw, dict) or raw.get('id') is None or
@@ -3850,7 +3987,8 @@ class BotRuntime(object):
             vehicle_profile = self._player_vehicle_profile(raw)
             target['class_tag'] = vehicle_profile['class_tag']
             target['armor'] = vehicle_profile['armor']
-            target['visible'] = visible_to_team(target)
+            (target['visible'], target['direct_visible'],
+             target['fresh_visible']) = visible_to_team(target)
             if retain_team_known_pose(target):
                 lookup[planner_id] = target
             contacts.append(target)
@@ -3862,7 +4000,8 @@ class BotRuntime(object):
             target['kind'] = 'bot'
             target['network_id'] = int(bot_id)
             target['position'] = _position(raw)
-            target['visible'] = visible_to_team(target)
+            (target['visible'], target['direct_visible'],
+             target['fresh_visible']) = visible_to_team(target)
             if retain_team_known_pose(target):
                 lookup[int(bot_id)] = target
             contacts.append(target)
@@ -3882,7 +4021,7 @@ class BotRuntime(object):
         """Copy one cached contact and overlay one canonical live record."""
         target = dict(cached)
         if live is not None:
-            if target.get('visible') is True:
+            if target.get('fresh_visible') is True:
                 target['position'] = _position(live)
                 pose_fields = ('x', 'y', 'z', 'yaw', 'speed')
             else:
@@ -6199,8 +6338,7 @@ class BotRuntime(object):
         self._shot_los_deadlines[key] = observation_time
         return True
 
-    @staticmethod
-    def _pack_observations(aggregate):
+    def _pack_observations(self, aggregate, now):
         """Serialise one lightweight record per canonical team target.
 
         Lane checks remain in the per-bot loop so their cache and native-probe
@@ -6213,17 +6351,40 @@ class BotRuntime(object):
             row = aggregate[key]
             target_visible, shootable, observed_target = row[:3]
             visible_by_players = row[3] if len(row) > 3 else ()
+            visible_by_bots = row[4] if len(row) > 4 else ()
+            time_left = self._team_spot_time_left(key, now)
+            visible = bool(time_left > 0.0)
+            remembered = self._visible_target_poses.get(key)
+            if visible and remembered is None:
+                # A fresh authority starts with no inherited pose.  A lease
+                # without one is not renderable and must not expose the
+                # simulator's current omniscient target state.
+                visible = False
+                time_left = 0.0
+            elif visible:
+                observed_target.update(remembered)
+            fresh = bool(
+                visible and (visible_by_players or visible_by_bots))
+            if not fresh:
+                shootable = ()
+            if not visible:
+                visible_by_players = ()
+                visible_by_bots = ()
+                time_left = 0.0
             profile = observed_target.get('profile')
             profile = profile if isinstance(profile, dict) else {}
             packed.append({
                 'observing_team': key[0], 'target_kind': key[1],
                 'target_id': key[2],
                 'target_team': int(observed_target.get('team', 0)),
-                'visible': bool(target_visible),
+                'visible': visible,
+                'fresh': fresh,
+                'time_left': round(time_left, 6),
                 # These identities are produced only by the hidden worker's
                 # native LOS probes. Visible clients cannot submit this
                 # authority message.
                 'visible_by_player_ids': sorted(visible_by_players),
+                'visible_by_bot_ids': sorted(visible_by_bots),
                 # Current clients always publish this field. An empty list
                 # means team-spotted without a local firing lane; the server
                 # rejects omission rather than guessing.
@@ -6950,6 +7111,7 @@ class BotRuntime(object):
         self._advance_probe_timing(now)
         self._advance_equipment_clock(frame_step)
         players = list(players or [])
+        self._track_human_observer_lifecycle(players, now)
         live_players = None
         live_probe_targets = {}
         processed_bot_ids = set()
@@ -7178,15 +7340,30 @@ class BotRuntime(object):
                     raise ValueError(
                         'canonical contact visible flag is invalid')
                 target_visible = bool(cached_target['visible'])
+                direct_visible = bool(cached_target.get('direct_visible'))
+                fresh_visible = bool(cached_target.get('fresh_visible'))
                 team_visibility[key] = bool(
-                    target_visible or team_visibility.get(key, False))
+                    fresh_visible or team_visibility.get(key, False))
+                if fresh_visible:
+                    remembered = {
+                        'position': _position(observed_target),
+                        'x': _number(observed_target.get('x')),
+                        'y': _number(observed_target.get('y')),
+                        'z': _number(observed_target.get('z')),
+                        'yaw': _number(observed_target.get('yaw')),
+                        'speed': _number(observed_target.get('speed')),
+                    }
+                    self._visible_target_poses[key] = remembered
+                    observed_target.update(remembered)
                 if collect_observation:
                     entry = observation_entries.get(key)
                     if entry is None:
-                        entry = [False, set(), observed_target, set()]
+                        entry = [False, set(), observed_target, set(), set()]
                         observation_entries[key] = entry
                     entry[0] = bool(target_visible or entry[0])
                     entry[2] = observed_target
+                    if direct_visible:
+                        entry[4].add(int(state['id']))
                 observation_pairs.append((
                     lane_source, observed_target, lane_key, key, [None]))
             target_id = command.get('target_id')
@@ -7858,7 +8035,8 @@ class BotRuntime(object):
             self._next_observation = _number(now) + OBSERVATION_SECONDS
             outgoing.append({
                 'type': 'bot_observation',
-                'contacts': self._pack_observations(observation_entries),
+                'contacts': self._pack_observations(
+                    observation_entries, now),
                 'affordances': list(completed_affordances),
             })
         return outgoing

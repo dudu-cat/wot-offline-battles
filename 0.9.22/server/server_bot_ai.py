@@ -169,6 +169,9 @@ class BotPlanner(object):
             if not bool(target.get("alive", True)):
                 continue
             visible = bool(raw.get("visible", True))
+            fresh = bool(raw.get("fresh", visible))
+            time_left = max(0.0, _number(
+                raw.get("time_left"), 10.0 if visible else 0.0))
             contact_key = (target_kind, target_id)
             previous = self._contacts[observing_team].get(contact_key)
             if visible:
@@ -195,6 +198,14 @@ class BotPlanner(object):
                         "target_id": target_id,
                         "target_team": _integer(target.get("team")),
                         "visible": True,
+                        "fresh": fresh,
+                        "time_left": time_left,
+                        "visible_by_bot_ids": self._bot_id_list(
+                            raw.get("visible_by_bot_ids")),
+                        "visible_by_player_ids": self._bot_id_list(
+                            raw.get("visible_by_player_ids")),
+                        "shootable_by_bot_ids": self._bot_id_list(
+                            raw.get("shootable_by_bot_ids")),
                     })
             elif previous is not None:
                 previous["visible"] = False
@@ -207,6 +218,11 @@ class BotPlanner(object):
                         "target_id": target_id,
                         "target_team": _integer(target.get("team")),
                         "visible": False,
+                        "fresh": False,
+                        "time_left": 0.0,
+                        "visible_by_bot_ids": [],
+                        "visible_by_player_ids": [],
+                        "shootable_by_bot_ids": [],
                     })
         return accepted
 

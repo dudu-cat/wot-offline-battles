@@ -858,12 +858,16 @@ class ServerBotObservationRelayTests(unittest.TestCase):
 
     @staticmethod
     def _message(round_id, visible=True, target_id=2):
+        observer_ids = [11] if visible else []
         return {
             'type': 'bot_observation', 'round_id': round_id,
             'contacts': [{
                 'observing_team': 2, 'target_kind': 'human',
                 'target_id': target_id, 'target_team': 1,
                 'visible': bool(visible),
+                'fresh': bool(visible),
+                'time_left': 10.0 if visible else 0.0,
+                'visible_by_bot_ids': observer_ids,
                 'visible_by_player_ids': [],
                 'shootable_by_bot_ids': [],
                 'x': 10.0, 'y': 0.0, 'z': 20.0,
@@ -874,13 +878,17 @@ class ServerBotObservationRelayTests(unittest.TestCase):
 
     @staticmethod
     def _human_message(round_id, observer_ids=(1,), visible=True):
+        observer_ids = list(observer_ids) if visible else []
         return {
             'type': 'bot_observation', 'round_id': round_id,
             'contacts': [{
                 'observing_team': 1, 'target_kind': 'bot',
                 'target_id': 11, 'target_team': 2,
                 'visible': bool(visible),
-                'visible_by_player_ids': list(observer_ids),
+                'fresh': bool(visible),
+                'time_left': 10.0 if visible else 0.0,
+                'visible_by_bot_ids': [],
+                'visible_by_player_ids': observer_ids,
                 'shootable_by_bot_ids': [],
                 'x': 20.0, 'y': 0.0, 'z': 20.0,
                 'health': 1000, 'max_health': 1000,
@@ -896,15 +904,37 @@ class ServerBotObservationRelayTests(unittest.TestCase):
             self._message(server.round_id))
 
         self.assertIsInstance(relay, dict)
+        self.assertEqual(frozenset((('player', 2),)),
+                         server.bot_spotted[11])
         self.assertEqual({
             'observing_team': 2, 'target_kind': 'human',
             'target_id': 2, 'target_team': 1, 'visible': True,
+            'fresh': True, 'time_left': 10.0,
+            'visible_by_bot_ids': [11],
+            'visible_by_player_ids': [],
+            'shootable_by_bot_ids': [],
         }, relay['contacts'][0])
         self.assertTrue(server.broadcast_bot_observation(relay))
         for connection in (authority_socket, guest_socket):
             payloads = [json.loads(value.decode('utf-8'))
                         for value in connection.payloads]
             self.assertEqual([relay], payloads)
+
+    def test_memory_contact_rejects_freshness_and_shooter_mismatches(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        bad_time = self._message(server.round_id)
+        bad_time['contacts'][0]['time_left'] = 0.0
+        remembered_shooter = self._message(server.round_id)
+        remembered_shooter['contacts'][0].update({
+            'fresh': False,
+            'visible_by_bot_ids': [],
+            'shootable_by_bot_ids': [11],
+        })
+
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, bad_time))
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, remembered_shooter))
 
     def test_valid_first_hidden_observation_is_a_noop_not_a_rejection(self):
         server, authority_socket, guest_socket = self._server()
@@ -8880,7 +8910,8 @@ class BotRuntimeTests(unittest.TestCase):
 
         contacts, unused_lookup = runtime._contacts_for(
             source, [player], 1.80)
-        self.assertFalse(contacts[0]['visible'])
+        self.assertTrue(contacts[0]['visible'])
+        self.assertFalse(contacts[0]['fresh_visible'])
 
         player.update(z=365.0, speed=10.0)
         contacts, unused_lookup = runtime._contacts_for(
@@ -8914,7 +8945,9 @@ class BotRuntimeTests(unittest.TestCase):
                       speed=20.0, health=700)
         contacts, lookup = runtime._contacts_for(source, [player], 1.1)
         hidden_human = lookup[planner_id]
-        self.assertFalse(contacts[0]['visible'])
+        self.assertTrue(contacts[0]['visible'])
+        self.assertFalse(contacts[0]['direct_visible'])
+        self.assertFalse(contacts[0]['fresh_visible'])
         self.assertEqual((10.0, 1.0, 100.0),
                          hidden_human['position'])
         refreshed_human = runtime._refresh_target_pose(
@@ -8943,13 +8976,113 @@ class BotRuntimeTests(unittest.TestCase):
         contacts, lookup = runtime._contacts_for(source, [], 1.3)
         hidden_bot = lookup[12]
         refreshed_bot = runtime._refresh_target_pose(12, hidden_bot, {})
-        self.assertFalse(contacts[0]['visible'])
+        self.assertTrue(contacts[0]['visible'])
+        self.assertFalse(contacts[0]['fresh_visible'])
         self.assertEqual((-20.0, 0.5, 90.0),
                          refreshed_bot['position'])
         self.assertEqual((-20.0, 0.5, 90.0, -0.4, 3.0), (
             refreshed_bot['x'], refreshed_bot['y'], refreshed_bot['z'],
             refreshed_bot['yaw'], refreshed_bot['speed']))
         self.assertEqual(600, refreshed_bot['health'])
+
+    def test_worker_owned_spot_memory_expires_without_pose_refresh(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor())
+        visible = [True]
+        runtime._visible = lambda *unused: visible[0]
+        source = {
+            'id': 11, 'team': 1, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'view_range': 445.0,
+        }
+        player = _admit_player({
+            'id': 2, 'team': 2, 'alive': True,
+            'vehicle': 'ussr:R11_MS-1',
+            'x': 10.0, 'y': 1.0, 'z': 100.0,
+            'health': 900, 'max_health': 1000,
+        })
+
+        runtime._contacts_for(source, [player], 1.0)
+        visible[0] = False
+        player.update(x=80.0, z=240.0)
+        remembered, lookup = runtime._contacts_for(source, [player], 5.0)
+        self.assertTrue(remembered[0]['visible'])
+        self.assertEqual((10.0, 1.0, 100.0),
+                         lookup[self.module.HUMAN_TARGET_ID_BASE + 2][
+                             'position'])
+
+        expired, lookup = runtime._contacts_for(source, [player], 11.01)
+        self.assertFalse(expired[0]['visible'])
+        self.assertNotIn(self.module.HUMAN_TARGET_ID_BASE + 2, lookup)
+
+    def test_designated_target_uses_completed_carrier_and_five_degree_sector(self):
+        snapshot = _effective_params_snapshot()
+        snapshot['crew']['members'] = [{
+            'instance': 'gunner', 'roles': ['gunner'],
+            'skills': [{
+                'name': 'gunner_rancorous',
+                'active': True, 'level': 100.0,
+            }],
+        }]
+        source = {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'aim_yaw': 0.0, 'critical': {'crew_ko': []},
+        }
+        target = {'position': (0.0, 0.0, 100.0)}
+
+        self.assertEqual(
+            12.0, self.module.BotRuntime._designated_spot_duration(
+                source, target, snapshot))
+        source['aim_yaw'] = math.radians(5.01)
+        self.assertEqual(
+            10.0, self.module.BotRuntime._designated_spot_duration(
+                source, target, snapshot))
+        source['aim_yaw'] = 0.0
+        source['critical'] = {'crew_ko': ['gunner']}
+        self.assertEqual(
+            10.0, self.module.BotRuntime._designated_spot_duration(
+                source, target, snapshot))
+
+    def test_last_effort_reuses_only_the_alive_direct_target_set(self):
+        params = _effective_params_snapshot()
+        params['crew']['members'] = [{
+            'instance': 'radioman', 'roles': ['radioman'],
+            'skills': [{
+                'name': 'radioman_lasteffort',
+                'active': True, 'level': 100.0,
+            }],
+        }]
+        params['crew']['dynamic_spotting']['crew'] = ['radioman']
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            visibility_probe=lambda *unused: self.fail(
+                'a destroyed observer must not acquire new LOS'))
+        runtime.states = {11: {
+            'id': 11, 'team': 2, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 100.0,
+            'health': 100, 'max_health': 100,
+        }}
+        alive = {
+            'id': 1, 'team': 1, 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'critical': {'crew_ko': []},
+            'effective_params': params,
+        }
+        runtime._track_human_observer_lifecycle([alive], 1.0)
+        runtime._human_direct_targets[1] = set((('bot', 11),))
+        dead = dict(alive, alive=False,
+                    critical={'crew_ko': ['radioman']})
+        runtime._track_human_observer_lifecycle([dead], 2.0)
+
+        aggregate = {}
+        runtime._append_human_observations(
+            [dead], 2.0, aggregate, {})
+        self.assertEqual(set((1,)), aggregate[(1, 'bot', 11)][3])
+
+        runtime._track_human_observer_lifecycle([dead], 4.01)
+        aggregate = {}
+        runtime._append_human_observations(
+            [dead], 4.01, aggregate, {})
+        self.assertEqual(set(), aggregate[(1, 'bot', 11)][3])
 
     def test_first_hidden_target_has_no_live_pose_in_local_lookup(self):
         runtime = self.module.BotRuntime(
@@ -10141,8 +10274,17 @@ class BotRuntimeTests(unittest.TestCase):
 
         aggregate = {}
         for target_id, target in by_network_id.items():
-            aggregate[(1, 'human', target_id)] = (True, set((11,)), target)
-        observations = runtime._pack_observations(aggregate)
+            key = (1, 'human', target_id)
+            aggregate[key] = (
+                True, set((11,)), target, set(), set((11,)))
+            runtime._renew_team_spot(key, 1.0)
+            runtime._visible_target_poses[key] = {
+                'position': target['position'],
+                'x': target['x'], 'y': target['y'], 'z': target['z'],
+                'yaw': target.get('yaw', 0.0),
+                'speed': target.get('speed', 0.0),
+            }
+        observations = runtime._pack_observations(aggregate, 1.0)
         planner = BotPlanner()
         known = planner.known_targets([], players)
         self.assertEqual(2, planner.report_contacts(
@@ -10650,7 +10792,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIn((11, 13), lane_pairs)
         self.assertIn((12, 13), lane_pairs)
         self.assertIn((11, 13), visibility_pairs)
-        self.assertNotIn((12, 13), visibility_pairs)
+        self.assertIn((12, 13), visibility_pairs)
+        self.assertEqual([11], contact['visible_by_bot_ids'])
 
     def test_negative_spots_remain_per_observer(self):
         visibility_pairs = []
