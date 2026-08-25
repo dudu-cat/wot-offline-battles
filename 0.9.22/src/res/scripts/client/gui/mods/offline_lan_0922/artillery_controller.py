@@ -5,6 +5,8 @@ import math
 
 from gui.mods.offline_lan_0922.artillery_arc_queue import ArcProbeQueue
 from gui.mods.offline_lan_0922 import ballistics
+from gui.mods.offline_lan_0922 import gun_pitch_limits
+from gui.mods.offline_lan_0922 import shot_geometry
 
 
 STRATEGIC_MAXIMUM_STEP = 0.20
@@ -45,15 +47,21 @@ def _target_velocity(target):
     return (math.sin(yaw) * speed, 0.0, math.cos(yaw) * speed)
 
 
-def _pitch_limits(descriptor):
+def _pitch_limits(descriptor, turret_yaw):
     gun = _value(descriptor, 'gun', {}) or {}
     limits = _value(gun, 'pitchLimits')
+    if isinstance(limits, dict) and all(
+            name in limits for name in ('minPitch', 'maxPitch')):
+        try:
+            return gun_pitch_limits.calc_pitch_limits(turret_yaw, limits)
+        except ValueError:
+            return None
     if isinstance(limits, dict):
-        limits = limits.get('absolute', limits)
+        limits = limits.get('absolute')
     try:
         return float(limits[0]), float(limits[1])
     except (TypeError, ValueError, IndexError, KeyError):
-        return -0.35, 0.15
+        return None
 
 
 def _shot(descriptor, shell_index):
@@ -78,7 +86,8 @@ def _quantized(point, scale=0.25):
 class ArtilleryController(object):
     """Create low/high candidates and publish only fully checked solutions."""
 
-    def __init__(self, queue=None, maximum_step=0.12):
+    def __init__(self, queue=None, maximum_step=0.12,
+                 origin_resolver=None):
         # A strategic job proves only the low/high arc family. Freeze it to the
         # source pose, target identity and shell while the bounded queue works;
         # moving-target pose buckets would restart long shared jobs forever.
@@ -94,6 +103,8 @@ class ArtilleryController(object):
             max_jobs=8, success_ttl=0.35, failure_ttl=0.25,
             max_job_age=40.0)
         self.maximum_step = max(0.04, min(0.20, float(maximum_step)))
+        self.origin_resolver = (
+            origin_resolver if callable(origin_resolver) else None)
         self._planning_keys = {}
         self._launch_keys = {}
         self._launch_receipts = {}
@@ -112,6 +123,8 @@ class ArtilleryController(object):
             int(source.get('id', 0)), str(target.get('kind') or ''),
             int(target_id or 0), int(shell_index),
             tuple(float(value) for value in _position(source)),
+            tuple(_number(source.get(name)) for name in (
+                'yaw', 'pitch', 'roll', 'turret_yaw', 'gun_pitch')),
         )
 
     @staticmethod
@@ -141,19 +154,30 @@ class ArtilleryController(object):
             return ()
         speed, gravity, maximum = physical
         source_position = _position(source)
-        start = (source_position[0], source_position[1] + 1.5,
-                 source_position[2])
+        if self.origin_resolver is None:
+            start = (source_position[0], source_position[1] + 1.5,
+                     source_position[2])
+        else:
+            try:
+                start = tuple(float(value) for value in
+                              self.origin_resolver(source, descriptor))
+            except (TypeError, ValueError, OverflowError):
+                return ()
+            if (len(start) != 3 or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in start)):
+                return ()
         target_position = _position(target)
         target_position = (
             target_position[0], target_position[1] + 1.0,
             target_position[2])
         velocity = _target_velocity(target)
-        minimum_pitch, maximum_pitch = _pitch_limits(descriptor)
         candidates = []
         for name, prefer_high in (('low', False), ('high', True)):
             solution = ballistics.ballistic_intercept(
                 start, target_position, velocity, speed, gravity,
-                minimum_pitch, maximum_pitch, prefer_high=prefer_high)
+                -math.pi * 0.5, math.pi * 0.5,
+                prefer_high=prefer_high)
             if solution is None:
                 continue
             aim_position, pitch, flight_time = solution
@@ -164,6 +188,24 @@ class ArtilleryController(object):
                 continue
             yaw = math.atan2(
                 aim_position[0] - start[0], aim_position[2] - start[2])
+            try:
+                local_turret_yaw, local_pitch = \
+                    shot_geometry.world_direction_to_local_gun_angles(
+                        (math.sin(yaw) * math.cos(pitch),
+                         -math.sin(pitch),
+                         math.cos(yaw) * math.cos(pitch)),
+                        _number(source.get('yaw')),
+                        _number(source.get('pitch')),
+                        _number(source.get('roll')))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            pitch_limits = _pitch_limits(descriptor, local_turret_yaw)
+            if pitch_limits is None:
+                continue
+            minimum_pitch, maximum_pitch = pitch_limits
+            if (local_pitch < minimum_pitch - 0.0001 or
+                    local_pitch > maximum_pitch + 0.0001):
+                continue
             candidates.append({
                 'aim_position': aim_position,
                 'yaw': yaw,

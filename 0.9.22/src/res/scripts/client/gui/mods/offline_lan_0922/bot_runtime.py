@@ -16,7 +16,11 @@ from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import ballistics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import effective_params
+from gui.mods.offline_lan_0922 import gun_pitch_limits
+from gui.mods.offline_lan_0922 import hull_aiming
 from gui.mods.offline_lan_0922 import prebaked_navigation
+from gui.mods.offline_lan_0922 import shot_geometry
+from gui.mods.offline_lan_0922 import siege_mechanics
 from gui.mods.offline_lan_0922 import spotting
 from gui.mods.offline_lan_0922 import loadout
 from gui.mods.offline_lan_0922 import lan_client
@@ -113,6 +117,9 @@ FRIENDLY_REPOSITION_SECONDS = 4.0
 MAX_WORLD_RECEIPTS_PER_FRAME = 13
 FIRE_DURATION_SECONDS = 10.0
 FIRE_TICK_SECONDS = 1.0
+SIEGE_ENABLE_DEBOUNCE_SECONDS = 0.30
+SIEGE_DISABLE_DEBOUNCE_SECONDS = 0.80
+SIEGE_LONG_TRAVEL_METRES = 35.0
 BOT_WATER_AVOID_DEPTH = 0.90
 BOT_DROWNING_PROBE_SECONDS = 0.30
 BOT_DROWNING_SECONDS = 10.0
@@ -441,15 +448,22 @@ def slope_pose(probe, position, yaw, half_length, half_width,
             float(last_roll) + (roll - float(last_roll)) * 0.5)
 
 
-def _gun_pitch_limits(descriptor):
+def _gun_pitch_limits(descriptor, turret_yaw=0.0):
+    """Return the installed gun envelope at the current local turret yaw."""
     gun = _value(descriptor, 'gun', {}) or {}
     limits = _value(gun, 'pitchLimits')
+    if isinstance(limits, dict) and all(
+            name in limits for name in ('minPitch', 'maxPitch')):
+        try:
+            return gun_pitch_limits.calc_pitch_limits(turret_yaw, limits)
+        except ValueError:
+            return None
     if isinstance(limits, dict):
-        limits = limits.get('absolute', limits)
+        limits = limits.get('absolute')
     try:
         return float(limits[0]), float(limits[1])
     except (TypeError, ValueError, IndexError, KeyError):
-        return -0.35, 0.15
+        return None
 
 
 def _shot_ballistics(descriptor, shell_index):
@@ -713,6 +727,7 @@ class _BotGunState(object):
         gun = _value(descriptor, 'gun', {}) or {}
         gun_modifiers = loadout.modifiers(
             descriptor, factors=loadout.attribute_factors(descriptor))
+        self.loadout = dict(gun_modifiers)
         raw_dispersion = _value(gun, 'shotDispersionAngle')
         try:
             self.fully_aimed_dispersion = (
@@ -774,6 +789,50 @@ class _BotGunState(object):
         self.reload_kind = 'full'
         self.reload_factor = 1.0
         self.restore_fire_seq(fire_seq, dispersion_factor)
+
+    def adopt_descriptor(self, descriptor):
+        """Adopt a mode descriptor without resetting active battle clocks."""
+        old_dispersion = self.dispersion
+        active_reload_duration = self.reload_duration
+        aiming_elapsed = self.aiming_elapsed
+        candidate = _BotGunState(descriptor)
+        if (candidate.shell_count != self.shell_count or
+                candidate.clip_size != self.clip_size):
+            raise RuntimeError(
+                '#1513 Siege descriptor changed the ammunition contract')
+        names = (
+            'loadout', 'fully_aimed_dispersion', 'after_shot',
+            'turret_dispersion_factor', 'aiming_time',
+            'movement_dispersion_factor', 'rotation_dispersion_factor',
+            'reload_full', 'reload_intra')
+        changed = any(getattr(self, name) != getattr(candidate, name)
+                      for name in names)
+        for name in names:
+            value = getattr(candidate, name)
+            setattr(self, name, dict(value) if isinstance(value, dict)
+                    else value)
+        # A composite descriptor changes future reload intervals only. The
+        # currently running interval and its completed fraction stay frozen.
+        self.reload_duration = active_reload_duration
+        current_factor = max(
+            1.0, old_dispersion / self.fully_aimed_dispersion)
+        self.current_dispersion_factor = current_factor
+        self.aiming_elapsed = aiming_elapsed
+        aiming_time = max(self.aiming_time, 0.1)
+        maximum_start = 1000.0
+        maximum_elapsed = (
+            aiming_time * math.log(maximum_start / current_factor)
+            if 0.0 < current_factor <= maximum_start else 0.0)
+        if aiming_elapsed > maximum_elapsed:
+            self.aiming_start_factor = max(
+                current_factor, maximum_start)
+            self.aiming_elapsed = maximum_elapsed
+        else:
+            self.aiming_start_factor = (
+                current_factor * math.exp(aiming_elapsed / aiming_time))
+        self.dispersion = (self.fully_aimed_dispersion *
+                           self.current_dispersion_factor)
+        return changed
 
     def restore_fire_seq(self, fire_seq, dispersion_factor=1.0,
                          reload_time=None, reload_duration=None,
@@ -1231,7 +1290,7 @@ def _effective_shot_dispersion(gun_state, state, descriptor):
 
 
 def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
-                             dispersion_angle):
+                             dispersion_angle, base_direction=None):
     """Return the actual physical shot ray used by the battle resolver.
 
     The 0.8.2 presentation uses negative pitch for a raised barrel.  Protocol
@@ -1239,7 +1298,21 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
     the #1513 projectile/raycast boundary.  A per-shot seed makes authority
     takeover deterministic without sharing ``random`` module state.
     """
-    direction = list(ai_driver.barrel_direction(yaw, pitch))
+    if base_direction is None:
+        direction = list(ai_driver.barrel_direction(yaw, pitch))
+    else:
+        try:
+            direction = [float(value) for value in base_direction]
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('bot shot direction is unavailable')
+        if (len(direction) != 3 or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in direction)):
+            raise ValueError('bot shot direction is unavailable')
+        length = math.sqrt(sum(value * value for value in direction))
+        if length <= 1.0e-12:
+            raise ValueError('bot shot direction is unavailable')
+        direction = [value / length for value in direction]
     seed = ((int(_number(round_id)) & 0xffff) * 1000003 +
             (int(bot_id) & 0xffff) * 9176 +
             (int(fire_seq) & 0x7fffffff) * 6113) & 0x7fffffff
@@ -1546,6 +1619,7 @@ class BotRuntime(object):
         # cannot be mistaken for a variable vehicle speed.
         self._sample_time_us = 0
         self._manifest_sent = False
+        self._descriptor_pairs = {}
         self._descriptors = {}
         self._gun_yaw_limits = {}
         self._gun_states = {}
@@ -1966,6 +2040,157 @@ class BotRuntime(object):
             return abs(_number(result.get('slope', 0.0))) <= 0.55
         return bool(result)
 
+    def _install_bot_descriptor(self, bot_id, state, siege_state):
+        """Install one bot's active immutable mode descriptor."""
+        bot_id = int(bot_id)
+        pair = self._descriptor_pairs.get(bot_id)
+        if pair is None:
+            return False
+        descriptor = siege_mechanics.active_descriptor(pair, siege_state)
+        previous = self._descriptors.get(bot_id)
+        self._descriptors[bot_id] = descriptor
+        if previous is descriptor:
+            return False
+        self._physics_params[bot_id] = vehicle_physics.derive_params(
+            descriptor)
+        self._gun_yaw_limits[bot_id] = ai_driver.gun_yaw_limits(descriptor)
+        gun_state = self._gun_states.get(bot_id)
+        if gun_state is not None:
+            gun_state.adopt_descriptor(descriptor)
+        self._repair_factors.pop(bot_id, None)
+        self._vision_ranges.pop(bot_id, None)
+        self._spotting_profiles.pop(('bot', bot_id), None)
+        self._motion_probe_cache.pop(bot_id, None)
+        self._cancel_artillery_intent(bot_id)
+        if state is not None:
+            half_length, half_width = _hull_dimensions(descriptor)
+            state['move_speed'] = _forward_speed(descriptor)
+            state['view_range'] = self._cache_vision_range(
+                bot_id, descriptor)
+            state['half_length'] = half_length
+            state['half_width'] = half_width
+            state['collision_shape'] = _collision_shape(descriptor)
+            state['mass'] = self._physics_params[bot_id]['mass']
+            state['ram_profile'] = tank_collision.descriptor_ram_profile(
+                descriptor)
+        return True
+
+    def _set_bot_siege_state(self, state, siege_state, duration=0.0,
+                             transition_total=None):
+        siege_state = int(siege_state)
+        duration = max(0.0, float(duration))
+        if transition_total is None:
+            transition_total = duration
+        transition_total = max(0.0, float(transition_total))
+        if siege_state not in (siege_mechanics.SWITCHING_ON,
+                               siege_mechanics.SWITCHING_OFF):
+            duration = 0.0
+            transition_total = 0.0
+        state['siege_state'] = siege_state
+        state['_siege_time_left'] = duration
+        state['_siege_transition_total'] = transition_total
+        state['siege_time_left_ms'] = (
+            int(math.ceil(duration * 1000.0 - 1.0e-9))
+            if duration > 0.0 else 0)
+        state['siege_transition_total_ms'] = (
+            int(math.ceil(transition_total * 1000.0 - 1.0e-9))
+            if transition_total > 0.0 else 0)
+        self._install_bot_descriptor(
+            int(state['id']), state, siege_state)
+        return True
+
+    def _advance_bot_siege(self, state, step):
+        pair = self._descriptor_pairs.get(int(state['id']))
+        if pair is None or pair[1] is None:
+            self._set_bot_siege_state(state, siege_mechanics.DISABLED)
+            return False
+        current = int(state.get(
+            'siege_state', siege_mechanics.DISABLED))
+        if current not in (siege_mechanics.SWITCHING_ON,
+                           siege_mechanics.SWITCHING_OFF):
+            state['_siege_time_left'] = 0.0
+            state['siege_time_left_ms'] = 0
+            state['_siege_transition_total'] = 0.0
+            state['siege_transition_total_ms'] = 0
+            return False
+        remaining = max(
+            0.0, _number(state.get('_siege_time_left')) - float(step))
+        if remaining > 1.0e-9:
+            state['_siege_time_left'] = remaining
+            state['siege_time_left_ms'] = int(math.ceil(
+                remaining * 1000.0 - 1.0e-9))
+            return True
+        final_state = (
+            siege_mechanics.ENABLED
+            if current == siege_mechanics.SWITCHING_ON else
+            siege_mechanics.DISABLED)
+        self._set_bot_siege_state(state, final_state)
+        state['_siege_intent'] = (final_state == siege_mechanics.ENABLED)
+        state['_siege_intent_elapsed'] = 0.0
+        return True
+
+    @staticmethod
+    def _siege_desired(state, command, target):
+        legal_target = bool(
+            isinstance(target, dict) and target.get('alive', True))
+        destination = _point(
+            command.get('move_position'), _position(state))
+        long_travel = bool(
+            command.get('movement_intent', abs(_number(
+                command.get('throttle'))) > 0.05) and
+            _distance(_position(state), destination) >
+            SIEGE_LONG_TRAVEL_METRES)
+        return legal_target and not long_travel
+
+    def _update_bot_siege_intent(self, state, command, target, step):
+        pair = self._descriptor_pairs.get(int(state['id']))
+        if pair is None or pair[1] is None:
+            return False
+        current = int(state.get(
+            'siege_state', siege_mechanics.DISABLED))
+        switching = current in (siege_mechanics.SWITCHING_ON,
+                                siege_mechanics.SWITCHING_OFF)
+        if switching:
+            command['fire_allowed'] = False
+        desired = self._siege_desired(state, command, target)
+        previous_desired = state.get('_siege_intent')
+        if previous_desired is None or bool(previous_desired) != desired:
+            state['_siege_intent'] = desired
+            state['_siege_intent_elapsed'] = 0.0
+            return switching
+        same_transition_direction = (
+            (current == siege_mechanics.SWITCHING_ON and desired) or
+            (current == siege_mechanics.SWITCHING_OFF and not desired))
+        if same_transition_direction:
+            state['_siege_intent_elapsed'] = 0.0
+            return True
+        elapsed = _number(state.get('_siege_intent_elapsed')) + float(step)
+        state['_siege_intent_elapsed'] = elapsed
+        threshold = (SIEGE_ENABLE_DEBOUNCE_SECONDS if desired else
+                     SIEGE_DISABLE_DEBOUNCE_SECONDS)
+        already_desired = (
+            (desired and current == siege_mechanics.ENABLED) or
+            (not desired and current == siege_mechanics.DISABLED))
+        if already_desired or elapsed + 1.0e-9 < threshold:
+            return False
+        unused_devices, destroyed, unused_crew, yellow = \
+            _critical_parts(state)
+        if 'engineHealth' in destroyed:
+            state['_siege_intent_elapsed'] = 0.0
+            return False
+        next_state, remaining, transition_total, changed = \
+            siege_mechanics.request_transition(
+                current, state.get('_siege_time_left', 0.0),
+                state.get('_siege_transition_total', 0.0),
+                state.get('vehicle', ''), desired,
+                'engineHealth' in yellow)
+        if changed:
+            self._set_bot_siege_state(
+                state, next_state, remaining, transition_total)
+        command['fire_allowed'] = False
+        state['_siege_intent_elapsed'] = 0.0
+        return changed or switching
+
     def battle_start(self, message):
         """Build a local authority manifest from the server roster once per round."""
         message = message if isinstance(message, dict) else {}
@@ -1976,6 +2201,7 @@ class BotRuntime(object):
             self._accumulator = 0.0
             self._sample_time_us = 0
             self._manifest_sent = False
+            self._descriptor_pairs = {}
             self._descriptors = {}
             self._gun_yaw_limits = {}
             self._gun_states = {}
@@ -2087,7 +2313,9 @@ class BotRuntime(object):
             bot_id = int(raw['id'])
             vehicle_name = self.vehicle_selector(raw)
             try:
-                descriptor = self.descriptor_resolver(vehicle_name)
+                resolved_descriptor = self.descriptor_resolver(vehicle_name)
+                descriptor_pair = siege_mechanics.descriptor_pair(
+                    resolved_descriptor)
             except Exception as error:
                 # A vehicle this client cannot build is a roster problem, not
                 # an authority one.  Leave the slot empty and keep the round.
@@ -2095,10 +2323,26 @@ class BotRuntime(object):
                     '[Offline LAN 0.9.22] bot %d dropped, vehicle %s is '
                     'unusable: %s\n' % (bot_id, vehicle_name, error))
                 continue
+            raw_siege_state = raw.get(
+                'siege_state', siege_mechanics.DISABLED)
+            raw_wire_time = raw.get('siege_time_left_ms', 0)
+            raw_wire_total = raw.get('siege_transition_total_ms', 0)
+            if not siege_mechanics.valid_wire_state(
+                    raw_siege_state, raw_wire_time, vehicle_name,
+                    raw_wire_total):
+                raise ValueError('authority manifest Bot Siege state is invalid')
+            siege_state = int(raw_siege_state)
+            wire_time = int(raw_wire_time)
+            wire_total = int(raw_wire_total)
+            siege_time_left = wire_time / 1000.0
+            siege_transition_total = wire_total / 1000.0
+            self._descriptor_pairs[bot_id] = descriptor_pair
+            descriptor = siege_mechanics.active_descriptor(
+                descriptor_pair, siege_state)
             half_length, half_width = _hull_dimensions(descriptor)
-            self._descriptors.setdefault(bot_id, descriptor)
-            self._gun_yaw_limits.setdefault(
-                bot_id, ai_driver.gun_yaw_limits(descriptor))
+            self._descriptors[bot_id] = descriptor
+            self._gun_yaw_limits[bot_id] = \
+                ai_driver.gun_yaw_limits(descriptor)
             if bot_id not in self._gun_states:
                 self._gun_states[bot_id] = _BotGunState(
                     descriptor, raw.get('fire_seq', 0),
@@ -2117,6 +2361,8 @@ class BotRuntime(object):
                         raw.get('reload_time'),
                         raw.get('reload_duration'), reload_factor,
                         raw.get('clip'), raw.get('clip_size'))
+            else:
+                self._gun_states[bot_id].adopt_descriptor(descriptor)
             self._physics_params[bot_id] = vehicle_physics.derive_params(
                 descriptor)
             self._turn_speeds[bot_id] = 0.0
@@ -2167,7 +2413,18 @@ class BotRuntime(object):
                 'slide_speed': 0.0,
                 'vertical_speed': 0.0, 'airborne': False,
                 'grounded_once': False, 'last_drive_pitch': 0.0,
-                'pitch': 0.0, 'roll': 0.0,
+                'pitch': _number(raw.get('pitch')),
+                'roll': _number(raw.get('roll')),
+                'terrain_pitch': _number(raw.get('pitch')),
+                'suspension_pitch': 0.0,
+                'siege_state': siege_state,
+                'siege_time_left_ms': wire_time,
+                '_siege_time_left': siege_time_left,
+                'siege_transition_total_ms': wire_total,
+                '_siege_transition_total': siege_transition_total,
+                '_siege_intent': (
+                    siege_state == siege_mechanics.ENABLED),
+                '_siege_intent_elapsed': 0.0,
                 '_drown_check': 0.0,
                 '_drown_time': 0.0,
                 '_drowning': False,
@@ -2197,6 +2454,14 @@ class BotRuntime(object):
             state.setdefault('_overturn_time', 0.0)
             state.setdefault('_overturn_level', 0)
             state.setdefault('_overturned', False)
+            state['siege_state'] = siege_state
+            state['siege_time_left_ms'] = wire_time
+            state['_siege_time_left'] = siege_time_left
+            state['siege_transition_total_ms'] = wire_total
+            state['_siege_transition_total'] = siege_transition_total
+            state['_siege_intent'] = (
+                siege_state == siege_mechanics.ENABLED)
+            state['_siege_intent_elapsed'] = 0.0
             ammo_state = self._ammo_states.get(bot_id)
             if ammo_state is None:
                 ammo_state = _BotAmmoState(descriptor, profile, raw)
@@ -2293,6 +2558,10 @@ class BotRuntime(object):
         state['turret_yaw'] = _angle_delta(aim_yaw, yaw)
         state['gun_pitch'] = gun_pitch
         state['desired_gun_pitch'] = gun_pitch
+        state['pitch'] = _number(raw.get('pitch'), state.get('pitch'))
+        state['roll'] = _number(raw.get('roll'), state.get('roll'))
+        state['terrain_pitch'] = state['pitch']
+        state['suspension_pitch'] = 0.0
         state['gun_aligned'] = False
         state['hull_aiming'] = False
         # Current LAN snapshots carry intent but not a velocity magnitude.
@@ -2841,7 +3110,8 @@ class BotRuntime(object):
                 'max_health', 'x', 'y', 'z', 'yaw', 'profile', 'fire_seq',
                 'shell_index', 'next_shell_index', 'ammo_remaining',
                 'ammo_reload_pending', 'reload_time', 'reload_duration',
-                'clip', 'clip_size')
+                'clip', 'clip_size', 'siege_state',
+                'siege_time_left_ms', 'siege_transition_total_ms')
         result = dict((key, state[key]) for key in keys)
         descriptor = self._descriptors.get(state['id'], {})
         terminal = _terminal_critical(state, descriptor, 'shot')
@@ -3733,12 +4003,17 @@ class BotRuntime(object):
             finally:
                 self._probe_finished(3, probe_started)
 
+        suspension_pitch = _number(state.get('suspension_pitch'))
+        terrain_pitch = _number(
+            state.get('terrain_pitch'),
+            _number(state.get('pitch')) - suspension_pitch)
         pitch, roll = slope_pose(
             probe, (x, _number(state.get('y')), z), yaw,
             _number(state.get('half_length'), 3.5),
             _number(state.get('half_width'), 1.7),
-            _number(state.get('pitch')), _number(state.get('roll')))
-        state['pitch'] = pitch
+            terrain_pitch, _number(state.get('roll')))
+        state['terrain_pitch'] = pitch
+        state['pitch'] = pitch + suspension_pitch
         state['roll'] = roll
         state['pose_sample'] = (x, z, yaw)
         return True
@@ -4885,6 +5160,249 @@ class BotRuntime(object):
         speed = _number(target.get('speed'))
         return (math.sin(yaw) * speed, 0.0, math.cos(yaw) * speed)
 
+    @staticmethod
+    def _exact_shot_direction(state, descriptor):
+        """Return the current barrel ray in the stabilised world basis."""
+        try:
+            yaw = _number(state.get('yaw'))
+            pitch = _number(state.get('pitch'))
+            roll = _number(state.get('roll'))
+            if abs(pitch) <= 1.0e-12 and abs(roll) <= 1.0e-12:
+                flat_yaw = (
+                    _wrapped(yaw + _number(state.get('turret_yaw')))
+                    if 'turret_yaw' in state else
+                    _number(state.get('aim_yaw'), yaw))
+                return ai_driver.barrel_direction(
+                    flat_yaw, _number(state.get('gun_pitch')))
+            turret_yaw = (
+                _number(state.get('turret_yaw'))
+                if 'turret_yaw' in state else
+                _angle_delta(_number(state.get('aim_yaw'), yaw), yaw))
+            local_direction = ai_driver.barrel_direction(
+                turret_yaw, _number(state.get('gun_pitch')))
+            return shot_geometry.transform_vehicle_vector(
+                local_direction, yaw, pitch, roll)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _exact_shot_origin(self, state, descriptor, shell_index=0):
+        """Read the worker's frozen native HP_gunFire transform."""
+        direction = self._exact_shot_direction(state, descriptor)
+        if direction is None:
+            return None
+        horizontal = math.sqrt(
+            direction[0] * direction[0] + direction[2] * direction[2])
+        shot_yaw = math.atan2(direction[0], direction[2])
+        shot_pitch = -math.atan2(
+            direction[1], max(1.0e-12, horizontal))
+        try:
+            raw = self.direct_launch_origin_probe(
+                dict(state), descriptor, int(shell_index),
+                int(state.get('fire_seq', 0)) + 1,
+                shot_yaw, shot_pitch, 0.0)
+            origin = tuple(float(value) for value in raw)
+        except Exception:
+            return None
+        if (len(origin) != 3 or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in origin)):
+            return None
+        return origin
+
+    @staticmethod
+    def _world_barrel_angles(state, descriptor):
+        """Return current world yaw and BigWorld negative-is-up pitch."""
+        direction = BotRuntime._exact_shot_direction(state, descriptor)
+        if direction is None:
+            return None
+        horizontal = math.sqrt(
+            direction[0] * direction[0] + direction[2] * direction[2])
+        return (math.atan2(direction[0], direction[2]),
+                -math.atan2(direction[1], max(1.0e-12, horizontal)))
+
+    @staticmethod
+    def _dispersal_base_direction(state, descriptor):
+        """Override the legacy flat basis only when hull attitude requires it."""
+        if (abs(_number(state.get('pitch'))) <= 1.0e-12 and
+                abs(_number(state.get('roll'))) <= 1.0e-12):
+            return None
+        return BotRuntime._exact_shot_direction(state, descriptor)
+
+    @staticmethod
+    def _local_gun_angles_for_world(state, world_yaw, world_pitch):
+        try:
+            return shot_geometry.world_direction_to_local_gun_angles(
+                ai_driver.barrel_direction(world_yaw, world_pitch),
+                _number(state.get('yaw')),
+                _number(state.get('pitch')),
+                _number(state.get('roll')))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _terrain_pitch(state):
+        correction = _number(state.get('suspension_pitch'))
+        return _number(
+            state.get('terrain_pitch'),
+            _number(state.get('pitch')) - correction)
+
+    @staticmethod
+    def _static_gun_value(descriptor, name):
+        gun = _value(descriptor, 'gun', {}) or {}
+        value = _value(gun, name)
+        return None if value is None else _number(value)
+
+    @classmethod
+    def _effective_gun_pitch_limits(cls, state, descriptor, turret_yaw):
+        static_pitch = cls._static_gun_value(descriptor, 'staticPitch')
+        unused_devices, destroyed, unused_crew, unused_yellow = \
+            _critical_parts(state)
+        if hull_aiming.static_pitch_locked(
+                static_pitch,
+                engine_destroyed='engineHealth' in destroyed,
+                overturned=bool(state.get('_overturned', False)),
+                siege_state=int(state.get(
+                    'siege_state', siege_mechanics.DISABLED))):
+            return static_pitch, static_pitch
+        return _gun_pitch_limits(descriptor, turret_yaw)
+
+    def _effective_gun_yaw_limits(self, state, descriptor, moving=None):
+        normal = self._gun_yaw_limits.get(state['id'])
+        if normal is None:
+            normal = ai_driver.gun_yaw_limits(descriptor)
+            self._gun_yaw_limits[state['id']] = normal
+        static_yaw = self._static_gun_value(
+            descriptor, 'staticTurretYaw')
+        unused_devices, destroyed, unused_crew, unused_yellow = \
+            _critical_parts(state)
+        if moving is None:
+            moving = int(_number(state.get('movement_dir'))) != 0
+        if hull_aiming.static_yaw_locked(
+                static_yaw,
+                engine_destroyed='engineHealth' in destroyed,
+                track_destroyed=bool(destroyed.intersection((
+                    'leftTrackHealth', 'rightTrackHealth'))),
+                overturned=bool(state.get('_overturned', False)),
+                moving=bool(moving),
+                siege_state=int(state.get(
+                    'siege_state', siege_mechanics.DISABLED))):
+            return static_yaw, static_yaw, True
+        return normal
+
+    @classmethod
+    def _pitch_status_at_correction(
+            cls, state, descriptor, direction, terrain_pitch, correction):
+        try:
+            local = shot_geometry.world_direction_to_local_gun_angles(
+                direction, _number(state.get('yaw')),
+                terrain_pitch + correction,
+                _number(state.get('roll')))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        limits = cls._effective_gun_pitch_limits(
+            state, descriptor, local[0])
+        if limits is None:
+            return None
+        return (hull_aiming.classify_pitch(
+                    local[1], limits[0], limits[1], 1.0e-8),
+                local, limits)
+
+    @classmethod
+    def _hydraulic_target_correction(
+            cls, state, descriptor, world_yaw, world_pitch, config):
+        direction = ai_driver.barrel_direction(world_yaw, world_pitch)
+        terrain_pitch = cls._terrain_pitch(state)
+        minimum = config['minimum']
+        maximum = config['maximum']
+        neutral = max(minimum, min(maximum, 0.0))
+        at_neutral = cls._pitch_status_at_correction(
+            state, descriptor, direction, terrain_pitch, neutral)
+        if at_neutral is None:
+            return neutral, False
+        status = at_neutral[0]
+        if status == 0:
+            return neutral, True
+        edge = minimum if status < 0 else maximum
+        at_edge = cls._pitch_status_at_correction(
+            state, descriptor, direction, terrain_pitch, edge)
+        if at_edge is None:
+            return edge, False
+        edge_status = at_edge[0]
+        if ((status < 0 and edge_status < 0) or
+                (status > 0 and edge_status > 0)):
+            return edge, False
+        blocked = neutral
+        feasible = edge
+        for unused in range(48):
+            candidate = (blocked + feasible) * 0.5
+            result = cls._pitch_status_at_correction(
+                state, descriptor, direction, terrain_pitch, candidate)
+            if result is None:
+                return edge, False
+            if result[0] == status:
+                blocked = candidate
+            else:
+                feasible = candidate
+        return feasible, True
+
+    @classmethod
+    def _active_hydraulic_config(cls, state, descriptor):
+        try:
+            config = hull_aiming.pitch_params(descriptor)
+        except ValueError:
+            return None
+        if (config is None or not config['isAvailable'] or
+                not config['isEnabled'] or
+                int(state.get('siege_state', siege_mechanics.DISABLED)) !=
+                siege_mechanics.ENABLED):
+            return None
+        return config
+
+    @classmethod
+    def _update_hydraulic_suspension(
+            cls, state, descriptor, world_yaw, world_pitch, elapsed):
+        try:
+            params = hull_aiming.pitch_params(descriptor)
+        except ValueError:
+            params = None
+        active = cls._active_hydraulic_config(state, descriptor)
+        target = 0.0
+        if active is not None:
+            target, unused_reachable = cls._hydraulic_target_correction(
+                state, descriptor, world_yaw, world_pitch, active)
+        current = _number(state.get('suspension_pitch'))
+        if params is None:
+            correction = 0.0
+        else:
+            current = max(
+                params['minimum'], min(params['maximum'], current))
+            correction = hull_aiming.slew(
+                current, target, params['speed'], elapsed)
+        terrain_pitch = cls._terrain_pitch(state)
+        state['terrain_pitch'] = terrain_pitch
+        state['suspension_pitch'] = correction
+        state['pitch'] = terrain_pitch + correction
+        return correction
+
+    @classmethod
+    def _world_solution_reachable(cls, state, descriptor,
+                                  world_yaw, world_pitch):
+        config = cls._active_hydraulic_config(state, descriptor)
+        if config is not None:
+            unused_target, reachable = cls._hydraulic_target_correction(
+                state, descriptor, world_yaw, world_pitch, config)
+            return reachable
+        local = cls._local_gun_angles_for_world(
+            state, world_yaw, world_pitch)
+        if local is None:
+            return False
+        limits = cls._effective_gun_pitch_limits(
+            state, descriptor, local[0])
+        if limits is None:
+            return False
+        return bool(
+            limits[0] - 0.0001 <= local[1] <= limits[1] + 0.0001)
+
     def _local_ballistic_solution(self, state, target, descriptor,
                                   shell_index):
         """Solve the ordinary low arc and moving-target lead without BSP."""
@@ -4892,8 +5410,9 @@ class BotRuntime(object):
         if target is None or physical is None:
             return None
         speed, gravity, maximum = physical
-        start = (_number(state.get('x')), _number(state.get('y')) + 1.5,
-                 _number(state.get('z')))
+        start = self._exact_shot_origin(state, descriptor, shell_index)
+        if start is None:
+            return None
         target_position = _point(
             target.get('position'), _position(target))
         target_position = (
@@ -4901,7 +5420,7 @@ class BotRuntime(object):
             target_position[2])
         solution = ballistics.ballistic_intercept(
             start, target_position, self._target_velocity(target),
-            speed, gravity, *_gun_pitch_limits(descriptor))
+            speed, gravity, -math.pi * 0.5, math.pi * 0.5)
         if solution is None:
             return None
         aim_position, pitch, flight_time = solution
@@ -4910,6 +5429,9 @@ class BotRuntime(object):
             return None
         yaw = math.atan2(
             aim_position[0] - start[0], aim_position[2] - start[2])
+        if not self._world_solution_reachable(
+                state, descriptor, yaw, pitch):
+            return None
         return {
             'aim_position': aim_position, 'yaw': yaw, 'pitch': pitch,
             'flight_time': flight_time, 'arc': 'low',
@@ -4932,6 +5454,9 @@ class BotRuntime(object):
         return (
             _number(state.get('x')), _number(state.get('y')),
             _number(state.get('z')), _number(state.get('yaw')),
+            _number(state.get('pitch')), _number(state.get('roll')),
+            _number(state.get('turret_yaw')),
+            _number(state.get('gun_pitch')),
         )
 
     def _cancel_artillery_intent(self, bot_id, preserve_reproof=False):
@@ -4978,6 +5503,9 @@ class BotRuntime(object):
         baseline = reproof['source_pose']
         moved = math.sqrt(sum(
             (pose[index] - baseline[index]) ** 2 for index in range(3)))
+        orientation_changed = any(
+            abs(_angle_delta(pose[index], baseline[index])) > 0.001
+            for index in range(3, min(len(pose), len(baseline))))
         invalid = (
             target_dead or
             self._artillery_target_identity(target) !=
@@ -4985,8 +5513,7 @@ class BotRuntime(object):
             int(shell_index) != reproof['shell_index'] or
             int(state.get('fire_seq', 0)) + 1 != reproof['fire_seq'] or
             physical != reproof['physical'] or
-            moved > 0.05 or
-            abs(_angle_delta(pose[3], baseline[3])) > 0.001)
+            moved > 0.05 or orientation_changed)
         if invalid:
             self._cancel_artillery_intent(bot_id)
             return None
@@ -5021,7 +5548,8 @@ class BotRuntime(object):
         if (physical is None or target_identity is None or
                 target_dead or
                 abs(_number(state.get('speed'))) > 0.05 or
-                not self._spg_exact_aligned(state, ballistic_solution)):
+                not self._spg_exact_aligned(
+                    state, descriptor, ballistic_solution)):
             return None
         bot_id = int(state['id'])
         fire_seq = int(state.get('fire_seq', 0)) + 1
@@ -5050,10 +5578,16 @@ class BotRuntime(object):
                 _number(reproof.get(
                     'absolute_deadline', reproof['deadline'])),
                 _number(now) + ARTILLERY_REPROOF_SECONDS)
+        base_direction = self._dispersal_base_direction(state, descriptor)
+        if (base_direction is None and
+                (abs(_number(state.get('pitch'))) > 1.0e-12 or
+                 abs(_number(state.get('roll'))) > 1.0e-12)):
+            return None
         shot_yaw, shot_pitch = _dispersed_barrel_angles(
             state['id'], self.round_id, fire_seq,
             state['aim_yaw'], state['gun_pitch'],
-            _effective_shot_dispersion(gun_state, state, descriptor))
+            _effective_shot_dispersion(gun_state, state, descriptor),
+            base_direction=base_direction)
         solution = dict(ballistic_solution)
         solution['aim_position'] = _point(solution['aim_position'])
         solution['yaw'] = float(solution['yaw'])
@@ -5091,9 +5625,9 @@ class BotRuntime(object):
         if physical is None or not isinstance(target, dict):
             return None
         speed, gravity, maximum = physical
-        start = (
-            _number(state.get('x')), _number(state.get('y')) + 1.5,
-            _number(state.get('z')))
+        start = self._exact_shot_origin(state, descriptor, shell_index)
+        if start is None:
+            return None
         target_position = _point(
             target.get('position'), _position(target))
         target_position = (
@@ -5108,20 +5642,23 @@ class BotRuntime(object):
         arc = str(reproof.get('arc') or '')
         if arc not in ('low', 'high'):
             return None
-        minimum_pitch, maximum_pitch = _gun_pitch_limits(descriptor)
         solution = ballistics.ballistic_intercept(
             start, predicted, target_velocity, speed, gravity,
-            minimum_pitch, maximum_pitch, arc == 'high')
+            -math.pi * 0.5, math.pi * 0.5, arc == 'high')
         if solution is None:
             return None
         aim_position, pitch, flight_time = solution
         if (flight_time > ballistics.PROJECTILE_MAX_FLIGHT_SECONDS or
                 speed * flight_time > maximum + 1e-6):
             return None
+        yaw = math.atan2(
+            aim_position[0] - start[0], aim_position[2] - start[2])
+        if not self._world_solution_reachable(
+                state, descriptor, yaw, pitch):
+            return None
         return {
             'aim_position': aim_position,
-            'yaw': math.atan2(
-                aim_position[0] - start[0], aim_position[2] - start[2]),
+            'yaw': yaw,
             'pitch': pitch, 'flight_time': flight_time, 'arc': arc,
         }
 
@@ -5164,11 +5701,10 @@ class BotRuntime(object):
                 flight_time = float(value['flight_time'])
             except (KeyError, TypeError, ValueError, OverflowError):
                 return None
-            minimum, maximum = _gun_pitch_limits(descriptor)
             if (flight_time <= 0.0 or
                     flight_time > ballistics.PROJECTILE_MAX_FLIGHT_SECONDS or
-                    pitch < minimum - 0.0001 or
-                    pitch > maximum + 0.0001):
+                    not self._world_solution_reachable(
+                        state, descriptor, yaw, pitch)):
                 return None
             result = dict(value)
             result.update({
@@ -5190,25 +5726,47 @@ class BotRuntime(object):
                 ballistic_solution.get('aim_position'), fallback)
         else:
             aim_position = _point(command.get('aim_position'), fallback)
-        dx = aim_position[0] - _number(state.get('x'))
-        dz = aim_position[2] - _number(state.get('z'))
+        origin = self._exact_shot_origin(
+            state, descriptor, state.get('shell_index', 0))
+        if origin is None:
+            state['gun_aligned'] = False
+            return _number(state.get('aim_yaw')), 0.0
+        dx = aim_position[0] - origin[0]
+        dz = aim_position[2] - origin[2]
         horizontal = math.sqrt(dx * dx + dz * dz)
         desired_yaw = (_number(ballistic_solution.get('yaw'))
                        if isinstance(ballistic_solution, dict) else
                        (math.atan2(dx, dz) if horizontal > 0.1
                         else _number(state.get('yaw'))))
-        gun_yaw_limits = self._gun_yaw_limits.get(state['id'])
-        if gun_yaw_limits is None:
-            gun_yaw_limits = ai_driver.gun_yaw_limits(descriptor)
-            self._gun_yaw_limits[state['id']] = gun_yaw_limits
-        minimum_yaw, maximum_yaw, limited = gun_yaw_limits
-        desired_relative = _angle_delta(desired_yaw, state['yaw'])
+        world_pitch = (_number(ballistic_solution.get('pitch'))
+                       if isinstance(ballistic_solution, dict) else
+                       -math.atan2(
+                           (aim_position[1] + 1.0) - origin[1],
+                           max(0.5, horizontal)))
+        self._update_hydraulic_suspension(
+            state, descriptor, desired_yaw, world_pitch, step)
+        local_angles = self._local_gun_angles_for_world(
+            state, desired_yaw, world_pitch)
+        if local_angles is None:
+            local_angles = (
+                _angle_delta(desired_yaw, state['yaw']), world_pitch)
+        raw_relative, raw_pitch = local_angles
+        minimum_yaw, maximum_yaw, limited = \
+            self._effective_gun_yaw_limits(state, descriptor)
+        desired_relative = raw_relative
         if limited:
             desired_relative = max(
                 minimum_yaw, min(maximum_yaw, desired_relative))
+        gun_state = self._gun_states.get(state['id'])
+        modifier_bundle = (gun_state.loadout
+                           if gun_state is not None else {})
         turret = _value(descriptor, 'turret', {}) or {}
-        turret_step = (_rotation_speed(turret, 0.5) * step *
-                       _critical_factor(state, descriptor, 'turret_speed'))
+        turret_speed = (_rotation_speed(turret, 0.5) *
+                        max(0.0, _number(
+                            modifier_bundle.get('crew_factor'), 1.0)) *
+                        _critical_factor(
+                            state, descriptor, 'turret_speed'))
+        turret_step = turret_speed * step
         current_relative = _number(state.get('turret_yaw'))
         turret_difference = _angle_delta(desired_relative, current_relative)
         current_relative = _wrapped(
@@ -5218,29 +5776,38 @@ class BotRuntime(object):
             current_relative = max(
                 minimum_yaw, min(maximum_yaw, current_relative))
         state['turret_yaw'] = current_relative
-        state['aim_yaw'] = _wrapped(state['yaw'] + current_relative)
 
-        # BigWorld's rendered gun convention is negative pitch for a raised
-        # barrel.  The offsets are the mature implementation's target and
-        # muzzle heights, rather than aiming the model roots at each other.
-        desired_pitch = (_number(ballistic_solution.get('pitch'))
-                         if isinstance(ballistic_solution, dict) else
-                         -math.atan2(
-                             (aim_position[1] + 1.0) -
-                             (_number(state.get('y')) + 1.5),
-                             max(0.5, horizontal)))
-        minimum_pitch, maximum_pitch = _gun_pitch_limits(descriptor)
-        desired_pitch = max(
-            minimum_pitch, min(maximum_pitch, desired_pitch))
+        turret_rotation_time = 0.0
+        if turret_speed > 0.0:
+            turret_rotation_time = abs(
+                current_relative - raw_relative) / turret_speed
+
+        desired_pitch = raw_pitch
+        pitch_limits = self._effective_gun_pitch_limits(
+            state, descriptor, current_relative)
+        if pitch_limits is None:
+            desired_pitch = _number(state.get('gun_pitch'))
+        else:
+            desired_pitch = max(
+                pitch_limits[0], min(pitch_limits[1], desired_pitch))
         gun = _value(descriptor, 'gun', {}) or {}
-        state['gun_pitch'] = _slew(
-            _number(state.get('gun_pitch')), desired_pitch,
-            _rotation_speed(gun, 0.35) * step)
+        static_pitch = self._static_gun_value(descriptor, 'staticPitch')
+        if pitch_limits is not None:
+            state['gun_pitch'] = hull_aiming.gun_pitch_step(
+                _number(state.get('gun_pitch')), raw_pitch, static_pitch,
+                _rotation_speed(gun, 0.35) * max(
+                    0.0, _number(modifier_bundle.get(
+                        'gun_rotation_factor'), 1.0)),
+                step, turret_rotation_time, pitch_limits)
         state['desired_gun_pitch'] = desired_pitch
+        world_angles = self._world_barrel_angles(state, descriptor)
+        state['aim_yaw'] = (
+            world_angles[0] if world_angles is not None else
+            _wrapped(state['yaw'] + current_relative))
         state['gun_aligned'] = bool(
-            target is not None and ai_driver.gun_aligned(
-                desired_yaw, state['yaw'], state['turret_yaw'],
-                desired_pitch, state['gun_pitch']))
+            pitch_limits is not None and target is not None and
+            abs(_angle_delta(raw_relative, state['turret_yaw'])) <= 0.06 and
+            abs(raw_pitch - state['gun_pitch']) <= 0.04)
         return desired_yaw, horizontal
 
     @staticmethod
@@ -5370,17 +5937,20 @@ class BotRuntime(object):
             })
         return packed
 
-    @staticmethod
-    def _spg_exact_aligned(state, ballistic_solution):
+    @classmethod
+    def _spg_exact_aligned(cls, state, descriptor, ballistic_solution):
         if (not state.get('gun_aligned') or
                 not isinstance(ballistic_solution, dict)):
+            return False
+        world_angles = cls._world_barrel_angles(state, descriptor)
+        if world_angles is None:
             return False
         return (
             abs(_angle_delta(
                 _number(ballistic_solution.get('yaw')),
-                _number(state.get('aim_yaw')))) <= 1e-7 and
+                world_angles[0])) <= 1e-7 and
             abs(_number(ballistic_solution.get('pitch')) -
-                _number(state.get('gun_pitch'))) <= 1e-7)
+                world_angles[1]) <= 1e-7)
 
     def _validated_artillery_receipt(
             self, value, descriptor, shell_index, fire_seq,
@@ -5505,7 +6075,8 @@ class BotRuntime(object):
                 state, target, descriptor, shell_index, gun_state,
                 ballistic_solution, now)
         if (intent is None or
-                not self._spg_exact_aligned(state, intent['solution'])):
+                not self._spg_exact_aligned(
+                    state, descriptor, intent['solution'])):
             return None
         fire_seq = intent['fire_seq']
         shot_yaw = intent['shot_yaw']
@@ -5552,10 +6123,16 @@ class BotRuntime(object):
                 flight_time > ballistics.PROJECTILE_MAX_FLIGHT_SECONDS):
             return None
         fire_seq = int(state.get('fire_seq', 0)) + 1
+        base_direction = self._dispersal_base_direction(state, descriptor)
+        if (base_direction is None and
+                (abs(_number(state.get('pitch'))) > 1.0e-12 or
+                 abs(_number(state.get('roll'))) > 1.0e-12)):
+            return None
         shot_yaw, shot_pitch = _dispersed_barrel_angles(
             state['id'], self.round_id, fire_seq,
             state['aim_yaw'], state['gun_pitch'],
-            _effective_shot_dispersion(gun_state, state, descriptor))
+            _effective_shot_dispersion(gun_state, state, descriptor),
+            base_direction=base_direction)
         try:
             if self._probe_clock is None:
                 raw_origin = self.direct_launch_origin_probe(
@@ -5747,12 +6324,15 @@ class BotRuntime(object):
                 state['shot_pitch'] = preview_pitch
                 state['shot_origin'] = preview_origin
             else:
+                base_direction = self._dispersal_base_direction(
+                    state, descriptor)
                 state['shot_yaw'], state['shot_pitch'] = \
                     _dispersed_barrel_angles(
                         state['id'], self.round_id, state['fire_seq'],
                         state['aim_yaw'], state['gun_pitch'],
                         _effective_shot_dispersion(
-                            gun_state, state, descriptor))
+                            gun_state, state, descriptor),
+                        base_direction=base_direction)
         else:
             state['shot_yaw'] = launch_receipt['shot_yaw']
             state['shot_pitch'] = launch_receipt['shot_pitch']
@@ -5866,6 +6446,7 @@ class BotRuntime(object):
             self._advance_bot_overturn(state, step)
             if not state['alive']:
                 continue
+            self._advance_bot_siege(state, step)
             position = _position(state)
             tick_poses[state['id']] = position
             tick_safe[state['id']] = prebaked_navigation.pose_is_safe(
@@ -6050,6 +6631,8 @@ class BotRuntime(object):
                 target.get('kind') if target is not None else None)
             state['target_id'] = (
                 target.get('network_id') if target is not None else None)
+            self._update_bot_siege_intent(
+                state, command, target, step)
             descriptor = self._descriptors.get(state['id'], {})
             profile = state.get('profile')
             profile = profile if isinstance(profile, dict) else {}
@@ -6381,6 +6964,12 @@ class BotRuntime(object):
                     self.motion_report(
                         state['id'], motion_status, contact_v0, speed)
                 state['speed'] = speed
+                if state.get('siege_state') == siege_mechanics.ENABLED:
+                    siege_limit = siege_mechanics.enabled_speed_limit(
+                        state.get('vehicle', ''))
+                    if siege_limit is not None:
+                        speed = max(-siege_limit, min(siege_limit, speed))
+                        state['speed'] = speed
                 if contact_deflected:
                     state['x'], state['y'], state['z'] = contact_position
                 elif path_clear:

@@ -10,6 +10,7 @@ import uuid
 
 from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
 from gui.mods.offline_lan_0922 import equipment_mechanics
+from gui.mods.offline_lan_0922 import siege_mechanics
 
 
 PROTOCOL_VERSION = 5
@@ -119,6 +120,7 @@ _BOT_STATE_WIRE_FIELDS = (
     'speed', 'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
     'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
     'reload_time', 'reload_duration', 'clip', 'clip_size',
+    'siege_state', 'siege_time_left_ms', 'siege_transition_total_ms',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',
     'death_reason', 'display_health', 'world_pose')
@@ -330,6 +332,22 @@ def _valid_player_siege_contract(player):
         return False
     return ((state in (1, 3) and time_left > 0) or
             (state in (0, 2) and time_left == 0))
+
+
+def _valid_bot_siege_contract(bot):
+    if not isinstance(bot, dict):
+        return False
+    fields = (
+        'siege_state', 'siege_time_left_ms',
+        'siege_transition_total_ms')
+    present = tuple(name in bot for name in fields)
+    if not any(present):
+        return True
+    if not all(present):
+        return False
+    return siege_mechanics.valid_wire_state(
+        bot.get('siege_state'), bot.get('siege_time_left_ms'),
+        transition_total_ms=bot.get('siege_transition_total_ms'))
 
 
 def _valid_stun_contract(vehicle):
@@ -558,6 +576,19 @@ def project_bot_state(state):
     if (reload_time is None or reload_duration is None or
             reload_duration <= 0.0 or reload_time < 0.0 or
             reload_time > reload_duration):
+        return None
+    siege_fields = (
+        'siege_state', 'siege_time_left_ms',
+        'siege_transition_total_ms')
+    siege_present = tuple(name in state for name in siege_fields)
+    if any(siege_present) and not all(siege_present):
+        return None
+    if (all(siege_present) and
+            not siege_mechanics.valid_wire_state(
+                state.get('siege_state'),
+                state.get('siege_time_left_ms'),
+                transition_total_ms=state.get(
+                    'siege_transition_total_ms'))):
         return None
     return projected
 
@@ -3920,6 +3951,8 @@ class LANClient(object):
                 _valid_stun_contract(player) for player in players or ())
             bot_combat_contract = all(
                 _valid_bot_combat_contract(bot) for bot in bots or ())
+            bot_siege_contract = all(
+                _valid_bot_siege_contract(bot) for bot in bots or ())
             bot_stun_contract = all(
                 _valid_stun_contract(bot) for bot in bots or ())
             ledger_required = self.has_projectile_ledger()
@@ -4018,6 +4051,8 @@ class LANClient(object):
                 invalid_reasons.append('player_stun')
             if not bot_combat_contract:
                 invalid_reasons.append('bot_combat')
+            if not bot_siege_contract:
+                invalid_reasons.append('bot_siege')
             if not bot_stun_contract:
                 invalid_reasons.append('bot_stun')
             if 'bot_manifest' in message and manifest is None:

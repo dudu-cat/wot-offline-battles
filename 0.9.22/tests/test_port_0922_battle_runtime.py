@@ -505,6 +505,7 @@ class _Descriptor(object):
         self.turret = types.SimpleNamespace(
             itemTypeName='vehicleTurret',
             circularVisionRadius=330.0, rotationSpeed=1.0,
+            gunPosition=_Vector(0.0, 0.9, 0.0),
             hitTester=_HitTester1513(
                 _Vector(-1.0, -0.4, -1.0),
                 _Vector(1.0, 0.8, 1.0), loaded))
@@ -527,6 +528,7 @@ class _Descriptor(object):
             turretPositions=(_Vector(),))
         self.maxHealth = 500
         self.activeGunShotIndex = 0
+        self.activeTurretPosition = 0
 
     def makeCompactDescr(self):
         return self.name
@@ -1365,6 +1367,7 @@ class _BigWorld(object):
         self.legacy_visibility_calls = []
         self.reset_visibility_before_ready = False
         self.res_mgr = None
+        self.wg_collideWater = lambda *unused: None
 
     def player(self):
         return self.avatar
@@ -8425,7 +8428,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             request_launch=mock.Mock(return_value=(True, receipt)))
 
         result = battle._bot_artillery_launch(
-            {'id': 7}, {'position': (4.0, 0.0, 100.0)},
+            {
+                'id': 7, 'x': 4.0, 'y': 2.0, 'z': 6.0,
+                'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+                'turret_yaw': 0.0, 'gun_pitch': 0.1,
+            }, {'position': (4.0, 0.0, 100.0)},
             entity.typeDescriptor, 0, 3, 0.0, 0.1, 2.0, 10.0)
 
         self.assertIs(receipt, result)

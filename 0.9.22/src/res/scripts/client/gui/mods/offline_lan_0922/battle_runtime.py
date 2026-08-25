@@ -47,7 +47,8 @@ from gui.mods.offline_lan_0922 import (
     destructibles_compat, effective_params, equipment_mechanics, gun_mechanics,
     lan_client as lan_protocol,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
-    prebaked_navigation, native_mapping_mask, spotting, tank_collision,
+    prebaked_navigation, native_mapping_mask, shot_geometry, spotting,
+    tank_collision,
     vehicle_blacklist, vehicle_physics, world_collision)
 
 
@@ -1629,7 +1630,8 @@ class BattleRuntime(object):
         self._projectile_perf = {}
         self._projectile_scan_count = 0
         self._projectile_candidate_count = 0
-        self._artillery = ArtilleryController()
+        self._artillery = ArtilleryController(
+            origin_resolver=self._bot_artillery_planning_origin)
         self._generation += 1
         self._deadline = self._clock() + float(
             self._config.get('startupTimeoutSeconds', 30.0))
@@ -4264,6 +4266,58 @@ class BattleRuntime(object):
             # The sensor is native and can disappear during a model refresh.
             # The point probe below remains valid while it is being rebuilt.
             return None
+
+    def _barrel_under_water(self, point):
+        """Mirror #1513's positive-distance barrel water gate."""
+        collide = getattr(self._runtime.bigworld, 'wg_collideWater', None)
+        if not callable(collide):
+            return True
+        try:
+            start = self._vector(point)
+            end = self._vector((
+                float(point[0]), float(point[1]) + 0.1,
+                float(point[2])))
+            value = collide(start, end, False)
+            return value is not None and float(value) > 0.0
+        except Exception:
+            return True
+
+    @staticmethod
+    def _bot_barrel_point(source, descriptor):
+        if not isinstance(source, dict):
+            return None
+        try:
+            yaw = float(source.get('yaw', 0.0) or 0.0)
+            turret_yaw = (float(source.get('turret_yaw'))
+                          if 'turret_yaw' in source else
+                          ((float(source.get('aim_yaw', yaw) or yaw) - yaw +
+                            math.pi) % (2.0 * math.pi)) - math.pi)
+            return shot_geometry.barrel_world_point(
+                descriptor,
+                (float(source.get('x')), float(source.get('y')),
+                 float(source.get('z'))),
+                yaw, float(source.get('pitch', 0.0) or 0.0),
+                float(source.get('roll', 0.0) or 0.0),
+                turret_yaw,
+                float(source.get('gun_pitch', 0.0) or 0.0))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _player_barrel_under_water(self, entity):
+        rotator = getattr(self._avatar, 'gunRotator', None)
+        if rotator is None:
+            return True
+        try:
+            barrel = shot_geometry.barrel_world_point(
+                entity.typeDescriptor,
+                tuple(float(value) for value in self._local_position),
+                float(self._local_yaw), float(self._local_pitch),
+                float(self._local_roll), float(rotator.turretYaw),
+                float(rotator.gunPitch))
+        except (AttributeError, KeyError, TypeError, ValueError,
+                OverflowError):
+            return True
+        return self._barrel_under_water(barrel)
 
     def _present_drowning_level(self, level, now):
         status_group = getattr(
@@ -14481,6 +14535,9 @@ class BattleRuntime(object):
             source_id = int(source.get('id'))
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None
+        barrel = self._bot_barrel_point(source, unused_descriptor)
+        if barrel is None or self._barrel_under_water(barrel):
+            return None
         source_record = self._records.get('bot:%s' % source_id)
         if source_record is None:
             return None
@@ -14493,6 +14550,11 @@ class BattleRuntime(object):
             return _xyz(self._runtime.math.Matrix(gun_node).translation)
         except Exception:
             return None
+
+    def _bot_artillery_planning_origin(self, source, descriptor):
+        """Read the same native muzzle used by the final SPG proof."""
+        return self._bot_direct_launch_origin(
+            source, descriptor, 0, 0, 0.0, 0.0, 0.0)
 
     def _bot_ballistic_solution(self, source, target, descriptor,
                                 shell_index, now):
@@ -14526,6 +14588,9 @@ class BattleRuntime(object):
         except Exception:
             # A logical pose is not a muzzle proof.  SPGs wait until the
             # native model exposes the exact launch transform.
+            return None
+        barrel = self._bot_barrel_point(source, descriptor)
+        if barrel is None or self._barrel_under_water(barrel):
             return None
         ready, receipt = self._artillery.request_launch(
             source, target, descriptor, int(shell_index), int(fire_seq),
@@ -16856,6 +16921,8 @@ class BattleRuntime(object):
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None or entity.typeDescriptor is None:
             return self._reject_local_fire('vehicle_unavailable')
+        if self._player_barrel_under_water(entity):
+            return self._reject_local_fire('barrel_under_water')
         siege_states = self._runtime.constants.VEHICLE_SIEGE_STATE
         if getattr(entity, 'siegeState', siege_states.DISABLED) in (
                 siege_states.SWITCHING_ON,

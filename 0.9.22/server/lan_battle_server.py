@@ -45,6 +45,7 @@ from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
 from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import player_critical_mechanics
+from gui.mods.offline_lan_0922 import siege_mechanics
 from gui.mods.offline_lan_0922 import vehicle_physics
 from gui.mods.offline_lan_0922.ai import planner as bot_planner
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
@@ -3949,6 +3950,68 @@ class BattleState:
         return {"clip": clip, "clip_size": clip_size}
 
     @staticmethod
+    def _sanitize_bot_siege(raw, identity, previous):
+        """Validate one atomic Bot Siege publication."""
+        fields = (
+            "siege_state", "siege_time_left_ms",
+            "siege_transition_total_ms")
+        present = tuple(name in raw for name in fields)
+        if any(present) and not all(present):
+            raise ValueError("bot Siege snapshot is incomplete")
+        if not any(present):
+            return (
+                int((previous or {}).get(
+                    "siege_state", SIEGE_DISABLED)),
+                int((previous or {}).get("siege_time_left_ms", 0)),
+                int((previous or {}).get(
+                    "siege_transition_total_ms", 0)),
+            )
+        state = _exact_int(raw.get("siege_state"), 0, 3)
+        time_left_ms = _exact_int(
+            raw.get("siege_time_left_ms"), 0, 4000)
+        transition_total_ms = _exact_int(
+            raw.get("siege_transition_total_ms"), 0, 4000)
+        vehicle = str(identity.get("vehicle", ""))
+        if not siege_mechanics.valid_wire_state(
+                state, time_left_ms, vehicle, transition_total_ms):
+            raise ValueError("bot Siege snapshot is invalid")
+        values = SIEGE_VEHICLE_PARAMS.get(vehicle)
+        if values is not None and state in (
+                SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
+            duration = values[0] if state == SIEGE_SWITCHING_ON else values[1]
+            base_ms = int(round(float(duration) * 1000.0))
+            damaged_ms = int(round(
+                float(duration) * float(values[3]) * 1000.0))
+            if transition_total_ms not in (base_ms, damaged_ms):
+                raise ValueError(
+                    "bot Siege transition exceeds vehicle law")
+        if previous is not None:
+            before = int(previous.get("siege_state", SIEGE_DISABLED))
+            allowed = {
+                SIEGE_DISABLED: (SIEGE_DISABLED, SIEGE_SWITCHING_ON),
+                SIEGE_SWITCHING_ON: (
+                    SIEGE_SWITCHING_ON, SIEGE_ENABLED,
+                    SIEGE_SWITCHING_OFF, SIEGE_DISABLED),
+                SIEGE_ENABLED: (SIEGE_ENABLED, SIEGE_SWITCHING_OFF),
+                SIEGE_SWITCHING_OFF: (
+                    SIEGE_SWITCHING_OFF, SIEGE_DISABLED,
+                    SIEGE_SWITCHING_ON, SIEGE_ENABLED),
+            }
+            if state not in allowed.get(before, ()):
+                raise ValueError("bot Siege transition skipped a state")
+            if state == before and state in (
+                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
+                if time_left_ms > int(previous.get(
+                        "siege_time_left_ms", 0)):
+                    raise ValueError(
+                        "bot Siege transition clock increased")
+                if transition_total_ms != int(previous.get(
+                        "siege_transition_total_ms", 0)):
+                    raise ValueError(
+                        "bot Siege transition total changed")
+        return state, time_left_ms, transition_total_ms
+
+    @staticmethod
     def _valid_hidden_observation(raw, known_targets):
         """Recognize a valid first hidden sample with no stored contact."""
         if (not isinstance(raw, dict) or raw.get("visible") is not False or
@@ -4133,6 +4196,9 @@ class BattleState:
             raw, identity, previous)
         gun_clip = BattleState._sanitize_bot_clip(raw, previous)
         reload_progress = _validated_bot_reload_progress(raw)
+        (siege_state, siege_time_left_ms,
+         siege_transition_total_ms) = BattleState._sanitize_bot_siege(
+             raw, identity, previous)
         result = {
             "id": int(identity["id"]),
             "team": int(identity["team"]),
@@ -4155,6 +4221,9 @@ class BattleState:
                              (-1 if movement < -0.01 else 0)),
             "rotation_dir": (1 if rotation > 0.01 else
                              (-1 if rotation < -0.01 else 0)),
+            "siege_state": siege_state,
+            "siege_time_left_ms": siege_time_left_ms,
+            "siege_transition_total_ms": siege_transition_total_ms,
             "fire_seq": fire_seq,
             "shell_index": ammunition.get(
                 "loaded", max(0, min(int(_finite_float(
@@ -4203,6 +4272,13 @@ class BattleState:
         if reload_progress is not None:
             result["reload_time"], result["reload_duration"] = \
                 reload_progress
+        siege_values = SIEGE_VEHICLE_PARAMS.get(str(identity.get(
+            "vehicle", "")))
+        if (siege_values is not None and
+                siege_state == SIEGE_ENABLED and
+                abs(float(result["speed"])) >
+                float(siege_values[2]) + 1.0e-6):
+            raise ValueError("bot Siege speed exceeds vehicle law")
         critical = (previous or {}).get("critical")
         if "critical" in raw:
             critical = _critical_state(_critical_payload(raw.get("critical")))
@@ -4657,6 +4733,14 @@ class BattleState:
                     _validated_bot_reload_progress(
                         raw, required=(
                             self.client_build == CLIENT_BUILD_0922))
+                    if (previous is not None and
+                            int(current.get("fire_seq", 0)) >
+                            int(previous.get("fire_seq", 0)) and
+                            current.get("siege_state") in (
+                                SIEGE_SWITCHING_ON,
+                                SIEGE_SWITCHING_OFF)):
+                        raise ValueError(
+                            "bot fired during a Siege transition")
                     if self.client_build == CLIENT_BUILD_0922:
                         self._reconcile_modern_bot_combat(
                             raw, previous, current)

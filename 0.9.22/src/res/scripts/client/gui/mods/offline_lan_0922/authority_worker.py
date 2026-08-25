@@ -13,6 +13,7 @@ import os
 import sys
 import time
 
+from gui.mods.offline_lan_0922 import siege_mechanics
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_BUILD, CLIENT_CAPABILITIES, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
@@ -64,6 +65,19 @@ def _trusted_projected_bot_states(bots):
             return False
         if (present_ammo and
                 not isinstance(state.get('ammo_reload_pending'), bool)):
+            return False
+        siege_fields = frozenset((
+            'siege_state', 'siege_time_left_ms',
+            'siege_transition_total_ms'))
+        present_siege = fields.intersection(siege_fields)
+        if present_siege and present_siege != siege_fields:
+            return False
+        if (present_siege and
+                not siege_mechanics.valid_wire_state(
+                    state.get('siege_state'),
+                    state.get('siege_time_left_ms'),
+                    transition_total_ms=state.get(
+                        'siege_transition_total_ms'))):
             return False
         try:
             reload_time = float(state['reload_time'])
