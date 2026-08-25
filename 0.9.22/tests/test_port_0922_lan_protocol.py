@@ -136,7 +136,9 @@ class LanProtocolTests(unittest.TestCase):
         }
 
         self.assertTrue(worker.send_projected_bot_state(
-            [], sample_time_us=40000, human_ram_armors=[result]))
+            [], sample_time_us=40000,
+            source_batch_horizon_us=40000,
+            human_ram_armors=[result]))
         self.assertEqual([result], self.sent[-1]['human_ram_armors'])
         self.assertFalse(worker.send_projected_bot_state(
             [], human_ram_armors=[dict(result, armor_first=float('nan'))]))

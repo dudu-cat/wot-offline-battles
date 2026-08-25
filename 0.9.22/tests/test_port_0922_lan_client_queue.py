@@ -234,10 +234,13 @@ class LanClientQueueTests(unittest.TestCase):
             full_message, [0])
 
         self.assertTrue(client.send_bot_state(
-            states, sample_time_us=40000))
+            states, sample_time_us=40000,
+            source_batch_horizon_us=40000))
 
         queued = client._outbound_queue[0]
         self.assertEqual(40000, queued[1]['sample_time_us'])
+        self.assertEqual(
+            40000, queued[1]['source_batch_horizon_us'])
         queued_bots = queued[1]['bots']
         expected = {
             'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll',

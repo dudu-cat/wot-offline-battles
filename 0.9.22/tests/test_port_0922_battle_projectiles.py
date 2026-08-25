@@ -439,12 +439,16 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(list(velocity), args[5])
         self.assertEqual(20000, args[8])
         self.assertEqual(10.0, kwargs['source_shot']['speed'])
+        first_kwargs = dict(kwargs)
         source.model.node.assert_not_called()
 
         state['shot_velocity'] = (velocity[0] + 0.01,) + velocity[1:]
         battle.client.launches = []
-        self.assertFalse(battle._launch_bot_projectile(state, 4))
-        self.assertEqual([], battle.client.launches)
+        self.assertTrue(battle._launch_bot_projectile(state, 4))
+        retry_args, retry_kwargs = battle.client.launches[-1]
+        self.assertEqual(list(origin), retry_args[4])
+        self.assertEqual(list(velocity), retry_args[5])
+        self.assertEqual(first_kwargs, retry_kwargs)
 
     def test_spg_without_final_path_receipt_never_launches(self):
         battle, unused_bigworld = _battle()
