@@ -1681,6 +1681,8 @@ class BotRuntime(object):
         self._ammo_states = {}
         self._burst_states = {}
         self._pending_launches = []
+        self._pending_launch_keys = {}
+        self._pending_launch_by_bot = {}
         self._artillery_intents = {}
         self._artillery_reproofs = {}
         self._friendly_repositions = {}
@@ -2271,6 +2273,8 @@ class BotRuntime(object):
             self._ammo_states = {}
             self._burst_states = {}
             self._pending_launches = []
+            self._pending_launch_keys = {}
+            self._pending_launch_by_bot = {}
             self._clear_artillery_intents()
             self._friendly_repositions = {}
             self._shot_los_cache = {}
@@ -2304,6 +2308,8 @@ class BotRuntime(object):
             self._next_publication = 0.0
             self._pending_ram_reports = []
             self._pending_launches = []
+            self._pending_launch_keys = {}
+            self._pending_launch_by_bot = {}
             self._cover_cursor = 0
             self._cover_queue = []
             self._cover_results = []
@@ -2345,6 +2351,8 @@ class BotRuntime(object):
             self._prewarm_receipt_cursor = 0
             self._pending_ram_reports = []
             self._pending_launches = []
+            self._pending_launch_keys = {}
+            self._pending_launch_by_bot = {}
             self._ram_cooldowns = {}
             self._human_ram_cooldowns = {}
             self._ram_contacts = frozenset()
@@ -6397,6 +6405,47 @@ class BotRuntime(object):
             return None
         return preview_yaw, preview_pitch, preview_origin
 
+    def _queue_pending_launch(self, launch):
+        """Freeze one physical launch in its ordered reliable outbox."""
+        try:
+            key = (int(launch['id']), int(launch['fire_seq']))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RuntimeError('physical bot launch identity is invalid')
+        frozen = dict(launch)
+        previous = self._pending_launch_keys.get(key)
+        if previous is not None:
+            if previous != frozen:
+                raise RuntimeError('physical bot launch identity changed')
+            return False
+        self._pending_launches.append(frozen)
+        self._pending_launch_keys[key] = frozen
+        self._pending_launch_by_bot.setdefault(key[0], []).append(key)
+        return True
+
+    def ack_projectile_launch(self, bot_id, fire_seq):
+        """Remove only this Bot's head accepted by the reliable LAN queue."""
+        try:
+            key = (int(bot_id), int(fire_seq))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        bot_queue = self._pending_launch_by_bot.get(key[0]) or []
+        if not bot_queue or bot_queue[0] != key:
+            return False
+        frozen = self._pending_launch_keys.get(key)
+        if frozen is None:
+            return False
+        launch_index = next((
+            index for index, launch in enumerate(self._pending_launches)
+            if launch is frozen), None)
+        if launch_index is None:
+            return False
+        del self._pending_launches[launch_index]
+        self._pending_launch_keys.pop(key, None)
+        del bot_queue[0]
+        if not bot_queue:
+            self._pending_launch_by_bot.pop(key[0], None)
+        return True
+
     def _commit_burst_edge(
             self, state, gun_state, reload_factor, descriptor, edge,
             ammo_state, launch_receipt=None, launch_preview=None):
@@ -6485,7 +6534,7 @@ class BotRuntime(object):
         launch = _local_launch_record(state)
         if launch is None:
             raise RuntimeError('physical bot burst launch is incomplete')
-        self._pending_launches.append(launch)
+        self._queue_pending_launch(launch)
         return True
 
     def _fire(self, state, gun_state, reload_factor, descriptor,
@@ -7530,7 +7579,7 @@ class BotRuntime(object):
         if not publish:
             return []
         wire_states = []
-        launches = list(self._pending_launches)
+        launches = [dict(launch) for launch in self._pending_launches]
         for state in self._ordered_states():
             burst_state = self._burst_states.get(int(state['id']))
             if burst_state is not None:
@@ -7549,7 +7598,6 @@ class BotRuntime(object):
             # Never put these local-only SPG proof receipts on the LAN wire.
             # BattleRuntime retries an unaccepted launch from this compact list.
             publication['launches'] = launches
-        self._pending_launches = []
         outgoing = [publication]
         # The server validates ram proximity against its latest authority pose.
         # Publish state first, then the cooldown-gated damage reports.

@@ -11337,14 +11337,12 @@ class BattleRuntime(object):
                     is_bot_state = outgoing.get('type') == 'bot_state'
                     if is_bot_state:
                         self._worker_probe_bot_generated += 1
-                    accepted = self._send_bot_message(outgoing)
+                    accepted = self._enqueue_bot_message(outgoing)
                     if is_bot_state:
                         if accepted:
                             self._worker_probe_bot_enqueued += 1
                         else:
                             self._worker_probe_bot_send_failed += 1
-                    if accepted:
-                        self._resolve_bot_fire(outgoing)
             if (self._battle_live and
                     (self._projectile_is_authority() or
                      self._projectile_visual_meta)):
@@ -14722,19 +14720,53 @@ class BattleRuntime(object):
                 message.get('base_team'))
         return False
 
+    def _enqueue_bot_message(self, message):
+        """Join one state enqueue with ordered physical-launch progress."""
+        accepted = self._send_bot_message(message)
+        if accepted:
+            self._resolve_bot_fire(message)
+        return accepted
+
     def _resolve_bot_fire(self, message):
         if message.get('type') != 'bot_state':
-            return
-        for state in (message.get('launches') or message.get('bots') or ()):
+            return False
+        acknowledge = getattr(
+            self._bots, 'ack_projectile_launch', None)
+        launches = message.get('launches') or ()
+        if launches and not callable(acknowledge):
+            raise RuntimeError(
+                'bot projectile outbox acknowledgement is unavailable')
+        blocked_bots = set()
+        complete = True
+        for state in launches:
             try:
-                bot_id = int(state.get('id'))
-                fire_seq = int(state.get('fire_seq', 0))
-            except (TypeError, ValueError):
+                bot_id = int(state['id'])
+                fire_seq = int(state['fire_seq'])
+            except (AttributeError, KeyError, OverflowError,
+                    TypeError, ValueError):
+                raise RuntimeError(
+                    'bot projectile outbox identity is invalid')
+            if bot_id in blocked_bots:
                 continue
             previous = self._bot_fire_seen.get(bot_id, 0)
-            if (fire_seq > previous and
-                    self._launch_bot_projectile(state, fire_seq)):
-                self._bot_fire_seen[bot_id] = fire_seq
+            if fire_seq <= previous:
+                # Replaying an already consumed publication is idempotent. Its
+                # outbox entry was removed with the original reliable enqueue.
+                continue
+            if (fire_seq != previous + 1 or
+                    not self._launch_bot_projectile(state, fire_seq)):
+                # A later physical round may never overtake a temporarily
+                # unavailable muzzle or a full reliable queue. Preserve that
+                # shooter's ordered tail, while independent Bot queues remain
+                # free to make progress.
+                blocked_bots.add(bot_id)
+                complete = False
+                continue
+            if not acknowledge(bot_id, fire_seq):
+                raise RuntimeError(
+                    'bot projectile outbox acknowledgement is out of order')
+            self._bot_fire_seen[bot_id] = fire_seq
+        return complete
 
     def _remember_player_fire_intent(self, key, intent):
         frozen = dict(intent)

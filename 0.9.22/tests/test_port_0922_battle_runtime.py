@@ -19701,6 +19701,130 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.client.send_projected_bot_state.assert_called_once_with(
             bots, sample_time_us=40000)
 
+    def test_bot_launch_outbox_survives_bot_state_enqueue_failure(self):
+        battle = BattleRuntime(_runtime())
+        outbox = bot_runtime.BotRuntime(1)
+        launch = {'id': 11, 'fire_seq': 1, 'shot_yaw': 0.25}
+        self.assertTrue(outbox._queue_pending_launch(launch))
+        launch['shot_yaw'] = 1.0
+        battle._bots = outbox
+        battle._send_bot_message = mock.Mock(side_effect=[False, True])
+        battle._launch_bot_projectile = mock.Mock(return_value=True)
+        publication = {
+            'type': 'bot_state', 'bots': [],
+            'launches': [dict(outbox._pending_launches[0])],
+        }
+
+        self.assertFalse(battle._enqueue_bot_message(publication))
+        self.assertEqual([1], [
+            value['fire_seq'] for value in outbox._pending_launches])
+        self.assertEqual(0.25, outbox._pending_launches[0]['shot_yaw'])
+        self.assertEqual({}, battle._bot_fire_seen)
+        battle._launch_bot_projectile.assert_not_called()
+
+        self.assertTrue(battle._enqueue_bot_message(publication))
+        self.assertEqual([], outbox._pending_launches)
+        self.assertEqual({11: 1}, battle._bot_fire_seen)
+
+    def test_bot_launch_outbox_retries_from_first_failed_launch(self):
+        battle = BattleRuntime(_runtime())
+        outbox = bot_runtime.BotRuntime(1)
+        for fire_seq in (1, 2, 3):
+            self.assertTrue(outbox._queue_pending_launch({
+                'id': 11, 'fire_seq': fire_seq,
+            }))
+        battle._bots = outbox
+        battle._send_bot_message = mock.Mock(return_value=True)
+        attempts = []
+
+        def enqueue_launch(unused_state, fire_seq):
+            attempts.append(fire_seq)
+            return fire_seq != 2 or attempts.count(2) > 1
+
+        battle._launch_bot_projectile = mock.Mock(
+            side_effect=enqueue_launch)
+        first = {
+            'type': 'bot_state', 'bots': [],
+            'launches': [dict(value)
+                         for value in outbox._pending_launches],
+        }
+
+        self.assertTrue(battle._enqueue_bot_message(first))
+        self.assertEqual([1, 2], attempts)
+        self.assertEqual([2, 3], [
+            value['fire_seq'] for value in outbox._pending_launches])
+        self.assertEqual({11: 1}, battle._bot_fire_seen)
+
+        retry = {
+            'type': 'bot_state', 'bots': [],
+            'launches': [dict(value)
+                         for value in outbox._pending_launches],
+        }
+        self.assertTrue(battle._enqueue_bot_message(retry))
+        self.assertEqual([1, 2, 2, 3], attempts)
+        self.assertEqual([], outbox._pending_launches)
+        self.assertEqual({11: 3}, battle._bot_fire_seen)
+
+        self.assertTrue(battle._resolve_bot_fire(first))
+        self.assertEqual([1, 2, 2, 3], attempts)
+
+    def test_bot_launch_failure_blocks_only_that_shooters_tail(self):
+        battle = BattleRuntime(_runtime())
+        outbox = bot_runtime.BotRuntime(1)
+        for bot_id, fire_seq in ((11, 1), (11, 2), (12, 1)):
+            self.assertTrue(outbox._queue_pending_launch({
+                'id': bot_id, 'fire_seq': fire_seq,
+            }))
+        battle._bots = outbox
+        battle._send_bot_message = mock.Mock(return_value=True)
+        attempts = []
+
+        def enqueue_launch(state, fire_seq):
+            key = (state['id'], fire_seq)
+            attempts.append(key)
+            return key != (11, 1) or attempts.count(key) > 1
+
+        battle._launch_bot_projectile = mock.Mock(
+            side_effect=enqueue_launch)
+        first = {
+            'type': 'bot_state', 'bots': [],
+            'launches': [dict(value)
+                         for value in outbox._pending_launches],
+        }
+
+        self.assertTrue(battle._enqueue_bot_message(first))
+        self.assertEqual([(11, 1), (12, 1)], attempts)
+        self.assertEqual([(11, 1), (11, 2)], [
+            (value['id'], value['fire_seq'])
+            for value in outbox._pending_launches])
+        self.assertEqual({12: 1}, battle._bot_fire_seen)
+
+        retry = {
+            'type': 'bot_state', 'bots': [],
+            'launches': [dict(value)
+                         for value in outbox._pending_launches],
+        }
+        self.assertTrue(battle._enqueue_bot_message(retry))
+        self.assertEqual(
+            [(11, 1), (12, 1), (11, 1), (11, 2)], attempts)
+        self.assertEqual([], outbox._pending_launches)
+        self.assertEqual({11: 2, 12: 1}, battle._bot_fire_seen)
+
+    def test_malformed_frozen_bot_launch_fails_the_worker_boundary(self):
+        battle = BattleRuntime(_runtime())
+        battle._bots = bot_runtime.BotRuntime(1)
+        battle._send_bot_message = mock.Mock(return_value=True)
+        battle._launch_bot_projectile = mock.Mock()
+
+        with self.assertRaisesRegex(
+                RuntimeError, 'outbox identity is invalid'):
+            battle._enqueue_bot_message({
+                'type': 'bot_state', 'bots': [],
+                'launches': [{'id': 11}],
+            })
+
+        battle._launch_bot_projectile.assert_not_called()
+
     def test_snapshot_health_is_forwarded_to_authority_runtime(self):
         battle = BattleRuntime(_runtime())
         battle._bots = types.SimpleNamespace(apply_snapshot=mock.Mock())
