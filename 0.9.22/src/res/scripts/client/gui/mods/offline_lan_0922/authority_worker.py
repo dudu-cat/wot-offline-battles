@@ -346,6 +346,9 @@ class AuthorityWorkerLANClient(LANClient):
             'health': 1, 'max_health': 1, 'alive': True,
             'critical': {}, 'critical_revision': 0,
             'critical_base_revision': 0, 'critical_ack_seq': 0,
+            'input_seq': 0,
+            'up_cosine': 1.0,
+            'landing_observation_seq': 0,
             # LANClient validates the equipment ledger for every projected
             # player, including this worker-local carrier.  Keep an isolated
             # copy of the real descriptor's canonical ledger; the carrier is
