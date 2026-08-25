@@ -301,7 +301,7 @@ CRITICAL_CREW_NAMES = frozenset((
 ))
 CRITICAL_STATES = frozenset(("normal", "critical", "destroyed"))
 CRITICAL_CAUSES = frozenset((
-    "shot", "explosion", "repair", "fire", "drowning"))
+    "shot", "explosion", "repair", "fire", "drowning", "ramming"))
 TRACK_DEVICE_NAMES = frozenset(("leftTrackHealth", "rightTrackHealth"))
 OUTFIT_SEASONS = frozenset((1, 2, 4))
 MAX_OUTFIT_BYTES = 64 * 1024
@@ -1041,6 +1041,27 @@ def _critical_state(value):
     return result
 
 
+def _bot_terminal_critical(value):
+    """Validate the worker's immutable full-wreck critical projection."""
+    terminal = _critical_payload(value)
+    if terminal is None or terminal.get("events"):
+        raise ValueError("bot terminal critical must be durable state")
+    devices = terminal.get("devices") or ()
+    if (set(record["name"] for record in devices) !=
+            set(CRITICAL_DEVICE_NAMES) or
+            any(record["hp"] != 0.0 or
+                record["state"] != "destroyed"
+                for record in devices) or
+            set(terminal.get("destroyed") or ()) !=
+            set(CRITICAL_DEVICE_NAMES) or terminal.get("fire", False)):
+        raise ValueError("bot terminal critical is not a complete wreck")
+    roster = terminal.get("crew_roster") or ()
+    if (not roster or
+            set(terminal.get("crew_ko") or ()) != set(roster)):
+        raise ValueError("bot terminal critical does not knock out its crew")
+    return _critical_state(terminal)
+
+
 def _critical_discrete_state(value):
     """Compare module/crew phases without per-frame repair HP progress."""
     if not isinstance(value, dict):
@@ -1622,6 +1643,7 @@ class BattleState:
         self.bot_manifest = []
         self.bot_manifest_revision = 0
         self.bot_states = {}
+        self.bot_terminal_criticals = {}
         self.bot_state_revision = 0
         self.bot_planner = BotPlanner()
         self.vehicle_catalogs = {}
@@ -2633,6 +2655,7 @@ class BattleState:
         self.bot_manifest = []
         self.bot_manifest_revision = 0
         self.bot_states = {}
+        self.bot_terminal_criticals = {}
         self.bot_state_revision = 0
         self.bot_state_time_us = 0
         self.bot_source_time_us = None
@@ -3672,6 +3695,7 @@ class BattleState:
                 if incoming:
                     return False
                 self.bot_manifest_authority_id = player_id
+                self.bot_terminal_criticals = {}
                 if human_profiles is not None:
                     self.human_collision_profiles = human_profiles
                     self.human_collision_profile_authority_id = player_id
@@ -3682,6 +3706,7 @@ class BattleState:
                 return False
             manifest = []
             states = {}
+            terminal_criticals = {}
             seen = set()
             required = ("id", "team", "slot", "vehicle", "health",
                         "max_health", "x", "y", "z", "yaw")
@@ -3711,6 +3736,10 @@ class BattleState:
                     _validated_bot_reload_progress(
                         raw, required=(
                             self.client_build == CLIENT_BUILD_0922))
+                    if "terminal_critical" in raw:
+                        terminal_criticals[bot_id] = (
+                            _bot_terminal_critical(
+                                raw.get("terminal_critical")))
                 except (TypeError, ValueError):
                     return False
                 entry = {
@@ -3732,6 +3761,7 @@ class BattleState:
             self.bot_manifest = manifest
             self.bot_manifest_revision += 1
             self.bot_manifest_authority_id = player_id
+            self.bot_terminal_criticals = terminal_criticals
             if human_profiles is not None:
                 self.human_collision_profiles = human_profiles
                 self.human_collision_profile_authority_id = player_id
@@ -4335,6 +4365,17 @@ class BattleState:
         # was incorporated before this external hit.
         bot["combat_ack_seq"] = int(bot.get("combat_ack_seq", 0))
         return True
+
+    def _apply_bot_terminal_critical(self, bot):
+        """Apply the worker-projected wreck without opening a revision."""
+        terminal = self.bot_terminal_criticals.get(int(bot.get("id", 0)))
+        if terminal is None:
+            return None
+        durable = json.loads(json.dumps(terminal))
+        bot["critical"] = durable
+        bot["combat_fire_elapsed"] = 0.0
+        bot["combat_fire_timer"] = 0.0
+        return durable
 
     def _reconcile_modern_bot_combat(self, raw, previous, current):
         """Apply the strict #1513 bot publication/base/ack contract."""
@@ -5827,6 +5868,7 @@ class BattleState:
             admitted_critical = (
                 critical if proposal["critical_accepted"] and was_alive
                 else None)
+        event_critical = admitted_critical
         crew_knockout = bool(
             was_alive and _whole_crew_knocked_out(admitted_critical))
         ammo_rack_death = bool(
@@ -5879,13 +5921,21 @@ class BattleState:
                 if not before_fire and after_fire:
                     target["fire_attacker_kind"] = record["shooter_kind"]
                     target["fire_attacker_id"] = record["shooter_id"]
+            if was_alive and not target["alive"]:
+                terminal = self._apply_bot_terminal_critical(target)
+                if terminal is not None:
+                    event_critical = dict(terminal)
+                    # Full wreck completion is durable state, not a burst of
+                    # fresh hit feedback. Preserve only admitted hit events.
+                    event_critical["events"] = list(
+                        (admitted_critical or {}).get("events") or ())
             self._commit_external_bot_combat(target, combat_before)
             critical_commit = ({
                 "combat_revision": target.get("combat_revision", 0),
                 "combat_base_revision": target.get(
                     "combat_base_revision", 0),
                 "combat_ack_seq": target.get("combat_ack_seq", 0),
-            } if critical is not None else None)
+            } if event_critical is not None else None)
             health = int(target["health"])
             alive = bool(target["alive"])
 
@@ -5926,7 +5976,7 @@ class BattleState:
                 (admitted_critical is not None or critical_noop) and
                 was_alive)
             if admitted_critical is not None:
-                event["critical"] = admitted_critical
+                event["critical"] = event_critical
                 if critical_commit:
                     event.update(critical_commit)
             elif not critical_noop:
@@ -6804,6 +6854,9 @@ class BattleState:
             bot["alive"] = bot["health"] > 0
             bot["display_health"] = bot["health"]
             bot["death_reason"] = reason if not bot["alive"] else 0
+            bot_terminal = None
+            if not bot["alive"]:
+                bot_terminal = self._apply_bot_terminal_critical(bot)
             self._commit_external_bot_combat(bot, bot_combat_before)
             if applied_bot > 0:
                 self._drop_capture_for_vehicle("bot", bot_id)
@@ -6815,6 +6868,13 @@ class BattleState:
                 "attack_reason": reason,
                 "death_reason": bot["death_reason"], "source": "ram",
             }
+            if bot_terminal is not None:
+                bot_event.update({
+                    "critical": bot_terminal,
+                    "combat_revision": bot["combat_revision"],
+                    "combat_base_revision": bot["combat_base_revision"],
+                    "combat_ack_seq": bot["combat_ack_seq"],
+                })
             if target_kind == "bot":
                 bot_event["attacker_bot"] = target_id
             else:
@@ -6833,6 +6893,10 @@ class BattleState:
                 target["alive"] = target["health"] > 0
                 target["display_health"] = target["health"]
                 target["death_reason"] = reason if not target["alive"] else 0
+                target_terminal = None
+                if not target["alive"]:
+                    target_terminal = self._apply_bot_terminal_critical(
+                        target)
                 self._commit_external_bot_combat(
                     target, target_combat_before)
                 if applied_target > 0:
@@ -6845,6 +6909,14 @@ class BattleState:
                     "attack_reason": reason,
                     "death_reason": target["death_reason"], "source": "ram",
                 }
+                if target_terminal is not None:
+                    target_event.update({
+                        "critical": target_terminal,
+                        "combat_revision": target["combat_revision"],
+                        "combat_base_revision":
+                            target["combat_base_revision"],
+                        "combat_ack_seq": target["combat_ack_seq"],
+                    })
                 target_team = int(target.get("team", 0))
             else:
                 target_critical_before = target.critical

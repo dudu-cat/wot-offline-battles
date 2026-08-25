@@ -6490,6 +6490,53 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual('critical', fuel['state'])
         self.assertNotIn('fuelTankHealth', outgoing['critical']['destroyed'])
 
+    def test_worker_projects_terminal_critical_and_fire_uses_same_wreck(self):
+        descriptor = _critical_descriptor()
+        descriptor.type = types.SimpleNamespace(crewRoles=(
+            ('commander',), ('driver',), ('gunner',),
+            ('loader',), ('radioman',)))
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+            direction_probe=lambda *unused: {
+                'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+
+        manifest = runtime.battle_start(self.start)[0]['bots'][0]
+        terminal = manifest['terminal_critical']
+        expected_devices = set(
+            self.module.critical_damage._OFFH_DEATH_DEVICES)
+        self.assertEqual(expected_devices, set(terminal['destroyed']))
+        self.assertEqual(
+            set(terminal['crew_roster']), set(terminal['crew_ko']))
+        self.assertFalse(terminal['fire'])
+        self.assertEqual([], terminal['events'])
+
+        state = runtime.states[11]
+        state.update({
+            'health': 20, 'display_health': 20,
+            'critical': _critical_payload({
+                'name': 'fuelTankHealth', 'hp': 0.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }, destroyed=['fuelTankHealth'], fire=True),
+            'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
+        })
+        self.assertTrue(runtime._advance_bot_critical(
+            state, 1.0, 1.0, record_step=False))
+        self.assertEqual(0, state['health'])
+        self.assertFalse(state['alive'])
+        self.assertEqual(expected_devices,
+                         set(state['critical']['destroyed']))
+        self.assertEqual(
+            set(terminal['crew_roster']),
+            set(state['critical']['crew_ko']))
+        self.assertFalse(state['critical']['fire'])
+        self.assertEqual([], state['critical']['events'])
+        self.assertEqual((0.0, 0.0), (
+            state['combat_fire_elapsed'], state['combat_fire_timer']))
+
     def test_delayed_server_echo_cannot_rewind_bot_fire_or_repair_publication(self):
         descriptor = _critical_descriptor()
         runtime = self.module.BotRuntime(

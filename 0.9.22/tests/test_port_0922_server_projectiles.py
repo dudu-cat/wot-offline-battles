@@ -255,6 +255,24 @@ def _ricochet(projectile_id, epoch=1, **changes):
     return message
 
 
+def _terminal_critical():
+    devices = [
+        'engineHealth', 'ammoBayHealth', 'fuelTankHealth', 'radioHealth',
+        'leftTrackHealth', 'rightTrackHealth', 'gunHealth',
+        'turretRotatorHealth', 'surveyingDeviceHealth',
+    ]
+    roster = ['commander', 'driver', 'gunner1', 'loader1']
+    return {
+        'devices': [{
+            'name': name, 'hp': 0.0, 'max_hp': 100.0,
+            'state': 'destroyed',
+        } for name in devices],
+        'destroyed': list(devices), 'crew_ko': list(roster),
+        'crew_roster': list(roster), 'fire': False,
+        'ammo_rack_death': False, 'events': [],
+    }
+
+
 def _destructible(chunk_id=7, item_index=3, **changes):
     event = {
         'destructible_kind': 'fragile', 'chunk_id': chunk_id,
@@ -266,6 +284,96 @@ def _destructible(chunk_id=7, item_index=3, **changes):
 
 
 class ServerProjectileLedgerTests(unittest.TestCase):
+    def test_fatal_bot_projectile_commits_worker_terminal_critical_once(self):
+        state = _state()
+        bot = {
+            'id': 16, 'team': 2, 'vehicle': 'ussr:R11_MS-1',
+            'health': 100, 'max_health': 1000, 'alive': True,
+            'display_health': 100, 'x': 10.0, 'y': 0.0, 'z': 0.0,
+            'critical': {}, 'combat_revision': 0,
+            'combat_base_revision': 0, 'combat_ack_seq': 0,
+            'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
+        }
+        state.bot_states[16] = bot
+        state.bot_terminal_criticals[16] = _terminal_critical()
+        admitted = {
+            'devices': [{
+                'name': 'leftTrackHealth', 'hp': 0.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False,
+            'events': [{
+                'kind': 'device', 'name': 'leftTrackHealth',
+                'old_state': 'normal', 'state': 'destroyed',
+                'cause': 'shot',
+            }],
+        }
+        proposal = {
+            'target_kind': 'bot', 'target_id': 16, 'target': bot,
+            'target_team': 2, 'target_alive': True,
+            'retired_target': False, 'damage': 100,
+            'potential_damage': 100, 'shot_result': 2,
+            'pose': (10.0, 1.0, 0.0), 'critical': admitted,
+            'critical_delta': None, 'critical_accepted': True,
+            'hull_damage': 100, 'splash': False,
+            'stun_end_server_time_ms': 0,
+        }
+        record = {
+            'shooter_kind': 'player', 'shooter_id': 1, 'team': 1,
+            'projectile_id': '1:p:1:1', 'shot_seq': 1,
+            'shell_index': 0,
+        }
+
+        state._apply_projectile_effect(record, proposal)
+
+        self.assertFalse(bot['alive'])
+        self.assertEqual(0, bot['health'])
+        self.assertEqual(
+            set(_terminal_critical()['destroyed']),
+            set(bot['critical']['destroyed']))
+        self.assertEqual(1, bot['combat_revision'])
+        hit = [event for event in state.pending_events
+               if event.get('target_bot') == 16][-1]
+        self.assertEqual(bot['combat_revision'], hit['combat_revision'])
+        self.assertEqual(
+            admitted['events'], hit['critical']['events'])
+
+    def test_bot_ram_commits_terminal_critical_for_both_wrecks(self):
+        state = _state()
+        state.bot_manifest_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        for bot_id in (16, 17):
+            state.bot_states[bot_id] = {
+                'id': bot_id, 'team': 1 if bot_id == 16 else 2,
+                'vehicle': 'ussr:R11_MS-1', 'health': 50,
+                'max_health': 1000, 'alive': True,
+                'display_health': 50, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                'critical': {}, 'combat_revision': 0,
+                'combat_base_revision': 0, 'combat_ack_seq': 0,
+                'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
+            }
+            state.bot_terminal_criticals[bot_id] = _terminal_critical()
+
+        self.assertTrue(state.report_bot_ram(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': state.round_id, 'bot_id': 16,
+                'target_kind': 'bot', 'target_id': 17, 'ram_seq': 1,
+                'damage_to_bot': 80, 'damage_to_target': 80,
+            }))
+
+        for bot_id in (16, 17):
+            bot = state.bot_states[bot_id]
+            self.assertFalse(bot['alive'])
+            self.assertEqual(0, bot['health'])
+            self.assertEqual(1, bot['combat_revision'])
+            self.assertEqual(
+                set(_terminal_critical()['destroyed']),
+                set(bot['critical']['destroyed']))
+        events = [event for event in state.pending_events
+                  if event.get('source') == 'ram']
+        self.assertEqual(2, len(events))
+        self.assertTrue(all('critical' in event for event in events))
+
     def test_1513_siege_transition_is_server_owned_and_caps_speed(self):
         state = _state()
         player = state.players[1]

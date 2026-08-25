@@ -583,6 +583,49 @@ class _BotCriticalVehicle(object):
         self.is_turret_locked = False
 
 
+def _descriptor_crew_roster(descriptor):
+    """Return the exact #1513 health-instance names for one real crew."""
+    roles = getattr(getattr(descriptor, 'type', None), 'crewRoles', None)
+    if not isinstance(roles, (list, tuple)) or not roles:
+        return ()
+    counters = {'gunner': 1, 'loader': 1, 'radioman': 1}
+    allowed = frozenset(
+        ('commander', 'driver', 'gunner', 'loader', 'radioman'))
+    roster = []
+    for crewman_roles in roles:
+        if (not isinstance(crewman_roles, (list, tuple)) or
+                not crewman_roles):
+            return ()
+        main_role = str(crewman_roles[0])
+        if main_role not in allowed:
+            return ()
+        if main_role in counters:
+            name = main_role + str(counters[main_role])
+            counters[main_role] += 1
+        else:
+            name = main_role
+        if name in roster:
+            return ()
+        roster.append(name)
+    return tuple(roster)
+
+
+def _terminal_critical(state, descriptor, cause):
+    """Build complete wreck state from the worker's installed descriptor."""
+    shadow = _BotCriticalVehicle(
+        state, descriptor, None,
+        _number(state.get('combat_fire_timer')))
+    terminal = critical_damage.apply_death(shadow, cause)
+    if not isinstance(terminal, dict):
+        return None
+    roster = _descriptor_crew_roster(descriptor)
+    if roster:
+        terminal = dict(terminal)
+        terminal['crew_roster'] = list(roster)
+        terminal['crew_ko'] = list(roster)
+    return _canonical_critical(terminal)
+
+
 class _BotGunState(object):
     """The final 0.8.2 bot reload/clip and #1513 dispersion clocks.
 
@@ -2453,6 +2496,12 @@ class BotRuntime(object):
             state['alive'] = state['health'] > 0
             state['display_health'] = state['health']
             if not state['alive']:
+                terminal = _terminal_critical(
+                    state, descriptor, 'fire')
+                if terminal is not None:
+                    state['critical'] = terminal
+                state['combat_fire_elapsed'] = 0.0
+                state['combat_fire_timer'] = 0.0
                 self._friendly_repositions.pop(state['id'], None)
                 state['death_reason'] = 1
                 state['speed'] = 0.0
@@ -2656,6 +2705,13 @@ class BotRuntime(object):
                 'ammo_reload_pending', 'reload_time', 'reload_duration',
                 'clip', 'clip_size')
         result = dict((key, state[key]) for key in keys)
+        descriptor = self._descriptors.get(state['id'], {})
+        terminal = _terminal_critical(state, descriptor, 'shot')
+        # Retail descriptors always expose the physical crew. Keep synthetic
+        # descriptor seams usable in tests, but never advertise a partial
+        # terminal projection as canonical.
+        if (terminal is not None and terminal.get('crew_roster')):
+            result['terminal_critical'] = terminal
         # These coordinates were resolved against the loaded retail map by
         # the authority.  Consumers must not run the formation resolver a
         # second time and nudge the same slot away from its canonical pose.
