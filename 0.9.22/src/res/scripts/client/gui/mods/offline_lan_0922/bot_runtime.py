@@ -622,7 +622,8 @@ def _combat_signature(state):
         bool(state.get('alive', False)),
         _critical_signature(state.get('critical')),
         round(_number(state.get('combat_fire_elapsed')), 6),
-        round(_number(state.get('combat_fire_timer')), 6))
+        round(_number(state.get('combat_fire_timer')), 6),
+        max(0, int(_number(state.get('stun_end_server_time_ms')))))
 
 
 def _combat_record(state):
@@ -634,6 +635,8 @@ def _combat_record(state):
             _number(state.get('combat_fire_elapsed')), 6),
         'combat_fire_timer': round(
             _number(state.get('combat_fire_timer')), 6),
+        'stun_end_server_time_ms': max(
+            0, int(_number(state.get('stun_end_server_time_ms')))),
     }
 
 
@@ -692,6 +695,8 @@ def _apply_combat_record(state, record):
         _number(record.get('combat_fire_elapsed')), 6)
     state['combat_fire_timer'] = round(
         _number(record.get('combat_fire_timer')), 6)
+    state['stun_end_server_time_ms'] = max(
+        0, int(_number(record.get('stun_end_server_time_ms'))))
     state['display_health'] = state['health']
     if not state['alive']:
         state['speed'] = 0.0
@@ -2226,7 +2231,8 @@ class BotRuntime(object):
                 contracts = restored_contracts
         return contracts
 
-    def _install_bot_equipments(self, bot_id, snapshots=None):
+    def _install_bot_equipments(self, bot_id, snapshots=None,
+                                canonical_restore=False):
         """Create one independent exact consumable ledger for each bot."""
         bot_id = int(bot_id)
         contracts = self._bot_equipment_contracts(snapshots)
@@ -2237,11 +2243,15 @@ class BotRuntime(object):
             if contracts and existing_contracts != contracts:
                 raise ValueError('bot equipment contracts changed')
             if snapshots is not None:
-                # Repeated manifests validate the canonical snapshot without
-                # rewinding clocks already owned by this worker process.
-                equipment_mechanics.restore_equipment_states(
+                restored = equipment_mechanics.restore_equipment_states(
                     snapshots, contracts=existing_contracts,
                     now=self._equipment_now)
+                if canonical_restore:
+                    # A server-issued authority handoff is an ownership
+                    # boundary. Discard any locally consumed but unacknowledged
+                    # item state from the former authority interval.
+                    existing = restored
+                    self._equipment_states[bot_id] = existing
         elif snapshots is None:
             existing = [equipment_mechanics.EquipmentState(
                 contract, self._equipment_now) for contract in contracts]
@@ -2265,6 +2275,28 @@ class BotRuntime(object):
         state['equipment_states'] = [
             equipment.snapshot(self._equipment_now) for equipment in states]
         return True
+
+    def _observe_bot_stun(self, state, raw, server_time_ms):
+        """Anchor one server-owned stun end time to the worker sim clock."""
+        raw = raw if isinstance(raw, dict) else {}
+        try:
+            end = int(raw.get('stun_end_server_time_ms', 0))
+            observed = int(server_time_ms)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('bot stun clock is invalid')
+        if (isinstance(raw.get('stun_end_server_time_ms', 0), bool) or
+                isinstance(server_time_ms, bool) or end < 0 or observed < 0):
+            raise ValueError('bot stun clock is invalid')
+        state['stun_end_server_time_ms'] = end
+        state['_stun_until_equipment_time'] = (
+            self._equipment_now + max(0.0, (end - observed) / 1000.0))
+        return end > observed
+
+    def _bot_stunned(self, state):
+        return bool(
+            state.get('alive', False) and
+            _number(state.get('_stun_until_equipment_time')) >
+            self._equipment_now + 1.0e-9)
 
     def bot_equipment_passives(self, bot_id):
         return dict(self._equipment_passives.get(
@@ -2657,6 +2689,9 @@ class BotRuntime(object):
                 '_overturn_time': 0.0,
                 '_overturn_level': 0,
                 '_overturned': False,
+                'stun_end_server_time_ms': max(0, int(_number(
+                    raw.get('stun_end_server_time_ms'), 0))),
+                '_stun_until_equipment_time': self._equipment_now,
                 'critical': (dict(raw.get('critical'))
                              if isinstance(raw.get('critical'), dict) else {}),
                 'combat_revision': max(0, int(_number(
@@ -2679,9 +2714,13 @@ class BotRuntime(object):
             state.setdefault('_overturn_time', 0.0)
             state.setdefault('_overturn_level', 0)
             state.setdefault('_overturned', False)
+            self._observe_bot_stun(
+                state, raw, max(0, int(_number(
+                    message.get('server_time_ms'), 0))))
             self._install_bot_equipments(
                 bot_id, raw.get('equipment_states')
-                if 'equipment_states' in raw else None)
+                if 'equipment_states' in raw else None,
+                canonical_restore=authority_handoff)
             self._publish_equipment_state(state)
             state['siege_state'] = siege_state
             state['siege_time_left_ms'] = wire_time
@@ -2863,7 +2902,7 @@ class BotRuntime(object):
             candidate['health'] > 0)
         contract = ('critical', 'combat_revision', 'combat_base_revision',
                     'combat_ack_seq', 'combat_fire_elapsed',
-                    'combat_fire_timer')
+                    'combat_fire_timer', 'stun_end_server_time_ms')
         if not all(name in raw for name in contract):
             raise ValueError('modern bot snapshot combat contract is missing')
         if not isinstance(raw['critical'], dict):
@@ -2874,15 +2913,18 @@ class BotRuntime(object):
             acked_seq = int(raw['combat_ack_seq'])
             fire_elapsed = float(raw['combat_fire_elapsed'])
             fire_timer = float(raw['combat_fire_timer'])
+            stun_end = int(raw['stun_end_server_time_ms'])
             exact = (
                 not isinstance(raw['combat_revision'], bool) and
                 not isinstance(raw['combat_base_revision'], bool) and
                 not isinstance(raw['combat_ack_seq'], bool) and
                 not isinstance(raw['combat_fire_elapsed'], bool) and
                 not isinstance(raw['combat_fire_timer'], bool) and
+                not isinstance(raw['stun_end_server_time_ms'], bool) and
                 float(raw['combat_revision']) == revision and
                 float(raw['combat_base_revision']) == base_revision and
                 float(raw['combat_ack_seq']) == acked_seq and
+                float(raw['stun_end_server_time_ms']) == stun_end and
                 not math.isnan(fire_elapsed) and
                 not math.isinf(fire_elapsed) and
                 not math.isnan(fire_timer) and
@@ -2901,6 +2943,9 @@ class BotRuntime(object):
             raise ValueError('inactive bot fire has a non-zero clock')
         candidate['combat_fire_elapsed'] = round(fire_elapsed, 6)
         candidate['combat_fire_timer'] = round(fire_timer, 6)
+        if stun_end < 0:
+            raise ValueError('modern bot snapshot combat contract is invalid')
+        candidate['stun_end_server_time_ms'] = stun_end
         candidate_record = _combat_record(candidate)
         signature = _combat_signature(candidate)
 
@@ -3061,6 +3106,20 @@ class BotRuntime(object):
             state, descriptor, None,
             _number(state.get('combat_fire_timer')),
             self._equipment_passives.get(int(state['id'])))
+        clear_stun = bool((effect or {}).get('clearStun', False))
+        stun_cleared = False
+        if clear_stun:
+            try:
+                stun_base = int(effect.get('stunBaseEndServerTimeMs'))
+            except (TypeError, ValueError, OverflowError):
+                if strict:
+                    raise RuntimeError('bot medkit stun base is invalid')
+                return False
+            if (isinstance(effect.get('stunBaseEndServerTimeMs'), bool) or
+                    stun_base <= 0):
+                if strict:
+                    raise RuntimeError('bot medkit stun base is invalid')
+                return False
         if action == 'extinguish_fire':
             payload = critical_damage.use_extinguisher(shadow)
         elif action == 'repair_devices':
@@ -3075,24 +3134,35 @@ class BotRuntime(object):
             if strict:
                 raise RuntimeError('bot equipment action is unsupported')
             return False
-        if payload is None:
+        if payload is None and not clear_stun:
             if strict:
                 raise RuntimeError('bot equipment effect could not be applied')
             return False
-        state['critical'] = _canonical_critical(payload)
+        if payload is not None:
+            state['critical'] = _canonical_critical(payload)
         if action == 'extinguish_fire':
             state['combat_fire_elapsed'] = 0.0
             state['combat_fire_timer'] = 0.0
-        return True
+        if clear_stun:
+            if int(state.get('stun_end_server_time_ms', 0)) == stun_base:
+                state['stun_end_server_time_ms'] = 0
+                state['_stun_until_equipment_time'] = self._equipment_now
+                stun_cleared = True
+        return payload is not None or stun_cleared
 
     def _poll_bot_equipments(self, state, descriptor):
         """Run fixed bot kit policy and return replayable effect records."""
         effects = []
         for equipment in self._equipment_states.get(int(state['id']), ()):
             effect = equipment.poll_bot(
-                self._equipment_now, state.get('critical'))
+                self._equipment_now, state.get('critical'),
+                stunned=self._bot_stunned(state))
             if effect is None:
                 continue
+            effect = dict(effect)
+            if effect.get('clearStun', False):
+                effect['stunBaseEndServerTimeMs'] = int(
+                    state.get('stun_end_server_time_ms', 0))
             self._apply_bot_equipment_effect(
                 state, descriptor, effect, strict=True)
             effects.append(dict(effect))
@@ -3102,7 +3172,8 @@ class BotRuntime(object):
     def _advance_bot_critical(self, state, step, now, record_step=True,
                               advance_fire=True, equipment_effects=None):
         payload = state.get('critical')
-        if not isinstance(payload, dict) or not payload:
+        if ((not isinstance(payload, dict) or not payload) and
+                not self._bot_stunned(state)):
             return False
         before_signature = _combat_signature(state)
         was_on_fire = bool(payload.get('fire', False))
@@ -3308,6 +3379,9 @@ class BotRuntime(object):
             if state is None:
                 continue
             self._apply_server_combat_state(state, raw, server_tick)
+            self._observe_bot_stun(
+                state, state, max(0, int(_number(
+                    message.get('server_time_ms'), 0))))
             previous_fire_seq = int(state.get('fire_seq', 0))
             previous_shell_index = int(state.get('shell_index', 0))
             incoming_fire_seq = max(
@@ -3416,7 +3490,7 @@ class BotRuntime(object):
                 'ammo_reload_pending', 'reload_time', 'reload_duration',
                 'clip', 'clip_size', 'siege_state',
                 'siege_time_left_ms', 'siege_transition_total_ms',
-                'equipment_states')
+                'equipment_states', 'stun_end_server_time_ms')
         result = dict((key, state[key]) for key in keys)
         descriptor = self._descriptors.get(state['id'], {})
         terminal = _terminal_critical(state, descriptor, 'shot')

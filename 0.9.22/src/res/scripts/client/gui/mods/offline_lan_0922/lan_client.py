@@ -128,7 +128,8 @@ _BOT_STATE_WIRE_FIELDS = (
     'siege_state', 'siege_time_left_ms', 'siege_transition_total_ms',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',
-    'death_reason', 'display_health', 'world_pose', 'equipment_states')
+    'death_reason', 'display_health', 'world_pose', 'equipment_states',
+    'stun_end_server_time_ms')
 STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
     'start_denied', 'team_denied', 'team_size_denied',
@@ -619,6 +620,12 @@ def project_bot_state(state):
     if ('equipment_states' in state and
             not _valid_bot_equipment_contract(state)):
         return None
+    if 'stun_end_server_time_ms' in state:
+        stun_end = _projectile_int_range(
+            state.get('stun_end_server_time_ms'), 0, MAX_PROJECTILE_ID)
+        if stun_end is None:
+            return None
+        projected['stun_end_server_time_ms'] = stun_end
     return projected
 
 

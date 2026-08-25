@@ -190,6 +190,18 @@ class EquipmentStateTests(unittest.TestCase):
         self.assertEqual(
             'repair_devices', state.poll_bot(95.02, critical)['action'])
 
+    def test_bot_large_medkit_waits_then_clears_stun_without_crew_damage(self):
+        contract = equipment_mechanics.project_equipment(_defaults()[1])
+        state = equipment_mechanics.EquipmentState(contract)
+
+        self.assertIsNone(state.poll_bot(5.0, {}, stunned=True))
+        self.assertIsNone(state.poll_bot(5.0, {}, stunned=True))
+        effect = state.poll_bot(5.01, {}, stunned=True)
+
+        self.assertEqual('restore_crew', effect['action'])
+        self.assertTrue(effect['clearStun'])
+        self.assertFalse(state.ready(5.01))
+
     def test_relative_snapshot_restores_cooldown_and_both_pending_clocks(self):
         auto = equipment_mechanics.EquipmentState(
             equipment_mechanics.project_equipment(

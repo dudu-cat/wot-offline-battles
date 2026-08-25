@@ -1142,6 +1142,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'reload_time': 0.0, 'reload_duration': 1.5,
             'critical': {}, 'combat_base_revision': 0, 'combat_seq': 0,
             'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
+            'stun_end_server_time_ms': 0,
         }
         first = dict(publication, fire_seq=0)
         self.assertTrue(state.update_bot_states(

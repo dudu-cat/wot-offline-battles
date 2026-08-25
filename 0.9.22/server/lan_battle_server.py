@@ -3603,7 +3603,11 @@ class BattleState:
                     _validated_bot_reload_progress(state, required=True)
                     for name in (
                             "fire_seq", "reload_time", "reload_duration",
-                            "equipment_states"):
+                            "equipment_states", "critical",
+                            "combat_revision", "combat_base_revision",
+                            "combat_ack_seq", "combat_fire_elapsed",
+                            "combat_fire_timer", "stun_end_server_time_ms",
+                            "stun_attacker_kind", "stun_attacker_id"):
                         entry[name] = state[name]
                 takeover_manifest.append(entry)
             message = {
@@ -3837,7 +3841,8 @@ class BattleState:
                     "route": route,
                 }
                 manifest.append(entry)
-                states[bot_id] = self._sanitize_bot_state(raw, entry, None)
+                states[bot_id] = self._sanitize_bot_state(
+                    raw, entry, self.bot_states.get(bot_id))
             if seen != set(roster):
                 return False
             manifest.sort(key=lambda value: value["id"])
@@ -4419,6 +4424,37 @@ class BattleState:
         } for index in range(first_index, current_next))
 
     @staticmethod
+    def _bot_medkit_activated(previous, current):
+        """Recognize one canonical large-medkit use from its wire ledgers."""
+        if previous is None:
+            return False
+        old_snapshots = previous.get("equipment_states")
+        new_snapshots = current.get("equipment_states")
+        if (not isinstance(old_snapshots, list) or
+                not isinstance(new_snapshots, list)):
+            return False
+        try:
+            contracts = equipment_mechanics.bot_consumable_contracts(
+                None, snapshot=old_snapshots)
+            old_states = equipment_mechanics.restore_equipment_states(
+                old_snapshots, contracts=contracts, now=0.0)
+            new_states = equipment_mechanics.restore_equipment_states(
+                new_snapshots, contracts=contracts, now=0.0)
+        except (TypeError, ValueError):
+            return False
+        for old, new in zip(old_states, new_states):
+            if str(old.contract.get("kind") or "") != "medkit":
+                continue
+            quantity_used = bool(
+                old.uses_left > 0 and new.uses_left == old.uses_left - 1)
+            unlimited_used = bool(
+                old.uses_left == -1 and new.uses_left == -1 and
+                new.ready_at > old.ready_at + 1.0e-6)
+            if quantity_used or unlimited_used:
+                return True
+        return False
+
+    @staticmethod
     def _sanitize_bot_state(raw, identity, previous):
         max_health = int(identity.get("max_health", 1000))
         reported_health = max(0, min(int(_finite_float(raw.get("health"), max_health)), max_health))
@@ -4595,6 +4631,31 @@ class BattleState:
                         new.uses_left > old.uses_left):
                     raise ValueError("bot equipment inventory increased")
         result["equipment_states"] = canonical_snapshots
+        raw_stun_end = raw.get(
+            "stun_end_server_time_ms",
+            (previous or {}).get("stun_end_server_time_ms", 0))
+        try:
+            proposed_stun_end = int(raw_stun_end)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("bot stun proposal is invalid")
+        previous_stun_end = int((previous or {}).get(
+            "stun_end_server_time_ms", 0))
+        if (isinstance(raw_stun_end, bool) or proposed_stun_end < 0 or
+                float(raw_stun_end) != proposed_stun_end or
+                proposed_stun_end not in (0, previous_stun_end)):
+            raise ValueError("bot stun proposal is invalid")
+        stale_combat_base = bool(
+            previous is not None and
+            int(_finite_float(raw.get("combat_base_revision"), -1)) <
+            int(previous.get("combat_base_revision", 0)))
+        if (previous_stun_end > 0 and proposed_stun_end == 0 and
+                not stale_combat_base and
+                not BattleState._bot_medkit_activated(previous, result)):
+            raise ValueError("bot stun clear has no medkit activation")
+        result["stun_end_server_time_ms"] = proposed_stun_end
+        if proposed_stun_end == 0:
+            result["stun_attacker_kind"] = ""
+            result["stun_attacker_id"] = 0
         return result
 
     @staticmethod
@@ -4746,7 +4807,8 @@ class BattleState:
         return (int(state.get("health", 0)), bool(state.get("alive")),
                 critical,
                 round(float(state.get("combat_fire_elapsed", 0.0)), 6),
-                round(float(state.get("combat_fire_timer", 0.0)), 6))
+                round(float(state.get("combat_fire_timer", 0.0)), 6),
+                int(state.get("stun_end_server_time_ms", 0)))
 
     @staticmethod
     def _copy_bot_combat(target, source):
@@ -4809,7 +4871,8 @@ class BattleState:
     def _reconcile_modern_bot_combat(self, raw, previous, current):
         """Apply the strict #1513 bot publication/base/ack contract."""
         required = ("critical", "combat_base_revision", "combat_seq",
-                    "combat_fire_elapsed", "combat_fire_timer")
+                    "combat_fire_elapsed", "combat_fire_timer",
+                    "stun_end_server_time_ms")
         if not all(key in raw for key in required):
             raise ValueError("modern bot combat publication is incomplete")
         if not isinstance(raw["critical"], dict):
@@ -5007,6 +5070,7 @@ class BattleState:
             pending_projectile_launches = {}
             fire_deaths = []
             capture_resets = set()
+            stun_clears = []
             seen = set()
             required = ("id", "x", "y", "z", "yaw", "health",
                         "alive", "fire_seq")
@@ -5092,6 +5156,10 @@ class BattleState:
                         "bot_state", "ammo_contract",
                         "bot=%s reason=%s" % (bot_id, error))
                 previous_fire = int((previous or {}).get("fire_seq", 0))
+                if (previous is not None and
+                        int(previous.get("stun_end_server_time_ms", 0)) > 0 and
+                        int(current.get("stun_end_server_time_ms", 0)) == 0):
+                    stun_clears.append(bot_id)
                 next_states[bot_id] = current
                 previous_fire_active = bool(
                     (previous or {}).get("critical") and
@@ -5168,6 +5236,12 @@ class BattleState:
                     "missing=%s" % sorted(set(identities) - seen))
             self._commit_human_ram_armors(human_ram_armors)
             self.bot_states = next_states
+            for bot_id in stun_clears:
+                self.pending_events.append({
+                    "kind": "stun", "active": False,
+                    "target_kind": "bot", "target_id": int(bot_id),
+                    "stun_end_server_time_ms": 0,
+                })
             self.bot_pending_projectile_launches.update(
                 pending_projectile_launches)
             self.bot_pending_projectile_metadata.update(
@@ -9735,8 +9809,14 @@ class BattleState:
         attacker = (str(attacker[0]), int(attacker[1]))
         if self._vehicle_team(*attacker) not in (1, 2):
             return False
+        bot = (self.bot_states.get(int(target[1]))
+               if str(target[0]) == "bot" else None)
+        combat_before = (self._bot_combat_signature(bot)
+                         if bot is not None else None)
         if not self._write_vehicle_stun(target, end_server_time_ms, attacker):
             return False
+        if bot is not None:
+            self._commit_external_bot_combat(bot, combat_before)
         self.pending_events.append({
             "kind": "stun", "active": True,
             "target_kind": str(target[0]), "target_id": int(target[1]),
@@ -9749,8 +9829,14 @@ class BattleState:
         state = self._vehicle_stun_state(target)
         if state is None or not state["end"]:
             return False
+        bot = (self.bot_states.get(int(target[1]))
+               if str(target[0]) == "bot" else None)
+        combat_before = (self._bot_combat_signature(bot)
+                         if bot is not None else None)
         if not self._write_vehicle_stun(target, 0, None):
             return False
+        if bot is not None:
+            self._commit_external_bot_combat(bot, combat_before)
         self.pending_events.append({
             "kind": "stun", "active": False,
             "target_kind": str(target[0]), "target_id": int(target[1]),

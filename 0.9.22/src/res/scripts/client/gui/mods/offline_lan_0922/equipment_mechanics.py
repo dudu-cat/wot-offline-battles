@@ -484,7 +484,7 @@ class EquipmentState(object):
             return None
         return self.activate(now, critical)
 
-    def poll_bot(self, now, critical=None):
+    def poll_bot(self, now, critical=None, stunned=False):
         """Apply deterministic bot policy without same-frame kit reactions."""
         kind = str(self.contract.get('kind') or '')
         if kind == 'extinguisher':
@@ -493,7 +493,7 @@ class EquipmentState(object):
             self._ai_pending_since = None
             return None
         now = _number(now, 0.0)
-        candidate = effect_policy(self, critical)
+        candidate = effect_policy(self, critical, stunned=stunned)
         if candidate is None or not self.ready(now):
             self._ai_pending_since = None
             return None
@@ -504,7 +504,7 @@ class EquipmentState(object):
         # observation that first noticed the damage.
         if now <= self._ai_pending_since + 1.0e-9:
             return None
-        return self.activate(now, critical)
+        return self.activate(now, critical, stunned=stunned)
 
     @staticmethod
     def _elapsed(now, started):

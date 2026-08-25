@@ -324,6 +324,7 @@ def _snapshot_bot(bot_id=11, health=1000, alive=True, critical=None,
         'combat_ack_seq': ack_seq,
         'combat_fire_elapsed': fire_elapsed,
         'combat_fire_timer': fire_timer,
+        'stun_end_server_time_ms': 0,
     }
     result.update(values)
     return result
@@ -493,6 +494,53 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID, invalid))
         self.assertEqual('combat_contract',
                          server.last_bot_state_reject_code)
+
+    def test_bot_large_medkit_clears_stun_once_and_survives_takeover(self):
+        module = _load()
+        contracts = _bot_equipment_contracts(module)
+        snapshots = [module.equipment_mechanics.EquipmentState(
+            contract).snapshot(0.0) for contract in contracts]
+        server, unused_manifest, unused_socket = self._server(
+            equipment_states=snapshots)
+        stun_end = server._server_time_ms() + 5000
+        self.assertTrue(server._set_canonical_stun(
+            ('player', 2), ('bot', 11), stun_end))
+
+        equipments = module.equipment_mechanics.restore_equipment_states(
+            server.bot_states[11]['equipment_states'],
+            contracts=contracts, now=0.0)
+        effect = equipments[1].activate(
+            0.2, critical={}, stunned=True)
+        self.assertTrue(effect['clearStun'])
+        publication = self._publication(server, 1.0)
+        publication['bots'][0]['equipment_states'] = [
+            equipment.snapshot(0.2) for equipment in equipments]
+        publication['bots'][0]['stun_end_server_time_ms'] = 0
+        publication['bots'][0]['combat_seq'] = (
+            server.bot_states[11]['combat_ack_seq'] + 1)
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, publication),
+            server.last_bot_state_reject)
+        self.assertEqual(0, server.bot_states[11][
+            'stun_end_server_time_ms'])
+        self.assertEqual(1, server.bot_states[11][
+            'equipment_states'][1]['usesLeft'])
+        clear_events = [event for event in server.pending_events
+                        if event.get('kind') == 'stun' and
+                        not event.get('active', False)]
+        self.assertEqual(1, len(clear_events))
+
+        repeated = self._publication(server, 2.0)
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, repeated),
+            server.last_bot_state_reject)
+        clear_events = [event for event in server.pending_events
+                        if event.get('kind') == 'stun' and
+                        not event.get('active', False)]
+        self.assertEqual(1, len(clear_events))
+        takeover = server.current_battle_message()['bot_manifest'][0]
+        self.assertEqual(0, takeover['stun_end_server_time_ms'])
+        self.assertEqual(1, takeover['equipment_states'][1]['usesLeft'])
 
     def test_snapshot_carries_real_bot_receipt_time_and_queue_age(self):
         now = [100.0]
@@ -7060,6 +7108,66 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIsNone(
             self.module.lan_client.project_bot_state(malformed))
 
+    def test_bot_medkit_clears_stun_only_after_a_later_simulation_frame(self):
+        contracts = _bot_equipment_contracts(self.module)
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _critical_descriptor(),
+            adapter_factory=lambda *unused: _Adapter(),
+            direction_probe=lambda *unused: {'clear': True},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            bot_equipment_resolver=lambda: contracts)
+        runtime.battle_start(dict(self.start, server_time_ms=1000))
+        runtime.apply_snapshot({
+            'server_tick': 1, 'server_time_ms': 1000,
+            'bots': [_snapshot_bot(
+                critical={}, revision=1, base_revision=1,
+                stun_end_server_time_ms=5000)]})
+        state = runtime.states[11]
+
+        runtime._advance_equipment_clock(0.2)
+        self.assertFalse(runtime._advance_bot_critical(state, 0.2, 0.2))
+        self.assertEqual(5000, state['stun_end_server_time_ms'])
+        self.assertEqual(2, runtime._equipment_states[11][1].uses_left)
+
+        runtime._advance_equipment_clock(0.2)
+        self.assertTrue(runtime._advance_bot_critical(state, 0.2, 0.4))
+        self.assertEqual(0, state['stun_end_server_time_ms'])
+        self.assertEqual(1, runtime._equipment_states[11][1].uses_left)
+        self.assertAlmostEqual(
+            90.0, state['equipment_states'][1]['cooldownTimeLeft'])
+        self.assertTrue(runtime._mark_combat_publication(state))
+        self.assertEqual(1, state['combat_seq'])
+
+    def test_bot_medkit_restores_crew_and_clears_same_stun_once(self):
+        contracts = _bot_equipment_contracts(self.module)
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _critical_descriptor(),
+            adapter_factory=lambda *unused: _Adapter(),
+            direction_probe=lambda *unused: {'clear': True},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            bot_equipment_resolver=lambda: contracts)
+        runtime.battle_start(dict(self.start, server_time_ms=1000))
+        runtime.apply_snapshot({
+            'server_tick': 1, 'server_time_ms': 1000,
+            'bots': [_snapshot_bot(
+                critical=_critical_payload(crew_ko=('commander',)),
+                revision=1, base_revision=1,
+                stun_end_server_time_ms=5000)]})
+        state = runtime.states[11]
+
+        runtime._advance_equipment_clock(0.2)
+        runtime._advance_bot_critical(state, 0.2, 0.2)
+        runtime._advance_equipment_clock(0.2)
+        runtime._advance_bot_critical(state, 0.2, 0.4)
+
+        self.assertEqual([], state['critical']['crew_ko'])
+        self.assertEqual(0, state['stun_end_server_time_ms'])
+        self.assertEqual(1, runtime._equipment_states[11][1].uses_left)
+
     def test_bot_equipment_takeover_restores_once_without_clock_rewind(self):
         contracts = _bot_equipment_contracts(self.module)
 
@@ -9648,7 +9756,7 @@ class BotRuntimeTests(unittest.TestCase):
             }, crew_ko=['gunner1']),
             combat_revision=0, combat_base_revision=0,
             combat_ack_seq=0, combat_fire_elapsed=0.0,
-            combat_fire_timer=0.0)
+            combat_fire_timer=0.0, stun_end_server_time_ms=0)
         takeover = dict(
             self.start, bot_authority_id=1,
             bot_manifest=[snapshot_bot])
