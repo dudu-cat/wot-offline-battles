@@ -2863,6 +2863,18 @@ class LANClient(object):
         latest_snapshot = None
         for message in messages:
             if message.get('type') == 'snapshot':
+                if (latest_snapshot is not None and
+                        'bot_manifest' in latest_snapshot and
+                        'bot_manifest' not in message):
+                    # A manifest-bearing snapshot is a static-lineage
+                    # barrier, not a replaceable motion sample.  During native
+                    # space loading several server ticks can accumulate in one
+                    # poll; consuming only the last lean snapshot would leave
+                    # this replica with no manifest to inherit.
+                    self._handle_message(latest_snapshot)
+                    latest_snapshot = None
+                    if not self.running:
+                        break
                 latest_snapshot = message
             elif (message.get('type') == 'events' and
                   latest_snapshot is not None and

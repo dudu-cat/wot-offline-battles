@@ -775,6 +775,40 @@ class LanProtocolTests(unittest.TestCase):
         self.assertIsNot(
             manifest, self.client.last_snapshot['bot_manifest'])
 
+    def test_poll_does_not_coalesce_away_manifest_barrier(self):
+        self.client.server_capabilities = (
+            LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
+        self.client.running = True
+        self.client.connected = False
+        self.client.bigworld = mock.Mock()
+        self.client.bigworld.callback.return_value = 1
+        player = {
+            'id': 1, 'critical_revision': 0,
+            'critical_base_revision': 0, 'critical_ack_seq': 0,
+            'equipment_states': [], 'equipment_revision': 0,
+            'equipment_intent_seq': 0,
+            'equipment_intent_result': {
+                'intent_seq': 0, 'accepted': False, 'reason': ''},
+        }
+        manifest = [{'id': 11, 'vehicle': 'ussr:R11_MS-1'}]
+        first = {
+            'type': 'snapshot', 'protocol': 5, 'round_id': 7,
+            'server_tick': 1, 'bot_state_revision': 0,
+            'players': [player], 'bots': [], 'bot_manifest': manifest,
+            'bot_authority_id': -1, 'authority_epoch': 1,
+        }
+        second = dict(first, server_tick=3)
+        second.pop('bot_manifest')
+        with self.client._pending_lock:
+            self.client._pending = [first, second]
+
+        self.client._poll()
+
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+        self.assertEqual(3, self.client.last_snapshot['server_tick'])
+        self.assertEqual(manifest, self.client.last_snapshot['bot_manifest'])
+
     def test_lean_snapshot_requires_server_capability(self):
         self.client.running = True
         player = {
