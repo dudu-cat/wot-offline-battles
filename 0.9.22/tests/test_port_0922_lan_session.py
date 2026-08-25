@@ -2457,7 +2457,7 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual('stopped', self.session.state)
         self.assertEqual([True], self.battle_runtime.stopped)
 
-    def test_stop_finishes_every_cleanup_stage_then_raises_first_error(self):
+    def test_stop_retains_native_room_owner_when_close_fails(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia']})
         queue = self.queues[0]
         calls = []
@@ -2491,11 +2491,12 @@ class LANSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'close failed'):
             self.session.stop(show_login=False)
 
-        self.assertEqual(['close', 'uninstall', 'client', 'battle'], calls)
+        self.assertEqual(['close', 'client', 'battle'], calls)
         self.assertEqual('stopped', self.session.state)
         self.assertIsNone(self.client.on_event)
         self.assertEqual(1, queue.close_calls)
-        self.assertEqual(1, queue.uninstall_calls)
+        self.assertEqual(0, queue.uninstall_calls)
+        self.assertIs(queue, self.session._queue)
         self.assertEqual(1, self.client.stop_calls)
         self.assertEqual([False], self.battle_runtime.stopped)
         self.session.stop(show_login=False)
@@ -2595,6 +2596,21 @@ class LANSessionRoomTests(unittest.TestCase):
         if 'players' in message:
             self.client.roster = list(message['players'])
         self.client.on_event(kind, message)
+
+    def test_incomplete_native_close_keeps_room_owned_for_retry(self):
+        self.emit('welcome', {
+            'phase': 'waiting', 'map_pool': ['01_karelia']})
+        room = self.rooms[0]
+        room.close = mock.Mock(side_effect=[False, True])
+
+        self.assertFalse(self.session._close_picker())
+        self.assertTrue(self.session._picker_open)
+        self.assertTrue(self.session._picker_cleanup_pending)
+        self.assertIs(room, self.session._queue)
+
+        self.assertTrue(self.session._close_picker())
+        self.assertFalse(self.session._picker_open)
+        self.assertFalse(self.session._picker_cleanup_pending)
 
     def test_the_host_gets_the_room_instead_of_the_stock_window(self):
         self.emit('welcome', {'phase': 'waiting', 'map_pool': ['01_karelia'],

@@ -17811,11 +17811,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.arena_vehicle_killed.assert_called_once_with(
             11, 10, 3)
 
-    def test_stop_restores_account_and_native_sync_owns_lobby_transition(self):
+    def test_stop_restores_account_after_native_callback_boundary(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
         battle._map_create_attempted = True
+        native_owner = object()
+        battle._local_model = native_owner
         calls = []
         runtime.offline_map_creator.destroy = lambda: calls.append('destroy')
         runtime.compatibility.restore_lobby_account = (
@@ -17825,8 +17827,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle.stop(show_login=False)
 
-        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual(['destroy'], calls)
         self.assertEqual('stopped', battle.state)
+        self.assertIn(native_owner, battle._retired_native_owners)
+        runtime.bigworld.callbacks.pop()()
+        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual([], battle._retired_native_owners)
 
     def test_cleanup_leaves_vehicle_teardown_to_native_avatar_then_map(self):
         runtime = _runtime()
@@ -17974,8 +17980,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle.stop(show_login=True)
 
-        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual(['destroy'], calls)
         self.assertEqual('stopped', battle.state)
+        runtime.bigworld.callbacks.pop()()
+        self.assertEqual(['destroy', 'restore'], calls)
 
     def test_global_shutdown_cleans_battle_without_recreating_account(self):
         runtime = _runtime()
@@ -17992,7 +18000,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(['destroy'], calls)
         self.assertEqual('stopped', battle.state)
 
-    def test_failed_account_restore_does_not_leave_runtime_running(self):
+    def test_failed_deferred_account_restore_disconnects_cleanly(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
@@ -18000,10 +18008,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.compatibility.restore_lobby_account = mock.Mock(
             side_effect=RuntimeError('restore failed'))
 
-        with self.assertRaisesRegex(RuntimeError, 'restore failed'):
-            battle.stop()
+        battle.stop()
+        runtime.bigworld.callbacks.pop()()
 
         self.assertEqual('stopped', battle.state)
+        self.assertEqual('lobby restore failed: restore failed', battle.error)
+        self.assertEqual(1, runtime.compatibility.disconnect_calls)
         self.assertIsNone(battle._avatar)
         self.assertIsNone(battle._server)
         battle.stop()
@@ -18202,6 +18212,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             if round_id == 1:
                 battle.stop(show_login=False)
                 self.assertEqual('stopped', battle.state)
+                runtime.bigworld.callbacks.pop()()
                 runtime.bigworld.callbacks[:] = []
 
     def test_async_failure_recovers_lobby_and_notifies_session(self):

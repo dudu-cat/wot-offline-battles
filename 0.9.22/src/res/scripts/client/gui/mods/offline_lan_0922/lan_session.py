@@ -385,6 +385,7 @@ class LANSession(object):
         self._picker_requested = False
         self._picker_callback_id = None
         self._picker_close_callback_id = None
+        self._picker_cleanup_pending = False
         self._battle_start_callback_id = None
         self._retry_callback_id = None
         self._retry_token = None
@@ -1319,6 +1320,7 @@ class LANSession(object):
 
     def _on_picker_closed(self):
         self._picker_open = False
+        self._picker_cleanup_pending = False
         # A close disarms the room: it took a host election after a refused
         # start to raise it over the garage again.  Only the Battle button
         # rearms it.
@@ -1415,7 +1417,8 @@ class LANSession(object):
         Every other caller reached this while the player was in the garage,
         which is how the room kept appearing over an open maintenance dialog.
         """
-        if self._stopped or self._picker_open or self._picker_dismissed:
+        if (self._stopped or self._picker_open or
+                self._picker_cleanup_pending or self._picker_dismissed):
             return False
         if not self._picker_requested:
             return False
@@ -1503,11 +1506,28 @@ class LANSession(object):
 
     def _close_picker(self):
         self._cancel_picker_callback()
+        queue = self._queue
+        if queue is None:
+            self._picker_open = False
+            self._picker_cleanup_pending = False
+            return True
+        if not self._picker_open and not self._picker_cleanup_pending:
+            return True
+        close = getattr(queue, 'close', None)
+        try:
+            closed = True if not callable(close) else close()
+        except Exception:
+            self._picker_cleanup_pending = True
+            raise
+        if closed is False:
+            self._picker_cleanup_pending = True
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] waiting-room native close remains '
+                'pending; retaining its owner\n')
+            return False
         self._picker_open = False
-        if self._queue is not None:
-            close = getattr(self._queue, 'close', None)
-            if callable(close):
-                close()
+        self._picker_cleanup_pending = False
+        return True
 
     def _save_endpoint(self, value):
         # The stock training description is also the only editable text area
@@ -1747,8 +1767,9 @@ class LANSession(object):
         # before any native Account/Avatar transition begins.
         self._cancel_picker_close_callback()
         self._cancel_picker_callback()
-        if self._picker_open:
-            self._close_picker()
+        if ((self._picker_open or self._picker_cleanup_pending) and
+                not self._close_picker()):
+            return self._defer_battle_until_lobby_ready(message)
         if not self._lobby_ready():
             return self._defer_battle_until_lobby_ready(message)
         self._clear_pending_battle_start()
@@ -2268,18 +2289,25 @@ class LANSession(object):
             self._clear_pending_battle_start()
         except Exception as error:
             errors.append(error)
+        picker_closed = False
         try:
-            self._close_picker()
+            picker_closed = self._close_picker()
         except Exception as error:
             errors.append(error)
-        if self._queue is not None:
+        # ``close() is False`` means native roots/cursor ownership remains;
+        # never uninstall and drop those Python owners in that state.
+        if picker_closed and self._queue is not None:
             try:
-                self._queue.uninstall()
+                if self._queue.uninstall() is False:
+                    raise RuntimeError(
+                        'waiting-room uninstall remains pending')
             except Exception as error:
                 errors.append(error)
-        if self._queue_screen is not None:
+        if picker_closed and self._queue_screen is not None:
             try:
-                self._queue_screen.uninstall()
+                if self._queue_screen.uninstall() is False:
+                    raise RuntimeError(
+                        'queue-screen uninstall remains pending')
             except Exception as error:
                 errors.append(error)
         if self._join_ui is not None and release_join:

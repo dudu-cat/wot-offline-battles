@@ -1099,6 +1099,9 @@ class BattleRuntime(object):
         self._ammo_callback_id = None
         self._callback_token = None
         self._ammo_callback_token = None
+        self._lobby_restore_callback_id = None
+        self._lobby_restore_token = None
+        self._retired_native_owners = []
         self._deadline = 0.0
         self._vehicle_ready_deadline = 0.0
         self._map_create_attempted = False
@@ -1330,6 +1333,8 @@ class BattleRuntime(object):
     def start(self, config, message=None, lan_client=None,
               on_local_leave=None):
         if self.state not in ('idle', 'stopped', 'failed'):
+            return False
+        if self._lobby_restore_token is not None:
             return False
         if lan_client is None:
             raise ValueError('LAN client is required')
@@ -16003,26 +16008,117 @@ class BattleRuntime(object):
 
     def stop(self, show_login=False, restore_account=True):
         if self.state in ('idle', 'stopped'):
+            if not restore_account and self._lobby_restore_token is not None:
+                self._cancel_deferred_lobby_restore()
             return
         self._generation += 1
         self._cancel_callbacks()
+        self._retain_native_teardown_owners()
         cleanup_error = None
         try:
             self._cleanup()
         except Exception as error:
             cleanup_error = error
-        # Mark ownership closed even when native Account reconstruction fails;
-        # otherwise this runtime rejects every later start as still running.
-        self.state = 'stopped'
         if cleanup_error is not None:
+            self.state = 'stopped'
+            self._retired_native_owners = []
             raise cleanup_error
+        self.state = 'stopped'
         if restore_account:
-            # A LAN transport failure is not a WoT account disconnect.
-            # OfflineMapCreator.destroy() removed the Avatar and the fake
-            # connection needs a replacement Account.  Account.showGUI owns
-            # the eventual native showLobby transition after synchronization;
-            # calling g_appLoader here would race and duplicate it.
-            self._runtime.compatibility.restore_lobby_account()
+            # Do not construct Account/Hangar on the callback which just
+            # destroyed battle GUI, Avatar entities and their client space.
+            # #1513 drains native GUI/material updates at its callback/frame
+            # boundary; crossing one callback prevents the new Hangar from
+            # reusing a SimpleGUIComponent still referenced by the old render
+            # queue.  Keep the Python owners alive through that hand-off too.
+            self._schedule_lobby_restore()
+        else:
+            self._retired_native_owners = []
+
+    def _native_teardown_owners(self):
+        """Snapshot Python owners whose native retirement may finish later."""
+        owners = []
+        for value in (
+                self._avatar, self._binding, self._server,
+                self._remote_factory, self._local_model, self._local_matrix,
+                self._outlined_entity, self._outlined_vehicle,
+                self._outlined_model, self._projectiles, self._sixth_sense,
+                self._destructibles):
+            if value is not None:
+                owners.append(value)
+        if self._records:
+            owners.append(tuple(self._records.values()))
+        factory = self._remote_factory
+        if factory is not None:
+            # Both presentation factories remove these entries immediately
+            # after destroyEntity().  Retain the exact wrappers/descriptors
+            # until the engine has crossed its native update boundary.
+            for name in ('_vehicles', '_states', '_descriptors',
+                         '_hit_testers'):
+                values = getattr(factory, name, None)
+                if isinstance(values, dict) and values:
+                    owners.append(tuple(values.values()))
+        return owners
+
+    def _retain_native_teardown_owners(self):
+        owners = self._native_teardown_owners()
+        if owners:
+            self._retired_native_owners.extend(owners)
+        return len(owners)
+
+    def _schedule_lobby_restore(self):
+        token = object()
+        self._lobby_restore_token = token
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] battle teardown complete; deferring '
+            'lobby Account restore\n')
+
+        def restore_after_native_boundary():
+            if self._lobby_restore_token is not token:
+                return
+            self._lobby_restore_token = None
+            self._lobby_restore_callback_id = None
+            try:
+                # A LAN transport failure is not a WoT account disconnect.
+                # Account.showGUI owns the native showLobby transition; do not
+                # call g_appLoader separately or duplicate it.
+                self._runtime.compatibility.restore_lobby_account()
+            except Exception as error:
+                self.error = 'lobby restore failed: %s' % error
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] deferred lobby restore failed: '
+                    '%s\n' % error)
+                try:
+                    self._runtime.compatibility.disconnect()
+                except Exception as disconnect_error:
+                    sys.stdout.write(
+                        '[Offline LAN 0.9.22] offline disconnect after lobby '
+                        'restore failure failed: %s\n' % disconnect_error)
+            else:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] deferred lobby Account restored\n')
+            self._retired_native_owners = []
+
+        try:
+            callback_id = self._runtime.bigworld.callback(
+                0.0, restore_after_native_boundary)
+        except Exception:
+            self._lobby_restore_token = None
+            self._retired_native_owners = []
+            raise
+        if self._lobby_restore_token is token:
+            self._lobby_restore_callback_id = callback_id
+
+    def _cancel_deferred_lobby_restore(self):
+        callback_id = self._lobby_restore_callback_id
+        self._lobby_restore_callback_id = None
+        self._lobby_restore_token = None
+        if callback_id is not None:
+            try:
+                self._runtime.bigworld.cancelCallback(callback_id)
+            except Exception:
+                pass
+        self._retired_native_owners = []
 
     def _cancel_callbacks(self):
         self._callback_token = None
