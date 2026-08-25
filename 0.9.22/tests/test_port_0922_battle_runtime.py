@@ -14321,6 +14321,41 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(enemy.model.visible)
         self.assertEqual([], enemy.shows)
 
+    def test_full_state_update_preserves_far_team_spot_minimap(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        enemy = _Vehicle(
+            1000, _Descriptor(), _Vector(600.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0), {'health': 500})
+        enemy.model.visible = False
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: enemy if entity_id == 1000 else None)
+        record = {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'presentation_initialized': True, 'native_remote': True,
+            'arena_added': True, 'visual_started': True,
+            'world_marker_started': False, 'minimap_started': True,
+            'spot_visible': False, 'spot_marker_visible': True,
+            '_spot_presentation_signature': (False, True, False, True),
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+
+        with mock.patch.object(battle, '_apply_siege_state'), \
+                mock.patch.object(battle, '_apply_vehicle_statistics'), \
+                mock.patch.object(battle, '_drain_event_journal'), \
+                mock.patch.object(
+                    battle, '_pending_combat_for_record', return_value=True):
+            self.assertTrue(battle._materialize_record(record))
+
+        self.assertFalse(record['spot_visible'])
+        self.assertTrue(record['spot_marker_visible'])
+        self.assertFalse(record['world_marker_started'])
+        self.assertTrue(record['minimap_started'])
+        battle._binding.start_vehicle_minimap.assert_not_called()
+        battle._binding.stop_vehicle_minimap.assert_not_called()
+
     def test_spotting_leaves_the_outline_alone(self):
         """PyModel.visible writes one flag at model+0xC4 and never touches the
         scene key, so a spotting update must not disturb the edge.  It runs

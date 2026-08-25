@@ -14191,7 +14191,10 @@ class BattleRuntime(object):
                 self._present_vehicle_dead(record, True)
         if record.get('presentation') and not self._worker_mode:
             self._set_record_spot_visibility(
-                record, record.get('spot_visible', True))
+                record, record.get('spot_visible', True),
+                record.get(
+                    'spot_marker_visible',
+                    record.get('spot_visible', True)))
         pose = record.pop('pending_pose', None)
         if pose is not None:
             self._apply_record_pose(record, pose)
