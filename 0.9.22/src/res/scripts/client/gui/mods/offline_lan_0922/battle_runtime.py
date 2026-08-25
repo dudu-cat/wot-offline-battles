@@ -116,9 +116,6 @@ PROJECTILE_MAX_CHORDS_PER_FRAME = 256
 # motion rather than silently treating one midpoint matrix as exact.
 PROJECTILE_POSE_MAX_ANGLE_STEP = math.pi / 180.0
 PROJECTILE_POSE_MAX_SWEEP_STEPS = 16
-# A process that stopped observing poses cannot reconstruct an arbitrary turn
-# across a long callback/network gap. Start a new coverage window instead.
-PROJECTILE_POSE_MAX_HISTORY_GAP_SECONDS = 1.0
 # Size the fair global budget for the observed low-FPS boundary without ever
 # exceeding the previous release's 256-chord hard cap.
 PROJECTILE_SUSTAIN_SECONDS = 1.0 / 15.0
@@ -9497,10 +9494,10 @@ class BattleRuntime(object):
             else:
                 frozen[key] = self._projectile_plain_pose(pose)
         sample = (float(now), frozen)
-        if (self._projectile_position_history and
-                sample[0] - self._projectile_position_history[-1][0] >
-                PROJECTILE_POSE_MAX_HISTORY_GAP_SECONDS):
-            self._projectile_position_history = []
+        # Keep both known endpoints across a delayed render callback. Historic
+        # queries interpolate only inside that covered interval and still reject
+        # pre-history or future extrapolation, so a long frame cannot silently
+        # retire an otherwise valid projectile.
         if (self._projectile_position_history and
                 abs(self._projectile_position_history[-1][0] -
                     sample[0]) <= 1.0e-9):

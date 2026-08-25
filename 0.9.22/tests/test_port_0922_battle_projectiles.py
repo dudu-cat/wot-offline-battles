@@ -1236,16 +1236,72 @@ class BattleProjectileTests(unittest.TestCase):
 
         self.assertEqual((0.0, 1.0), fractions)
 
-    def test_pose_history_does_not_interpolate_across_observation_gap(self):
+    def test_pose_history_interpolates_between_known_long_gap_endpoints(self):
         battle, unused_bigworld = _battle()
         first = battle._projectile_plain_pose((5.0, 1.0, 0.0))
         second = battle._projectile_plain_pose((15.0, 1.0, 0.0))
         battle._sample_projectile_positions(0.0, {'bot:8': first})
         battle._sample_projectile_positions(2.0, {'bot:8': second})
 
-        self.assertIsNone(battle._projectile_historic_pose('bot:8', 1.0))
+        self.assertEqual(
+            10.0, battle._projectile_historic_pose('bot:8', 1.0)['x'])
         self.assertEqual(
             15.0, battle._projectile_historic_pose('bot:8', 2.0)['x'])
+        self.assertIsNone(battle._projectile_historic_pose('bot:8', 2.001))
+
+    def test_two_second_render_stall_keeps_projectile_elapsed_time(self):
+        battle, bigworld = _battle()
+        self.assertTrue(battle._accept_projectile_event(_event()))
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=42, isStarted=True, position=_Vector((5.0, 1.0, 0.0)),
+            isAlive=lambda: True)
+        target_pose = battle._projectile_plain_pose((5.0, 1.0, 0.0))
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'projectile_collision_pose': target_pose,
+            'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: (
+            source if entity_id == 41 else target if entity_id == 42 else None)
+        source_pose = battle._projectile_plain_pose((0.0, 0.0, 0.0))
+        battle._projectile_position_history = []
+        battle._sample_projectile_positions(0.0, {
+            'player:7': source_pose, 'bot:8': target_pose})
+        observed = []
+
+        def collide(unused_record, unused_target, unused_start, unused_end,
+                    pose=None):
+            observed.append(dict(pose))
+            return (), ()
+
+        battle._projectile_vehicle_collisions = collide
+        battle._resolve_shot_scene = mock.Mock(return_value={
+            'piercing_loss': 0.0, 'penetration_factor': 1.0,
+            'world_distance': 99999.0,
+            'stopped_by_destructible': False,
+        })
+        target.position = _Vector((15.0, 1.0, 0.0))
+        battle._records['bot:8']['projectile_collision_pose'] = \
+            battle._projectile_plain_pose((15.0, 1.0, 0.0))
+        bigworld.now = 2.0
+
+        invocations = 0
+        for unused_index in range(8):
+            self.assertTrue(battle._advance_projectiles(2.0))
+            invocations += 1
+            if battle._projectile_perf['debt'] <= 1.0e-9:
+                break
+        else:
+            self.fail('projectile debt did not drain after a render stall')
+
+        state = battle._projectiles.get('player:7:1')
+        self.assertEqual(2, invocations)
+        self.assertAlmostEqual(2.0, state['cursor_time'])
+        self.assertEqual([], battle.client.resolutions)
+        self.assertTrue(observed)
+        self.assertLess(min(pose['x'] for pose in observed), 6.0)
+        self.assertGreater(max(pose['x'] for pose in observed), 14.0)
 
     def test_excessive_angular_target_sweep_fails_closed(self):
         battle, unused_bigworld = _battle()
