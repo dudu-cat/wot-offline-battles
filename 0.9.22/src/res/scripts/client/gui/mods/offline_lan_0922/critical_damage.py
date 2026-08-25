@@ -1124,6 +1124,43 @@ def _payload(before, after, descriptor, cause=None):
     }
 
 
+def _damage_delta(before, after, descriptor):
+    """Describe only irreversible damage introduced by one proposal.
+
+    The full critical payload remains useful for presentation, but it cannot
+    be installed after unrelated server-owned repair/fire progress: doing so
+    would restore the proposal's stale snapshot.  This compact delta keeps the
+    native #1513 result while making that merge field-local.
+    """
+    devices = []
+    names = sorted(set(before['devices']) | set(after['devices']) |
+                   set(before['critical']) | set(after['critical']) |
+                   set(before['destroyed']) | set(after['destroyed']))
+    for name in names:
+        maximum = _device_damage.device_max_hp(descriptor, name)
+        if maximum is None:
+            continue
+        maximum = max(1.0, float(maximum))
+        before_hp = max(0.0, min(
+            maximum, float(before['devices'].get(name, maximum))))
+        after_hp = max(0.0, min(
+            maximum, float(after['devices'].get(name, before_hp))))
+        hp_loss = max(0.0, before_hp - after_hp)
+        if hp_loss <= 0.0005:
+            continue
+        devices.append({
+            'name': str(name),
+            'hp_loss': round(hp_loss, 3),
+        })
+    result = {
+        'devices': devices,
+        'crew_ko': sorted(str(name) for name in
+                          (after['crew_ko'] - before['crew_ko'])),
+        'ignite': bool(after['fire'] and not before['fire']),
+    }
+    return result
+
+
 def apply_direct(vehicle, collisions, start_pos, end_pos, hull_damage,
                  shell, attacker_id, penetrated=None, by_explosion=False,
                  deadeye=False, _internal_hits=None,
@@ -1205,14 +1242,19 @@ class _CriticalProposalVehicle(object):
 
 def propose_direct(vehicle, collisions, start_pos, end_pos, hull_damage,
                    shell, attacker_id, penetrated=None, by_explosion=False,
-                   deadeye=False):
+                   deadeye=False, with_delta=False):
     """Return a critical-hit proposal without mutating the live Vehicle."""
     if vehicle is None:
         raise ValueError('critical proposal requires a vehicle')
     shadow = _CriticalProposalVehicle(vehicle)
-    return apply_direct(
+    before = _state(shadow)
+    damage, payload = apply_direct(
         shadow, collisions, start_pos, end_pos, hull_damage, shell,
         attacker_id, penetrated, by_explosion, deadeye)
+    if with_delta:
+        return (damage, payload,
+                _damage_delta(before, _state(shadow), shadow.typeDescriptor))
+    return damage, payload
 
 
 def apply_explosion(vehicle, collisions, burst, direction, hull_damage,
@@ -1250,14 +1292,19 @@ def apply_explosion(vehicle, collisions, burst, direction, hull_damage,
 
 
 def propose_explosion(vehicle, collisions, burst, direction, hull_damage,
-                      shell, attacker_id, deadeye=False):
+                      shell, attacker_id, deadeye=False, with_delta=False):
     """Return an HE-cone critical proposal without mutating the live Vehicle."""
     if vehicle is None:
         raise ValueError('critical proposal requires a vehicle')
     shadow = _CriticalProposalVehicle(vehicle)
-    return apply_explosion(
+    before = _state(shadow)
+    damage, payload = apply_explosion(
         shadow, collisions, burst, direction, hull_damage, shell,
         attacker_id, deadeye)
+    if with_delta:
+        return (damage, payload,
+                _damage_delta(before, _state(shadow), shadow.typeDescriptor))
+    return damage, payload
 
 
 def apply_payload(vehicle, payload):

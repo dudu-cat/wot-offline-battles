@@ -25,7 +25,8 @@ from gui.mods.offline_lan_0922.battle_runtime import (
 from gui.mods.offline_lan_0922 import battle_runtime as \
     battle_runtime_module
 from gui.mods.offline_lan_0922 import bot_runtime, combat_rules, \
-    critical_damage, gun_mechanics, tank_collision, vehicle_physics
+    critical_damage, equipment_mechanics, gun_mechanics, tank_collision, \
+    vehicle_physics
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
@@ -1582,6 +1583,13 @@ def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
         },
         'skills': {
             'deadeye': bool(deadeye), 'intuition_chances': 0,
+        },
+        'equipment': [],
+        'critical': {
+            'devices': [{
+                'name': 'engineHealth', 'max_hp': 100.0,
+                'regen_hp': 50.0,
+            }],
         },
         'gun': {
             'clip_size': 1,
@@ -5679,7 +5687,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime = _runtime()
         descriptor = types.SimpleNamespace(
             id=(11, 17), compactDescr=401, name='cola', tags=(),
-            cooldownSeconds=0.0, reuseCount=-1)
+            cooldownSeconds=0.0, reuseCount=-1,
+            crewLevelIncrease=10.0)
         runtime.vehicles.g_cache.equipments = lambda: {401: descriptor}
         battle = BattleRuntime(runtime)
         battle.client = _Client()
@@ -5691,7 +5700,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._equipment_state = state
         battle._present_equipments(now=0.0)
 
-        self.assertEqual('passive', state[0]['kind'])
+        self.assertIsInstance(state[0], equipment_mechanics.EquipmentState)
+        self.assertEqual('stimulator', state[0].contract['kind'])
         self.assertEqual(
             (10, 401, 1, runtime.constants.EQUIPMENT_STAGES.READY, 0),
             runtime.bigworld.avatar.ammo_updates[-1])
@@ -5727,17 +5737,56 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         state = battle._default_equipments()
 
-        self.assertEqual('rpm_limiter', state[0]['kind'])
-        self.assertEqual(-1, state[0]['uses_left'])
-        self.assertEqual(1.1, state[0]['engine_power_factor'])
-        self.assertEqual(1.5, state[0]['engine_hp_loss_per_second'])
+        self.assertEqual('rpm_limiter', state[0].contract['kind'])
+        self.assertEqual(1, state[0].uses_left)
+        self.assertEqual(1.1, state[0].contract['enginePowerFactor'])
+        self.assertEqual(
+            1.5, state[0].contract['engineHpLossPerSecond'])
+
+    def test_worker_replica_rebuilds_equipment_from_canonical_snapshot(self):
+        descriptor = types.SimpleNamespace(
+            id=(11, 41), compactDescr=441,
+            name='smallRepairkit', tags=('repairkit',), reuseCount=1,
+            cooldownSeconds=10.0, repairAll=False)
+        canonical = equipment_mechanics.EquipmentState(
+            equipment_mechanics.project_equipment(descriptor), now=100.0)
+        self.assertIsNotNone(canonical.activate(
+            100.0,
+            critical={
+                'devices': [{
+                    'name': 'engineHealth', 'state': 'destroyed'}],
+                'destroyed': ['engineHealth'],
+            },
+            selected='engineHealth'))
+        snapshot = canonical.snapshot(103.0)
+
+        battle = BattleRuntime(_runtime())
+        battle.client = types.SimpleNamespace(player_id=7)
+        battle._worker_mode = True
+        battle._clock = lambda: 500.0
+        battle._equipment_revision = -1
+
+        self.assertTrue(battle._restore_local_equipment_snapshot({
+            'players': [{
+                'id': 7, 'equipment_revision': 4,
+                'equipment_states': [snapshot],
+            }],
+        }))
+
+        restored = battle._equipment_state[0]
+        self.assertEqual(1, restored.uses_left)
+        self.assertAlmostEqual(507.0, restored.ready_at)
+        self.assertEqual(snapshot, restored.snapshot(500.0))
+        self.assertEqual(4, battle._equipment_revision)
 
     def test_removed_rpm_limiter_toggles_stock_trigger_stage(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.state = 'running'
         battle._avatar = runtime.bigworld.avatar
-        battle.client = types.SimpleNamespace(player_id=1)
+        send_intent = mock.Mock(side_effect=(1, 2))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_equipment_intent=send_intent)
         descriptor = _Descriptor()
         entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
                           {'health': 500})
@@ -5746,25 +5795,26 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._records = {'player:1': {
             'engine_id': 10, 'state': {'health': 500, 'alive': True},
             'kind': 'player', 'network_id': 1, 'local': True}}
-        battle._equipment_state = [{
-            'id': 12, 'compact_descr': 401,
-            'name': 'removedrpmlimiter', 'kind': 'rpm_limiter',
-            'cooldown': 0.0, 'uses_left': -1, 'ready_at': 0.0,
-            'active': False, 'engine_power_factor': 1.1,
-            'engine_hp_loss_per_second': 1.5}]
+        limiter = types.SimpleNamespace(
+            id=(11, 12), compactDescr=401,
+            name='removedRpmLimiter', tags=('trigger',),
+            cooldownSeconds=0.0, reuseCount=0,
+            enginePowerFactor=1.1, engineHpLossPerSecond=1.5)
+        battle._equipment_state = [equipment_mechanics.EquipmentState(
+            equipment_mechanics.project_equipment(limiter))]
         battle._clock = lambda: 1000.0
 
         self.assertTrue(battle._activate_equipment((1 << 16) | 12))
-        self.assertEqual(1.1, battle._active_engine_power_factor())
-        self.assertEqual(
-            (10, 401, 1,
-             runtime.constants.EQUIPMENT_STAGES.PREPARING, 0),
-            runtime.bigworld.avatar.ammo_updates[-1])
+        self.assertEqual(1.0, battle._active_engine_power_factor())
         self.assertTrue(battle._activate_equipment(12))
         self.assertEqual(1.0, battle._active_engine_power_factor())
-        self.assertEqual(
-            (10, 401, 1, runtime.constants.EQUIPMENT_STAGES.READY, 0),
-            runtime.bigworld.avatar.ammo_updates[-1])
+        self.assertEqual([
+            mock.call(12, activation_code=(1 << 16) | 12,
+                      selected=None, requested_active=True),
+            mock.call(12, activation_code=12,
+                      selected=None, requested_active=False),
+        ], send_intent.call_args_list)
+        self.assertFalse(battle._equipment_state[0].active)
 
     def test_active_removed_rpm_limiter_damages_engine_at_exact_rate(self):
         runtime = _runtime()
@@ -5785,18 +5835,22 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'engine_id': 10, 'state': {'health': 500, 'alive': True},
             'kind': 'player', 'network_id': 1, 'local': True}
         battle._records = {'player:1': record}
-        battle._equipment_state = [{
-            'kind': 'rpm_limiter', 'active': True,
-            'engine_power_factor': 1.1,
-            'engine_hp_loss_per_second': 1.5}]
+        limiter = types.SimpleNamespace(
+            id=(11, 12), compactDescr=401,
+            name='removedRpmLimiter', tags=('trigger',), reuseCount=0,
+            cooldownSeconds=0.0, enginePowerFactor=1.1,
+            engineHpLossPerSecond=1.5)
+        limiter_state = equipment_mechanics.EquipmentState(
+            equipment_mechanics.project_equipment(limiter))
+        limiter_state.active = True
+        battle._equipment_state = [limiter_state]
         battle._present_critical = mock.Mock(return_value=True)
 
-        self.assertTrue(battle._tick_rpm_limiter(
+        self.assertFalse(battle._tick_rpm_limiter(
             record, entity, 2.0, 1000.0))
 
-        self.assertEqual(97.0, entity.devices_hp['engineHealth'])
-        self.assertEqual(
-            97.0, record['critical_state']['devices'][0]['hp'])
+        self.assertEqual({}, entity.devices_hp)
+        self.assertNotIn('critical_state', record)
         self.assertIsNone(battle._local_damage_report)
 
     def _shell_change_battle(self):
@@ -8790,16 +8844,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._tick_critical_states(1.0)
 
-        self.assertEqual(475, entity.health)
-        self.assertEqual(475, record['state']['health'])
-        self.assertEqual(475, record['state']['display_health'])
-        self.assertEqual(
-            (10, 475, battle._attack_reason('FIRE', 1), True, False),
-            battle._avatar.health_update)
-        send_input.assert_called_once()
-        self.assertFalse(any(
-            key.startswith('reported_')
-            for key in send_input.call_args.kwargs))
+        self.assertEqual(500, entity.health)
+        self.assertEqual(500, record['state']['health'])
+        self.assertEqual(500, record['state']['display_health'])
+        send_input.assert_not_called()
 
         # Local native callbacks remain presentation-only. Canonical server
         # state wins even when it raises the transient local health value.
@@ -16388,7 +16436,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle.state = 'running'
         battle._avatar = runtime.bigworld.avatar
-        battle.client = types.SimpleNamespace(player_id=1)
+        send_intent = mock.Mock(side_effect=(1, 2, 3, 4))
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_equipment_intent=send_intent)
         descriptor = _Descriptor()
         extra = types.SimpleNamespace(name='engineHealth')
         descriptor.extras = {7: extra}
@@ -16405,10 +16455,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._records = {'player:1': {
             'engine_id': 10, 'state': {'health': 500, 'alive': True},
             'kind': 'player', 'network_id': 1, 'local': True}}
-        battle._equipment_state = [{
-            'id': 41, 'compact_descr': 401,
-            'name': 'smallrepairkit', 'kind': 'repairkit',
-            'cooldown': 90.0, 'uses_left': -1, 'ready_at': 0.0}]
+        repairkit = types.SimpleNamespace(
+            id=(11, 41), compactDescr=401,
+            name='smallRepairkit', tags=('repairkit',),
+            cooldownSeconds=90.0, reuseCount=-1, repairAll=False)
+        battle._equipment_state = [equipment_mechanics.EquipmentState(
+            equipment_mechanics.project_equipment(repairkit))]
         battle._present_critical = mock.Mock(return_value=True)
         clock = [1000.0]
         battle._clock = lambda: clock[0]
@@ -16416,29 +16468,25 @@ class BattleRuntimeContractTests(unittest.TestCase):
         activation_code = (7 << 16) | 41
         battle._records['player:1']['state'].update(
             health=0, alive=False, display_health=500)
-        self.assertFalse(battle.change_vehicle_setting(
+        self.assertTrue(battle.change_vehicle_setting(
             runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
             activation_code))
         self.assertEqual(0.0, entity.devices_hp['engineHealth'])
-        self.assertEqual(0.0, battle._equipment_state[0]['ready_at'])
+        self.assertEqual(0.0, battle._equipment_state[0].ready_at)
         battle._records['player:1']['state'].update(
             health=500, alive=True)
         self.assertTrue(battle.change_vehicle_setting(
             runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
             activation_code))
 
-        self.assertEqual(100.0, entity.devices_hp['engineHealth'])
-        # equipments.xml gives these kits reuseCount -1 and a 90 s cooldown,
-        # so the echo is COOLDOWN with a remaining time, never a zero quantity.
-        self.assertEqual(1090.0, battle._equipment_state[0]['ready_at'])
-        self.assertEqual((10, 401, 1, 6, 90),
-                         runtime.bigworld.avatar.ammo_updates[-1])
-        self.assertEqual([], battle._records[
-            'player:1']['critical_state']['destroyed'])
+        self.assertEqual(0.0, entity.devices_hp['engineHealth'])
+        self.assertEqual(0.0, battle._equipment_state[0].ready_at)
+        self.assertNotIn('critical_state', battle._records['player:1'])
         self.assertIsNone(battle._local_damage_report)
 
-        # A second click inside the cooldown is refused.
-        self.assertFalse(battle.change_vehicle_setting(
+        # Readiness, life and inventory are canonical server decisions; the
+        # visible bridge relays the immutable selection intent only.
+        self.assertTrue(battle.change_vehicle_setting(
             runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
             activation_code))
 
@@ -16452,7 +16500,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle.change_vehicle_setting(
             runtime.constants.VEHICLE_SETTING.ACTIVATE_EQUIPMENT,
             activation_code))
-        self.assertEqual(100.0, entity.devices_hp['engineHealth'])
+        self.assertEqual(0.0, entity.devices_hp['engineHealth'])
+        self.assertEqual(4, send_intent.call_count)
+        for call in send_intent.call_args_list:
+            self.assertEqual(
+                mock.call(41, activation_code=activation_code,
+                          selected='engineHealth',
+                          requested_active=None), call)
 
     def test_hit_resolution_uses_public_1513_gun_rotator_api(self):
         runtime = _runtime()
@@ -16484,7 +16538,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             player_id=1, send_bot_hit=mock.Mock(return_value=True))
         battle._shell_damage = mock.Mock(return_value=(120, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            500, {'events': []})
+            500, {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         battle._resolve_hit(7, 0.0, 0.0)
 
@@ -16559,7 +16614,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             player_id=1, send_bot_hit=mock.Mock(return_value=True))
         battle._shell_damage = mock.Mock(return_value=(120, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            args[5], {'events': []})
+            args[5], {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         battle._resolve_hit(7, 0.0, 0.0)
 
@@ -16609,7 +16665,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             player_id=1, send_bot_hit=mock.Mock(return_value=True))
         battle._shell_damage = mock.Mock(return_value=(120, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            args[5], {'events': []})
+            args[5], {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         battle._resolve_hit(7, 0.0, 0.0)
 
@@ -16713,7 +16770,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             player_id=1, send_bot_hit=mock.Mock(return_value=True))
         battle._shell_damage = mock.Mock(return_value=(120, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            args[5], {'events': []})
+            args[5], {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         battle._resolve_hit(7, 0.0, 0.0)
 
@@ -17085,7 +17143,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'gui.mods.offline_lan_0922.battle_runtime.'
                 'critical_damage.propose_explosion',
                 side_effect=lambda *args, **kwargs: (
-                    args[4] + 111, {'events': []})) as apply_critical:
+                    args[4] + 111, {'events': []}, {
+                        'devices': [], 'crew_ko': [], 'ignite': False,
+                    })) as apply_critical:
             count = battle._he_splash(
                 _Vector(0, 0, 0), descriptor.gun.shots[0], 7,
                 direct_record, 'player', 1, 10)
@@ -17885,7 +17945,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             send_bot_bot_hit=mock.Mock(return_value=True))
         battle._shell_damage = mock.Mock(return_value=(80, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            400, {'events': []})
+            400, {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         self.assertTrue(battle._resolve_bot_shot({
             'id': 1, 'target_kind': 'bot', 'target_id': 2,
@@ -17926,7 +17987,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'stop_distance': None, 'continue_from': None}))
         battle._shell_damage = mock.Mock(return_value=(80, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            80, {'events': []})
+            80, {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         with mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
@@ -17972,7 +18034,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.client = types.SimpleNamespace(
             player_id=1, send_bot_hit=mock.Mock(return_value=True))
         battle._critical_hit = lambda *args, **kwargs: (
-            args[5], {'events': []})
+            args[5], {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
         battle._destructibles = types.SimpleNamespace(
             shot_world_distance=mock.Mock(side_effect=(
                 {'world_distance': 999999.0, 'piercing_loss': 25.0,
@@ -18029,7 +18092,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'stop_distance': None, 'continue_from': None}))
         battle._shell_damage = mock.Mock(return_value=(120, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            args[5], {'events': []})
+            args[5], {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         with mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
@@ -18095,7 +18159,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                       'kind': 'bot', 'network_id': 2}}
         battle.client = types.SimpleNamespace(
             send_bot_bot_hit=mock.Mock(return_value=True))
-        battle._critical_hit = lambda *args, **kwargs: (args[5], None)
+        battle._critical_hit = lambda *args, **kwargs: (
+            args[5], None, None)
 
         self.assertTrue(battle._resolve_bot_shot({
             'id': 1, 'target_kind': 'bot', 'target_id': 2,
@@ -18139,7 +18204,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             send_bot_human_hit=mock.Mock(return_value=True))
         battle._shell_damage = mock.Mock(return_value=(90, 2))
         battle._critical_hit = lambda *args, **kwargs: (
-            450, {'events': []})
+            450, {'events': []},
+            {'devices': [], 'crew_ko': [], 'ignite': False})
 
         with mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'

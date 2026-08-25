@@ -41,7 +41,7 @@ from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
     ballistics, combat_rules, critical_damage, descriptor_donation,
-    destructibles_compat, effective_params, gun_mechanics,
+    destructibles_compat, effective_params, equipment_mechanics, gun_mechanics,
     lan_client as lan_protocol,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
     prebaked_navigation, native_mapping_mask, spotting, tank_collision,
@@ -1227,6 +1227,7 @@ class BattleRuntime(object):
         self._reload_event = None
         self._equipment_state = None
         self._equipment_signature = None
+        self._equipment_revision = -1
         self._local_loadout_cache = None
         self._garage_loadout = None
         self._offframe_seconds = 0.0
@@ -1462,6 +1463,7 @@ class BattleRuntime(object):
         self._reload_event = None
         self._equipment_state = None
         self._equipment_signature = None
+        self._equipment_revision = -1
         self._local_loadout_cache = None
         self._garage_loadout = None
         self._offframe_seconds = 0.0
@@ -2566,6 +2568,8 @@ class BattleRuntime(object):
                     self._start_message.get('round_id')):
                 self._last_snapshot = dict(latest_snapshot)
             if self._last_snapshot is not None:
+                self._restore_local_equipment_snapshot(
+                    self._last_snapshot, present=True)
                 self._sync.snapshot(self._last_snapshot)
             self._bots = BotRuntime(
                 self.client.player_id,
@@ -4899,11 +4903,9 @@ class BattleRuntime(object):
     def _default_equipments(self):
         """Resolve the consumables the player actually mounted in the garage.
 
-        ``reuseCount`` and ``cooldownSeconds`` come from the exact client's
-        ``scripts/item_defs/vehicles/common/equipments.xml``, where the three
-        stock kits carry ``reuseCount = -1`` (unlimited) and 90-second
-        cooldowns.  An empty garage slot contributes nothing, so a vehicle with
-        no consumables really carries none.
+        Immutable effects and mutable charge/cooldown state share one strict
+        descriptor projection.  An empty garage slot contributes nothing, so
+        a vehicle with no consumables really carries none.
         """
         try:
             values = self._runtime.vehicles.g_cache.equipments().values()
@@ -4927,54 +4929,51 @@ class BattleRuntime(object):
                 descriptor = by_compact_descr.get(compact_descr)
                 if descriptor is None:
                     continue
-                kind = self._equipment_kind(descriptor)
-                if kind is None:
-                    # A booster or a special active device this battle law
-                    # cannot apply must not be advertised as functional.
-                    continue
-                selected.append((
-                    str(getattr(descriptor, 'name', '') or '').lower(),
-                    kind, descriptor))
+                selected.append(descriptor)
         else:
             # No garage item, for example a test or a direct battle start.
             selected = []
-            for name, kind in (
-                    ('smallrepairkit', 'repairkit'),
-                    ('smallmedkit', 'medkit'),
-                    ('handextinguishers', 'extinguisher')):
+            for name in (
+                    'smallrepairkit', 'smallmedkit', 'handextinguishers'):
                 descriptor = by_name.get(name)
                 if descriptor is not None:
-                    selected.append((name, kind, descriptor))
+                    selected.append(descriptor)
 
         result = []
-        for name, kind, descriptor in selected:
+        for descriptor in selected:
             try:
-                equipment_id = int(descriptor.id[1])
-                compact_descr = int(descriptor.compactDescr)
+                contract = equipment_mechanics.project_equipment(descriptor)
             except (TypeError, ValueError, IndexError, AttributeError):
                 continue
-            cooldown = _number(
-                getattr(descriptor, 'cooldownSeconds',
-                        getattr(descriptor, 'cooldownTime', 0.0)), 0.0)
-            try:
-                reuse_count = int(getattr(descriptor, 'reuseCount', -1))
-            except (TypeError, ValueError):
-                reuse_count = -1
-            result.append({
-                'id': equipment_id, 'compact_descr': compact_descr,
-                'name': name, 'kind': kind,
-                'cooldown': max(0.0, cooldown),
-                # -1 is the client's unlimited-reuse marker; 0 means one shot.
-                'uses_left': (-1 if kind == 'rpm_limiter' or reuse_count < 0
-                              else max(1, reuse_count)),
-                'ready_at': 0.0,
-                'active': False,
-                'engine_power_factor': max(1.0, _number(
-                    getattr(descriptor, 'enginePowerFactor', 1.0), 1.0)),
-                'engine_hp_loss_per_second': max(0.0, _number(
-                    getattr(descriptor, 'engineHpLossPerSecond', 0.0), 0.0)),
-            })
+            if contract['id'] <= 0 or contract['compactDescr'] <= 0:
+                continue
+            result.append(equipment_mechanics.EquipmentState(contract))
         return result
+
+    def _restore_local_equipment_snapshot(self, snapshot, present=False):
+        """Restore the visible replica from one complete canonical ledger."""
+        if not isinstance(snapshot, dict) or self.client is None:
+            return False
+        local = next((
+            value for value in (snapshot.get('players') or ())
+            if isinstance(value, dict) and
+            int(value.get('id', 0) or 0) == int(self.client.player_id)), None)
+        if local is None or 'equipment_states' not in local:
+            return False
+        try:
+            revision = int(local.get('equipment_revision'))
+            if revision < 0 or revision < self._equipment_revision:
+                raise ValueError('player equipment revision regressed')
+            states = equipment_mechanics.restore_equipment_states(
+                local.get('equipment_states'), now=self._clock())
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError('canonical player equipment snapshot is invalid')
+        self._equipment_state = states
+        self._equipment_revision = revision
+        if (present and not self._worker_mode and
+                self._avatar is not None and self._server is not None):
+            self._present_equipments(self._clock())
+        return True
 
     def _garage_item(self):
         """Return the lobby's current vehicle item, or None outside a garage.
@@ -5265,29 +5264,34 @@ class BattleRuntime(object):
         stage 0 (``NOT_RUNNING``) never becomes usable again.
         """
         stages = self._equipment_stages()
-        if equipment['uses_left'] == 0:
+        if equipment.uses_left == 0:
             return 0, int(stages.EXHAUSTED), 0
-        if (equipment.get('kind') == 'rpm_limiter' and
-                equipment.get('active')):
+        if (equipment.contract.get('kind') == 'rpm_limiter' and
+                equipment.active):
             # #1513's trigger item interprets PREPARING with zero remaining
             # time as the toggled-on state and sends the raw equipment id to
             # deactivate it on the next click.
             return 1, int(stages.PREPARING), 0
-        remaining = _number(equipment.get('ready_at'), 0.0) - float(now)
+        remaining = float(equipment.ready_at) - float(now)
         if remaining > 0.0:
             return 1, int(stages.COOLDOWN), int(math.ceil(remaining))
         return 1, int(stages.READY), 0
 
     def _present_equipments(self, now=None):
         if self._equipment_state is None:
-            self._equipment_state = self._default_equipments()
+            return False
         if now is None:
             now = self._clock()
         for equipment in self._equipment_state:
             quantity, stage, remaining = self._equipment_echo(equipment, now)
             self._avatar.updateVehicleAmmo(
-                self._server.vehicle_id, equipment['compact_descr'],
+                self._server.vehicle_id,
+                equipment.contract['compactDescr'],
                 quantity, stage, remaining)
+        self._equipment_signature = tuple(
+            self._equipment_echo(equipment, now)
+            for equipment in self._equipment_state)
+        return True
 
     def _tick_equipment_cooldowns(self, now):
         """Republish a consumable the moment its cooldown expires."""
@@ -5320,24 +5324,21 @@ class BattleRuntime(object):
             if not matches:
                 continue
             name = str(getattr(extra, 'name', '') or '')
-            return name[:-6] if name.endswith('Health') else name
+            return name
         return None
 
     def _activate_equipment(self, activation_code):
-        if self._equipment_state is None:
-            self._equipment_state = self._default_equipments()
         try:
             activation_code = int(activation_code)
         except (TypeError, ValueError):
             return False
+        if self._equipment_state is None:
+            return False
         equipment_id = activation_code & 65535
         extra_index = max(0, activation_code >> 16)
         equipment = next((value for value in self._equipment_state
-                          if value['id'] == equipment_id), None)
-        if equipment is None or equipment['uses_left'] == 0:
-            return False
-        now = self._clock()
-        if _number(equipment.get('ready_at'), 0.0) > now:
+                          if value.contract['id'] == equipment_id), None)
+        if equipment is None:
             return False
         record = self._records.get('player:%s' % self.client.player_id)
         if record is None or self._server is None:
@@ -5345,81 +5346,35 @@ class BattleRuntime(object):
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None or entity.typeDescriptor is None:
             return False
-        if not self._record_alive(record, entity):
-            return False
-        if equipment['kind'] == 'rpm_limiter':
-            requested_active = bool(extra_index)
-            if requested_active == bool(equipment.get('active')):
-                return False
-            equipment['active'] = requested_active
-            self._equipment_signature = None
-            self._present_equipments(now)
-            return True
         selected = self._critical_name_from_extra_index(
             entity.typeDescriptor, extra_index)
-        if equipment['kind'] == 'extinguisher':
-            payload = critical_damage.use_extinguisher(entity)
-        elif equipment['kind'] == 'repairkit':
-            payload = critical_damage.repair_device(
-                entity, selected, 'large' in equipment['name'])
-        elif equipment['kind'] == 'medkit':
-            payload = critical_damage.restore_crew(
-                entity, selected, 'large' in equipment['name'])
-        else:
+        equipment_kind = equipment.contract['kind']
+        repair_all = bool(equipment.contract.get('repairAll', False))
+        if repair_all:
+            selected = None
+        elif (equipment_kind == 'medkit' and selected is not None and
+                selected.endswith('Health')):
+            selected = selected[:-6]
+        sender = getattr(self.client, 'send_equipment_intent', None)
+        if not callable(sender):
             return False
-        if payload is None:
-            return False
-        equipment['ready_at'] = now + equipment['cooldown']
-        if equipment['uses_left'] > 0:
-            equipment['uses_left'] -= 1
-        canonical = self._critical_state(payload)
-        record['critical_state'] = canonical
-        state = dict(record.get('state') or {})
-        state['critical'] = canonical
-        record['state'] = state
-        self._present_critical(
-            record, payload.get('events'), record['engine_id'])
-        self._queue_local_track_repair(payload)
-        self._present_equipments()
-        return True
+        sequence = sender(
+            equipment_id,
+            activation_code=activation_code,
+            selected=None if equipment_kind == 'rpm_limiter' else selected,
+            requested_active=(bool(extra_index)
+                              if equipment_kind == 'rpm_limiter' else None))
+        return sequence is not None
 
     def _active_engine_power_factor(self):
-        if not self._equipment_state:
-            return 1.0
-        for equipment in self._equipment_state:
-            if (equipment.get('kind') == 'rpm_limiter' and
-                    equipment.get('active')):
-                return max(1.0, _number(
-                    equipment.get('engine_power_factor'), 1.0))
-        return 1.0
+        return max(0.0, _number(
+            equipment_mechanics.passive_effects(
+                self._equipment_state or ()).get(
+                    'enginePowerFactor'), 1.0))
 
     def _tick_rpm_limiter(self, record, entity, dt, now):
-        if not self._battle_live or dt <= 0.0:
-            return False
-        if self._equipment_state is None:
-            self._equipment_state = self._default_equipments()
-        equipment = next((value for value in self._equipment_state
-                          if (value.get('kind') == 'rpm_limiter' and
-                              value.get('active'))), None)
-        if equipment is None:
-            return False
-        loss = max(0.0, _number(
-            equipment.get('engine_hp_loss_per_second'), 0.0)) * float(dt)
-        payload = critical_damage.damage_device_over_time(
-            entity, 'engineHealth', loss, 'removedRpmLimiter')
-        if payload is None:
-            return False
-        record['critical_state'] = self._critical_state(payload)
-        state = dict(record.get('state') or {})
-        state['critical'] = record['critical_state']
-        record['state'] = state
-        self._present_critical(
-            record, payload.get('events'), record['engine_id'])
-        if (payload.get('events') or now >= self._next_critical_report_time):
-            self._queue_local_damage_report(critical=payload)
-            self._next_critical_report_time = (
-                now + CRITICAL_REPAIR_NETWORK_SECONDS)
-        return True
+        """Removed RPM Limiter damage is advanced only by BattleState."""
+        return False
 
     def _publish_reload_event(self, time_left, base_time, force=False):
         """Send one #1513 reload edge and let the stock HUD interpolate it."""
@@ -5736,6 +5691,8 @@ class BattleRuntime(object):
             return
         try:
             self._last_snapshot = dict(message or {})
+            self._restore_local_equipment_snapshot(
+                self._last_snapshot, present=True)
             self._ack_local_ram_contacts(self._last_snapshot)
             self._ack_local_destructible_contacts(self._last_snapshot)
             self._observe_destructibles_disabled(self._last_snapshot)
@@ -6392,7 +6349,11 @@ class BattleRuntime(object):
             holder['state'] = state
 
     def _missing_projectile_attacker_allowed(self, event):
-        """Allow a fired shell to outlive a disconnected shooter entity."""
+        """Allow canonical delayed damage to outlive its shooter entity."""
+        if (event.get('source') == 'fire' and
+                event.get('kind') in (
+                    'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')):
+            return True
         if (event.get('source') != 'shot' or
                 event.get('kind') not in (
                     'hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit')):
@@ -7349,7 +7310,7 @@ class BattleRuntime(object):
         kind = event.get('kind')
         valid_kinds = {
             'shot': ('hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit'),
-            'fire': ('bot_hit', 'bot_human_hit', 'bot_bot_hit'),
+            'fire': ('hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit'),
             'ram': ('hit', 'bot_hit', 'bot_human_hit', 'bot_bot_hit'),
             'client_simulation': ('health',),
             'player_left': ('health',),
@@ -7627,10 +7588,13 @@ class BattleRuntime(object):
         return result
 
     @staticmethod
-    def _critical_proposal_contract(record, critical, hull_damage):
+    def _critical_proposal_contract(record, critical, hull_damage,
+                                    critical_delta):
         """Bind a firing-client proposal to the last canonical target state."""
         if not isinstance(critical, dict):
             return {}
+        if not isinstance(critical_delta, dict):
+            raise RuntimeError('#1513 critical proposal has no damage delta')
         state = record.get('state') or {}
         if record.get('kind') == 'bot':
             base_name = 'combat_base_revision'
@@ -7656,6 +7620,7 @@ class BattleRuntime(object):
                     '#1513 critical target has no exact %s' % state_name)
             values[wire_name] = parsed
         values['hull_damage'] = hull_damage
+        values['critical_delta'] = critical_delta
         return values
 
     def _reconcile_critical_authority(self, record, source):
@@ -7932,8 +7897,44 @@ class BattleRuntime(object):
             return False
         return True
 
+    @staticmethod
+    def _tick_local_track_repair(entity, dt, loadout):
+        """Advance only the existing owner-CAS track repair checkpoint."""
+        before = critical_damage._state(entity)
+        devices = getattr(entity, 'devices_hp', None) or {}
+        destroyed = set(getattr(entity, '_destroyed_devices', None) or ())
+        critical = set(getattr(entity, '_critical_devices', None) or ())
+        changed = False
+        for name in ('leftTrackHealth', 'rightTrackHealth'):
+            if name not in destroyed or name not in devices:
+                continue
+            cap = critical_damage._device_damage.device_regen_hp(
+                entity.typeDescriptor, name)
+            if cap is None or devices[name] >= cap:
+                continue
+            repaired = critical_damage._device_damage.repair_step_hp(
+                devices[name], name, entity.typeDescriptor, dt,
+                has_big_repairkit=bool(loadout['has_big_kit']),
+                repair_factor=loadout['repair_factor'])
+            if repaired <= devices[name]:
+                continue
+            devices[name] = repaired
+            changed = True
+            if repaired >= cap:
+                destroyed.discard(name)
+                critical.add(name)
+        if not changed:
+            return None
+        entity.devices_hp = devices
+        entity._destroyed_devices = destroyed
+        entity._critical_devices = critical
+        critical_damage._refresh_mobility_flags(entity)
+        return critical_damage._payload(
+            before, critical_damage._state(entity),
+            entity.typeDescriptor, 'repair')
+
     def _tick_critical_states(self, dt):
-        """Advance copied repair/fire laws only for the locally-owned human."""
+        """Present canonical state while retaining owner-CAS track repair."""
         if dt <= 0.0:
             return
         record = self._records.get('player:%s' % self.client.player_id)
@@ -7948,10 +7949,8 @@ class BattleRuntime(object):
             entity.maxHealth = int(entity.typeDescriptor.maxHealth)
         now = self._clock()
         loadout = self._local_loadout(entity.typeDescriptor)
-        self._tick_rpm_limiter(record, entity, dt, now)
-        payload = critical_damage.tick_repair(
-            entity, dt, has_big_kit=loadout['has_big_kit'],
-            repair_factor=loadout['repair_factor'])
+        payload = self._tick_local_track_repair(
+            entity, dt, loadout)
         if payload is not None:
             record['critical_state'] = self._critical_state(payload)
             state = dict(record.get('state') or {})
@@ -7967,45 +7966,7 @@ class BattleRuntime(object):
                 self._queue_local_track_repair(payload)
                 self._next_critical_report_time = (
                     now + CRITICAL_REPAIR_NETWORK_SECONDS)
-        fire_reason = self._attack_reason('FIRE', 1)
-        damage, fire_payload = critical_damage.tick_fire(
-            entity, dt, now=now)
-        if fire_payload is not None:
-            record['critical_state'] = self._critical_state(fire_payload)
-            state = dict(record.get('state') or {})
-            state['critical'] = record['critical_state']
-            record['state'] = state
-            self._present_critical(
-                record, fire_payload.get('events'), record['engine_id'])
-            if (fire_payload.get('events') or
-                    now >= self._next_critical_report_time):
-                self._queue_local_damage_report(
-                    critical=fire_payload, reason=fire_reason)
-                self._next_critical_report_time = (
-                    now + CRITICAL_REPAIR_NETWORK_SECONDS)
-        if damage > 0:
-            state = dict(record.get('state') or {})
-            state['health'] = max(
-                0, int(getattr(entity, 'health', 0)) - int(damage))
-            state['alive'] = state['health'] > 0
-            # A live vehicle has no separate display-health value.  Keeping
-            # the preceding snapshot's value here makes PlayerAvatar first
-            # show the new native HP, then immediately paint the old HUD HP
-            # over it until the server echoes this fire tick.
-            state['display_health'] = state['health']
-            state['death_reason'] = fire_reason
-            record['state'] = state
-            self._queue_local_damage_report(reason=fire_reason)
-            self._apply_health(
-                record, state, getattr(entity, 'last_killer_id', 0),
-                fire_reason)
-            # Freeze the lower HP into the outbound queue in this callback.
-            # Waiting for the regular 30 Hz input phase leaves a window where
-            # an older server snapshot can restore ``entity.health`` first;
-            # send_current() would then report that stale higher value and the
-            # entire one-second burn tick would disappear.
-            if self._sender is not None:
-                self._sender.send_current()
+        self._tick_equipment_cooldowns(now)
         self._present_repair_progress(entity)
 
     def _present_repair_progress(self, entity):
@@ -8021,6 +7982,7 @@ class BattleRuntime(object):
         if cache is None:
             cache = {}
             entity._offline_lan_repair_progress = cache
+        loadout = self._local_loadout(entity.typeDescriptor)
         for name in tuple(destroyed):
             if name in critical_damage._device_damage.NO_REPAIR_PROGRESS_DEVICES:
                 continue
@@ -8038,7 +8000,9 @@ class BattleRuntime(object):
             if extra_index <= 0:
                 continue
             seconds = critical_damage._device_damage.repair_seconds(
-                name, entity.typeDescriptor)
+                name, entity.typeDescriptor,
+                has_big_repairkit=bool(loadout['has_big_kit']),
+                repair_factor=loadout['repair_factor'])
             seconds_left = max(0.0, seconds * (1.0 - hp / cap))
             callback(entity.id, int(status),
                      int(extra_index) | (progress << 8),
@@ -9255,7 +9219,7 @@ class BattleRuntime(object):
         return self._server_entity(record.get('engine_id'))
 
     def _projectile_effect(self, record, damage, result, impact,
-                           critical, hull_damage):
+                           critical, hull_damage, critical_delta):
         target_kind = record.get('kind')
         if target_kind == 'human':
             target_kind = 'player'
@@ -9272,7 +9236,7 @@ class BattleRuntime(object):
         if isinstance(critical, dict):
             effect['critical'] = critical
             effect.update(self._critical_proposal_contract(
-                record, critical, hull_damage))
+                record, critical, hull_damage, critical_delta))
         return effect
 
     def _projectile_direct_effect(self, meta, state, terminal_data):
@@ -9326,19 +9290,20 @@ class BattleRuntime(object):
         deadeye = bool(_field(shot, 'deadeye', False))
         layers = combat_rules.collision_layers(collisions)
         if combat_rules.is_he(shot):
-            damage, critical = critical_damage.propose_explosion(
-                target, layers, self._vector(terminal_data['impact']),
-                trace_end - trace_start, damage, legacy_shell, attacker_id,
-                deadeye=deadeye)
+            damage, critical, critical_delta = (
+                critical_damage.propose_explosion(
+                    target, layers, self._vector(terminal_data['impact']),
+                    trace_end - trace_start, damage, legacy_shell,
+                    attacker_id, deadeye=deadeye, with_delta=True))
         else:
-            damage, critical = critical_damage.propose_direct(
+            damage, critical, critical_delta = critical_damage.propose_direct(
                 target, layers, trace_start, trace_end, damage,
                 legacy_shell, attacker_id, penetrated=int(result) == 2,
-                deadeye=deadeye)
+                deadeye=deadeye, with_delta=True)
         critical = self._critical_with_crew_roster(target, critical)
         return self._projectile_effect(
             record, damage, result, terminal_data['impact'],
-            critical, hull_damage)
+            critical, hull_damage, critical_delta)
 
     def _projectile_splash_effects(self, meta, impact, direct_key):
         source = self._projectile_source_entity(meta)
@@ -9391,14 +9356,17 @@ class BattleRuntime(object):
             if damage <= 0:
                 continue
             hull_damage = damage
-            damage, critical = critical_damage.propose_explosion(
-                target, combat_rules.collision_layers(collisions),
-                burst, aim - burst, damage, legacy_shell,
-                int(getattr(source, 'id', meta.get('shooter_id', 0))),
-                deadeye=bool(_field(shot, 'deadeye', False)))
+            damage, critical, critical_delta = (
+                critical_damage.propose_explosion(
+                    target, combat_rules.collision_layers(collisions),
+                    burst, aim - burst, damage, legacy_shell,
+                    int(getattr(source, 'id', meta.get('shooter_id', 0))),
+                    deadeye=bool(_field(shot, 'deadeye', False)),
+                    with_delta=True))
             critical = self._critical_with_crew_roster(target, critical)
             effects.append(self._projectile_effect(
-                record, damage, 2, impact, critical, hull_damage))
+                record, damage, 2, impact, critical, hull_damage,
+                critical_delta))
             if len(effects) >= 30:
                 break
         return effects
@@ -13848,13 +13816,13 @@ class BattleRuntime(object):
             target_descriptor=getattr(hit_entity, 'typeDescriptor', None))
         impact = start + direction.scale(distance)
         hull_damage = damage
-        damage, critical = self._critical_hit(
+        damage, critical, critical_delta = self._critical_hit(
             hit_entity, source.typeDescriptor, target_collisions,
             trace_start, trace_end,
             damage, result, source.id, state.get('shell_index'),
             burst_position=impact, deadeye=False)
         critical_contract = self._critical_proposal_contract(
-            hit_record, critical, hull_damage)
+            hit_record, critical, hull_damage, critical_delta)
         sent = False
         if hit_record.get('kind') == 'bot':
             sent = self.client.send_bot_bot_hit(
@@ -15546,13 +15514,13 @@ class BattleRuntime(object):
             target_descriptor=getattr(target, 'typeDescriptor', None))
         impact = start + direction.scale(distance)
         hull_damage = damage
-        damage, critical = self._critical_hit(
+        damage, critical, critical_delta = self._critical_hit(
             target, entity.typeDescriptor, target_collisions,
             trace_start, trace_end,
             damage, result, entity.id, shell_index,
             burst_position=impact, deadeye=self._has_deadeye)
         critical_contract = self._critical_proposal_contract(
-            target_record, critical, hull_damage)
+            target_record, critical, hull_damage, critical_delta)
         if target_record.get('kind') == 'bot':
             self.client.send_bot_hit(
                 target_record['network_id'], shot_seq, damage, result,
@@ -15711,23 +15679,25 @@ class BattleRuntime(object):
             if damage <= 0:
                 continue
             hull_damage = damage
-            damage, critical = critical_damage.propose_explosion(
-                target, combat_rules.collision_layers(collisions),
-                burst_position, aim - burst_position, damage,
-                legacy_shell, attacker_engine_id, deadeye=False)
+            damage, critical, critical_delta = (
+                critical_damage.propose_explosion(
+                    target, combat_rules.collision_layers(collisions),
+                    burst_position, aim - burst_position, damage,
+                    legacy_shell, attacker_engine_id, deadeye=False,
+                    with_delta=True))
             critical = self._critical_with_crew_roster(target, critical)
             if self._send_splash_hit(
                     record, attacker_kind, attacker_id, shot_seq, damage,
-                    hull_damage, burst_position, critical):
+                    hull_damage, burst_position, critical, critical_delta):
                 hit_count += 1
         return hit_count
 
     def _send_splash_hit(self, target_record, attacker_kind, attacker_id,
                          shot_seq, damage, hull_damage, burst_position,
-                         critical):
+                         critical, critical_delta):
         impact = _xyz(burst_position)
         critical_contract = self._critical_proposal_contract(
-            target_record, critical, hull_damage)
+            target_record, critical, hull_damage, critical_delta)
         if attacker_kind == 'player':
             if target_record.get('kind') == 'bot':
                 return self.client.send_bot_hit(
@@ -15753,7 +15723,7 @@ class BattleRuntime(object):
                       deadeye=False):
         """Adapt #1513 collision objects to the copied 0.8.2 crit loop."""
         if target is None or getattr(target, 'typeDescriptor', None) is None:
-            return damage, None
+            return damage, None, None
         shots = tuple(source_descriptor.gun.shots or ())
         if shell_index is None:
             shell_index = getattr(source_descriptor, 'activeGunShotIndex', 0)
@@ -15762,16 +15732,19 @@ class BattleRuntime(object):
         shell = (combat_rules.legacy_shot(shot).get('shell') or {})
         layers = combat_rules.collision_layers(collisions)
         if combat_rules.is_he(shot):
-            damage, critical = critical_damage.propose_explosion(
-                target, layers,
-                burst_position if burst_position is not None else start,
-                end - start, damage, shell, attacker_id,
-                deadeye=deadeye)
+            damage, critical, critical_delta = (
+                critical_damage.propose_explosion(
+                    target, layers,
+                    burst_position if burst_position is not None else start,
+                    end - start, damage, shell, attacker_id,
+                    deadeye=deadeye, with_delta=True))
         else:
-            damage, critical = critical_damage.propose_direct(
+            damage, critical, critical_delta = critical_damage.propose_direct(
                 target, layers, start, end, damage, shell, attacker_id,
-                penetrated=int(result) == 2, deadeye=deadeye)
-        return damage, self._critical_with_crew_roster(target, critical)
+                penetrated=int(result) == 2, deadeye=deadeye,
+                with_delta=True)
+        return (damage, self._critical_with_crew_roster(target, critical),
+                critical_delta)
 
     @staticmethod
     def _descriptor_crew_roster(descriptor):
@@ -16164,6 +16137,7 @@ class BattleRuntime(object):
         self._targeting_signature = None
         self._equipment_state = None
         self._equipment_signature = None
+        self._equipment_revision = -1
         self._local_loadout_cache = None
         self._garage_loadout = None
         self._offframe_seconds = 0.0

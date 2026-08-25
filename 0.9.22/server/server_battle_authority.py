@@ -1602,11 +1602,13 @@ class ServerBattleAuthority(object):
                 float(position[0]) - float(impact[0]),
                 float(position[1]) - float(impact[1]),
                 float(position[2]) - float(impact[2]))
-            damage, critical = critical_damage.propose_explosion(
+            damage, critical, critical_delta = (
+                critical_damage.propose_explosion(
                 mock, combat_rules.collision_layers(()),
                 Vector3(*impact), direction, damage, shell,
                 int(meta.get('shooter_id', 0)),
-                deadeye=bool(shot.get('deadeye', False)))
+                deadeye=bool(shot.get('deadeye', False)),
+                with_delta=True))
             effect = {
                 'target_kind': target['kind'],
                 'target_id': int(target['id']),
@@ -1619,6 +1621,7 @@ class ServerBattleAuthority(object):
                 contract = self._critical_contract(target)
                 if contract is not None:
                     effect['critical'] = critical
+                    effect['critical_delta'] = critical_delta
                     effect['hull_damage'] = int(hull_damage)
                     effect.update(contract)
             effects.append(effect)
@@ -1673,17 +1676,19 @@ class ServerBattleAuthority(object):
                 float(ray_end[0]) - float(ray_start[0]),
                 float(ray_end[1]) - float(ray_start[1]),
                 float(ray_end[2]) - float(ray_start[2]))
-            damage, critical = critical_damage.propose_explosion(
+            damage, critical, critical_delta = (
+                critical_damage.propose_explosion(
                 mock, critical_collisions, Vector3(*state['position']),
                 direction, damage, shell, int(meta.get('shooter_id', 0)),
-                deadeye=bool(shot.get('deadeye', False)))
+                deadeye=bool(shot.get('deadeye', False)),
+                with_delta=True))
         else:
-            damage, critical = critical_damage.propose_direct(
+            damage, critical, critical_delta = critical_damage.propose_direct(
                 mock, critical_collisions,
                 trace_start, trace_end, damage, shell,
                 int(meta.get('shooter_id', 0)),
                 penetrated=int(result) == 2,
-                deadeye=bool(shot.get('deadeye', False)))
+                deadeye=bool(shot.get('deadeye', False)), with_delta=True)
         effect = {
             'target_kind': target['kind'],
             'target_id': int(target['id']),
@@ -1699,6 +1704,7 @@ class ServerBattleAuthority(object):
             contract = self._critical_contract(target)
             if contract is not None:
                 effect['critical'] = critical
+                effect['critical_delta'] = critical_delta
                 effect['hull_damage'] = int(hull_damage)
                 effect.update(contract)
         return effect

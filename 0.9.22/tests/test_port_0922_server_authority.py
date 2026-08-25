@@ -32,6 +32,7 @@ from server_battle_authority import (  # noqa: E402
 )
 import server_world  # noqa: E402
 from descriptor_projection import DescriptorStore, wrap  # noqa: E402
+from gui.mods.offline_lan_0922 import equipment_mechanics  # noqa: E402
 
 
 class _Socket(object):
@@ -83,7 +84,8 @@ def _player(player_id, team=1, x=398.0, z=402.0):
         capabilities=(
             PROJECTILE_CAPABILITY, HUMAN_RAM_TIMELINE_CAPABILITY,
             RAM_CONTACT_LEDGER_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
-            PLAYER_ENVIRONMENT_CAPABILITY, EFFECTIVE_PARAMS_CAPABILITY),
+            PLAYER_ENVIRONMENT_CAPABILITY,
+            EFFECTIVE_PARAMS_CAPABILITY),
         effective_params=effective_params(),
     )
 
@@ -665,6 +667,338 @@ class ServerAuthorityElectionTest(unittest.TestCase):
         state.request_start(1, '01_karelia')
         state._reset_round()
         self.assertIsNone(state.server_authority)
+
+
+class CanonicalPlayerEquipmentTest(unittest.TestCase):
+    @staticmethod
+    def _contract(name, equipment_id, **values):
+        raw = {
+            'name': name, 'id': (0, equipment_id),
+            'compactDescr': 400 + equipment_id, 'tags': (),
+            'reuseCount': 0, 'cooldownSeconds': 0.0,
+        }
+        raw.update(values)
+        return equipment_mechanics.project_equipment(raw)
+
+    @staticmethod
+    def _critical(engine_hp=100.0, engine_state='normal', fire=False):
+        return _critical_payload({
+            'devices': [
+                {'name': 'engineHealth', 'hp': float(engine_hp),
+                 'max_hp': 100.0, 'state': engine_state},
+                {'name': 'leftTrackHealth', 'hp': 0.0,
+                 'max_hp': 100.0, 'state': 'destroyed'},
+            ],
+            'destroyed': ([
+                'leftTrackHealth'] + ([
+                    'engineHealth'] if engine_state == 'destroyed' else [])),
+            'crew_ko': [], 'fire': bool(fire),
+            'ammo_rack_death': False, 'events': [],
+        })
+
+    def _state(self, contracts, critical=None):
+        state = BattleState(map_name='01_karelia', authority_mode='client')
+        state.client_build = CLIENT_BUILD_0922
+        player = _player(1)
+        params = effective_params()
+        params['equipment'] = list(contracts)
+        params['critical'] = {'devices': [
+            {'name': 'engineHealth', 'max_hp': 100.0, 'regen_hp': 50.0},
+            {'name': 'leftTrackHealth', 'max_hp': 100.0,
+             'regen_hp': 50.0},
+        ], 'activation_targets': [
+            {'index': 1, 'name': 'commander'},
+            {'index': 4, 'name': 'engineHealth'},
+            {'index': 5, 'name': 'leftTrackHealth'},
+        ], 'crew_roster': ['commander', 'driver']}
+        player.effective_params = params
+        player.critical = critical or self._critical()
+        state.players = {1: player}
+        state.phase = 'battle'
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        self.assertTrue(state._install_player_equipments(player))
+        return state, player
+
+    @staticmethod
+    def _intent(state, sequence, equipment_id, selected=None,
+                requested_active=None):
+        equipment = next(value for value in
+                         state.players[1].equipment_states
+                         if value.contract['id'] == equipment_id)
+        if equipment.contract.get('repairAll', False):
+            extra_index = 1
+        elif equipment.contract.get('kind') == 'rpm_limiter':
+            extra_index = int(bool(requested_active))
+        elif selected is not None:
+            extra_index = next(
+                row['index'] for row in
+                state.players[1].effective_params['critical'][
+                    'activation_targets']
+                if row['name'] == selected)
+        else:
+            extra_index = 0
+        return state.submit_equipment_intent(1, {
+            'type': 'equipment_intent', 'round_id': state.round_id,
+            'intent_seq': sequence, 'equipment_id': equipment_id,
+            'activation_code': (extra_index << 16) | equipment_id,
+            'selected': selected, 'requested_active': requested_active,
+        })
+
+    def test_inventory_cooldown_and_fingerprint_are_idempotent(self):
+        repair = self._contract(
+            'smallRepairkit', 41, tags=('repairkit',), reuseCount=1,
+            cooldownSeconds=5.0, repairAll=False)
+        state, player = self._state(
+            [repair], self._critical(0.0, 'destroyed'))
+
+        self.assertTrue(self._intent(
+            state, 1, 41, selected='engineHealth'))
+        equipment = player.equipment_states[0]
+        revision = player.equipment_revision
+        self.assertEqual(1, equipment.uses_left)
+        self.assertTrue(self._intent(
+            state, 1, 41, selected='engineHealth'))
+        self.assertEqual((1, revision), (
+            equipment.uses_left, player.equipment_revision))
+        self.assertFalse(self._intent(
+            state, 1, 41, selected='leftTrackHealth'))
+        self.assertFalse(self._intent(
+            state, 3, 41, selected='engineHealth'))
+
+        player.critical = self._critical(0.0, 'destroyed')
+        state.tick += int(4.0 * TICK_HZ)
+        self.assertTrue(self._intent(
+            state, 2, 41, selected='engineHealth'))
+        self.assertEqual(
+            'equipment_ineligible',
+            player.equipment_intent_result['reason'])
+        self.assertEqual(1, equipment.uses_left)
+        state.tick += int(1.0 * TICK_HZ)
+        self.assertTrue(self._intent(
+            state, 3, 41, selected='engineHealth'))
+        self.assertEqual(0, equipment.uses_left)
+
+    def test_malformed_equipment_identifiers_fail_closed(self):
+        state, player = self._state([])
+        base = {
+            'type': 'equipment_intent', 'round_id': state.round_id,
+            'intent_seq': 1, 'equipment_id': 41,
+            'activation_code': 41,
+            'selected': None, 'requested_active': None,
+        }
+        for field, value in (
+                ('intent_seq', []), ('intent_seq', '1'),
+                ('equipment_id', {}), ('equipment_id', 1.5)):
+            message = dict(base)
+            message[field] = value
+            with self.subTest(field=field, value=value):
+                self.assertFalse(
+                    state.submit_equipment_intent(1, message))
+                self.assertEqual(0, player.equipment_intent_seq)
+
+    def test_rpm_and_non_track_repair_are_server_owned(self):
+        limiter = self._contract(
+            'removedRpmLimiter', 12, reuseCount=-1,
+            enginePowerFactor=1.1, engineHpLossPerSecond=1.5)
+        state, player = self._state([limiter])
+        self.assertTrue(self._intent(
+            state, 1, 12, requested_active=True))
+        self.assertEqual(1, state._tick_player_critical(2.0))
+        engine = next(value for value in player.critical['devices']
+                      if value['name'] == 'engineHealth')
+        track = next(value for value in player.critical['devices']
+                     if value['name'] == 'leftTrackHealth')
+        self.assertEqual(97.0, engine['hp'])
+        self.assertEqual(0.0, track['hp'])
+
+        repair_state, repair_player = self._state(
+            [], self._critical(0.0, 'destroyed'))
+        self.assertEqual(1, repair_state._tick_player_critical(1.0))
+        engine = next(value for value in repair_player.critical['devices']
+                      if value['name'] == 'engineHealth')
+        track = next(value for value in repair_player.critical['devices']
+                     if value['name'] == 'leftTrackHealth')
+        self.assertGreater(engine['hp'], 0.0)
+        self.assertEqual(0.0, track['hp'])
+
+    def test_continuous_progress_does_not_starve_track_owner_cas(self):
+        limiter = self._contract(
+            'removedRpmLimiter', 12, reuseCount=-1,
+            enginePowerFactor=1.1, engineHpLossPerSecond=1.5)
+        critical = self._critical()
+        state, player = self._state([limiter], critical)
+        player.critical = {}
+        initial = state._commit_external_player_critical(player, critical)
+        base_revision = initial['critical_base_revision']
+        self.assertGreater(base_revision, 0)
+        self.assertTrue(self._intent(
+            state, 1, 12, requested_active=True))
+
+        for unused_index in range(3):
+            state.tick += TICK_HZ
+            self.assertEqual(1, state._tick_player_critical(1.0))
+            self.assertEqual(
+                base_revision, player.critical_report_base_revision)
+            self.assertEqual(0, player.critical_ack_seq)
+
+        revision = player.critical_revision
+        unchanged = state._commit_player_critical_progress(
+            player, player.critical)
+        self.assertEqual(revision, unchanged['critical_revision'])
+
+        self.assertTrue(state.report_track_repair(1, {
+            'type': 'track_repair', 'round_id': state.round_id,
+            'critical_base_revision': base_revision, 'repair_seq': 1,
+            'tracks': [{
+                'name': 'leftTrackHealth', 'hp': 25.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }],
+        }))
+        self.assertEqual(1, player.critical_ack_seq)
+        engine_before = next(
+            value['hp'] for value in player.critical['devices']
+            if value['name'] == 'engineHealth')
+
+        state.tick += TICK_HZ
+        self.assertEqual(1, state._tick_player_critical(1.0))
+        self.assertEqual((base_revision, 1), (
+            player.critical_report_base_revision,
+            player.critical_ack_seq))
+        track = next(value for value in player.critical['devices']
+                     if value['name'] == 'leftTrackHealth')
+        engine = next(value for value in player.critical['devices']
+                      if value['name'] == 'engineHealth')
+        self.assertEqual(25.0, track['hp'])
+        self.assertLess(engine['hp'], engine_before)
+
+        hull_damage, accepted = (
+            lan_battle_server._critical_proposal_admission({
+                'critical_target_base_revision': base_revision,
+                'critical_target_ack_seq': 1,
+                'hull_damage': 120,
+            }, player.critical_report_base_revision,
+                player.critical_ack_seq))
+        self.assertEqual(120, hull_damage)
+        self.assertTrue(accepted)
+
+    def test_damage_delta_preserves_unrelated_repair_and_fire_progress(self):
+        critical = _critical_payload({
+            'devices': [
+                {'name': 'engineHealth', 'hp': 0.0, 'max_hp': 100.0,
+                 'state': 'destroyed'},
+                {'name': 'leftTrackHealth', 'hp': 100.0,
+                 'max_hp': 100.0, 'state': 'normal'},
+            ],
+            'destroyed': ['engineHealth'], 'crew_ko': [],
+            'crew_roster': ['commander', 'driver'],
+            'fire': False, 'ammo_rack_death': False, 'events': [],
+        })
+        state, player = self._state([], critical)
+        state.tick += TICK_HZ
+        self.assertEqual(1, state._tick_player_critical(1.0))
+        repaired_engine = next(
+            row['hp'] for row in player.critical['devices']
+            if row['name'] == 'engineHealth')
+        self.assertGreater(repaired_engine, 0.0)
+
+        stale_full = _critical_payload({
+            'devices': [
+                {'name': 'engineHealth', 'hp': 0.0, 'max_hp': 100.0,
+                 'state': 'destroyed'},
+                {'name': 'leftTrackHealth', 'hp': 50.0,
+                 'max_hp': 100.0, 'state': 'critical'},
+            ],
+            'destroyed': ['engineHealth'], 'crew_ko': [],
+            'crew_roster': ['commander', 'driver'],
+            'fire': False, 'ammo_rack_death': False, 'events': [],
+        })
+        merged = state._merge_player_critical_damage(
+            player, stale_full, {
+                'devices': [{'name': 'leftTrackHealth', 'hp_loss': 50.0}],
+                'crew_ko': [], 'ignite': False,
+            })
+        self.assertEqual(repaired_engine, next(
+            row['hp'] for row in merged['devices']
+            if row['name'] == 'engineHealth'))
+        self.assertEqual(50.0, next(
+            row['hp'] for row in merged['devices']
+            if row['name'] == 'leftTrackHealth'))
+
+        player.critical = copy.deepcopy(merged)
+        player.critical['fire'] = False
+        stale_burning = copy.deepcopy(merged)
+        stale_burning['fire'] = True
+        stale_burning['events'] = []
+        not_reignited = state._merge_player_critical_damage(
+            player, stale_burning, {
+                'devices': [{'name': 'leftTrackHealth', 'hp_loss': 1.0}],
+                'crew_ko': [], 'ignite': False,
+            })
+        self.assertFalse(not_reignited['fire'])
+
+        player.critical = copy.deepcopy(not_reignited)
+        player.critical['fire'] = True
+        stale_clear = copy.deepcopy(not_reignited)
+        stale_clear['fire'] = False
+        still_burning = state._merge_player_critical_damage(
+            player, stale_clear, {
+                'devices': [{'name': 'leftTrackHealth', 'hp_loss': 1.0}],
+                'crew_ko': [], 'ignite': False,
+            })
+        self.assertTrue(still_burning['fire'])
+
+    def test_snapshot_restores_inventory_and_cooldown_exactly(self):
+        repair = self._contract(
+            'smallRepairkit', 41, tags=('repairkit',), reuseCount=1,
+            cooldownSeconds=10.0, repairAll=False)
+        state, player = self._state(
+            [repair], self._critical(0.0, 'destroyed'))
+        self.assertTrue(self._intent(
+            state, 1, 41, selected='engineHealth'))
+        state.tick += int(3.0 * TICK_HZ)
+        state._tick_player_critical(0.0)
+        snapshot = BattleState._public_player(player)
+
+        self.assertEqual(1, snapshot['equipment_intent_seq'])
+        self.assertAlmostEqual(
+            7.0, snapshot['equipment_states'][0]['cooldownTimeLeft'])
+        restored = equipment_mechanics.restore_equipment_states(
+            snapshot['equipment_states'], now=200.0)
+        self.assertEqual(1, restored[0].uses_left)
+        self.assertAlmostEqual(207.0, restored[0].ready_at)
+
+    def test_disconnected_human_igniter_keeps_damage_and_frag_credit(self):
+        state = BattleState(map_name='01_karelia', authority_mode='client')
+        state.client_build = CLIENT_BUILD_0922
+        attacker = _player(1, team=1)
+        victim = _player(2, team=2)
+        attacker.account_key = 'fire-attacker'
+        victim.account_key = 'fire-victim'
+        victim.health = 40
+        victim.critical = self._critical(fire=True)
+        victim.fire_attacker_kind = 'player'
+        victim.fire_attacker_id = 1
+        state.players = {1: attacker, 2: victim}
+        state.phase = 'battle'
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        state.bot_manifest = [{
+            'id': 10, 'team': 1, 'name': 'Bot',
+            'vehicle': attacker.vehicle, 'max_health': 1000}]
+        state.bot_states = {10: {
+            'id': 10, 'team': 1, 'alive': True,
+            'health': 1000, 'max_health': 1000}}
+        state._freeze_round_participants((attacker, victim))
+        state.remove_player(1, expected=attacker)
+
+        self.assertEqual(1, state._tick_player_fire(1.0))
+
+        self.assertFalse(victim.alive)
+        event = state.pending_events[-2]
+        self.assertEqual(('hit', 'fire', 1), (
+            event['kind'], event['source'], event['attacker']))
+        self.assertEqual(
+            40, state._statistics_row('player', 1)['damage_dealt'])
+        self.assertEqual(1, state._statistics_row('player', 1)['kills'])
 
 
 class HumanRamTimelineTest(unittest.TestCase):
@@ -2381,8 +2715,28 @@ class VehicleStatisticsTest(unittest.TestCase):
         if potential_damage is not None:
             direct['potential_damage'] = potential_damage
         if critical is not None:
+            profile = state.players[target_id].effective_params['critical'][
+                'devices']
+            known = set(row['name'] for row in profile)
+            for row in critical.get('devices') or ():
+                if row['name'] not in known:
+                    profile.append({
+                        'name': row['name'], 'max_hp': row['max_hp'],
+                        'regen_hp': row['max_hp'] * 0.5,
+                    })
+                    known.add(row['name'])
+            delta = {
+                'devices': [
+                    {'name': row['name'],
+                     'hp_loss': max(0.001, row['max_hp'] - row['hp'])}
+                    for row in critical.get('devices') or ()
+                ],
+                'crew_ko': list(critical.get('crew_ko') or ()),
+                'ignite': bool(critical.get('fire', False)),
+            }
             direct.update({
                 'critical': critical,
+                'critical_delta': delta,
                 'critical_target_base_revision':
                     target.critical_report_base_revision,
                 'critical_target_ack_seq': target.critical_ack_seq,
@@ -2407,6 +2761,80 @@ class VehicleStatisticsTest(unittest.TestCase):
         self.assertTrue(state.resolve_projectile(
             SERVER_AUTHORITY_ID, resolution))
         return resolution
+
+    def test_same_baseline_projectile_deltas_both_apply_once(self):
+        state = self._live_state()
+        target = state.players[2]
+        critical = {
+            'devices': [{'name': 'engineHealth', 'hp': 90.0,
+                         'max_hp': 100.0, 'state': 'normal'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        base = target.critical_report_base_revision
+        ack = target.critical_ack_seq
+
+        def resolution(shot_seq):
+            projectile_id = self._launch(state, 1, shot_seq)
+            record = state.projectiles[projectile_id]
+            return {
+                'type': 'projectile_resolve',
+                'round_id': state.round_id,
+                'authority_epoch': state.authority_epoch,
+                'projectile_id': projectile_id,
+                'base_checked_ms': record['checked_through_ms'],
+                'outcome': 'impact',
+                'resolved_time_ms': record['checked_through_ms'],
+                'checked_distance': record['checked_distance'],
+                'piercing_loss': record['piercing_loss'],
+                'penetration_factor': record['penetration_factor'],
+                'impact': [0.0, 1.0, 20.0],
+                'direct': {
+                    'target_kind': 'player', 'target_id': 2,
+                    'damage': 0, 'shot_result': 2,
+                    'x': 0.0, 'y': 1.0, 'z': 20.0,
+                    'critical': critical,
+                    'critical_delta': {
+                        'devices': [{
+                            'name': 'engineHealth', 'hp_loss': 10.0}],
+                        'crew_ko': [], 'ignite': False,
+                    },
+                    'critical_target_base_revision': base,
+                    'critical_target_ack_seq': ack,
+                    'hull_damage': 0,
+                },
+                'splash': [], 'destructibles': [],
+            }
+
+        first = resolution(1)
+        second = resolution(2)
+        self.assertTrue(state.resolve_projectile(
+            SERVER_AUTHORITY_ID, first))
+        self.assertTrue(state.resolve_projectile(
+            SERVER_AUTHORITY_ID, second))
+        self.assertEqual(80.0, next(
+            row['hp'] for row in target.critical['devices']
+            if row['name'] == 'engineHealth'))
+        revision = target.critical_revision
+        self.assertTrue(state.resolve_projectile(
+            SERVER_AUTHORITY_ID, second))
+        self.assertEqual(revision, target.critical_revision)
+        self.assertEqual(80.0, next(
+            row['hp'] for row in target.critical['devices']
+            if row['name'] == 'engineHealth'))
+
+    def test_plain_ap_without_critical_delta_still_applies_hull_damage(self):
+        state = self._live_state()
+        target = state.players[2]
+        revision = target.critical_revision
+
+        self._shoot(state, 1, 2, 115, critical={
+            'devices': [], 'destroyed': [], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False, 'events': [],
+        })
+
+        self.assertEqual(885, target.health)
+        self.assertEqual(revision, target.critical_revision)
 
     def _assists(self, state):
         return [event for event in state.pending_events
@@ -2982,7 +3410,8 @@ class SplashEffectsTest(unittest.TestCase):
                     server_battle_authority.combat_rules, 'damage',
                     return_value=120), mock.patch.object(
                         server_battle_authority.critical_damage,
-                        'propose_explosion', return_value=(120, None)) as cone, \
+                        'propose_explosion',
+                        return_value=(120, None, None)) as cone, \
                 mock.patch.object(
                     server_battle_authority.critical_damage,
                     'propose_direct', side_effect=AssertionError(

@@ -9,6 +9,7 @@ import time
 import uuid
 
 from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
+from gui.mods.offline_lan_0922 import equipment_mechanics
 
 
 PROTOCOL_VERSION = 5
@@ -68,6 +69,13 @@ MAX_PLAYER_DISPERSION_ANGLE = 0.5
 MAX_PLAYER_CLIP_SIZE = 255
 MAX_PLAYER_RELOAD_SECONDS = 3600.0
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
+CRITICAL_DELTA_DEVICE_NAMES = frozenset((
+    'engineHealth', 'ammoBayHealth', 'fuelTankHealth', 'radioHealth',
+    'leftTrackHealth', 'rightTrackHealth', 'gunHealth',
+    'turretRotatorHealth', 'surveyingDeviceHealth'))
+CRITICAL_DELTA_CREW_NAMES = frozenset((
+    'commander', 'driver', 'gunner', 'gunner1', 'gunner2', 'loader',
+    'loader1', 'loader2', 'radioman', 'radioman1', 'radioman2'))
 PROJECTILE_SHELL_KINDS = frozenset((
     'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
     'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
@@ -401,10 +409,13 @@ def _valid_player_gun_checkpoint_contract(player):
 
 
 def _attach_critical_proposal(message, critical, base_revision, ack_seq,
-                              hull_damage):
+                              hull_damage, critical_delta):
     """Attach one strict #1513 compare-and-swap critical proposal."""
     if not isinstance(critical, dict):
         return
+    parsed_delta = _strict_critical_delta(critical_delta)
+    if parsed_delta is None:
+        raise ValueError('critical proposal requires a damage delta')
     parsed = []
     for name, value in (
             ('critical_target_base_revision', base_revision),
@@ -415,6 +426,7 @@ def _attach_critical_proposal(message, critical, base_revision, ack_seq,
             raise ValueError('%s must be a non-negative integer' % name)
         parsed.append((name, exact))
     message['critical'] = critical
+    message['critical_delta'] = parsed_delta
     for name, value in parsed:
         message[name] = value
 
@@ -436,6 +448,38 @@ def _valid_bot_combat_contract(bot):
         return False
     if (not bool(bot['critical'].get('fire', False)) and
             (fire_elapsed != 0.0 or fire_timer != 0.0)):
+        return False
+    return True
+
+
+def _valid_player_equipment_contract(state, required=False):
+    """Validate the complete canonical player equipment ledger."""
+    fields = {
+        'equipment_states', 'equipment_revision',
+        'equipment_intent_seq', 'equipment_intent_result'}
+    if not fields.issubset(state):
+        return not required and not (set(state) & fields)
+    snapshots = state.get('equipment_states')
+    revision = _projectile_int_range(
+        state.get('equipment_revision'), 0, MAX_PROJECTILE_ID)
+    sequence = _projectile_int_range(
+        state.get('equipment_intent_seq'), 0, MAX_PROJECTILE_ID)
+    result = state.get('equipment_intent_result')
+    if (not isinstance(snapshots, list) or len(snapshots) > 3 or
+            revision is None or sequence is None or
+            not isinstance(result, dict) or set(result) != {
+                'intent_seq', 'accepted', 'reason'}):
+        return False
+    result_sequence = _projectile_int_range(
+        result.get('intent_seq'), 0, MAX_PROJECTILE_ID)
+    reason = result.get('reason')
+    if (result_sequence != sequence or
+            not isinstance(result.get('accepted'), bool) or
+            not isinstance(reason, string_types) or len(reason) > 64):
+        return False
+    try:
+        equipment_mechanics.restore_equipment_states(snapshots, now=0.0)
+    except (TypeError, ValueError):
         return False
     return True
 
@@ -735,6 +779,40 @@ def _strict_projectile_id(value):
     return value
 
 
+def _strict_critical_delta(value):
+    """Validate one monotonic native critical-damage delta."""
+    if not isinstance(value, dict) or set(value) != {
+            'devices', 'crew_ko', 'ignite'}:
+        return None
+    raw_devices = value.get('devices')
+    raw_crew = value.get('crew_ko')
+    if (not isinstance(raw_devices, (list, tuple)) or
+            len(raw_devices) > 16 or
+            not isinstance(raw_crew, (list, tuple)) or len(raw_crew) > 11 or
+            not isinstance(value.get('ignite'), bool)):
+        return None
+    devices = []
+    seen = set()
+    for raw in raw_devices:
+        if not isinstance(raw, dict) or set(raw) != {'name', 'hp_loss'}:
+            return None
+        name = _safe_text(raw.get('name'), '', 40)
+        hp_loss = _projectile_float_range(raw.get('hp_loss'), 0.0, 10000.0)
+        if (name not in CRITICAL_DELTA_DEVICE_NAMES or name in seen or
+                hp_loss is None or hp_loss <= 0.0):
+            return None
+        seen.add(name)
+        devices.append({'name': name, 'hp_loss': hp_loss})
+    crew = []
+    for raw in raw_crew:
+        name = _safe_text(raw, '', 40)
+        if name not in CRITICAL_DELTA_CREW_NAMES or name in crew:
+            return None
+        crew.append(name)
+    return {'devices': devices, 'crew_ko': sorted(crew),
+            'ignite': bool(value['ignite'])}
+
+
 def _strict_projectile_effect(value):
     """Validate one terminal direct/splash damage proposal."""
     if not isinstance(value, dict):
@@ -743,7 +821,7 @@ def _strict_projectile_effect(value):
         'target_kind', 'target_id', 'damage', 'shot_result', 'x', 'y', 'z'))
     critical_fields = frozenset((
         'critical', 'critical_target_base_revision',
-        'critical_target_ack_seq', 'hull_damage'))
+        'critical_target_ack_seq', 'hull_damage', 'critical_delta'))
     stun_fields = frozenset(('stun_end_server_time_ms',))
     keys = set(value)
     if not required.issubset(keys) or not keys.issubset(
@@ -789,13 +867,16 @@ def _strict_projectile_effect(value):
             MAX_PROJECTILE_ID)
         hull_damage = _projectile_int_range(
             value.get('hull_damage'), 0, 5000)
+        critical_delta = _strict_critical_delta(value.get('critical_delta'))
         if (not isinstance(critical, dict) or base_revision is None or
-                ack_seq is None or hull_damage is None):
+                ack_seq is None or hull_damage is None or
+                critical_delta is None):
             return None
         result['critical'] = critical
         result['critical_target_base_revision'] = base_revision
         result['critical_target_ack_seq'] = ack_seq
         result['hull_damage'] = hull_damage
+        result['critical_delta'] = critical_delta
     if has_stun:
         stun_end = _projectile_int_range(
             value.get('stun_end_server_time_ms'), 1, MAX_PROJECTILE_ID)
@@ -1201,6 +1282,7 @@ class LANClient(object):
         self._ping_seq = 0
         self._fire_seq = 0
         self._fire_intent_seq = 0
+        self._equipment_intent_seq = 0
         self._input_seq = 0
         self._input_seq_round = None
         self._projectile_lock = threading.Lock()
@@ -1760,6 +1842,43 @@ class LANClient(object):
             self._fire_intent_seq = sequence
             return sequence
 
+    def send_equipment_intent(
+            self, equipment_id, activation_code=None, selected=None,
+            requested_active=None):
+        """Queue one ordered trigger without a local critical verdict."""
+        if (not self.ready or self.phase != 'battle' or
+                self.is_bot_authority()):
+            return None
+        parsed_id = _projectile_int_range(equipment_id, 1, 65535)
+        parsed_activation = _projectile_int_range(
+            activation_code, 1, MAX_PROJECTILE_ID)
+        if (parsed_id is None or parsed_activation is None or
+                parsed_activation & 65535 != parsed_id):
+            return None
+        if selected is not None:
+            if (not isinstance(selected, string_types) or not selected or
+                    len(selected) > 64):
+                return None
+            selected = str(selected)
+        if (requested_active is not None and
+                not isinstance(requested_active, bool)):
+            return None
+        with self._projectile_lock:
+            sequence = self._equipment_intent_seq + 1
+            message = {
+                'type': 'equipment_intent',
+                'round_id': self.round_id,
+                'intent_seq': sequence,
+                'equipment_id': parsed_id,
+                'activation_code': parsed_activation,
+                'selected': selected,
+                'requested_active': requested_active,
+            }
+            if not self._send(message):
+                return None
+            self._equipment_intent_seq = sequence
+            return sequence
+
     def send_fire_intent_result(self, player_id, intent_seq, reason):
         """Publish one worker-owned terminal rejection."""
         parsed_player = _projectile_int_range(
@@ -2060,7 +2179,8 @@ class LANClient(object):
     def send_hit(self, target_id, shot_seq, damage, shot_result,
                  shell_index=0, impact_position=None, critical=None,
                  splash=False, critical_target_base_revision=None,
-                 critical_target_ack_seq=None, hull_damage=None):
+                 critical_target_ack_seq=None, hull_damage=None,
+                 critical_delta=None):
         """Visible #1513 clients never publish hit verdicts."""
         return False
 
@@ -2259,7 +2379,8 @@ class LANClient(object):
     def send_bot_hit(self, target_id, shot_seq, damage, shot_result,
                      impact_position=None, critical=None, splash=False,
                      critical_target_base_revision=None,
-                     critical_target_ack_seq=None, hull_damage=None):
+                     critical_target_ack_seq=None, hull_damage=None,
+                     critical_delta=None):
         if (not self.ready or self.phase != 'battle' or
                 not self.is_bot_authority()):
             return False
@@ -2275,14 +2396,15 @@ class LANClient(object):
             message['z'] = _finite_float(impact_position[2])
         _attach_critical_proposal(
             message, critical, critical_target_base_revision,
-            critical_target_ack_seq, hull_damage)
+            critical_target_ack_seq, hull_damage, critical_delta)
         return self._send(message)
 
     def send_bot_human_hit(self, bot_id, target_id, shot_seq, damage,
                            shot_result, impact_position=None, critical=None,
                            splash=False,
                            critical_target_base_revision=None,
-                           critical_target_ack_seq=None, hull_damage=None):
+                           critical_target_ack_seq=None, hull_damage=None,
+                           critical_delta=None):
         if not self.is_bot_authority():
             return False
         message = {'type': 'bot_human_hit', 'round_id': self.round_id,
@@ -2297,14 +2419,15 @@ class LANClient(object):
             message['z'] = _finite_float(impact_position[2])
         _attach_critical_proposal(
             message, critical, critical_target_base_revision,
-            critical_target_ack_seq, hull_damage)
+            critical_target_ack_seq, hull_damage, critical_delta)
         return self._send(message)
 
     def send_bot_bot_hit(self, bot_id, target_id, shot_seq, damage,
                          shot_result, impact_position=None, critical=None,
                          splash=False,
                          critical_target_base_revision=None,
-                         critical_target_ack_seq=None, hull_damage=None):
+                         critical_target_ack_seq=None, hull_damage=None,
+                         critical_delta=None):
         """Report an authority-simulated bot shot against another bot."""
         if not self.is_bot_authority():
             return False
@@ -2320,7 +2443,7 @@ class LANClient(object):
             message['z'] = _finite_float(impact_position[2])
         _attach_critical_proposal(
             message, critical, critical_target_base_revision,
-            critical_target_ack_seq, hull_damage)
+            critical_target_ack_seq, hull_damage, critical_delta)
         return self._send(message)
 
     def send_bot_ram(self, bot_id, target_kind, target_id, ram_seq,
@@ -3025,12 +3148,16 @@ class LANClient(object):
             player_gun_checkpoint_contract = all(
                 _valid_player_gun_checkpoint_contract(value)
                 for value in players or ())
+            player_equipment_contract = all(
+                _valid_player_equipment_contract(value, required=True)
+                for value in players or ())
             ledger_required = self.has_projectile_ledger()
             if (phase not in ('waiting', 'loading', 'battle') or not map_name or
                     players is None or not player_outfits_valid or
                     not player_effective_params_valid or
                     not player_siege_contract or
                     not player_gun_checkpoint_contract or
+                    not player_equipment_contract or
                     team_sizes is None or
                     host_player_id not in player_ids or
                     not _valid_visible_authority_message(message) or
@@ -3056,6 +3183,7 @@ class LANClient(object):
                 self.last_snapshot = None
                 self._fire_seq = 0
                 self._fire_intent_seq = 0
+                self._equipment_intent_seq = 0
                 self._battle_start_round_id = None
                 self._battle_live_round_id = None
                 self._combat_timing_round_id = None
@@ -3136,6 +3264,9 @@ class LANClient(object):
             player_gun_checkpoint_contract = all(
                 _valid_player_gun_checkpoint_contract(value)
                 for value in players or ())
+            player_equipment_contract = all(
+                _valid_player_equipment_contract(value, required=True)
+                for value in players or ())
             local_ids = set(_exact_int(value.get('id')) for value in players or ())
             host_player_id = _exact_int(message.get('host_player_id'))
             authority_epoch = _projectile_int_range(
@@ -3153,6 +3284,7 @@ class LANClient(object):
                     not player_effective_params_valid or
                     not player_siege_contract or
                     not player_gun_checkpoint_contract or
+                    not player_equipment_contract or
                     team_sizes is None or
                     self.player_id not in local_ids or
                     host_player_id not in local_ids or
@@ -3171,6 +3303,7 @@ class LANClient(object):
                 self.last_snapshot = None
                 self._fire_seq = 0
                 self._fire_intent_seq = 0
+                self._equipment_intent_seq = 0
                 self._battle_start_round_id = None
                 self._battle_live_round_id = None
                 self._combat_timing_round_id = None
@@ -3330,6 +3463,9 @@ class LANClient(object):
                 _exact_int(player.get('critical_ack_seq')) is not None and
                 _exact_int(player.get('critical_ack_seq')) >= 0
                 for player in players or ())
+            player_equipment_contract = all(
+                _valid_player_equipment_contract(player, required=True)
+                for player in players or ())
             player_siege_contract = all(
                 _valid_player_siege_contract(player)
                 for player in players or ())
@@ -3426,6 +3562,8 @@ class LANClient(object):
                 invalid_reasons.append('bots')
             if not player_critical_contract:
                 invalid_reasons.append('player_critical')
+            if not player_equipment_contract:
+                invalid_reasons.append('player_equipment')
             if not player_siege_contract:
                 invalid_reasons.append('player_siege')
             if not player_gun_checkpoint_contract:
@@ -3502,6 +3640,13 @@ class LANClient(object):
                     dict(value)
                     for value in previous_snapshot.get('bot_manifest') or ()]
             self.last_snapshot = message
+            local_player = next((
+                player for player in players
+                if _exact_int(player.get('id')) == self.player_id), None)
+            if local_player is not None:
+                self._equipment_intent_seq = max(
+                    self._equipment_intent_seq,
+                    int(local_player['equipment_intent_seq']))
             if server_time_ms is not None:
                 self.server_time_ms = server_time_ms
             self.bot_authority_id = message.get(

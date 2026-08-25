@@ -14,6 +14,8 @@ importable on both the embedded Python 2 client and the Python 3 server.
 
 import math
 
+from gui.mods.offline_lan_0922 import equipment_mechanics
+
 
 SCHEMA_VERSION = 1
 CAPABILITY = 'effective_params_v1'
@@ -71,6 +73,24 @@ _PROJECTILE_SHELL_KINDS = frozenset((
 _TOP_LEVEL_KEYS = frozenset((
     'version', 'loadout', 'physics', 'spotting', 'ramming', 'ammo',
     'camouflage', 'skills', 'gun'))
+_TOP_LEVEL_KEYS_WITH_EQUIPMENT = frozenset(
+    tuple(_TOP_LEVEL_KEYS) + ('equipment',))
+_TOP_LEVEL_KEYS_WITH_CRITICAL = frozenset(
+    tuple(_TOP_LEVEL_KEYS) + ('equipment', 'critical'))
+_CRITICAL_KEYS = frozenset(('devices',))
+_CRITICAL_KEYS_WITH_TARGETS = frozenset(
+    ('devices', 'activation_targets'))
+_CRITICAL_KEYS_COMPLETE = frozenset(
+    ('devices', 'activation_targets', 'crew_roster'))
+_CRITICAL_DEVICE_KEYS = frozenset(('name', 'max_hp', 'regen_hp'))
+_CRITICAL_TARGET_KEYS = frozenset(('index', 'name'))
+_CRITICAL_DEVICE_NAMES = frozenset((
+    'engineHealth', 'ammoBayHealth', 'fuelTankHealth', 'radioHealth',
+    'leftTrackHealth', 'rightTrackHealth', 'gunHealth',
+    'turretRotatorHealth', 'surveyingDeviceHealth'))
+_CRITICAL_TARGET_NAMES = _CRITICAL_DEVICE_NAMES | frozenset((
+    'commander', 'driver', 'gunner', 'gunner1', 'gunner2', 'loader',
+    'loader1', 'loader2', 'radioman', 'radioman1', 'radioman2'))
 
 
 try:
@@ -322,9 +342,96 @@ def _canonical_gun(value):
     return {'clip_size': clip_size, 'shots': result}
 
 
+def _canonical_equipment(value):
+    """Validate the immutable mounted regular-consumable contracts."""
+    if not isinstance(value, (list, tuple)) or len(value) > 3:
+        return None
+    result = []
+    ids = set()
+    compact_descriptors = set()
+    for raw in value:
+        try:
+            contract = equipment_mechanics._validate_contract(raw)
+        except (TypeError, ValueError):
+            return None
+        equipment_id = contract['id']
+        compact_descriptor = contract['compactDescr']
+        if (equipment_id <= 0 or compact_descriptor <= 0 or
+                equipment_id in ids or
+                compact_descriptor in compact_descriptors):
+            return None
+        ids.add(equipment_id)
+        compact_descriptors.add(compact_descriptor)
+        result.append(contract)
+    return result
+
+
+def _canonical_critical(value):
+    """Validate final mounted module pools donated by the exact client."""
+    if (not isinstance(value, dict) or
+            set(value) not in (
+                _CRITICAL_KEYS, _CRITICAL_KEYS_WITH_TARGETS,
+                _CRITICAL_KEYS_COMPLETE)):
+        return None
+    devices = value.get('devices')
+    if (not isinstance(devices, (list, tuple)) or
+            not 1 <= len(devices) <= len(_CRITICAL_DEVICE_NAMES)):
+        return None
+    result = []
+    seen = set()
+    for entry in devices:
+        if not _mapping(entry, _CRITICAL_DEVICE_KEYS):
+            return None
+        name = entry.get('name')
+        maximum = _number(entry.get('max_hp'), 1.0, 100000.0)
+        regen = _number(entry.get('regen_hp'), 0.0, 100000.0)
+        if (not isinstance(name, string_types) or
+                name not in _CRITICAL_DEVICE_NAMES or name in seen or
+                maximum is None or regen is None or regen > maximum):
+            return None
+        seen.add(name)
+        result.append({
+            'name': str(name), 'max_hp': maximum, 'regen_hp': regen})
+    result.sort(key=lambda entry: entry['name'])
+    targets = []
+    target_indexes = set()
+    for raw in value.get('activation_targets') or ():
+        if not _mapping(raw, _CRITICAL_TARGET_KEYS):
+            return None
+        index = _exact_int(raw.get('index'), 1, 65535)
+        name = raw.get('name')
+        if (index is None or index in target_indexes or
+                not isinstance(name, string_types) or
+                name not in _CRITICAL_TARGET_NAMES):
+            return None
+        target_indexes.add(index)
+        targets.append({'index': index, 'name': str(name)})
+    targets.sort(key=lambda entry: entry['index'])
+    canonical = {'devices': result}
+    if 'activation_targets' in value:
+        canonical['activation_targets'] = targets
+    if 'crew_roster' in value:
+        raw_roster = value.get('crew_roster')
+        if (not isinstance(raw_roster, (list, tuple)) or
+                not 1 <= len(raw_roster) <= 11):
+            return None
+        roster = []
+        for raw in raw_roster:
+            if (not isinstance(raw, string_types) or
+                    raw not in _CRITICAL_TARGET_NAMES or
+                    raw in _CRITICAL_DEVICE_NAMES or raw in roster):
+                return None
+            roster.append(str(raw))
+        canonical['crew_roster'] = roster
+    return canonical
+
+
 def canonical(value):
     """Return a detached canonical snapshot, or ``None`` when invalid."""
-    if not _mapping(value, _TOP_LEVEL_KEYS):
+    if (not isinstance(value, dict) or
+            set(value) not in (
+                _TOP_LEVEL_KEYS, _TOP_LEVEL_KEYS_WITH_EQUIPMENT,
+                _TOP_LEVEL_KEYS_WITH_CRITICAL)):
         return None
     if _exact_int(value.get('version'), 1, 1) != SCHEMA_VERSION:
         return None
@@ -336,14 +443,19 @@ def canonical(value):
     camouflage = _canonical_camouflage(value.get('camouflage'))
     skills = _canonical_skills(value.get('skills'))
     gun = _canonical_gun(value.get('gun'))
+    equipment = _canonical_equipment(value.get('equipment', ()))
+    critical = (_canonical_critical(value.get('critical'))
+                if 'critical' in value else None)
     if any(entry is None for entry in (
             loadout, physics, spotting, ramming, ammo, camouflage, skills,
-            gun)):
+            gun, equipment)):
+        return None
+    if 'critical' in value and critical is None:
         return None
     if any(shot['source_shot']['deadeye'] != skills['deadeye']
            for shot in gun['shots']):
         return None
-    return {
+    result = {
         'version': SCHEMA_VERSION,
         'loadout': loadout,
         'physics': physics,
@@ -353,4 +465,8 @@ def canonical(value):
         'camouflage': camouflage,
         'skills': skills,
         'gun': gun,
+        'equipment': equipment,
     }
+    if critical is not None:
+        result['critical'] = critical
+    return result

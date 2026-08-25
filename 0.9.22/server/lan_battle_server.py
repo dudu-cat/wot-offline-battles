@@ -45,6 +45,9 @@ from server_bot_ai import BotPlanner
 from offline_rewards import compute_offline_rewards
 from gui.mods.offline_lan_0922 import tank_collision
 from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
+from gui.mods.offline_lan_0922 import equipment_mechanics
+from gui.mods.offline_lan_0922 import device_damage
+from gui.mods.offline_lan_0922 import player_critical_mechanics
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
 from gui.mods.offline_lan_0922.ai.maps_0922_extra import (
     TACTICAL_MAPS_0922_EXTRA as _MAPS_0922_DATA,
@@ -75,6 +78,7 @@ MAX_PENDING_RAM_CONTACTS = 32
 MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS = 16
 MAX_PLAYER_DESTRUCTIBLE_REJECTIONS = 16
 MAX_PLAYER_INPUT_FINGERPRINTS = 128
+MAX_PLAYER_EQUIPMENT_FINGERPRINTS = 64
 HUMAN_POSE_HISTORY_SECONDS = 1.5
 HUMAN_RAM_MAX_SUBSTEP_US = 100000
 HUMAN_POSE_CLOCK_LEEWAY_US = 250000
@@ -170,6 +174,7 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "battle_result", "leave_battle", "battle_ready", "simulation_progress",
     "player_environment",
     "track_repair",
+    "equipment_intent",
 ))
 MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
     "input", "fire_intent", "start_battle", "battle_ready", "leave_battle",
@@ -177,6 +182,7 @@ MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
     "destructible_map", "select_vehicle", "select_team", "set_team_size",
     "ping", "leave",
     "track_repair",
+    "equipment_intent",
 ))
 # The elected #1513 authority uses the same bounded in-process manager.  The
 # server must never admit more durable launches than a takeover client can
@@ -276,7 +282,8 @@ COMBAT_EVENT_KINDS = frozenset((
 COMBAT_SOURCE_KINDS = {
     "shot": frozenset((
         "hit", "bot_hit", "bot_human_hit", "bot_bot_hit")),
-    "fire": frozenset(("bot_hit", "bot_human_hit", "bot_bot_hit")),
+    "fire": frozenset((
+        "hit", "bot_hit", "bot_human_hit", "bot_bot_hit")),
     "ram": frozenset((
         "hit", "bot_hit", "bot_human_hit", "bot_bot_hit")),
     "client_simulation": frozenset(("health",)),
@@ -947,6 +954,48 @@ def _critical_payload(value):
     return result
 
 
+def _critical_damage_delta(value):
+    """Validate one monotonic native critical-damage proposal delta."""
+    if not isinstance(value, dict) or set(value) != {
+            "devices", "crew_ko", "ignite"}:
+        raise ValueError("critical delta has an invalid shape")
+    raw_devices = value.get("devices")
+    raw_crew = value.get("crew_ko")
+    if (not isinstance(raw_devices, (list, tuple)) or
+            len(raw_devices) > len(CRITICAL_DEVICE_NAMES) or
+            not isinstance(raw_crew, (list, tuple)) or
+            len(raw_crew) > len(CRITICAL_CREW_NAMES) or
+            not isinstance(value.get("ignite"), bool)):
+        raise ValueError("critical delta has invalid fields")
+    devices = []
+    seen = set()
+    for raw in raw_devices:
+        if not isinstance(raw, dict) or set(raw) != {"name", "hp_loss"}:
+            raise ValueError("critical device delta has an invalid shape")
+        name = str(raw.get("name", ""))
+        if (name not in CRITICAL_DEVICE_NAMES or name in seen or
+                isinstance(raw.get("hp_loss"), bool) or
+                not _has_finite_fields(raw, ("hp_loss",))):
+            raise ValueError("invalid critical device delta")
+        hp_loss = _finite_float(raw.get("hp_loss"), -1.0)
+        if hp_loss <= 0.0 or hp_loss > 10000.0:
+            raise ValueError("invalid critical device HP loss")
+        seen.add(name)
+        devices.append({"name": name, "hp_loss": round(hp_loss, 3)})
+    crew = []
+    for raw in raw_crew:
+        name = str(raw)
+        if name not in CRITICAL_CREW_NAMES or name in crew:
+            raise ValueError("invalid critical crew delta")
+        crew.append(name)
+    result = {
+        "devices": devices,
+        "crew_ko": sorted(crew),
+        "ignite": bool(value["ignite"]),
+    }
+    return result
+
+
 def _whole_crew_knocked_out(value):
     """Return whether a validated #1513 physical crew roster is all KO."""
     if not isinstance(value, dict):
@@ -1416,6 +1465,18 @@ class Player(_EndpointSendMixin):
     critical_ack_seq: int = 0
     track_repair_fingerprints: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
+    equipment_states: list = field(default_factory=list, repr=False)
+    equipment_clock: float = 0.0
+    equipment_revision: int = 0
+    equipment_intent_seq: int = 0
+    equipment_intent_fingerprints: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
+    equipment_intent_result: dict = field(default_factory=lambda: {
+        "intent_seq": 0, "accepted": False, "reason": ""})
+    combat_fire_elapsed: float = 0.0
+    combat_fire_timer: float = 0.0
+    fire_attacker_kind: str = ""
+    fire_attacker_id: int = 0
     death_reason: int = 0
     display_health: Optional[int] = None
     frags: int = 0
@@ -2318,8 +2379,8 @@ class BattleState:
                         player.death_attacker_kind or '')
                     participant['death_attacker_id'] = int(
                         player.death_attacker_id or 0)
-                    participant['team_killer'] = bool(player.team_killer)
                     participant['frags'] = int(player.frags)
+                    participant['team_killer'] = bool(player.team_killer)
                 self.state_revision += 1
             self.player_spotted.pop(player_id, None)
             self.player_environment.pop(player_id, None)
@@ -2431,6 +2492,17 @@ class BattleState:
             player.critical_report_base_revision = 0
             player.critical_ack_seq = 0
             player.track_repair_fingerprints.clear()
+            player.equipment_states = []
+            player.equipment_clock = 0.0
+            player.equipment_revision = 0
+            player.equipment_intent_seq = 0
+            player.equipment_intent_fingerprints.clear()
+            player.equipment_intent_result = {
+                "intent_seq": 0, "accepted": False, "reason": ""}
+            player.combat_fire_elapsed = 0.0
+            player.combat_fire_timer = 0.0
+            player.fire_attacker_kind = ""
+            player.fire_attacker_id = 0
             player.death_reason = 0
             player.display_health = None
             player.frags = 0
@@ -2822,6 +2894,8 @@ class BattleState:
             self.round_start_time = int(time.time())
             for participant in connected:
                 participant.participating = True
+                if not self._install_player_equipments(participant):
+                    return None, "invalid_player_critical_profile"
             self._freeze_round_participants(connected)
             occupied_slots = {(p.team, p.slot) for p in connected}
             self.bot_roster = self._new_bot_roster(occupied_slots)
@@ -2912,6 +2986,32 @@ class BattleState:
                 start_message["need_destructible_map"] = True
             return start_message, None
 
+    def _install_player_equipments(self, player):
+        """Create mutable round equipment state from immutable owner input."""
+        params = effective_params_wire.canonical(player.effective_params)
+        if params is None or params.get("critical") is None:
+            return False
+        try:
+            contracts = tuple(params.get("equipment") or ())
+            states = [
+                equipment_mechanics.EquipmentState(contract, 0.0)
+                for contract in contracts]
+        except (TypeError, ValueError, OverflowError):
+            return False
+        player.effective_params = params
+        player.equipment_states = states
+        player.equipment_clock = 0.0
+        player.equipment_revision = 1
+        player.equipment_intent_seq = 0
+        player.equipment_intent_fingerprints.clear()
+        player.equipment_intent_result = {
+            "intent_seq": 0, "accepted": False, "reason": ""}
+        player.combat_fire_elapsed = 0.0
+        player.combat_fire_timer = 0.0
+        player.fire_attacker_kind = ""
+        player.fire_attacker_id = 0
+        return True
+
     def _freeze_round_participants(self, players):
         """Retain receipt identity after a participant disconnects."""
         frozen = {}
@@ -2936,8 +3036,8 @@ class BattleState:
                     participant.death_attacker_kind or ""),
                 "death_attacker_id": int(
                     participant.death_attacker_id or 0),
-                "team_killer": bool(participant.team_killer),
                 "frags": int(participant.frags),
+                "team_killer": bool(participant.team_killer),
             }
         self.round_participants = frozen
 
@@ -5735,7 +5835,8 @@ class BattleState:
             "target_kind", "target_id", "damage", "shot_result",
             "x", "y", "z", "critical",
             "critical_target_base_revision", "critical_target_ack_seq",
-            "hull_damage", "potential_damage", "stun_end_server_time_ms",
+            "hull_damage", "critical_delta", "potential_damage",
+            "stun_end_server_time_ms",
         }
         required = {
             "target_kind", "target_id", "damage", "shot_result",
@@ -5780,12 +5881,16 @@ class BattleState:
             raise ValueError("direct self hit")
 
         critical = _critical_payload(raw.get("critical"))
+        critical_delta = None
         critical_accepted = True
         hull_damage = None
         if critical is not None:
             if not {"critical_target_base_revision",
-                    "critical_target_ack_seq", "hull_damage"}.issubset(raw):
+                    "critical_target_ack_seq", "hull_damage",
+                    "critical_delta"}.issubset(raw):
                 raise ValueError("critical tokens missing")
+            critical_delta = _critical_damage_delta(
+                raw.get("critical_delta"))
             expected_base = (
                 target.critical_report_base_revision
                 if target_kind == "player" else
@@ -5796,7 +5901,8 @@ class BattleState:
             hull_damage, critical_accepted = _critical_proposal_admission(
                 raw, expected_base, expected_ack)
         elif set(raw) & {"critical_target_base_revision",
-                         "critical_target_ack_seq", "hull_damage"}:
+                         "critical_target_ack_seq", "hull_damage",
+                         "critical_delta"}:
             raise ValueError("critical tokens without critical payload")
         stun_end_server_time_ms = 0
         if "stun_end_server_time_ms" in raw:
@@ -5814,6 +5920,7 @@ class BattleState:
             "potential_damage": potential_damage,
             "shot_result": shot_result, "pose": pose,
             "critical": critical,
+            "critical_delta": critical_delta,
             "critical_accepted": critical_accepted,
             "hull_damage": hull_damage, "splash": bool(splash),
             "stun_end_server_time_ms": stun_end_server_time_ms,
@@ -5825,12 +5932,31 @@ class BattleState:
         target = proposal["target"]
         was_alive = proposal["target_alive"]
         critical = proposal["critical"]
-        admitted_critical = (
-            critical if proposal["critical_accepted"] and was_alive else None)
+        critical_noop = bool(
+            target_kind == "player" and critical is not None and was_alive and
+            not proposal["critical_delta"]["devices"] and
+            not proposal["critical_delta"]["crew_ko"] and
+            not proposal["critical_delta"]["ignite"])
+        if critical_noop:
+            admitted_critical = None
+        elif (target_kind == "player" and critical is not None and was_alive and
+                not critical_noop):
+            admitted_critical = self._merge_player_critical_damage(
+                target, critical, proposal["critical_delta"])
+        else:
+            admitted_critical = (
+                critical if proposal["critical_accepted"] and was_alive
+                else None)
         crew_knockout = bool(
             was_alive and _whole_crew_knocked_out(admitted_critical))
-        damage = proposal["damage"]
-        if critical is not None and not proposal["critical_accepted"]:
+        ammo_rack_death = bool(
+            was_alive and isinstance(admitted_critical, dict) and
+            admitted_critical.get("ammo_rack_death", False))
+        damage = (proposal["hull_damage"]
+                  if target_kind == "player" and critical is not None
+                  else proposal["damage"])
+        if (target_kind != "player" and critical is not None and
+                not proposal["critical_accepted"]):
             damage = proposal["hull_damage"]
         if not was_alive:
             damage = 0
@@ -5839,7 +5965,12 @@ class BattleState:
             critical_before = target.critical
             applied = min(damage, target.health)
             target.health -= applied
-            target.alive = target.health > 0 and not crew_knockout
+            if ammo_rack_death and target.health > 0:
+                applied += target.health
+                target.health = 0
+            target.alive = (
+                target.health > 0 and not crew_knockout and
+                not ammo_rack_death)
             target.display_health = target.health
             if crew_knockout:
                 # #1513 uses ATTACK_REASON.SHOT (index 0) for a crew-loss
@@ -5847,7 +5978,8 @@ class BattleState:
                 # isCrewActive becomes false on the client.
                 target.death_reason = 0
             critical_commit = self._commit_external_player_critical(
-                target, admitted_critical)
+                target, admitted_critical,
+                (record["shooter_kind"], record["shooter_id"]))
             health = target.health
             alive = target.alive
         else:
@@ -5911,12 +6043,13 @@ class BattleState:
         }
         if critical is not None:
             event["critical_accepted"] = bool(
-                proposal["critical_accepted"] and was_alive)
+                (admitted_critical is not None or critical_noop) and
+                was_alive)
             if admitted_critical is not None:
                 event["critical"] = admitted_critical
                 if critical_commit:
                     event.update(critical_commit)
-            else:
+            elif not critical_noop:
                 event["critical_reject_reason"] = (
                     "target_destroyed" if not was_alive else
                     "stale_target_state")
@@ -6582,7 +6715,7 @@ class BattleState:
                 critical if not modern_proposal or critical_accepted else None)
             critical_before = target.critical
             critical_commit = self._commit_external_player_critical(
-                target, admitted_critical)
+                target, admitted_critical, ("bot", bot_id))
             capture_reset = bool(
                 applied > 0 or _critical_damage_transition(
                     critical_before, admitted_critical))
@@ -7829,7 +7962,144 @@ class BattleState:
                 else SIEGE_DISABLED)
 
     @staticmethod
-    def _commit_external_player_critical(player, critical):
+    def _merge_player_critical_damage(player, proposal, delta):
+        """Apply one monotonic worker delta over current canonical progress."""
+        if proposal is None or delta is None:
+            return None
+        params = player.effective_params if isinstance(
+            player.effective_params, dict) else {}
+        profile = params.get("critical") if isinstance(params, dict) else None
+        rows = profile.get("devices") if isinstance(profile, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("player critical profile is unavailable")
+        maxima = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("player critical profile is invalid")
+            name = str(row.get("name", ""))
+            maximum = _finite_float(row.get("max_hp"), -1.0)
+            if (name not in CRITICAL_DEVICE_NAMES or name in maxima or
+                    maximum <= 0.0):
+                raise ValueError("player critical profile is invalid")
+            maxima[name] = maximum
+
+        current = (copy.deepcopy(player.critical)
+                   if isinstance(player.critical, dict) else {})
+        current_devices = []
+        by_name = {}
+        for raw in current.get("devices") or ():
+            if not isinstance(raw, dict):
+                continue
+            record = dict(raw)
+            name = str(record.get("name", ""))
+            if name in by_name:
+                raise ValueError("canonical critical device is duplicated")
+            by_name[name] = record
+            current_devices.append(record)
+        proposal_devices = {
+            str(record.get("name")): record
+            for record in proposal.get("devices") or ()
+            if isinstance(record, dict)
+        }
+        events = []
+        ammo_rack_destroyed = bool(
+            current.get("ammo_rack_death", False))
+        for change in delta["devices"]:
+            name = change["name"]
+            maximum = maxima.get(name)
+            proposed = proposal_devices.get(name)
+            if maximum is None or proposed is None:
+                raise ValueError("critical delta is outside fitted profile")
+            if abs(_finite_float(
+                    proposed.get("max_hp"), -1.0) - maximum) > 0.001:
+                raise ValueError("critical delta maximum disagrees")
+            hp_loss = float(change["hp_loss"])
+            if hp_loss > maximum + 0.001:
+                raise ValueError("critical delta HP loss exceeds pool")
+            record = by_name.get(name)
+            if record is None:
+                record = {
+                    "name": name, "hp": maximum, "max_hp": maximum,
+                    "state": "normal",
+                }
+                by_name[name] = record
+                current_devices.append(record)
+            if abs(_finite_float(
+                    record.get("max_hp"), -1.0) - maximum) > 0.001:
+                raise ValueError("canonical critical maximum disagrees")
+            old_hp = _clamp(
+                _finite_float(record.get("hp"), maximum), 0.0, maximum)
+            new_hp = max(0.0, old_hp - hp_loss)
+            old_state = str(record.get("state", "normal"))
+            derived = device_damage.device_state(new_hp, maximum)
+            state_rank = {"normal": 0, "critical": 1, "destroyed": 2}
+            new_state = (old_state if state_rank.get(old_state, 0) >=
+                         state_rank.get(derived, 0) else derived)
+            record.update({
+                "hp": round(new_hp, 3), "max_hp": round(maximum, 3),
+                "state": new_state,
+            })
+            if old_state != new_state:
+                events.append({
+                    "kind": "device", "name": name,
+                    "old_state": old_state, "state": new_state,
+                    "cause": "shot",
+                })
+            if (name == "ammoBayHealth" and old_hp > 0.0 and
+                    new_hp <= 0.0 and not ammo_rack_destroyed):
+                ammo_rack_destroyed = True
+                events.append({
+                    "kind": "ammo_rack", "state": "destroyed",
+                    "cause": "shot",
+                })
+
+        profile_roster = tuple(profile.get("crew_roster") or ())
+        current_roster = tuple(current.get("crew_roster") or ())
+        proposal_roster = tuple(proposal.get("crew_roster") or ())
+        if ((current_roster and profile_roster and
+             current_roster != profile_roster) or
+                (proposal_roster and profile_roster and
+                 proposal_roster != profile_roster) or
+                (current_roster and proposal_roster and
+                 current_roster != proposal_roster)):
+            raise ValueError("critical crew roster changed mid-round")
+        roster = profile_roster or current_roster or proposal_roster
+        crew_ko = set(current.get("crew_ko") or ())
+        proposal_crew = set(proposal.get("crew_ko") or ())
+        for name in delta["crew_ko"]:
+            if name not in proposal_crew or (roster and name not in roster):
+                raise ValueError("critical crew delta disagrees")
+            if name not in crew_ko:
+                crew_ko.add(name)
+                events.append({
+                    "kind": "crew", "name": name,
+                    "state": "destroyed", "cause": "shot",
+                })
+        burning = bool(current.get("fire", False))
+        if delta["ignite"]:
+            if not bool(proposal.get("fire", False)):
+                raise ValueError("critical fire delta disagrees")
+            if not burning:
+                burning = True
+                events.append({
+                    "kind": "fire", "state": True, "cause": "shot",
+                })
+        candidate = {
+            "devices": current_devices,
+            "destroyed": sorted(
+                record["name"] for record in current_devices
+                if record.get("state") == "destroyed"),
+            "crew_ko": sorted(crew_ko),
+            "fire": burning,
+            "ammo_rack_death": ammo_rack_destroyed,
+            "events": events,
+        }
+        if roster:
+            candidate["crew_roster"] = list(roster)
+        return _critical_payload(candidate)
+
+    @staticmethod
+    def _commit_external_player_critical(player, critical, attacker=None):
         """Commit damage and open a new owner-report lineage.
 
         A later repair checkpoint may advance within this lineage, but a
@@ -7837,11 +8107,83 @@ class BattleState:
         """
         if critical is None:
             return None
-        player.critical = _critical_state(critical)
+        candidate = _critical_state(critical)
+        if (isinstance(player.critical, dict) and
+                player.critical.get("crew_roster") and
+                not candidate.get("crew_roster")):
+            candidate["crew_roster"] = list(
+                player.critical["crew_roster"])
+        if candidate == player.critical:
+            return {
+                "critical_revision": player.critical_revision,
+                "critical_base_revision":
+                    player.critical_report_base_revision,
+                "critical_ack_seq": player.critical_ack_seq,
+            }
+        was_burning = bool(
+            isinstance(player.critical, dict) and
+            player.critical.get("fire", False))
+        player.critical = candidate
+        burning = bool(player.critical.get("fire", False))
+        if not was_burning and burning:
+            player.combat_fire_elapsed = 0.0
+            player.combat_fire_timer = 0.0
+            if (isinstance(attacker, tuple) and len(attacker) == 2 and
+                    attacker[0] in ("player", "bot") and
+                    int(attacker[1]) > 0):
+                player.fire_attacker_kind = str(attacker[0])
+                player.fire_attacker_id = int(attacker[1])
+        elif was_burning and not burning:
+            player.combat_fire_elapsed = 0.0
+            player.combat_fire_timer = 0.0
+            player.fire_attacker_kind = ""
+            player.fire_attacker_id = 0
         player.critical_revision += 1
         player.critical_report_base_revision = player.critical_revision
         player.critical_ack_seq = 0
         player.track_repair_fingerprints.clear()
+        return {
+            "critical_revision": player.critical_revision,
+            "critical_base_revision":
+                player.critical_report_base_revision,
+            "critical_ack_seq": player.critical_ack_seq,
+        }
+
+    @staticmethod
+    def _commit_player_critical_progress(player, critical):
+        """Commit repair/equipment/fire progress within one damage lineage.
+
+        Owner-timed track repair reports merge only their track rows into the
+        current canonical payload.  Non-track progress therefore must retain
+        the damage base and acknowledgement ledger instead of starving that
+        independent owner CAS with a new lineage every server tick.
+        """
+        if critical is None:
+            return None
+        candidate = _critical_state(critical)
+        if (isinstance(player.critical, dict) and
+                player.critical.get("crew_roster") and
+                not candidate.get("crew_roster")):
+            candidate["crew_roster"] = list(
+                player.critical["crew_roster"])
+        if candidate == player.critical:
+            return {
+                "critical_revision": player.critical_revision,
+                "critical_base_revision":
+                    player.critical_report_base_revision,
+                "critical_ack_seq": player.critical_ack_seq,
+            }
+        was_burning = bool(
+            isinstance(player.critical, dict) and
+            player.critical.get("fire", False))
+        player.critical = candidate
+        burning = bool(player.critical.get("fire", False))
+        if was_burning and not burning:
+            player.combat_fire_elapsed = 0.0
+            player.combat_fire_timer = 0.0
+            player.fire_attacker_kind = ""
+            player.fire_attacker_id = 0
+        player.critical_revision += 1
         return {
             "critical_revision": player.critical_revision,
             "critical_base_revision":
@@ -7974,6 +8316,289 @@ class BattleState:
             while len(player.track_repair_fingerprints) > 64:
                 player.track_repair_fingerprints.popitem(last=False)
             return True
+
+    @staticmethod
+    def _finish_equipment_intent(player, intent_seq, accepted, reason):
+        player.equipment_intent_result = {
+            "intent_seq": int(intent_seq),
+            "accepted": bool(accepted),
+            "reason": str(reason or "")[:64],
+        }
+        return True
+
+    def submit_equipment_intent(self, player_id, message):
+        """Commit one visible trigger against the server-owned kit ledger."""
+        with self.lock:
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    not self._message_round_matches(message) or
+                    message.get("type") != "equipment_intent" or
+                    set(message) != {
+                        "type", "round_id", "intent_seq", "equipment_id",
+                        "activation_code", "selected",
+                        "requested_active"}):
+                return False
+            player = self.players.get(player_id)
+            if player is None or not player.connected:
+                return False
+            try:
+                intent_seq = _exact_int(
+                    message.get("intent_seq"), 1, PROJECTILE_MAX_ID)
+                equipment_id = _exact_int(
+                    message.get("equipment_id"), 1, 65535)
+                activation_code = _exact_int(
+                    message.get("activation_code"), 1,
+                    PROJECTILE_MAX_ID)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (intent_seq is None or equipment_id is None or
+                    activation_code is None or
+                    activation_code & 65535 != equipment_id):
+                return False
+            selected = message.get("selected")
+            if selected is not None:
+                if (not isinstance(selected, str) or not selected or
+                        len(selected) > 64 or
+                        selected not in CRITICAL_DEVICE_NAMES and
+                        selected not in CRITICAL_CREW_NAMES):
+                    return False
+            requested_active = message.get("requested_active")
+            if (requested_active is not None and
+                    not isinstance(requested_active, bool)):
+                return False
+            normalized = {
+                "intent_seq": intent_seq,
+                "equipment_id": equipment_id,
+                "activation_code": activation_code,
+                "selected": selected,
+                "requested_active": requested_active,
+            }
+            fingerprint = _message_fingerprint(normalized)
+            previous = player.equipment_intent_fingerprints.get(intent_seq)
+            if previous is not None:
+                return previous == fingerprint
+            if intent_seq != player.equipment_intent_seq + 1:
+                return False
+            player.equipment_intent_seq = intent_seq
+            player.equipment_intent_fingerprints[intent_seq] = fingerprint
+            while (len(player.equipment_intent_fingerprints) >
+                   MAX_PLAYER_EQUIPMENT_FINGERPRINTS):
+                player.equipment_intent_fingerprints.popitem(last=False)
+            if (not self._combat_accepting() or
+                    self.battle_result is not None or
+                    not player.participating or not player.alive):
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "vehicle_not_alive")
+            equipment = next((
+                value for value in player.equipment_states
+                if int(value.contract.get("id", 0)) == equipment_id), None)
+            if equipment is None:
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "equipment_not_mounted")
+            kind = str(equipment.contract.get("kind") or "")
+            repair_all = bool(equipment.contract.get("repairAll", False))
+            extra_index = activation_code >> 16
+            if ((kind == "rpm_limiter" and requested_active is None) or
+                    (kind != "rpm_limiter" and
+                     requested_active is not None)):
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "invalid_activation_mode")
+            if (repair_all and
+                    (kind not in ("repairkit", "medkit") or
+                     extra_index != 1 or selected is not None)):
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "invalid_activation_code")
+            if kind in ("repairkit", "medkit") and not repair_all:
+                targets = {
+                    int(row.get("index")): str(row.get("name"))
+                    for row in ((player.effective_params.get("critical") or
+                                 {}).get("activation_targets") or ())
+                    if isinstance(row, dict)
+                }
+                if extra_index <= 0 or targets.get(extra_index) != selected:
+                    return self._finish_equipment_intent(
+                        player, intent_seq, False,
+                        "invalid_activation_code")
+            elif kind == "rpm_limiter":
+                if (extra_index not in (0, 1) or
+                        bool(extra_index) != requested_active):
+                    return self._finish_equipment_intent(
+                        player, intent_seq, False,
+                        "invalid_activation_code")
+            elif not repair_all and extra_index != 0:
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "invalid_activation_code")
+            if ((kind == "repairkit" and
+                 ((repair_all and selected is not None) or
+                  (not repair_all and
+                   selected not in CRITICAL_DEVICE_NAMES))) or
+                    (kind == "medkit" and
+                     ((repair_all and selected is not None) or
+                      (not repair_all and
+                       selected not in CRITICAL_CREW_NAMES))) or
+                    (kind not in ("repairkit", "medkit") and
+                     selected is not None)):
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "invalid_equipment_target")
+            if (kind == "extinguisher" and
+                    bool(equipment.contract.get("autoactivate", False))):
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "automatic_only")
+            critical = (player.critical
+                        if isinstance(player.critical, dict) else {})
+            effect = equipment_mechanics.effect_policy(
+                equipment, critical, selected=selected,
+                requested_active=requested_active,
+                active=equipment.active)
+            now = float(self.tick) / TICK_HZ
+            player.equipment_clock = now
+            if effect is None or not equipment.ready(now):
+                return self._finish_equipment_intent(
+                    player, intent_seq, False, "equipment_ineligible")
+            payload = None
+            if effect.get("action") != "set_rpm_limiter":
+                payload = player_critical_mechanics.apply_equipment(
+                    player, effect, now)
+                if payload is None:
+                    return self._finish_equipment_intent(
+                        player, intent_seq, False, "equipment_no_effect")
+            committed = equipment.activate(
+                now, critical, selected=selected,
+                requested_active=requested_active)
+            if committed != effect:
+                raise RuntimeError(
+                    "canonical player equipment commit diverged")
+            if payload is not None:
+                self._commit_player_critical_progress(
+                    player, _critical_payload(payload))
+            player.equipment_revision += 1
+            return self._finish_equipment_intent(
+                player, intent_seq, True, "")
+
+    def _tick_player_critical(self, dt):
+        """Advance non-track repairs and automatic equipment canonically."""
+        if not self._combat_accepting() or self.battle_result is not None:
+            return 0
+        changed = 0
+        now = float(self.tick) / TICK_HZ
+        for player in list(self.players.values()):
+            if (not player.connected or not player.participating or
+                    not player.alive):
+                continue
+            player.equipment_clock = now
+            for equipment in player.equipment_states:
+                critical = (player.critical if isinstance(
+                    player.critical, dict) else {})
+                effect = equipment.poll_auto(now, critical)
+                if effect is None:
+                    continue
+                payload = player_critical_mechanics.apply_equipment(
+                    player, effect, now)
+                if payload is None:
+                    raise RuntimeError(
+                        "canonical automatic equipment had no effect")
+                self._commit_player_critical_progress(
+                    player, _critical_payload(payload))
+                player.equipment_revision += 1
+                changed += 1
+            payload = player_critical_mechanics.advance_critical(
+                player, max(0.0, float(dt)), now)
+            if payload is not None:
+                self._commit_player_critical_progress(
+                    player, _critical_payload(payload))
+                changed += 1
+        return changed
+
+    def _tick_player_fire(self, dt):
+        """Advance participant fires against the canonical health ledger."""
+        if not self._combat_accepting() or self.battle_result is not None:
+            return 0
+        changed = 0
+        now = float(self.tick) / TICK_HZ
+        for player in list(self.players.values()):
+            burning = bool(
+                isinstance(player.critical, dict) and
+                player.critical.get("fire", False))
+            if (not player.connected or not player.participating or
+                    not player.alive or not burning):
+                if not burning:
+                    player.combat_fire_elapsed = 0.0
+                    player.combat_fire_timer = 0.0
+                    player.fire_attacker_kind = ""
+                    player.fire_attacker_id = 0
+                continue
+            attacker_kind = str(player.fire_attacker_kind or "")
+            attacker_id = int(player.fire_attacker_id or 0)
+            attacker = ((attacker_kind, attacker_id)
+                        if attacker_kind in ("player", "bot") and
+                        attacker_id > 0 else None)
+            if attacker is None:
+                continue
+            result = player_critical_mechanics.advance_fire(
+                player, max(0.0, float(dt)), now)
+            if not isinstance(result, dict):
+                continue
+            critical_before = player.critical
+            critical = result.get("critical")
+            damage = min(
+                max(0, int(result.get("damage", 0))), player.health)
+            player.combat_fire_elapsed = max(
+                0.0, float(result.get("fire_elapsed", 0.0)))
+            player.combat_fire_timer = max(
+                0.0, float(result.get("fire_timer", 0.0)))
+            critical_commit = self._commit_player_critical_progress(
+                player, _critical_payload(critical)
+                if critical is not None else None)
+            if damage <= 0 and critical is None:
+                continue
+            player.health -= damage
+            player.alive = player.health > 0
+            player.display_health = player.health
+            player.death_reason = 1 if not player.alive else 0
+            if damage > 0:
+                self._drop_capture_for_vehicle("player", player.player_id)
+            self._record_damage(
+                attacker, ("player", player.player_id), damage,
+                critical_before)
+            event = {
+                "kind": ("hit" if attacker_kind == "player" else
+                         "bot_human_hit"),
+                "target": player.player_id,
+                "damage": damage,
+                "health": player.health,
+                "dead": not player.alive,
+                "attack_reason": 1,
+                "death_reason": player.death_reason,
+                "source": "fire",
+            }
+            if attacker_kind == "player":
+                event["attacker"] = attacker_id
+            elif attacker_kind == "bot":
+                event["attacker_bot"] = attacker_id
+            if critical is not None:
+                event["critical"] = player.critical
+                if critical_commit:
+                    event.update(critical_commit)
+            self.pending_events.append(event)
+            changed += int(damage > 0)
+            if not player.alive:
+                player.forward = 0.0
+                player.turn = 0.0
+                player.speed = 0.0
+                player.pending_fire_intents.clear()
+                if attacker is not None:
+                    player.death_attacker_kind = attacker_kind
+                    player.death_attacker_id = attacker_id
+                    self._record_frag(
+                        attacker_kind, attacker_id, player.team,
+                        "player", player.player_id)
+                player.fire_attacker_kind = ""
+                player.fire_attacker_id = 0
+                if self._maybe_finish_battle():
+                    break
+            elif not bool(player.critical.get("fire", False)):
+                player.fire_attacker_kind = ""
+                player.fire_attacker_id = 0
+        return changed
 
     def _apply_reported_health(self, player, message):
         """Relay legacy 0.8.2 client-simulated damage.
@@ -8160,7 +8785,8 @@ class BattleState:
                 critical if not modern_proposal or critical_accepted else None)
             critical_before = target.critical
             critical_commit = self._commit_external_player_critical(
-                target, admitted_critical)
+                target, admitted_critical,
+                ("player", attacker.player_id))
             capture_reset = bool(
                 applied_damage > 0 or _critical_damage_transition(
                     critical_before, admitted_critical))
@@ -9329,6 +9955,8 @@ class BattleState:
                         live=(self.battle_result is None and
                               self._timing_payload()["phase"] == "battle"))
                     or ())
+            self._tick_player_critical(dt)
+            self._tick_player_fire(dt)
             self._tick_player_drowning(dt)
             self._expire_projectiles()
             if self.battle_result is None:
@@ -9576,6 +10204,13 @@ class BattleState:
             "critical_base_revision":
                 player.critical_report_base_revision,
             "critical_ack_seq": player.critical_ack_seq,
+            "equipment_states": [
+                equipment.snapshot(player.equipment_clock)
+                for equipment in player.equipment_states],
+            "equipment_revision": int(player.equipment_revision),
+            "equipment_intent_seq": int(player.equipment_intent_seq),
+            "equipment_intent_result": dict(
+                player.equipment_intent_result),
             "ram_contact_admitted_seq": player.ram_contact_seq,
             "ram_contact_resolved_seq": player.ram_contact_resolved_seq,
             "destructible_contact_admitted_seq":
@@ -10254,6 +10889,14 @@ class ClientHandler(socketserver.BaseRequestHandler):
                             _server_log_limited(
                                 "fire-intent:%d" % player.player_id,
                                 "FIRE INTENT rejected sender=%d seq=%s" % (
+                                    player.player_id,
+                                    message.get("intent_seq")))
+                    elif message_type == "equipment_intent":
+                        if not server.state.submit_equipment_intent(
+                                player.player_id, message):
+                            _server_log_limited(
+                                "equipment-intent:%d" % player.player_id,
+                                "EQUIPMENT INTENT rejected sender=%d seq=%s" % (
                                     player.player_id,
                                     message.get("intent_seq")))
                     elif message_type == "hit_report":

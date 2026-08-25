@@ -110,4 +110,12 @@ def effective_params():
                 },
             }],
         },
+        'equipment': [],
+        'critical': {
+            'devices': [{
+                'name': 'engineHealth',
+                'max_hp': 100.0,
+                'regen_hp': 50.0,
+            }],
+        },
     }

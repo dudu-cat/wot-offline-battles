@@ -519,6 +519,8 @@ class ProjectileWireTests(unittest.TestCase):
             'critical_target_base_revision': 3,
             'critical_target_ack_seq': 4,
             'hull_damage': 120,
+            'critical_delta': {
+                'devices': [], 'crew_ko': [], 'ignite': True},
         })
         self.assertTrue(client.send_projectile_resolve(
             4, 'bot:17:1', 0, 'impact', 10,
@@ -652,7 +654,11 @@ class ProjectileWireTests(unittest.TestCase):
             'authority_epoch': 2,
             'players': [{
                 'id': 7, 'outfits': {},
-                'effective_params': effective_params()}],
+                'effective_params': effective_params(),
+                'equipment_states': [], 'equipment_revision': 0,
+                'equipment_intent_seq': 0,
+                'equipment_intent_result': {
+                    'intent_seq': 0, 'accepted': False, 'reason': ''}}],
         })
 
         self.assertTrue(client.running)
@@ -709,6 +715,11 @@ class ProjectileWireTests(unittest.TestCase):
                 'critical_revision': 0,
                 'critical_base_revision': 0,
                 'critical_ack_seq': 0,
+                'equipment_states': [],
+                'equipment_revision': 0,
+                'equipment_intent_seq': 0,
+                'equipment_intent_result': {
+                    'intent_seq': 0, 'accepted': False, 'reason': ''},
             }],
             'bots': [],
         }
@@ -734,6 +745,38 @@ class ProjectileWireTests(unittest.TestCase):
         })
         self.assertEqual(3, client.authority_epoch)
         self.assertEqual(1010, client.server_time_ms)
+
+    def test_snapshot_recovers_equipment_intent_sequence_for_reconnect(self):
+        client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
+        client.running = True
+        client._handle_message(self.welcome())
+        client.phase = 'battle'
+        client._handle_message({
+            'type': 'snapshot', 'protocol': module.PROTOCOL_VERSION,
+            'round_id': 3, 'server_tick': 10,
+            'bot_state_revision': 0,
+            'bot_authority_id': module.WORKER_AUTHORITY_ID,
+            'server_time_ms': 1000, 'authority_epoch': 2,
+            'projectile_revision': 0, 'projectiles': [],
+            'bot_manifest': [], 'bots': [],
+            'players': [{
+                'id': 7,
+                'critical_revision': 0, 'critical_base_revision': 0,
+                'critical_ack_seq': 0,
+                'equipment_states': [], 'equipment_revision': 4,
+                'equipment_intent_seq': 5,
+                'equipment_intent_result': {
+                    'intent_seq': 5, 'accepted': False,
+                    'reason': 'equipment_ineligible'},
+            }],
+        })
+
+        self.assertTrue(client.running)
+        self.assertEqual(5, client._equipment_intent_seq)
+        self.assertEqual(
+            'equipment_ineligible',
+            client.last_snapshot['players'][0][
+                'equipment_intent_result']['reason'])
 
     def test_player_shot_event_preserves_fire_intent_identity(self):
         received = []

@@ -21,7 +21,8 @@ from lan_battle_server import (
     BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     EFFECTIVE_PARAMS_CAPABILITY as SERVER_EFFECTIVE_PARAMS_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, PLAYER_ENVIRONMENT_CAPABILITY,
-    PLAYER_FIRE_INTENT_CAPABILITY, PROJECTILE_CAPABILITY,
+    PLAYER_FIRE_INTENT_CAPABILITY,
+    PROJECTILE_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY)
 
 
@@ -65,10 +66,18 @@ class EffectiveParamsContractTests(unittest.TestCase):
                 for entry in expected['gun']['shots']))
         descriptor.computeBaseInvisibility = mock.Mock(
             return_value=(0.2, 0.3))
+        descriptor.engine = {
+            'maxHealth': 100.0, 'maxRegenHealth': 50.0}
+        descriptor.miscAttrs = {}
+        descriptor.type = types.SimpleNamespace(
+            crewRoles=(('commander',),))
         crew = [types.SimpleNamespace(skills=[types.SimpleNamespace(
             name='gunner_sniper', isActive=True, level=100.0)])]
         consumables = types.SimpleNamespace(
-            getInstalledItems=lambda: (types.SimpleNamespace(name='ration'),))
+            getInstalledItems=lambda: (types.SimpleNamespace(
+                name='ration', id=(0, 9), compactDescr=1009,
+                reuseCount=-1, cooldownSeconds=0.0,
+                crewLevelIncrease=10.0),))
         item = types.SimpleNamespace(
             descriptor=descriptor,
             crew=crew,
@@ -169,6 +178,36 @@ class EffectiveParamsContractTests(unittest.TestCase):
         duplicate_shot['gun']['shots'][1]['compact_descr'] = 1
         self.assertIsNone(contract.canonical(duplicate_shot))
 
+    def test_critical_and_equipment_projection_rejects_forged_identity(self):
+        unknown = effective_params()
+        unknown['critical']['devices'][0]['name'] = 'inventedHealth'
+        self.assertIsNone(contract.canonical(unknown))
+
+        changed_pool = effective_params()
+        changed_pool['critical']['devices'][0]['regen_hp'] = 101.0
+        self.assertIsNone(contract.canonical(changed_pool))
+
+        duplicate_pool = effective_params()
+        duplicate_pool['critical']['devices'].append(dict(
+            duplicate_pool['critical']['devices'][0]))
+        self.assertIsNone(contract.canonical(duplicate_pool))
+
+        equipment = {
+            'name': 'smallRepairkit', 'kind': 'repairkit',
+            'id': 41, 'compactDescr': 441, 'tags': ['repairkit'],
+            'reuseCount': 0, 'cooldownSeconds': 90.0,
+            'autoactivate': False, 'fireStartingChanceFactor': 1.0,
+            'repairAll': False, 'bonusValue': 0.0,
+            'crewLevelIncrease': 0.0, 'enginePowerFactor': 1.0,
+            'turretRotationSpeedFactor': 1.0,
+            'engineHpLossPerSecond': 0.0,
+            'autoReactionSeconds': 0.0,
+        }
+        duplicate_equipment_id = effective_params()
+        duplicate_equipment_id['equipment'] = [
+            equipment, dict(equipment, compactDescr=442)]
+        self.assertIsNone(contract.canonical(duplicate_equipment_id))
+
     def test_player_hello_requires_and_publishes_snapshot(self):
         client = LANClient(
             '127.0.0.1', 28782, 'Player', 'ussr:R11_MS-1',
@@ -243,6 +282,23 @@ class EffectiveParamsContractTests(unittest.TestCase):
         message, error = state.request_start(player.player_id)
         self.assertIsNone(message)
         self.assertEqual('invalid_effective_params', error)
+
+    def test_battle_phase_rejects_mid_round_critical_projection_change(self):
+        state = BattleState()
+        player, error = state.add_player(
+            _Connection(), ('127.0.0.1', 2000), _hello())
+        self.assertIsNone(error)
+        original = player.effective_params
+        changed = effective_params()
+        changed['critical']['devices'][0]['max_hp'] = 999.0
+        state.phase = 'battle'
+
+        self.assertFalse(state.select_vehicle(player.player_id, {
+            'vehicle': player.vehicle, 'max_health': player.max_health,
+            'outfits': {}, 'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': changed,
+        }))
+        self.assertEqual(original, player.effective_params)
 
     def test_lean_snapshot_inherits_canonical_static_parameters(self):
         client = LANClient(

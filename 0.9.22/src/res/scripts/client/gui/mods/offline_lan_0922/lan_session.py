@@ -176,8 +176,10 @@ def _selected_vehicle_effective_params():
     from CurrentVehicle import g_currentVehicle
     from gui.mods.offline_lan_0922 import descriptor_donation
     from gui.mods.offline_lan_0922 import effective_params
+    from gui.mods.offline_lan_0922 import equipment_mechanics
     from gui.mods.offline_lan_0922 import loadout
     from gui.mods.offline_lan_0922 import tank_collision
+    from gui.mods.offline_lan_0922 import player_critical_mechanics
     from gui.mods.offline_lan_0922 import vehicle_physics
 
     item = g_currentVehicle.item
@@ -275,6 +277,10 @@ def _selected_vehicle_effective_params():
             'clip_size': clip_size,
             'shots': shots,
         },
+        'equipment': [
+            equipment_mechanics.project_equipment(equipment)
+            for equipment in equipments],
+        'critical': player_critical_mechanics.project_profile(descriptor),
     })
     if result is None:
         raise ValueError('the selected vehicle effective parameters are invalid')
