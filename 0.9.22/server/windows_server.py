@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ SERVER_TEAM_SIZE = 15
 SERVER_TEAM_SIZE_ENV = "WOT_0922_TEAM_SIZE"
 SERVER_TEAM1_SIZE_ENV = "WOT_0922_TEAM1_SIZE"
 SERVER_TEAM2_SIZE_ENV = "WOT_0922_TEAM2_SIZE"
+SERVER_BOT_LINEUP_ENV = "WOT_0922_BOT_LINEUP"
 SERVER_LOOPBACK_ONLY_ENV = "WOT_0922_LOOPBACK_ONLY"
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
 # Get-NetFirewallRule can take many seconds on a busy machine.
@@ -200,6 +202,21 @@ def _loopback_only_from_environment(environment=None):
     return environment.get(SERVER_LOOPBACK_ONLY_ENV) == "1"
 
 
+def _bot_lineup_from_environment(environment=None):
+    """Load the launcher-owned exact lineup without silent fallback."""
+    environment = os.environ if environment is None else environment
+    raw_value = environment.get(SERVER_BOT_LINEUP_ENV)
+    if raw_value is None:
+        return []
+    try:
+        value = json.loads(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid exact Bot lineup JSON: %s" % error)
+    if not isinstance(value, list):
+        raise ValueError("the exact Bot lineup must be a JSON list")
+    return value
+
+
 def main():
     loopback_only = _loopback_only_from_environment()
     server_host = SERVER_LOOPBACK_HOST if loopback_only else SERVER_HOST
@@ -213,6 +230,7 @@ def main():
     try:
         default_map, run_server = _load_server()
         team1_size, team2_size = _team_sizes_from_environment()
+        bot_lineup = _bot_lineup_from_environment()
         if not loopback_only:
             _ensure_windows_firewall_rule(SERVER_PORT)
         run_server(
@@ -222,6 +240,7 @@ def main():
             team_size=SERVER_TEAM_SIZE,
             team1_size=team1_size,
             team2_size=team2_size,
+            bot_lineup=bot_lineup,
         )
     except Exception:
         traceback.print_exc()

@@ -69,6 +69,7 @@ SERVER_DATA_ENV_0922 = "WOT_0922_SERVER_DATA"
 SERVER_TEAM_SIZE_ENV_0922 = "WOT_0922_TEAM_SIZE"
 SERVER_TEAM1_SIZE_ENV_0922 = "WOT_0922_TEAM1_SIZE"
 SERVER_TEAM2_SIZE_ENV_0922 = "WOT_0922_TEAM2_SIZE"
+SERVER_BOT_LINEUP_ENV_0922 = "WOT_0922_BOT_LINEUP"
 SERVER_LOOPBACK_ONLY_ENV_0922 = "WOT_0922_LOOPBACK_ONLY"
 CLIENT_SERVER_HOST_ENV_0922 = "OFFLINE_LAN_0922_SERVER_HOST"
 CLIENT_SERVER_PORT_ENV_0922 = "OFFLINE_LAN_0922_SERVER_PORT"
@@ -1442,7 +1443,7 @@ def server_argv(port_version, base_dir=None):
 
 def server_environment(port_version, game_root, environment=None,
                        team_size=DEFAULT_TEAM_SIZE, loopback_only=False,
-                       team1_size=None, team2_size=None):
+                       team1_size=None, team2_size=None, bot_lineup=None):
     """Point each server at the baked data installed with its client."""
     environment = dict(os.environ if environment is None else environment)
     if port_version == PORT_0_8_2:
@@ -1459,6 +1460,8 @@ def server_environment(port_version, game_root, environment=None,
             max(team1_size, team2_size))
         environment[SERVER_TEAM1_SIZE_ENV_0922] = str(team1_size)
         environment[SERVER_TEAM2_SIZE_ENV_0922] = str(team2_size)
+        environment[SERVER_BOT_LINEUP_ENV_0922] = json.dumps(
+            list(bot_lineup or ()), separators=(",", ":"))
         if loopback_only:
             environment[SERVER_LOOPBACK_ONLY_ENV_0922] = "1"
         else:

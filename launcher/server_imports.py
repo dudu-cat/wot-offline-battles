@@ -20,6 +20,7 @@ import math
 import os
 import pickle
 import random
+import re
 import socket
 import socketserver
 import subprocess
@@ -48,6 +49,7 @@ SERVER_STDLIB_MODULES = (
     os.__name__,
     pickle.__name__,
     random.__name__,
+    re.__name__,
     socket.__name__,
     socketserver.__name__,
     subprocess.__name__,

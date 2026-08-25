@@ -15,6 +15,8 @@ import time
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import bot_lineup_profiles
+    import bot_lineup_ui
     import core
     import error_reports
     import i18n
@@ -22,7 +24,8 @@ if __package__ in (None, ""):
     import vehicle_overlays
 else:
     from . import (
-        core, error_reports, i18n, vehicle_editor_ui, vehicle_overlays)
+        bot_lineup_profiles, bot_lineup_ui, core, error_reports, i18n,
+        vehicle_editor_ui, vehicle_overlays)
 
 
 LAUNCHER_VERSION = "0.6.0 alpha.5"
@@ -48,6 +51,14 @@ _CHINESE = {
     "address shown in the log.": "作为主机：先启动服务器，再加入游戏；其他玩家使用日志中显示的局域网地址。",
     "Join network battle": "加入联网战斗",
     "Vehicle modifier": "坦克属性修改器",
+    "Exact lineup": "阵容精确设置",
+    "Bot lineup profile": "Bot 阵容方案",
+    "New Bot lineup profile...": "新建 Bot 阵容方案…",
+    "Edit Bot lineup...": "编辑 Bot 阵容…",
+    "Delete Bot lineup profile...": "删除 Bot 阵容方案…",
+    "New Bot lineup profile": "新建 Bot 阵容方案",
+    "Delete Bot lineup profile?": "删除 Bot 阵容方案？",
+    "Delete Bot lineup profile '%s'?": "删除 Bot 阵容方案“%s”？",
     "Vehicle data profile": "车辆属性方案",
     "New profile...": "新建方案…",
     "Edit selected profile...": "编辑所选方案…",
@@ -288,6 +299,7 @@ class LauncherWindow(object):
         self._close_pending = False
         self._selected_client = None
         self._profile_names = []
+        self._bot_lineup_profile_names = []
         self._build()
 
     def _build(self):
@@ -437,9 +449,45 @@ class LauncherWindow(object):
         self.tools_tabs = self._ttk.Notebook(frame)
         self.tools_tabs.grid(row=3, column=0, sticky="we", pady=(0, 8))
         self.vehicle_panel = tk.Frame(self.tools_tabs, padx=10, pady=10)
+        self.bot_lineup_panel = tk.Frame(self.tools_tabs, padx=10, pady=10)
         self.repair_panel = tk.Frame(self.tools_tabs, padx=10, pady=10)
         self.tools_tabs.add(self.vehicle_panel, text="")
+        self.tools_tabs.add(self.bot_lineup_panel, text="")
         self.tools_tabs.add(self.repair_panel, text="")
+
+        self._bot_lineup_store = bot_lineup_profiles.normalize_store(
+            settings.get("bot_lineup_profiles"))
+        self.bot_lineup_profile_label = tk.Label(
+            self.bot_lineup_panel, text="")
+        self.bot_lineup_profile_label.grid(row=0, column=0, sticky="w")
+        self.bot_lineup_profile = tk.StringVar(value=settings.get(
+            "bot_lineup_profile",
+            bot_lineup_profiles.AUTOMATIC_PROFILE_LABEL))
+        self.bot_lineup_profile_box = self._ttk.Combobox(
+            self.bot_lineup_panel, textvariable=self.bot_lineup_profile,
+            values=(bot_lineup_profiles.AUTOMATIC_PROFILE_LABEL,),
+            state="disabled", width=40)
+        self.bot_lineup_profile_box.grid(
+            row=0, column=1, sticky="we", padx=(6, 0))
+        self.bot_lineup_profile_box.bind(
+            "<<ComboboxSelected>>", self._bot_lineup_profile_selected)
+        bot_lineup_actions = tk.Frame(self.bot_lineup_panel)
+        bot_lineup_actions.grid(
+            row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        self.new_bot_lineup_profile_button = tk.Button(
+            bot_lineup_actions, text="", command=self._new_bot_lineup_profile)
+        self.new_bot_lineup_profile_button.pack(
+            side="left", fill="x", expand=True)
+        self.bot_lineup_editor_button = tk.Button(
+            bot_lineup_actions, text="", command=self._open_bot_lineup_editor)
+        self.bot_lineup_editor_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        self.delete_bot_lineup_profile_button = tk.Button(
+            bot_lineup_actions, text="",
+            command=self._delete_bot_lineup_profile)
+        self.delete_bot_lineup_profile_button.pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+        self.bot_lineup_panel.grid_columnconfigure(1, weight=1)
 
         self.vehicle_profile_label = tk.Label(self.vehicle_panel, text="")
         self.vehicle_profile_label.grid(row=0, column=0, sticky="w")
@@ -557,6 +605,8 @@ class LauncherWindow(object):
             "a LAN address shown in the log."))
         self.tools_tabs.tab(
             self.vehicle_panel, text=self._t("Vehicle modifier"))
+        self.tools_tabs.tab(
+            self.bot_lineup_panel, text=self._t("Exact lineup"))
         self.tools_tabs.tab(self.repair_panel, text=self._t("Repair"))
         self.vehicle_profile_label.config(text=self._t("Vehicle data profile"))
         self.new_profile_button.config(text=self._t("New profile..."))
@@ -564,6 +614,12 @@ class LauncherWindow(object):
             text=self._t("Edit selected profile..."))
         self.delete_profile_button.config(
             text=self._t("Delete selected profile..."))
+        self.bot_lineup_profile_label.config(text=self._t("Bot lineup profile"))
+        self.new_bot_lineup_profile_button.config(
+            text=self._t("New Bot lineup profile..."))
+        self.bot_lineup_editor_button.config(text=self._t("Edit Bot lineup..."))
+        self.delete_bot_lineup_profile_button.config(
+            text=self._t("Delete Bot lineup profile..."))
         self.repair_button.config(
             text=self._t("Repair startup (keep saved data)"))
         self.normal_preferences_button.config(text=self._t(
@@ -647,6 +703,7 @@ class LauncherWindow(object):
         self.client_label.config(text=text)
         self._selected_client = status["client"]
         self._refresh_profiles(status)
+        self._refresh_bot_lineup_profiles()
         self._update_action_controls()
         self._refresh_mode()
         return status
@@ -716,6 +773,20 @@ class LauncherWindow(object):
         edit_state = "normal" if selected_custom else "disabled"
         self.vehicle_editor_button.config(state=edit_state)
         self.delete_profile_button.config(state=edit_state)
+        lineup_state = (
+            "readonly" if maintenance_state == "normal" else "disabled")
+        self.bot_lineup_profile_box.config(state=lineup_state)
+        lineup_create_state = (
+            "normal" if lineup_state == "readonly" else "disabled")
+        self.new_bot_lineup_profile_button.config(state=lineup_create_state)
+        selected_lineup = self.bot_lineup_profile.get().strip()
+        selected_custom_lineup = (
+            lineup_state == "readonly" and
+            selected_lineup in self._bot_lineup_profile_names)
+        lineup_edit_state = (
+            "normal" if selected_custom_lineup else "disabled")
+        self.bot_lineup_editor_button.config(state=lineup_edit_state)
+        self.delete_bot_lineup_profile_button.config(state=lineup_edit_state)
 
     def _refresh_profiles(self, status=None):
         status = status or core.inspect_game_root(self.game_root.get())
@@ -735,6 +806,24 @@ class LauncherWindow(object):
         return values
 
     def _profile_selected(self, unused_event=None):
+        self._update_action_controls()
+        self._save_settings()
+
+    def _refresh_bot_lineup_profiles(self):
+        self._bot_lineup_store = bot_lineup_profiles.normalize_store(
+            self._bot_lineup_store)
+        self._bot_lineup_profile_names = bot_lineup_profiles.names(
+            self._bot_lineup_store)
+        values = tuple(
+            [bot_lineup_profiles.AUTOMATIC_PROFILE_LABEL] +
+            self._bot_lineup_profile_names)
+        self.bot_lineup_profile_box.config(values=values)
+        if self.bot_lineup_profile.get().strip() not in values:
+            self.bot_lineup_profile.set(
+                bot_lineup_profiles.AUTOMATIC_PROFILE_LABEL)
+        return values
+
+    def _bot_lineup_profile_selected(self, unused_event=None):
         self._update_action_controls()
         self._save_settings()
 
@@ -1133,6 +1222,8 @@ class LauncherWindow(object):
             "join_address": self.join_address.get().strip(),
             "name": self.player_name.get().strip(),
             "vehicle_profile": self.vehicle_profile.get().strip(),
+            "bot_lineup_profile": self.bot_lineup_profile.get().strip(),
+            "bot_lineup_profiles": self._bot_lineup_store,
             "language": self.language_preference,
             COLLECT_CRASH_REPORTS_SETTING:
                 bool(self.collect_crash_reports.get()),
@@ -1206,6 +1297,88 @@ class LauncherWindow(object):
         return simpledialog.askstring(
             self._t("New vehicle profile"),
             self._t("Profile name:"))
+
+    def _ask_bot_lineup_profile_name(self):
+        from tkinter import simpledialog
+
+        return simpledialog.askstring(
+            self._t("New Bot lineup profile"), self._t("Profile name:"))
+
+    def _confirm_delete_bot_lineup_profile(self, profile_name):
+        from tkinter import messagebox
+
+        return messagebox.askyesno(
+            self._t("Delete Bot lineup profile?"),
+            self._t("Delete Bot lineup profile '%s'?") % profile_name,
+            icon="warning")
+
+    def _save_bot_lineup_store(self, store):
+        self._bot_lineup_store = bot_lineup_profiles.normalize_store(store)
+        self._refresh_bot_lineup_profiles()
+        self._save_settings()
+
+    def _new_bot_lineup_profile(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        status = self._refresh_client()
+        if status.get("client") != core.PORT_0_9_22:
+            self._log("Select the supported 0.9.22 game folder first.")
+            return False
+        raw_name = self._ask_bot_lineup_profile_name()
+        if raw_name is None:
+            return False
+        try:
+            self._bot_lineup_store, profile_name = bot_lineup_profiles.create(
+                self._bot_lineup_store, raw_name)
+        except bot_lineup_profiles.BotLineupProfileError as error:
+            self._log(
+                "Could not create the Bot lineup profile: %s" % error)
+            return False
+        self._refresh_bot_lineup_profiles()
+        self.bot_lineup_profile.set(profile_name)
+        self._save_settings()
+        return self._open_bot_lineup_editor()
+
+    def _open_bot_lineup_editor(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        status = self._refresh_client()
+        profile_name = self.bot_lineup_profile.get().strip()
+        if (status.get("client") != core.PORT_0_9_22 or
+                profile_name not in self._bot_lineup_profile_names):
+            self._log("Create or select a Bot lineup profile before editing.")
+            return False
+        self._remember_folder()
+        bot_lineup_ui.open_bot_lineup_editor(
+            self.root, status["path"], profile_name,
+            self._bot_lineup_store, self._save_bot_lineup_store,
+            log=self._log)
+        return True
+
+    def _delete_bot_lineup_profile(self):
+        if self._busy or self._maintenance_busy:
+            self._log("Wait for the current launcher operation to finish.")
+            return False
+        profile_name = self.bot_lineup_profile.get().strip()
+        if profile_name not in self._bot_lineup_profile_names:
+            self._log("Select a saved Bot lineup profile before deleting it.")
+            return False
+        if not self._confirm_delete_bot_lineup_profile(profile_name):
+            return False
+        try:
+            self._bot_lineup_store = bot_lineup_profiles.delete(
+                self._bot_lineup_store, profile_name)
+        except bot_lineup_profiles.BotLineupProfileError as error:
+            self._log(
+                "Could not delete the Bot lineup profile: %s" % error)
+            return False
+        self.bot_lineup_profile.set(
+            bot_lineup_profiles.AUTOMATIC_PROFILE_LABEL)
+        self._refresh_bot_lineup_profiles()
+        self._save_settings()
+        return True
 
     def _confirm_delete_profile(self, profile_name):
         from tkinter import messagebox
@@ -1331,6 +1504,13 @@ class LauncherWindow(object):
             self._log(
                 "Select Online and a supported game folder first.")
             return False
+        try:
+            bot_lineup = bot_lineup_profiles.assignments_for(
+                self._bot_lineup_store,
+                self.bot_lineup_profile.get().strip())
+        except bot_lineup_profiles.BotLineupProfileError as error:
+            self._log("The selected Bot lineup is invalid: %s" % error)
+            return False
         self._remember_folder()
         self._save_settings()
         self._set_maintenance_busy(True)
@@ -1342,8 +1522,11 @@ class LauncherWindow(object):
                 for action in core.install_client_mod(
                         status["path"], status["client"]):
                     self._log(action)
+                start_options = {"persistent": True}
+                if bot_lineup:
+                    start_options["bot_lineup"] = bot_lineup
                 started = self._start_server(
-                    status["path"], status["client"], persistent=True)
+                    status["path"], status["client"], **start_options)
                 if started:
                     self.root.after(0, self._use_local_server_address)
             except core.LauncherError as error:
@@ -1390,9 +1573,13 @@ class LauncherWindow(object):
             session = core.plan_session(
                 status, session_mode, self.join_address.get(),
                 vehicle_profile=profile_name)
+            session["bot_lineup"] = bot_lineup_profiles.assignments_for(
+                self._bot_lineup_store,
+                self.bot_lineup_profile.get().strip())
             session[COLLECT_CRASH_REPORTS_SETTING] = bool(
                 self.collect_crash_reports.get())
-        except core.LauncherError as error:
+        except (core.LauncherError,
+                bot_lineup_profiles.BotLineupProfileError) as error:
             self._log(str(error))
             return
         self._remember_folder()
@@ -1469,12 +1656,21 @@ class LauncherWindow(object):
                                             session["mode"], host, port, name):
                 self._log("Wrote %s" % path)
             if session["needs_server"]:
+                start_options = {
+                    "loopback_only": server_loopback_only,
+                }
+                if session.get("bot_lineup"):
+                    start_options["bot_lineup"] = session["bot_lineup"]
                 started = self._start_server(
-                    game_root, session["client"],
-                    loopback_only=server_loopback_only)
+                    game_root, session["client"], **start_options)
                 if not started:
                     return
             elif session["mode"] == core.MODE_JOIN:
+                if session.get("bot_lineup"):
+                    self._log(
+                        "The selected exact Bot lineup applies only to a "
+                        "server started by this Launcher; this external "
+                        "server keeps its own lineup.")
                 status = core.listener_status(
                     session["client"], host, port)
                 if status == core.LISTENER_COMPATIBLE:
@@ -1600,20 +1796,23 @@ class LauncherWindow(object):
                 self.root.after(0, self._finish_close)
 
     def _start_server(self, game_root, port_version,
-                      loopback_only=False, persistent=False):
+                      loopback_only=False, persistent=False,
+                      bot_lineup=None):
         requested_context = {
             "game_root": os.path.normcase(os.path.realpath(
                 os.path.abspath(game_root))),
             "port_version": port_version,
             "loopback_only": bool(loopback_only),
+            "bot_lineup": list(bot_lineup or ()),
         }
         if self._server_is_running():
             current_context = dict(self._server_context or {})
+            current_context.setdefault("bot_lineup", [])
             if current_context != requested_context:
                 self._log(
                     "The launcher-owned LAN server uses a different game "
-                    "or visibility setting. Stop it before starting "
-                    "this session.")
+                    "or visibility setting, or a different exact lineup. "
+                    "Stop it before starting this session.")
                 return False
             self._log("Reusing the launcher-owned %s LAN server." %
                       port_version)
@@ -1629,6 +1828,12 @@ class LauncherWindow(object):
                     "a compatible server already uses port %d. Close it "
                     "first." % core.DEFAULT_SERVER_PORT)
                 return False
+            if bot_lineup:
+                self._log(
+                    "The exact Bot lineup needs a fresh launcher-owned "
+                    "server. Stop the compatible server already using port "
+                    "%d first." % core.DEFAULT_SERVER_PORT)
+                return False
             self._log("A compatible %s LAN server is already running; "
                       "using it." % port_version)
             return True
@@ -1639,7 +1844,8 @@ class LauncherWindow(object):
             return False
         command = core.server_child_command(port_version)
         environment = core.server_environment(
-            port_version, game_root, loopback_only=loopback_only)
+            port_version, game_root, loopback_only=loopback_only,
+            bot_lineup=bot_lineup)
         server_log_path = core.server_log_path()
         report_session = self._active_report_session
         if report_session is not None:

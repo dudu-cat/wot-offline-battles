@@ -102,6 +102,8 @@ RESULT_INTERACTION_LIMITS = {
     'no_damage_direct_hits_received': (0, 65535),
     'target_kills': (0, 255),
 }
+BOT_TIER_MODES = frozenset((
+    'random', 'same', 'minus1_0', '0_plus1', 'minus1_plus2'))
 SENDER_JOIN_TIMEOUT = 0.1
 SEND_STALL_TIMEOUT = 5.0
 LEAVE_SEND_TIMEOUT = 0.05
@@ -116,14 +118,16 @@ _BOT_STATE_WIRE_FIELDS = (
     'death_reason', 'display_health', 'world_pose')
 STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
-    'start_denied', 'team_denied', 'team_size_denied', 'events', 'error'))
+    'start_denied', 'team_denied', 'team_size_denied',
+    'bot_tier_mode_denied', 'events', 'error'))
 ORDERED_RECEIVE_TYPES = STATE_BARRIER_TYPES | frozenset((
     'battle_receipt', 'fire_intent', 'fire_intent_result',
     'player_destructible_contact',
     'player_destructible_contact_result'))
 SERVER_STATE_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live', 'start_denied',
-    'team_denied', 'team_size_denied', 'snapshot', 'events', 'bot_observation',
+    'team_denied', 'team_size_denied', 'bot_tier_mode_denied', 'snapshot',
+    'events', 'bot_observation',
     'battle_receipt', 'player_destructible_contact'))
 
 
@@ -1256,6 +1260,7 @@ class LANClient(object):
         self.player_id = None
         self.team = None
         self.team_sizes = {1: 15, 2: 15}
+        self.bot_tier_mode = 'random'
         self.slot = 0
         self.map_name = None
         self.map_pool = []
@@ -1520,6 +1525,14 @@ class LANClient(object):
             return False
         return self._send({
             'type': 'set_team_size', 'team': team, 'size': size})
+
+    def set_bot_tier_mode(self, mode):
+        """Ask the waiting-room server to change the next Bot lineup."""
+        if (not self.ready or self.phase != 'waiting' or
+                self.player_id != self.host_player_id or
+                mode not in BOT_TIER_MODES):
+            return False
+        return self._send({'type': 'set_bot_tier_mode', 'mode': mode})
 
     def _adopt_published_vehicle(self, players):
         """Track the vehicle and HP the server holds for this client."""
@@ -3081,6 +3094,8 @@ class LANClient(object):
             team_sizes = _team_sizes(
                 message.get('team_sizes'), message.get('team_size'),
                 self.team_sizes)
+            bot_tier_mode = _safe_text(
+                message.get('bot_tier_mode'), self.bot_tier_mode, 32)
             if (player_id is None or state_revision is None or
                     state_revision < 0 or host_player_id is None or
                     host_player_id <= 0 or team not in (1, 2) or
@@ -3093,6 +3108,7 @@ class LANClient(object):
                     phase != 'waiting' or not map_name or outfits is None or
                     effective_params is None or
                     team_sizes is None or
+                    bot_tier_mode not in BOT_TIER_MODES or
                     not isinstance(spawn, dict) or
                     not all(axis in spawn for axis in ('x', 'y', 'z'))):
                 self.last_error = 'invalid welcome message'
@@ -3109,6 +3125,7 @@ class LANClient(object):
             self.vehicle = _safe_text(message.get('vehicle'), self.vehicle)
             self.team = team
             self.team_sizes = team_sizes
+            self.bot_tier_mode = bot_tier_mode
             self.slot = slot
             self.max_health = max_health
             self.outfits = outfits
@@ -3162,6 +3179,8 @@ class LANClient(object):
             team_sizes = _team_sizes(
                 message.get('team_sizes'), message.get('team_size'),
                 self.team_sizes)
+            bot_tier_mode = _safe_text(
+                message.get('bot_tier_mode'), self.bot_tier_mode, 32)
             roster_server_time = None
             if 'server_time_ms' in message:
                 roster_server_time = _projectile_int_range(
@@ -3192,6 +3211,7 @@ class LANClient(object):
                     not player_gun_checkpoint_contract or
                     not player_equipment_contract or
                     team_sizes is None or
+                    bot_tier_mode not in BOT_TIER_MODES or
                     host_player_id not in player_ids or
                     not _valid_visible_authority_message(message) or
                     (ledger_required and authority_epoch is None) or
@@ -3234,6 +3254,7 @@ class LANClient(object):
             players = self._remember_player_outfits(players)
             self.roster = players
             self.team_sizes = team_sizes
+            self.bot_tier_mode = bot_tier_mode
             self._adopt_published_vehicle(players)
             self.host_player_id = host_player_id
             self.bot_authority_id = message.get(
@@ -3432,6 +3453,18 @@ class LANClient(object):
                 self.stop()
                 return
             self.team_sizes = team_sizes
+        elif kind == 'bot_tier_mode_denied':
+            round_id = _exact_int(message.get('round_id'))
+            mode = _safe_text(message.get('bot_tier_mode'), '', 32)
+            code = _safe_text(message.get('code'), '', 32)
+            if (round_id is None or round_id != self.round_id or
+                    mode not in BOT_TIER_MODES or
+                    code not in ('host_only', 'invalid_mode',
+                                 'not_waiting')):
+                self.last_error = 'invalid bot_tier_mode_denied message'
+                self.stop()
+                return
+            self.bot_tier_mode = mode
         elif kind == 'snapshot':
             round_id = _exact_int(message.get('round_id'))
             if round_id is None:

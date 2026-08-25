@@ -714,7 +714,7 @@ def list_vehicle_choices(game_root):
                 status["path"], nation)
         label = _vehicle_label(record, translators[nation])
         choice = dict((key, record[key]) for key in (
-            "nation", "vehicle", "member"))
+            "nation", "vehicle", "member", "tags"))
         choice["label"] = label
         choices.append(choice)
     return choices
@@ -831,6 +831,7 @@ def _vehicle_roster_from_archive(archive, counts, nation=None):
                 "nation": roster_nation,
                 "vehicle": vehicle,
                 "member": member,
+                "tags": tuple(tags.split()),
                 "selectable": "observer" not in tags.split(),
                 "userString": user_strings.get("userString", ""),
                 "shortUserString": user_strings.get("shortUserString", ""),

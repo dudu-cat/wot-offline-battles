@@ -645,6 +645,7 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertEqual("MS-1", ms1["label"])
         self.assertEqual("R11_MS-1", ms1["vehicle"])
         self.assertEqual(self.VEHICLE, ms1["member"])
+        self.assertIn("lightTank", ms1["tags"])
 
     def test_type_5_heavy_is_read_from_the_japanese_roster(self):
         class _Translations(object):

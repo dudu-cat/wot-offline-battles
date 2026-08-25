@@ -58,7 +58,7 @@ OVERLAY_Z = 0.1
 CONTROL_Z = 0.05
 CONTROL_FRAME_OFFSET = 0.01
 PANEL_WIDTH = 680
-PANEL_HEIGHT = 300
+PANEL_HEIGHT = 340
 PANEL_SAFE_MARGIN = 16
 PANEL_RAISE_PIXELS = 24
 POINTER_TICK_SECONDS = 0.03
@@ -72,6 +72,12 @@ _TEAM_SIZE_ACTIONS = {
     'team1_down': (1, -1), 'team1_up': (1, 1),
     'team2_down': (2, -1), 'team2_up': (2, 1),
 }
+_BOT_TIER_CONTROLS = ('tier_previous', 'tier', 'tier_next')
+BOT_TIER_OPTIONS = (
+    ('random', 'Random'), ('same', 'Same tier'),
+    ('minus1_0', 'Tier -1 / 0'), ('0_plus1', 'Tier 0 / +1'),
+    ('minus1_plus2', 'Tier -1 / +2'),
+)
 
 
 def _LEFT_MOUSE_KEY():
@@ -98,6 +104,13 @@ def friendly_map_name(map_name):
         parts = parts[1:]
     return prefix + (' '.join([part.capitalize() for part in parts]) or
                      'Unknown')
+
+
+def friendly_bot_tier_mode(mode):
+    for value, label in BOT_TIER_OPTIONS:
+        if value == mode:
+            return label
+    return 'Random'
 
 
 def panel_geometry(screen_size):
@@ -290,7 +303,8 @@ class WaitingRoomUI(object):
                  host=None, surface=None, random_supported=None,
                  request_team=None, team_status=None,
                  request_team_size=None, initial_map=None,
-                 on_map_selected=None):
+                 on_map_selected=None, bot_tier_status=None,
+                 request_bot_tier_mode=None):
         self._request_start = request_start
         self._map_pool = map_pool
         self._status = status or (lambda: '')
@@ -300,6 +314,8 @@ class WaitingRoomUI(object):
         self._request_team = request_team
         self._request_team_size = request_team_size
         self._team_status = team_status or (lambda: {})
+        self._bot_tier_status = bot_tier_status or (lambda: {})
+        self._request_bot_tier_mode = request_bot_tier_mode
         self._on_map_selected = on_map_selected
         self._surface = surface
         self._panel = None
@@ -317,6 +333,7 @@ class WaitingRoomUI(object):
         self._selected_map = initial_map
         self._message = ''
         self._pending_team_sizes = {}
+        self._pending_bot_tier_mode = None
 
     def install(self):
         """Build the native components without showing them."""
@@ -359,46 +376,55 @@ class WaitingRoomUI(object):
             self._make_label(
                 role, text, position, width, height, panel=panel, labels=labels,
                 surface=surface, **kwargs)
-        make_control('previous', (-0.72, 0.16, CONTROL_Z), 0.20, 0.20)
-        make_control('map', (0.0, 0.16, CONTROL_Z), 1.15, 0.20)
-        make_control('next', (0.72, 0.16, CONTROL_Z), 0.20, 0.20)
-        make_control('team1_down', (-0.82, -0.08, CONTROL_Z), 0.12, 0.16)
-        make_control('team1', (-0.52, -0.08, CONTROL_Z), 0.42, 0.16)
-        make_control('team1_up', (-0.22, -0.08, CONTROL_Z), 0.12, 0.16)
-        make_control('team2_down', (0.22, -0.08, CONTROL_Z), 0.12, 0.16)
-        make_control('team2', (0.52, -0.08, CONTROL_Z), 0.42, 0.16)
-        make_control('team2_up', (0.82, -0.08, CONTROL_Z), 0.12, 0.16)
-        make_control('start', (0.0, -0.40, CONTROL_Z), 1.20, 0.22)
-        make_control('close', (0.0, -0.78, CONTROL_Z), 0.50, 0.18)
+        make_control('tier_previous', (-0.72, 0.28, CONTROL_Z), 0.20, 0.16)
+        make_control('tier', (0.0, 0.28, CONTROL_Z), 1.15, 0.16)
+        make_control('tier_next', (0.72, 0.28, CONTROL_Z), 0.20, 0.16)
+        make_control('previous', (-0.72, 0.04, CONTROL_Z), 0.20, 0.16)
+        make_control('map', (0.0, 0.04, CONTROL_Z), 1.15, 0.16)
+        make_control('next', (0.72, 0.04, CONTROL_Z), 0.20, 0.16)
+        make_control('team1_down', (-0.82, -0.18, CONTROL_Z), 0.12, 0.14)
+        make_control('team1', (-0.52, -0.18, CONTROL_Z), 0.42, 0.14)
+        make_control('team1_up', (-0.22, -0.18, CONTROL_Z), 0.12, 0.14)
+        make_control('team2_down', (0.22, -0.18, CONTROL_Z), 0.12, 0.14)
+        make_control('team2', (0.52, -0.18, CONTROL_Z), 0.42, 0.14)
+        make_control('team2_up', (0.82, -0.18, CONTROL_Z), 0.12, 0.14)
+        make_control('start', (0.0, -0.48, CONTROL_Z), 1.20, 0.20)
+        make_control('close', (0.0, -0.82, CONTROL_Z), 0.50, 0.16)
         make_label('title', 'LAN WAITING ROOM', (-0.86, 0.82, 0.0), 1.72,
                    0.12, colour=(232, 244, 255, 255))
         make_label('room', '', (-0.86, 0.62, 0.0), 1.72, 0.11)
         make_label('players', '', (-0.86, 0.44, 0.0), 1.72, 0.11)
         # These labels sit on textured buttons, which render white until a
         # tint is proved, so their text has to be dark to stay readable.
-        make_label('previous', '<', (-0.72, 0.16, 0.0), 0.18, 0.12,
+        make_label('tier_previous', '<', (-0.72, 0.28, 0.0), 0.18, 0.10,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('map', '', (0.0, 0.16, 0.0), 1.10, 0.12,
+        make_label('tier', '', (0.0, 0.28, 0.0), 1.10, 0.10,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('next', '>', (0.72, 0.16, 0.0), 0.18, 0.12,
+        make_label('tier_next', '>', (0.72, 0.28, 0.0), 0.18, 0.10,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('team1_down', '-', (-0.82, -0.08, 0.0), 0.10, 0.10,
+        make_label('previous', '<', (-0.72, 0.04, 0.0), 0.18, 0.10,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('team1', 'TEAM 1', (-0.52, -0.08, 0.0), 0.40, 0.10,
+        make_label('map', '', (0.0, 0.04, 0.0), 1.10, 0.10,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('team1_up', '+', (-0.22, -0.08, 0.0), 0.10, 0.10,
+        make_label('next', '>', (0.72, 0.04, 0.0), 0.18, 0.10,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('team2_down', '-', (0.22, -0.08, 0.0), 0.10, 0.10,
+        make_label('team1_down', '-', (-0.82, -0.18, 0.0), 0.10, 0.09,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('team2', 'TEAM 2', (0.52, -0.08, 0.0), 0.40, 0.10,
+        make_label('team1', 'TEAM 1', (-0.52, -0.18, 0.0), 0.40, 0.09,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('team2_up', '+', (0.82, -0.08, 0.0), 0.10, 0.10,
+        make_label('team1_up', '+', (-0.22, -0.18, 0.0), 0.10, 0.09,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('start', 'START BATTLE', (0.0, -0.40, 0.0), 1.16, 0.12,
+        make_label('team2_down', '-', (0.22, -0.18, 0.0), 0.10, 0.09,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('close', 'LEAVE', (0.0, -0.78, 0.0), 0.46, 0.12,
+        make_label('team2', 'TEAM 2', (0.52, -0.18, 0.0), 0.40, 0.09,
                    anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
-        make_label('message', '', (-0.86, -0.60, 0.0), 1.72, 0.11,
+        make_label('team2_up', '+', (0.82, -0.18, 0.0), 0.10, 0.09,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('start', 'START BATTLE', (0.0, -0.48, 0.0), 1.16, 0.11,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('close', 'LEAVE', (0.0, -0.82, 0.0), 0.46, 0.10,
+                   anchor='CENTER', colour=CONTROL_TEXT_COLOUR)
+        make_label('message', '', (-0.86, -0.66, 0.0), 1.72, 0.10,
                    colour=(184, 205, 222, 255))
         # Component construction is fallible on the native client. Commit the
         # installed state only after the complete graph exists.
@@ -861,6 +887,17 @@ class WaitingRoomUI(object):
         team_size_supported = bool(
             is_host and callable(self._request_team_size) and
             team_status.get('size_supported'))
+        tier_status = self._bot_tier_status() or {}
+        tier_supported = bool(
+            is_host and callable(self._request_bot_tier_mode) and
+            tier_status.get('supported'))
+        tier_mode = tier_status.get('mode', 'random')
+        if self._pending_bot_tier_mode == tier_mode:
+            self._pending_bot_tier_mode = None
+        shown_tier_mode = self._pending_bot_tier_mode or tier_mode
+        self._set_text('tier', 'BOT TIER: %s%s' % (
+            friendly_bot_tier_mode(shown_tier_mode),
+            '...' if self._pending_bot_tier_mode is not None else ''))
         current_team = team_status.get('team')
         sizes = team_status.get('sizes') or {}
         counts = team_status.get('counts') or {}
@@ -891,12 +928,13 @@ class WaitingRoomUI(object):
         for role, component in self._controls.items():
             visible = (team_supported if role in _TEAM_SELECT_CONTROLS else
                        team_size_supported if role in _TEAM_SIZE_CONTROLS else
+                       tier_supported if role in _BOT_TIER_CONTROLS else
                        role == 'close' or is_host)
             self._set(component, 'visible', visible)
             label = self._labels.get(role)
             if label is not None:
                 self._set(label, 'visible', visible)
-        for role in ('title', 'room', 'players', 'map', 'message'):
+        for role in ('title', 'room', 'players', 'tier', 'map', 'message'):
             self._set(self._labels[role], 'visible', True)
         self._paint()
         self._set(self._panel, 'visible', True)
@@ -936,6 +974,9 @@ class WaitingRoomUI(object):
         if role in _TEAM_SIZE_ACTIONS:
             team, step = _TEAM_SIZE_ACTIONS[role]
             return self._adjust_team_size(team, step)
+        if role in _BOT_TIER_CONTROLS:
+            return self._cycle_bot_tier_mode(
+                -1 if role == 'tier_previous' else 1)
         if not self._host():
             return False
         if role == 'previous':
@@ -999,6 +1040,35 @@ class WaitingRoomUI(object):
             return False
         self._pending_team_sizes.pop(team, None)
         self._message = message or 'The server did not accept that team size.'
+        self.refresh()
+        return True
+
+    def _cycle_bot_tier_mode(self, step):
+        status = self._bot_tier_status() or {}
+        if (not self._host() or not callable(self._request_bot_tier_mode) or
+                not status.get('supported')):
+            return False
+        current = self._pending_bot_tier_mode or status.get('mode', 'random')
+        modes = [value for value, unused_label in BOT_TIER_OPTIONS]
+        try:
+            index = modes.index(current)
+        except ValueError:
+            index = 0
+        target = modes[(index + int(step)) % len(modes)]
+        self._pending_bot_tier_mode = target
+        self._message = 'Setting Bot tier preset...'
+        self.refresh()
+        if self._request_bot_tier_mode(target) is False:
+            self._pending_bot_tier_mode = None
+            self._message = 'The server did not accept that Bot tier preset.'
+            self.refresh()
+            return False
+        return True
+
+    def reject_bot_tier_mode(self, unused_mode=None, message=None):
+        self._pending_bot_tier_mode = None
+        self._message = (message or
+                         'The server did not accept that Bot tier preset.')
         self.refresh()
         return True
 

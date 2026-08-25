@@ -381,7 +381,8 @@ class ServerBattleAuthority(object):
         return self._required_names
 
     def prepare_lineup(self, catalog, roster, public_players,
-                       requester_vehicle):
+                       requester_vehicle, tier_mode='random',
+                       bot_lineup=()):
         """Port of the client's mirrored 0.8.2 lineup law over the catalog."""
         self._assignments = {}
         human_names = sorted(set(
@@ -398,10 +399,11 @@ class ServerBattleAuthority(object):
         if requester_profile is None:
             return False
         tier = int(requester_profile['level'])
+        tier_mode = bot_planner.normalize_bot_tier_mode(tier_mode)
         candidates = [
             profile for profile in profiles.values()
-            if bot_planner.vehicle_in_battle_tier_band(
-                tier, profile['level']) and
+            if bot_planner.vehicle_in_bot_tier_mode(
+                tier, profile['level'], tier_mode) and
             not _vehicle_excluded(profile)]
         if not candidates:
             return False
@@ -420,8 +422,9 @@ class ServerBattleAuthority(object):
             humans_by_team[1].append(requester_profile)
         available_tiers = sorted(set(
             int(candidate['level']) for candidate in candidates))
-        match_tiers = list(bot_planner.choose_match_tiers(
-            tier, random.random(), random.random(), available_tiers))
+        match_tiers = list(bot_planner.bot_match_tiers(
+            tier, tier_mode, random.random(), random.random(),
+            available_tiers))
         for team_profiles in humans_by_team.values():
             for profile in team_profiles:
                 if profile['level'] not in match_tiers:
@@ -453,6 +456,21 @@ class ServerBattleAuthority(object):
             picked.sort(key=_vehicle_class_order)
             for raw, entry in zip(team_bots, picked):
                 assignments[(team, int(raw.get('slot', 0)))] = entry['name']
+        allowed_names = bot_lineup_allowed_names(catalog)
+        for raw in bot_lineup or ():
+            if not isinstance(raw, dict):
+                return False
+            try:
+                team = int(raw.get('team'))
+                slot = int(raw.get('slot'))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            vehicle = raw.get('vehicle')
+            if (team not in (1, 2) or not 0 <= slot < 15 or
+                    vehicle not in allowed_names):
+                return False
+            if (team, slot) in assignments:
+                assignments[(team, slot)] = vehicle
         self._assignments = assignments
         self._required_names = tuple(sorted(
             set(human_names) | set(assignments.values())))
@@ -2156,6 +2174,14 @@ def _vehicle_excluded(profile):
     if 'secret' in tags:
         return True
     return profile.get('name') == 'usa:T23'
+
+
+def bot_lineup_allowed_names(catalog):
+    """Return the exact catalog identity set shared by both authorities."""
+    return set(
+        row.get('name') for row in (catalog or ())
+        if isinstance(row, dict) and row.get('name') and
+        not _vehicle_excluded(row))
 
 
 def _vehicle_class_order(profile):

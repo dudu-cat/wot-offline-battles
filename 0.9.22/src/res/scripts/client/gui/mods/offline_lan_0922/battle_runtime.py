@@ -2371,7 +2371,10 @@ class BattleRuntime(object):
             # Every unique destroyed-model prerequisite is submitted now in
             # this one startup callback; bot presentation staggering is a
             # separate later phase and never throttles this prewarm.
-            self._prepare_bot_vehicle_assignments(descriptor)
+            lineup_ready = self._prepare_bot_vehicle_assignments(descriptor)
+            if self._start_message.get('bot_lineup') and not lineup_ready:
+                raise RuntimeError(
+                    'the exact Bot lineup is not available in this client')
             prewarm_enabled = getattr(
                 self._remote_factory, 'prewarm_wrecks_enabled', None)
             if callable(prewarm_enabled) and prewarm_enabled():
@@ -3647,17 +3650,22 @@ class BattleRuntime(object):
             player_profile = self._vehicle_profile(
                 planning_descriptor.type)
             tier = int(player_profile['level'])
-            candidates = []
+            tier_mode = bot_planner.normalize_bot_tier_mode(
+                self._start_message.get('bot_tier_mode'))
+            all_candidates = []
             for nation in self._runtime.nations.AVAILABLE_NAMES:
                 nation_id = self._runtime.nations.INDICES[nation]
                 values = self._runtime.vehicles.g_list.getList(nation_id)
                 iterator = getattr(values, 'itervalues', None)
                 entries = iterator() if callable(iterator) else values.values()
                 for entry in entries:
-                    if (bot_planner.vehicle_in_battle_tier_band(
-                            tier, _field(entry, 'level')) and
-                            not self._vehicle_excluded(entry)):
-                        candidates.append(self._vehicle_profile(entry))
+                    if not self._vehicle_excluded(entry):
+                        all_candidates.append(self._vehicle_profile(entry))
+            candidates = [
+                candidate for candidate in all_candidates
+                if bot_planner.vehicle_in_bot_tier_mode(
+                    tier, candidate['level'], tier_mode)
+            ]
             if not candidates:
                 return False
             candidates.sort(key=lambda value: (
@@ -3722,9 +3730,9 @@ class BattleRuntime(object):
 
             available_tiers = sorted(set(
                 int(candidate['level']) for candidate in candidates))
-            match_tiers = list(bot_planner.choose_match_tiers(
-                tier, lineup_random.random(), lineup_random.random(),
-                available_tiers))
+            match_tiers = list(bot_planner.bot_match_tiers(
+                tier, tier_mode, lineup_random.random(),
+                lineup_random.random(), available_tiers))
             for profiles in humans_by_team.values():
                 for profile in profiles:
                     if profile['level'] not in match_tiers:
@@ -3759,6 +3767,25 @@ class BattleRuntime(object):
                 for raw, entry in zip(team_bots, picked):
                     assignments[(team, int(raw.get('slot', 0)))] = \
                         entry['name']
+            allowed_names = set(
+                candidate['name'] for candidate in all_candidates)
+            for raw in self._start_message.get('bot_lineup') or ():
+                if not isinstance(raw, dict):
+                    self._bot_vehicle_assignments = {}
+                    return False
+                try:
+                    team = int(raw.get('team'))
+                    slot = int(raw.get('slot'))
+                except (TypeError, ValueError, OverflowError):
+                    self._bot_vehicle_assignments = {}
+                    return False
+                vehicle = raw.get('vehicle')
+                if (team not in (1, 2) or not 0 <= slot < 15 or
+                        vehicle not in allowed_names):
+                    self._bot_vehicle_assignments = {}
+                    return False
+                if (team, slot) in assignments:
+                    assignments[(team, slot)] = vehicle
             self._bot_vehicle_assignments = assignments
             return True
         except Exception:

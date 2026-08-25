@@ -616,6 +616,7 @@ class ServerPayloadTest(unittest.TestCase):
         self.assertEqual(
             str(core.DEFAULT_TEAM_SIZE),
             environment[core.SERVER_TEAM_SIZE_ENV_0922])
+        self.assertEqual("[]", environment[core.SERVER_BOT_LINEUP_ENV_0922])
         self.assertNotIn(core.NAVGRAPH_DIR_ENV, environment)
 
     def test_0_9_22_server_receives_the_selected_team_size(self):
@@ -630,6 +631,16 @@ class ServerPayloadTest(unittest.TestCase):
         self.assertEqual("9", environment[core.SERVER_TEAM_SIZE_ENV_0922])
         self.assertEqual("4", environment[core.SERVER_TEAM1_SIZE_ENV_0922])
         self.assertEqual("9", environment[core.SERVER_TEAM2_SIZE_ENV_0922])
+
+    def test_0_9_22_server_receives_the_selected_bot_lineup(self):
+        environment = core.server_environment(
+            core.PORT_0_9_22, "/game", {}, bot_lineup=[{
+                "team": 1, "slot": 2,
+                "vehicle": "ussr:R11_MS-1",
+            }])
+        self.assertEqual(
+            '[{"team":1,"slot":2,"vehicle":"ussr:R11_MS-1"}]',
+            environment[core.SERVER_BOT_LINEUP_ENV_0922])
 
     def test_single_player_server_is_explicitly_loopback_only(self):
         environment = core.server_environment(

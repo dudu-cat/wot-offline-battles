@@ -218,6 +218,13 @@ class WindowTest(unittest.TestCase):
             self.window.network_start_button.master, self.window.network_panel)
         self.assertIs(
             self.window.vehicle_profile_box.master, self.window.vehicle_panel)
+        self.assertEqual(
+            "Exact lineup",
+            self.window.tools_tabs.tab(
+                self.window.bot_lineup_panel).get("text"))
+        self.assertIs(
+            self.window.bot_lineup_profile_box.master,
+            self.window.bot_lineup_panel)
         self.assertIs(self.window.repair_button.master, self.window.repair_panel)
         self.assertIs(
             self.window.normal_preferences_button.master,
@@ -1252,6 +1259,42 @@ class WindowTest(unittest.TestCase):
                 loopback_only=True))
         popen.assert_not_called()
         self.assertIn("fresh launcher-owned server", self._log_text())
+
+    def test_exact_lineup_refuses_an_external_compatible_server(self):
+        lineup = [{
+            "team": 2, "slot": 0,
+            "vehicle": "germany:G12_Ltraktor",
+        }]
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_COMPATIBLE), \
+                mock.patch("wot_launcher.subprocess.Popen") as popen:
+            self.assertFalse(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22,
+                bot_lineup=lineup))
+        popen.assert_not_called()
+        self.assertIn("exact Bot lineup", self._log_text())
+
+    def test_launcher_owned_server_receives_the_exact_lineup(self):
+        server = _Process()
+        lineup = [{
+            "team": 2, "slot": 0,
+            "vehicle": "germany:G12_Ltraktor",
+        }]
+        with mock.patch("core.listener_status",
+                        return_value=core.LISTENER_FREE), \
+                mock.patch("core.wait_for_server", return_value=True), \
+                mock.patch("core.local_addresses", return_value=[]), \
+                mock.patch("wot_launcher.subprocess.Popen",
+                           return_value=server) as popen:
+            self.assertTrue(self.window._start_server(
+                self.settings_dir, core.PORT_0_9_22,
+                bot_lineup=lineup))
+
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(
+            '[{"team":2,"slot":0,"vehicle":"germany:G12_Ltraktor"}]',
+            environment[core.SERVER_BOT_LINEUP_ENV_0922])
+        self.window._stop_server(force=True)
 
     def test_launcher_owned_server_reuse_requires_game_and_visibility_context(self):
         server = _Process()

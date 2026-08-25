@@ -72,6 +72,54 @@ class ServerTeamSizeTests(unittest.TestCase):
     def test_visible_clients_may_send_team_size_requests(self):
         self.assertIn('set_team_size', MODERN_VISIBLE_MESSAGE_TYPES)
 
+    def test_host_can_select_a_bot_tier_preset(self):
+        self.assertIn('set_bot_tier_mode', MODERN_VISIBLE_MESSAGE_TYPES)
+        state = BattleState()
+        host, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1000), _hello(1))
+        self.assertIsNone(error)
+
+        self.assertEqual((True, None), state.set_bot_tier_mode(
+            host.player_id, 'minus1_plus2'))
+        self.assertEqual('minus1_plus2', state.bot_tier_mode)
+        self.assertEqual(
+            'minus1_plus2', state.lobby_message()['bot_tier_mode'])
+
+    def test_guest_cannot_select_a_bot_tier_preset(self):
+        state = BattleState()
+        unused_host, error = state.add_player(
+            _Connection(), ('10.0.0.1', 1000), _hello(1))
+        self.assertIsNone(error)
+        guest, error = state.add_player(
+            _Connection(), ('10.0.0.2', 1001), _hello(2))
+        self.assertIsNone(error)
+
+        self.assertEqual((False, 'host_only'), state.set_bot_tier_mode(
+            guest.player_id, 'same'))
+        self.assertEqual('random', state.bot_tier_mode)
+
+    def test_exact_lineup_requires_unique_fully_qualified_slots(self):
+        state = BattleState(bot_lineup=[{
+            'team': 2, 'slot': 3,
+            'vehicle': 'germany:G12_Ltraktor',
+        }])
+        self.assertEqual([{
+            'team': 2, 'slot': 3,
+            'vehicle': 'germany:G12_Ltraktor',
+        }], state.bot_lineup)
+
+        with self.assertRaisesRegex(ValueError, 'lineup vehicle'):
+            BattleState(bot_lineup=[{
+                'team': 2, 'slot': 3, 'vehicle': 'G12_Ltraktor',
+            }])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            BattleState(bot_lineup=[
+                {'team': 2, 'slot': 3,
+                 'vehicle': 'germany:G12_Ltraktor'},
+                {'team': 2, 'slot': 3,
+                 'vehicle': 'ussr:R11_MS-1'},
+            ])
+
     def test_default_roster_still_has_fifteen_tanks_per_team(self):
         state = BattleState()
 

@@ -314,6 +314,23 @@ class WaitingRoomTests(unittest.TestCase):
         self.assertEqual([(1, 1), (2, 6), (2, 7)], requested)
         self.assertIn('3/7', room._labels['team2'].properties['text'])
 
+    def test_host_can_cycle_the_bot_tier_preset(self):
+        requested = []
+        tier_state = {'mode': 'random', 'supported': True}
+        room = self.module.WaitingRoomUI(
+            self._request_start, lambda: list(self.pool),
+            status=lambda: self.status, host=lambda: True,
+            surface=self.surface,
+            bot_tier_status=lambda: dict(tier_state),
+            request_bot_tier_mode=lambda mode: requested.append(mode) or True)
+
+        self.assertTrue(room.open())
+        for role in self.module._BOT_TIER_CONTROLS:
+            self.assertTrue(room._controls[role].properties['visible'])
+        self.assertTrue(room.activate('tier_next'))
+        self.assertEqual(['same'], requested)
+        self.assertIn('Same tier', room._labels['tier'].properties['text'])
+
     def test_non_host_sees_capacities_but_not_size_controls(self):
         team_state = {
             'team': 2, 'sizes': {1: 4, 2: 6},

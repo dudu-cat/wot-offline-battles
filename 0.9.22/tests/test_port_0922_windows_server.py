@@ -28,6 +28,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
             '0.0.0.0', 28782, 'server_random', 30,
             authority_mode='client', team_size=15,
             team1_size=15, team2_size=15,
+            bot_lineup=[],
         )
 
     def test_firewall_request_precedes_server_bind(self):
@@ -73,6 +74,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
             '127.0.0.1', 28782, 'server_random', 30,
             authority_mode='client', team_size=15,
             team1_size=15, team2_size=15,
+            bot_lineup=[],
         )
 
     def test_launcher_environment_selects_the_total_tanks_per_team(self):
@@ -103,6 +105,42 @@ class WindowsServerLauncherTests(unittest.TestCase):
 
         self.assertEqual(3, run_server.call_args.kwargs['team1_size'])
         self.assertEqual(8, run_server.call_args.kwargs['team2_size'])
+
+    def test_launcher_environment_forwards_the_exact_bot_lineup(self):
+        run_server = mock.Mock()
+        lineup = [{
+            'team': 2, 'slot': 4, 'vehicle': 'germany:G12_Ltraktor',
+        }]
+        with mock.patch.dict(os.environ, {
+                windows_server.SERVER_BOT_LINEUP_ENV:
+                    '[{"team":2,"slot":4,'
+                    '"vehicle":"germany:G12_Ltraktor"}]',
+        }), mock.patch.object(
+                windows_server, '_load_server',
+                return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server, '_ensure_windows_firewall_rule'):
+            self.assertEqual(0, windows_server.main())
+
+        self.assertEqual(lineup, run_server.call_args.kwargs['bot_lineup'])
+
+    def test_invalid_exact_bot_lineup_json_fails_before_server_bind(self):
+        run_server = mock.Mock()
+        with mock.patch.dict(
+                os.environ,
+                {windows_server.SERVER_BOT_LINEUP_ENV: '{bad json'}), \
+                mock.patch.object(
+                    windows_server, '_load_server',
+                    return_value=('server_random', run_server)), \
+                mock.patch.object(
+                    windows_server,
+                    '_ensure_windows_firewall_rule') as ensure, \
+                mock.patch.object(windows_server, '_pause_after_error'), \
+                mock.patch.object(windows_server.traceback, 'print_exc'):
+            self.assertEqual(1, windows_server.main())
+
+        ensure.assert_not_called()
+        run_server.assert_not_called()
 
     def test_invalid_launcher_team_size_fails_before_server_bind(self):
         run_server = mock.Mock()
