@@ -6995,6 +6995,14 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.9, runtime.bot_equipment_passives(11)[
                 'fireStartingChanceFactor'])
+        descriptor = runtime._descriptors[11]
+        base_repair = self.module.loadout.modifiers(
+            descriptor,
+            factors=self.module.loadout.attribute_factors(descriptor))[
+                'repair_factor']
+        self.assertAlmostEqual(
+            base_repair * 1.10,
+            runtime._bot_repair_factor(11, descriptor))
         projected = self.module.lan_client.project_bot_state(state)
         self.assertEqual(3, len(projected['equipment_states']))
         malformed = dict(state)

@@ -3516,6 +3516,9 @@ class BotRuntime(object):
                 descriptor,
                 factors=loadout.attribute_factors(descriptor))[
                     'repair_factor']
+            passive = self._equipment_passives.get(int(bot_id), {})
+            cached *= 1.0 + max(0.0, _number(
+                passive.get('repairkitBonusValue'), 0.0))
             self._repair_factors[bot_id] = cached
         return cached
 
