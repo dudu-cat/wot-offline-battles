@@ -2044,7 +2044,10 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         pending.appearance.suspension = object()
         motion_lod = types.SimpleNamespace(setupPosition=mock.Mock())
         pending.appearance.lodCalculator = motion_lod
-        swinging = types.SimpleNamespace(worldMatrix=object())
+        native_placing_compensation = object()
+        swinging = types.SimpleNamespace(
+            worldMatrix=object(),
+            placingCompensationMatrix=native_placing_compensation)
         pending.appearance.swingingAnimator = swinging
         runtime.bigworld.enter_pending_vehicle(vehicle_id)
         self.assertTrue(factory.is_ready(vehicle_id))
@@ -2056,6 +2059,13 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(1, len(vehicle.aim_targets))
         self.assertIsNotNone(vehicle.track_scroll)
         self.assertIs(swinging.worldMatrix, vehicle.model.matrix)
+        state = factory._states[vehicle_id]
+        self.assertIs(
+            state._identity_placing_compensation,
+            swinging.placingCompensationMatrix)
+        self.assertIsNot(
+            native_placing_compensation,
+            swinging.placingCompensationMatrix)
         self.assertTrue(callable(detailed_engine.vehicleSpeedLink))
         self.assertTrue(callable(detailed_engine.rotationSpeedLink))
         self.assertEqual(0.0, detailed_engine.vehicleSpeedLink())
@@ -2153,15 +2163,18 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
                     raise RuntimeError('animation rejected rekey')
                 object.__setattr__(self, name, value)
 
-        state = factory._states[vehicle_id]
         rejected = _RejectingAnimation()
         state.animation = rejected
         state.provider = rejected
         vehicle.model.matrix = rejected
         swinging.worldMatrix = rejected
+        swinging.placingCompensationMatrix = native_placing_compensation
         self.assertFalse(state._rekey(0.1))
         self.assertIs(state.matrix, vehicle.model.matrix)
         self.assertIs(state.matrix, swinging.worldMatrix)
+        self.assertIs(
+            state._identity_placing_compensation,
+            swinging.placingCompensationMatrix)
         self.assertEqual(2, data_links.linkMatrixTranslation.call_count)
         data_links.linkMatrixTranslation.assert_called_with(state.matrix)
         self.assertEqual(2, motion_lod.setupPosition.call_count)

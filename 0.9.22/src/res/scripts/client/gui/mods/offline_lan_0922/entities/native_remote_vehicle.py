@@ -70,6 +70,8 @@ class _NativeRemoteState(object):
         self._last_pose_time = None
         self.matrix = math_module.Matrix()
         self._write_matrix(self.matrix)
+        self._identity_placing_compensation = math_module.Matrix()
+        self._identity_placing_compensation.setIdentity()
         self._key_from = math_module.Matrix(self.matrix)
         self._key_to = math_module.Matrix(self.matrix)
         self._render_pose = (
@@ -279,9 +281,13 @@ class _NativeRemoteState(object):
         if swinging is not None:
             try:
                 # CompoundAppearance initially binds this to the entity's
-                # native filter matrix.  Our model is driven by a copied LAN
-                # MatrixAnimation, so acceleration rocking must follow that
-                # same provider or it remains at the spawn pose.
+                # native filter matrices.  Our model is driven by a copied
+                # LAN MatrixAnimation whose root already contains the
+                # authoritative ground pitch and roll.  Keep acceleration
+                # rocking on that provider, but replace the stale native
+                # placing compensation so ground placement is applied once.
+                swinging.placingCompensationMatrix = \
+                    self._identity_placing_compensation
                 swinging.worldMatrix = self.provider
                 self._record_capability('body_swinging', True)
             except Exception as error:
