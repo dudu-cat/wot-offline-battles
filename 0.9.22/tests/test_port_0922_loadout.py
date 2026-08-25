@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -386,6 +387,16 @@ class MountedArtefactTests(unittest.TestCase):
     def test_an_empty_slot_still_resolves_to_nothing(self):
         self.assertIsNone(loadout._artefact(0, None))
         self.assertIsNone(loadout._artefact(None, None))
+
+    def test_an_intcd_only_gui_item_resolves_through_the_client_cache(self):
+        descriptor = types.SimpleNamespace(name='smallRepairkit')
+        vehicles = types.SimpleNamespace(
+            getItemByCompactDescr=mock.Mock(return_value=descriptor))
+
+        self.assertIs(
+            descriptor,
+            loadout._artefact(types.SimpleNamespace(intCD=441), vehicles))
+        vehicles.getItemByCompactDescr.assert_called_once_with(441)
 
 
 if __name__ == '__main__':

@@ -73,11 +73,13 @@ class EffectiveParamsContractTests(unittest.TestCase):
             crewRoles=(('commander',),))
         crew = [types.SimpleNamespace(skills=[types.SimpleNamespace(
             name='gunner_sniper', isActive=True, level=100.0)])]
+        equipment_descriptor = types.SimpleNamespace(
+            name='ration', id=(0, 9), compactDescr=1009,
+            reuseCount=-1, cooldownSeconds=0.0,
+            crewLevelIncrease=10.0)
         consumables = types.SimpleNamespace(
-            getInstalledItems=lambda: (types.SimpleNamespace(
-                name='ration', id=(0, 9), compactDescr=1009,
-                reuseCount=-1, cooldownSeconds=0.0,
-                crewLevelIncrease=10.0),))
+            getInstalledItems=lambda: (
+                types.SimpleNamespace(intCD=1009),))
         item = types.SimpleNamespace(
             descriptor=descriptor,
             crew=crew,
@@ -89,7 +91,13 @@ class EffectiveParamsContractTests(unittest.TestCase):
         current_vehicle.g_currentVehicle = types.SimpleNamespace(item=item)
         factors = {'exact': True}
 
-        with mock.patch.dict(sys.modules, {'CurrentVehicle': current_vehicle}), \
+        items_module = types.ModuleType('items')
+        items_module.vehicles = types.SimpleNamespace(
+            getItemByCompactDescr=mock.Mock(
+                return_value=equipment_descriptor))
+
+        with mock.patch.dict(sys.modules, {
+                'CurrentVehicle': current_vehicle, 'items': items_module}), \
                 mock.patch(
                     'gui.mods.offline_lan_0922.loadout.attribute_factors',
                     return_value=factors) as attribute_factors, \

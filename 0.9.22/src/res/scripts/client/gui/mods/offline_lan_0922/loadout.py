@@ -113,6 +113,12 @@ def _artefact(value, vehicles_module):
     descriptor = getattr(value, 'descriptor', None)
     if hasattr(descriptor, 'updateVehicleAttrFactors'):
         return descriptor
+    compact_descr = getattr(value, 'intCD', None)
+    if compact_descr and vehicles_module is not None:
+        try:
+            return vehicles_module.getItemByCompactDescr(int(compact_descr))
+        except Exception:
+            return None
     return None
 
 

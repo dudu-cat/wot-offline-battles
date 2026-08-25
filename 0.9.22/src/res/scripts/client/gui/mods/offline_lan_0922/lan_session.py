@@ -181,6 +181,7 @@ def _selected_vehicle_effective_params():
     from gui.mods.offline_lan_0922 import tank_collision
     from gui.mods.offline_lan_0922 import player_critical_mechanics
     from gui.mods.offline_lan_0922 import vehicle_physics
+    from items import vehicles
 
     item = g_currentVehicle.item
     if item is None:
@@ -189,8 +190,16 @@ def _selected_vehicle_effective_params():
     crew = tuple(getattr(item, 'crew', None) or ())
     consumables = getattr(
         getattr(item, 'equipment', None), 'regularConsumables', None)
-    equipments = (() if consumables is None else
-                  tuple(consumables.getInstalledItems()))
+    mounted_equipments = (() if consumables is None else
+                          tuple(consumables.getInstalledItems()))
+    equipments = []
+    for mounted in mounted_equipments:
+        equipment = loadout._artefact(mounted, vehicles)
+        if equipment is None:
+            raise ValueError(
+                'a mounted garage equipment descriptor is unavailable')
+        equipments.append(equipment)
+    equipments = tuple(equipments)
     # A Removed RPM Limiter is trigger-only.  Supplying it to the passive
     # attribute-factor chain would claim it is permanently enabled.
     factor_equipments = tuple(
@@ -256,6 +265,14 @@ def _selected_vehicle_effective_params():
                 shot, deadeye=deadeye),
         })
 
+    equipment_contracts = [
+        equipment_mechanics.project_equipment(equipment)
+        for equipment in equipments]
+    critical_profile = player_critical_mechanics.project_profile(descriptor)
+    if effective_params._canonical_equipment(equipment_contracts) is None:
+        raise ValueError('the selected vehicle equipment projection is invalid')
+    if effective_params._canonical_critical(critical_profile) is None:
+        raise ValueError('the selected vehicle critical profile is invalid')
     result = effective_params.canonical({
         'version': effective_params.SCHEMA_VERSION,
         'loadout': loadout_values,
@@ -277,10 +294,8 @@ def _selected_vehicle_effective_params():
             'clip_size': clip_size,
             'shots': shots,
         },
-        'equipment': [
-            equipment_mechanics.project_equipment(equipment)
-            for equipment in equipments],
-        'critical': player_critical_mechanics.project_profile(descriptor),
+        'equipment': equipment_contracts,
+        'critical': critical_profile,
     })
     if result is None:
         raise ValueError('the selected vehicle effective parameters are invalid')
@@ -442,7 +457,10 @@ class LANSession(object):
         if self._effective_params_provider is not None:
             try:
                 client.effective_params = self._effective_params_provider()
-            except Exception:
+            except Exception as error:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] selected vehicle projection '
+                    'failed: %s\n' % error)
                 raise _VehicleSelectionError()
         return client
 
