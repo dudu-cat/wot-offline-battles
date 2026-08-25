@@ -276,10 +276,25 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
 
 def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 	import AreaDestructibles
+	from gui.mods.offline_lan_0922 import destructibles_compat
 	# Native getDestructibleDesc (called by the game's __launchFallEffect)
 	# demands a plain int destrID; a float/long index reaching it raised
 	# 'argument 1 must be set to an int'. Coerce here.
 	chunkID = int(chunkID); itemIndex = int(itemIndex)
+	# The pinned scalar ``wg_getDestructibleFilename`` wrapper dereferences a
+	# nullable native string before Python can handle it.  For a currently loaded
+	# chunk, prove this is a named SpeedTree and cache its descriptor before the
+	# stock animation path.  Unloaded chunks retain the stock queued-order
+	# behavior; the installed safe resolver performs the same check on load.
+	mgr = AreaDestructibles.g_destructiblesManager
+	if mgr.isChunkLoaded(chunkID):
+		desc = destructibles_compat.resolve_destructible_desc(
+			AreaDestructibles.g_cache, spaceID, chunkID, itemIndex)
+		if (desc is None or
+				desc.get('type') != AreaDestructibles.DESTR_TYPE_TREE):
+			raise RuntimeError(
+				'#1513 tree descriptor is unavailable: chunk=%s item=%s' %
+				(chunkID, itemIndex))
 	pitch = math.pi / 2.0
 	pc = BigWorld.wg_getDestructibleFallPitchConstr(
 		spaceID, chunkID, itemIndex, fallYaw)

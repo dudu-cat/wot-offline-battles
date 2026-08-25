@@ -598,6 +598,10 @@ EXPECTED_ABI = {
     'scripts/client/AreaDestructibles.pyc': {
         'init': (),
         'clear': (),
+        '_printErrDescNotAvailable': (
+            'spaceID', 'chunkID', 'destrIndex'),
+        'ClientDestructiblesCache.getDestructibleDesc': (
+            'self', 'spaceID', 'chunkID', 'destrIndex'),
         'AreaDestructibles.set_fallenTrees': ('self', 'prev'),
         'AreaDestructibles.set_fallenColumns': ('self', 'prev'),
         'AreaDestructibles.set_destroyedFragiles': ('self', 'prev'),
@@ -618,9 +622,15 @@ EXPECTED_ABI = {
             'self', 'chunkID', 'destrIndex', 'dmgType', 'fallDirYaw',
             'pitchConstr', 'fallSpeed', 'isAnimate',
             'obstacleCollisionFlags'),
+        'DestructiblesManager.__launchTreeFallEffect': (
+            'self', 'chunkID', 'destrIndex', 'effectName', 'fallDirYaw'),
         'DestructiblesManager.__getDestrInitialMatrix': (
             'self', 'chunkID', 'destrIndex'),
         '_DestructiblesAnimator.showFall': (
+            'self', 'spaceID', 'chunkID', 'destrIndex', 'fallDirYaw',
+            'pitchConstr', 'discreteInitSpeed', 'isNeedAnimation',
+            'initialMatrix', 'touchdownCallback'),
+        '_DestructiblesAnimator.showFallTree': (
             'self', 'spaceID', 'chunkID', 'destrIndex', 'fallDirYaw',
             'pitchConstr', 'discreteInitSpeed', 'isNeedAnimation',
             'initialMatrix', 'touchdownCallback'),
@@ -1445,6 +1455,11 @@ EXPECTED_CODE_NAMES = {
         '_ExtinguisherItem.getActivationCode': ('id',),
     },
     'scripts/client/AreaDestructibles.pyc': {
+        '_printErrDescNotAvailable': (
+            'BigWorld', 'wg_getDestructibleFilename'),
+        'ClientDestructiblesCache.getDestructibleDesc': (
+            'BigWorld', 'wg_getDestructibleFilename',
+            'getDescByFilename'),
         'DestructiblesManager.onChunkLoad': (
             '_DestructiblesManager__loadedChunkIDs',),
         '_DestructiblesAnimator.showFall': (
@@ -1462,11 +1477,17 @@ EXPECTED_CODE_NAMES = {
             'decodeFragile', 'decodeDestructibleModule'),
         'DestructiblesManager.__destroyDestructible': (
             'wg_getDestructibleFallPitchConstr',),
+        'DestructiblesManager.__launchTreeFallEffect': (
+            'g_cache', 'getDestructibleDesc',
+            '_printErrDescNotAvailable'),
         'DestructiblesManager.__getDestrInitialMatrix': (
             '_DestructiblesManager__destrInitialMatrices',
             'wg_getDestructibleMatrix', 'setdefault'),
         '_DestructiblesAnimator.showFall': (
             '_DestructiblesAnimator__bodies', 'append'),
+        '_DestructiblesAnimator.showFallTree': (
+            'g_cache', 'getDestructibleDesc',
+            '_printErrDescNotAvailable'),
         '_DestructiblesAnimator.__positionBodyModel': (
             'BigWorld', 'wg_setDestructibleMatrix'),
     },

@@ -153,13 +153,17 @@ def _authority_environment(manager):
     area._DAMAGE_TYPE_COLUMN = 2
     area._DAMAGE_TYPE_FRAGILE = 3
     area._DAMAGE_TYPE_MODULE = 4
+    area.DESTR_TYPE_TREE = 1
+    area.g_cache = types.SimpleNamespace(
+        getDescByFilename=lambda filename: (
+            {'type': 1, 'health': 10} if filename == 'tree' else None))
     area.encodeFragile = lambda item, shot: (int(item) << 8) | int(bool(shot))
     area.encodeFallenTree = lambda *args: ('tree',) + args
     area.encodeFallenColumn = lambda *args: ('column',) + args
     area.encodeDestructibleModule = lambda *args: ('module',) + args
     bigworld = types.SimpleNamespace(
         createEntity=lambda *unused: 900,
-        wg_getChunkDestrFilenames=lambda *unused: (),
+        wg_getChunkDestrFilenames=lambda *unused: ('tree',) * 256,
         wg_getDestructibleFallPitchConstr=lambda *unused: (None, 0))
     math_module = types.SimpleNamespace(Vector3=_Vector)
     destructibles_authority.BigWorld = bigworld
@@ -172,6 +176,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
     def setUp(self):
         destructibles_sensor.set_diagnostics(False)
+        destructibles_compat.reset_safe_descriptor_cache()
 
     def tearDown(self):
         destructibles_sensor.set_event_sink(None)
@@ -193,6 +198,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                      'g_offh_destr_runtime_space'):
             destructibles_sensor.__dict__.pop(name, None)
         destructibles_authority.reset()
+        destructibles_compat.reset_safe_descriptor_cache()
 
     def test_restores_only_names_moved_by_1513(self):
         area = types.ModuleType('AreaDestructibles')
@@ -251,6 +257,79 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_compat.install()
 
         self.assertIs(original, area.encodeFallenTree)
+
+    def test_tree_descriptor_uses_nullable_chunk_list_not_scalar_wrapper(self):
+        direct = mock.Mock(
+            side_effect=AssertionError('unsafe scalar wrapper was called'))
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getDestructibleFilename = direct
+        bigworld.wg_getChunkDestrFilenames = mock.Mock(
+            return_value=('tree-a',))
+        logs = []
+
+        class _Cache(object):
+            def getDescByFilename(self, filename):
+                if filename == 'tree-a':
+                    return {'type': 1, 'health': 10}
+                return None
+
+        area = types.ModuleType('AreaDestructibles')
+        area.ClientDestructiblesCache = _Cache
+        area._printErrDescNotAvailable = lambda *unused: None
+        area.LOG_ERROR = logs.append
+        instance = _Cache()
+        cache = types.ModuleType('DestructiblesCache')
+        cache.chunkIDFromPosition = object()
+        cache.encodeFallenTree = object()
+        cache.encodeFallenColumn = object()
+        cache.encodeFragile = object()
+        cache.encodeDestructibleModule = object()
+        cache.DESTR_TYPE_TREE = 1
+        cache.DESTR_TYPE_FALLING_ATOM = 2
+        cache.DESTR_TYPE_FRAGILE = 3
+        cache.DESTR_TYPE_STRUCTURE = 4
+
+        destructibles_compat._INSTALLED = False
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'DestructiblesCache': cache,
+                              'BigWorld': bigworld}):
+            destructibles_compat.install()
+            self.assertEqual(
+                10, instance.getDestructibleDesc(1, 22, 0)['health'])
+            # The descriptor survives a later chunk unload for the animator's
+            # delayed touchdown callback.
+            bigworld.wg_getChunkDestrFilenames.return_value = None
+            self.assertEqual(
+                10, instance.getDestructibleDesc(1, 22, 0)['health'])
+            area._printErrDescNotAvailable(1, 22, 9)
+
+        direct.assert_not_called()
+        self.assertEqual(1, bigworld.wg_getChunkDestrFilenames.call_count)
+        self.assertIn('chunk: 22, id: 9', logs[0])
+
+    def test_missing_tree_descriptor_fails_before_native_destroy(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = _authority_environment(manager)
+        destructibles_authority.BigWorld.wg_getChunkDestrFilenames = (
+            lambda *unused: ())
+        fall_pitch = mock.Mock(
+            side_effect=AssertionError('native fall query was called'))
+        destructibles_authority.BigWorld.wg_getDestructibleFallPitchConstr = (
+            fall_pitch)
+
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': destructibles_authority.BigWorld}):
+            with self.assertRaisesRegex(
+                    RuntimeError, 'tree descriptor is unavailable'):
+                destructibles_authority.destroy_tree(
+                    1, 22, 0, 0.0, 6.0, (10.0, 2.0, 20.0))
+
+        fall_pitch.assert_not_called()
+        self.assertEqual([], manager.attempts)
 
     def test_sensor_publishes_normalized_client_report(self):
         events = []
