@@ -257,6 +257,29 @@ def _player_effective_params(raw):
     return snapshot
 
 
+def _player_dynamic_spotting(snapshot, state):
+    """Select the client's exact native row for this crew/fire state."""
+    crew = snapshot.get('crew') or {}
+    dynamic = crew.get('dynamic_spotting') or {}
+    roster = tuple(str(name) for name in (dynamic.get('crew') or ()))
+    states = dynamic.get('states') or {}
+    critical = state.get('critical')
+    critical = critical if isinstance(critical, dict) else {}
+    knocked_out = set(str(name) for name in
+                      (critical.get('crew_ko') or ()))
+    if knocked_out.difference(roster):
+        raise ValueError('player critical crew is outside its projection')
+    mask = 0
+    for index, name in enumerate(roster):
+        if name in knocked_out:
+            mask |= 1 << index
+    key = '%d:%d' % (mask, int(bool(critical.get('fire', False))))
+    row = states.get(key)
+    if not isinstance(row, dict):
+        raise ValueError('player dynamic spotting state is unavailable')
+    return key, row
+
+
 def _forward_speed(descriptor):
     physics = _value(descriptor, 'physics', {}) or {}
     limits = _value(physics, 'speedLimits', (14.0, 7.0))
@@ -3292,7 +3315,13 @@ class BotRuntime(object):
     def _spotting_profile(self, target):
         kind = target.get('kind')
         target_id = target.get('network_id', target.get('id', 0))
-        key = (kind, int(target_id))
+        dynamic_key = None
+        if kind != 'bot':
+            snapshot = _player_effective_params(target)
+            dynamic_key, unused_row = _player_dynamic_spotting(
+                snapshot, target)
+        key = ((kind, int(target_id)) if kind == 'bot' else
+               (kind, int(target_id), dynamic_key))
         cached = self._spotting_profiles.get(key)
         if cached is not None:
             return cached
@@ -3303,7 +3332,19 @@ class BotRuntime(object):
                       _shot_invisibility_factor(descriptor), profile)
         else:
             vehicle_profile = self._player_vehicle_profile(target)
-            cached = vehicle_profile['spotting']
+            snapshot = _player_effective_params(target)
+            unused_key, dynamic = _player_dynamic_spotting(
+                snapshot, target)
+            profile = dict(snapshot['spotting'])
+            profile['vision_factor'] *= _number(dynamic.get('vision'), 1.0)
+            profile['camouflage_factor'] *= _number(
+                dynamic.get('camouflage'), 1.0)
+            profile['invisibility_moving'] = tuple(
+                dynamic['invisibility_moving'])
+            profile['invisibility_still'] = tuple(
+                dynamic['invisibility_still'])
+            cached = ((dynamic['base_moving'], dynamic['base_still']),
+                      snapshot['camouflage']['shot_factor'], profile)
         self._spotting_profiles[key] = cached
         return cached
 
@@ -3333,6 +3374,12 @@ class BotRuntime(object):
             descriptor = self._player_vehicle_profile(source)['descriptor']
             turret = _value(descriptor, 'turret', {}) or {}
             misc = _value(descriptor, 'miscAttrs', {}) or {}
+            unused_key, dynamic = _player_dynamic_spotting(snapshot, source)
+            devices, destroyed, unused_crew, yellow = _critical_parts(source)
+            module_factor = device_damage.module_stat_factor(
+                devices, destroyed, descriptor, 'vision', yellow)
+            damage_factor = device_damage.clamp_vision_factor(
+                _number(dynamic.get('vision'), 1.0) * module_factor)
             since = self._source_still.get(('human', player_id))
             binocular_active = bool(
                 profile['has_binoculars'] and since is not None and
@@ -3340,8 +3387,9 @@ class BotRuntime(object):
                     _number(now) - since, profile['binocular_delay']))
             return spotting.effective_view_range(
                 _value(turret, 'circularVisionRadius', 330.0),
-                misc_factor=_value(
-                    misc, 'circularVisionRadiusFactor', 1.0),
+                misc_factor=(
+                    _value(misc, 'circularVisionRadiusFactor', 1.0) *
+                    damage_factor),
                 crew_factor=profile['vision_factor'],
                 binocular_factor=profile['binocular_factor'],
                 binocular_active=binocular_active)
@@ -3351,15 +3399,21 @@ class BotRuntime(object):
         bot_id = int(source.get('id', 0))
         cached = self._vision_ranges.get(bot_id)
         if cached is None:
-            return _number(source.get('view_range'), 330.0)
-        moving, still, delay = cached
-        if delay is None:
-            return moving
-        since = self._source_still.get(bot_id)
-        if since is None:
-            return moving
-        return still if loadout.still_device_active(
-            _number(now) - since, delay) else moving
+            value = _number(source.get('view_range'), 330.0)
+        else:
+            moving, still, delay = cached
+            since = self._source_still.get(bot_id)
+            if (delay is not None and since is not None and
+                    loadout.still_device_active(
+                        _number(now) - since, delay)):
+                value = still
+            else:
+                value = moving
+        descriptor = getattr(self, '_descriptors', {}).get(bot_id)
+        if descriptor is None:
+            return value
+        return value * device_damage.clamp_vision_factor(
+            _critical_factor(source, descriptor, 'vision'))
 
     def _note_source_stillness(self, state, now):
         """Stamp when this bot stopped, so its own stereoscope can arm.

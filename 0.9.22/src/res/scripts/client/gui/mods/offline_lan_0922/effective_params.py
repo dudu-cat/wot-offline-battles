@@ -61,6 +61,15 @@ _RAMMING_KEYS = frozenset(('spall_coefficient', 'ramming_bonus'))
 _CAMOUFLAGE_KEYS = frozenset(
     ('camouflage_id', 'base_moving', 'base_still', 'shot_factor'))
 _SKILL_KEYS = frozenset(('deadeye', 'intuition_chances'))
+_CREW_KEYS = frozenset(('members', 'dynamic_spotting'))
+_CREW_MEMBER_KEYS = frozenset(('instance', 'roles', 'skills'))
+_CREW_SKILL_KEYS = frozenset(('name', 'active', 'level'))
+_DYNAMIC_SPOTTING_KEYS = frozenset(('crew', 'states'))
+_DYNAMIC_SPOTTING_ROW_KEYS = frozenset((
+    'vision', 'signal', 'camouflage', 'base_moving', 'base_still',
+    'invisibility_moving', 'invisibility_still'))
+_PROJECTED_SPOTTING_PERKS = frozenset((
+    'gunner_rancorous', 'radioman_lasteffort'))
 _GUN_KEYS = frozenset(('clip_size', 'shots'))
 _GUN_SHOT_KEYS = frozenset(('compact_descr', 'source_shot'))
 _SOURCE_SHOT_KEYS = frozenset((
@@ -72,7 +81,7 @@ _PROJECTILE_SHELL_KINDS = frozenset((
     'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
 _TOP_LEVEL_KEYS = frozenset((
     'version', 'loadout', 'physics', 'spotting', 'ramming', 'ammo',
-    'camouflage', 'skills', 'gun'))
+    'camouflage', 'skills', 'crew', 'gun'))
 _TOP_LEVEL_KEYS_WITH_EQUIPMENT = frozenset(
     tuple(_TOP_LEVEL_KEYS) + ('equipment',))
 _TOP_LEVEL_KEYS_WITH_CRITICAL = frozenset(
@@ -426,6 +435,100 @@ def _canonical_critical(value):
     return canonical
 
 
+def _canonical_crew(value):
+    """Validate the owner's physical crew and exact native spotting states."""
+    if not _mapping(value, _CREW_KEYS):
+        return None
+    raw_members = value.get('members')
+    if (not isinstance(raw_members, (list, tuple)) or
+            not 1 <= len(raw_members) <= 6):
+        return None
+    members = []
+    instances = []
+    allowed_roles = frozenset(
+        ('commander', 'driver', 'gunner', 'loader', 'radioman'))
+    for raw in raw_members:
+        if not _mapping(raw, _CREW_MEMBER_KEYS):
+            return None
+        instance = raw.get('instance')
+        roles = raw.get('roles')
+        skills = raw.get('skills')
+        if (not isinstance(instance, string_types) or
+                instance not in _CRITICAL_TARGET_NAMES or
+                instance in _CRITICAL_DEVICE_NAMES or
+                instance in instances or
+                not isinstance(roles, (list, tuple)) or
+                not 1 <= len(roles) <= len(allowed_roles) or
+                not isinstance(skills, (list, tuple)) or len(skills) > 2):
+            return None
+        canonical_roles = []
+        for role in roles:
+            if (not isinstance(role, string_types) or
+                    role not in allowed_roles or role in canonical_roles):
+                return None
+            canonical_roles.append(str(role))
+        canonical_skills = []
+        skill_names = set()
+        for skill in skills:
+            if not _mapping(skill, _CREW_SKILL_KEYS):
+                return None
+            name = skill.get('name')
+            active = _bool(skill.get('active'))
+            level = _number(skill.get('level'), 0.0, 100.0)
+            if (not isinstance(name, string_types) or
+                    name not in _PROJECTED_SPOTTING_PERKS or
+                    name in skill_names or active is None or level is None):
+                return None
+            skill_names.add(name)
+            canonical_skills.append({
+                'name': str(name), 'active': active, 'level': level})
+        canonical_skills.sort(key=lambda entry: entry['name'])
+        instances.append(str(instance))
+        members.append({
+            'instance': str(instance), 'roles': canonical_roles,
+            'skills': canonical_skills})
+
+    dynamic = value.get('dynamic_spotting')
+    if not _mapping(dynamic, _DYNAMIC_SPOTTING_KEYS):
+        return None
+    raw_roster = dynamic.get('crew')
+    raw_states = dynamic.get('states')
+    if (not isinstance(raw_roster, (list, tuple)) or
+            list(raw_roster) != instances or not isinstance(raw_states, dict)):
+        return None
+    expected = set('%d:%d' % (mask, fire)
+                   for mask in range(1 << len(instances))
+                   for fire in (0, 1))
+    if set(raw_states) != expected:
+        return None
+    states = {}
+    for key in sorted(expected):
+        row = raw_states.get(key)
+        if not _mapping(row, _DYNAMIC_SPOTTING_ROW_KEYS):
+            return None
+        canonical_row = {}
+        for name in ('vision', 'signal', 'camouflage'):
+            value = _number(row.get(name), 0.0, 10.0)
+            if value is None:
+                return None
+            canonical_row[name] = value
+        for name in ('base_moving', 'base_still'):
+            value = _number(row.get(name), 0.0, 100.0)
+            if value is None:
+                return None
+            canonical_row[name] = value
+        for name in ('invisibility_moving', 'invisibility_still'):
+            pair = _tuple(row.get(name), 2, -100.0, 100.0)
+            if pair is None or pair[1] < 0.0:
+                return None
+            canonical_row[name] = pair
+        states[key] = canonical_row
+    return {
+        'members': members,
+        'dynamic_spotting': {'crew': list(instances), 'states': states},
+    }
+
+
 def canonical(value):
     """Return a detached canonical snapshot, or ``None`` when invalid."""
     if (not isinstance(value, dict) or
@@ -442,15 +545,21 @@ def canonical(value):
     ammo = _canonical_ammo(value.get('ammo'))
     camouflage = _canonical_camouflage(value.get('camouflage'))
     skills = _canonical_skills(value.get('skills'))
+    crew = _canonical_crew(value.get('crew'))
     gun = _canonical_gun(value.get('gun'))
     equipment = _canonical_equipment(value.get('equipment', ()))
     critical = (_canonical_critical(value.get('critical'))
                 if 'critical' in value else None)
     if any(entry is None for entry in (
             loadout, physics, spotting, ramming, ammo, camouflage, skills,
+            crew,
             gun, equipment)):
         return None
     if 'critical' in value and critical is None:
+        return None
+    if (critical is not None and critical.get('crew_roster') is not None and
+            critical.get('crew_roster') !=
+            crew['dynamic_spotting']['crew']):
         return None
     if any(shot['source_shot']['deadeye'] != skills['deadeye']
            for shot in gun['shots']):
@@ -464,6 +573,7 @@ def canonical(value):
         'ammo': ammo,
         'camouflage': camouflage,
         'skills': skills,
+        'crew': crew,
         'gun': gun,
         'equipment': equipment,
     }

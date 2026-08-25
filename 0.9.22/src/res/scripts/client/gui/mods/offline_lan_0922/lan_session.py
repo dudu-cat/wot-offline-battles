@@ -3,6 +3,7 @@ from __future__ import print_function
 """Coordinator between LAN protocol, stock map picker and battle runtime."""
 
 import base64
+import math
 import sys
 import time
 
@@ -166,6 +167,35 @@ def _crew_has_finished_skill(crew, wanted):
     return False
 
 
+def _ordered_crew_members(crew):
+    members = list(crew or ())
+    if members and all(isinstance(member, tuple) and len(member) == 2
+                       for member in members):
+        members = [member[1] for member in
+                   sorted(members, key=lambda entry: entry[0])]
+    return tuple(members)
+
+
+def _project_spotting_skill(skill):
+    name = str(_field(skill, 'name', '') or '').lower()
+    if name not in ('gunner_rancorous', 'radioman_lasteffort'):
+        return None
+    active = _field(skill, 'isActive', True)
+    if callable(active):
+        active = active()
+    try:
+        level = float(_field(
+            skill, 'level', _field(skill, 'progress', 100.0)))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('a mounted crew skill level is invalid')
+    if math.isnan(level) or math.isinf(level):
+        raise ValueError('a mounted crew skill level is invalid')
+    return {
+        'name': name, 'active': bool(active),
+        'level': max(0.0, min(100.0, level)),
+    }
+
+
 def _selected_vehicle_effective_params():
     """Build the immutable effective-parameter snapshot from #1513 garage.
 
@@ -269,6 +299,81 @@ def _selected_vehicle_effective_params():
         equipment_mechanics.project_equipment(equipment)
         for equipment in equipments]
     critical_profile = player_critical_mechanics.project_profile(descriptor)
+    members = _ordered_crew_members(crew)
+    roles = tuple(getattr(
+        getattr(descriptor, 'type', None), 'crewRoles', ()) or ())
+    roster = tuple(critical_profile.get('crew_roster') or ())
+    if (len(members) != len(roles) or len(roster) != len(roles) or
+            not members or len(members) > 6 or
+            any(member is None for member in members)):
+        raise ValueError('the selected vehicle physical crew is incomplete')
+    projected_members = []
+    for index, member in enumerate(members):
+        member_roles = roles[index]
+        if not isinstance(member_roles, (list, tuple)) or not member_roles:
+            raise ValueError('the selected vehicle crew roles are invalid')
+        raw_skills = _field(member, 'skills', None)
+        if raw_skills is None:
+            raw_skills = _field(_field(member, 'descriptor', {}), 'skills', ())
+        projected_skills = []
+        for skill in raw_skills or ():
+            projected = _project_spotting_skill(skill)
+            if projected is not None:
+                projected_skills.append(projected)
+        projected_skills.sort(key=lambda entry: entry['name'])
+        projected_members.append({
+            'instance': roster[index],
+            'roles': [str(role) for role in member_roles],
+            'skills': projected_skills,
+        })
+
+    dynamic_states = {}
+    for mask in range(1 << len(roster)):
+        activity = [not bool(mask & (1 << index))
+                    for index in range(len(roster))]
+        for fire in (False, True):
+            dynamic = loadout.attribute_factors(
+                descriptor, crew or None, factor_equipments,
+                activity_flags=activity, is_fire=fire)
+            if dynamic is None:
+                raise ValueError(
+                    'the exact dynamic crew factors are unavailable')
+            ratios = loadout.dynamic_spotting_ratios(factors, dynamic)
+            dynamic_profile = loadout.spotting_profile(
+                descriptor, crew or None,
+                level_increase=loadout.crew_level_increase(
+                    descriptor, equipments, crew_skills),
+                factors=dynamic)
+            dynamic_base = calculator(
+                dynamic_profile['camouflage_factor'], camouflage_id)
+            if (not isinstance(dynamic_base, (list, tuple)) or
+                    len(dynamic_base) < 2):
+                raise ValueError(
+                    'the exact dynamic camouflage values are invalid')
+            row = {
+                'vision': float(ratios['vision']),
+                'signal': float(ratios['signal']),
+                'camouflage': float(ratios['camouflage']),
+                'base_moving': float(dynamic_base[0]),
+                'base_still': float(dynamic_base[1]),
+                'invisibility_moving': list(
+                    loadout.invisibility_pair(dynamic, False)),
+                'invisibility_still': list(
+                    loadout.invisibility_pair(dynamic, True)),
+            }
+            if any(math.isnan(float(value)) or math.isinf(float(value))
+                   for value in (
+                       row['vision'], row['signal'], row['camouflage'],
+                       row['base_moving'], row['base_still'])):
+                raise ValueError('a dynamic crew factor is not finite')
+            dynamic_states['%d:%d' % (mask, int(fire))] = row
+    crew_projection = {
+        'members': projected_members,
+        'dynamic_spotting': {
+            'crew': list(roster),
+            'states': dynamic_states,
+        },
+    }
     if effective_params._canonical_equipment(equipment_contracts) is None:
         raise ValueError('the selected vehicle equipment projection is invalid')
     if effective_params._canonical_critical(critical_profile) is None:
@@ -290,6 +395,7 @@ def _selected_vehicle_effective_params():
             'deadeye': deadeye,
             'intuition_chances': loadout.intuition_chances(crew),
         },
+        'crew': crew_projection,
         'gun': {
             'clip_size': clip_size,
             'shots': shots,

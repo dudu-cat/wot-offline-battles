@@ -15,6 +15,7 @@ sys.path.insert(0, str(SERVER_ROOT))
 from effective_params_fixture import effective_params
 from gui.mods.offline_lan_0922 import effective_params as contract
 from gui.mods.offline_lan_0922 import lan_session
+from gui.mods.offline_lan_0922 import loadout
 from gui.mods.offline_lan_0922.lan_client import (
     CLIENT_CAPABILITIES, EFFECTIVE_PARAMS_CAPABILITY, LANClient)
 from lan_battle_server import (
@@ -52,6 +53,22 @@ def _hello(params=None):
 
 
 class EffectiveParamsContractTests(unittest.TestCase):
+    def test_dynamic_spotting_ratios_use_native_factor_pairs(self):
+        healthy = {
+            'circularVisionRadius': 1.2,
+            'radio/distance': 0.8,
+            'camouflage': 0.6,
+        }
+        injured = {
+            'circularVisionRadius': 0.9,
+            'radio/distance': 0.4,
+            'camouflage': 0.3,
+        }
+
+        self.assertEqual(
+            {'vision': 0.75, 'signal': 0.5, 'camouflage': 0.5},
+            loadout.dynamic_spotting_ratios(healthy, injured))
+
     def test_garage_builder_uses_exact_client_final_value_providers(self):
         expected = effective_params()
         descriptor = types.SimpleNamespace()
@@ -104,6 +121,15 @@ class EffectiveParamsContractTests(unittest.TestCase):
                     'gui.mods.offline_lan_0922.loadout.attribute_factors',
                     return_value=factors) as attribute_factors, \
                 mock.patch(
+                    'gui.mods.offline_lan_0922.loadout.'
+                    'dynamic_spotting_ratios',
+                    return_value={
+                        'vision': 1.0, 'signal': 1.0,
+                        'camouflage': 1.0}), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.loadout.invisibility_pair',
+                    return_value=(0.0, 1.0)), \
+                mock.patch(
                     'gui.mods.offline_lan_0922.loadout.crew_skill_names',
                     return_value=(('gunner_sniper',),)), \
                 mock.patch(
@@ -130,10 +156,21 @@ class EffectiveParamsContractTests(unittest.TestCase):
                     return_value=expected['ramming']):
             result = lan_session._selected_vehicle_effective_params()
 
-        attribute_factors.assert_called_once()
-        self.assertIs(attribute_factors.call_args.args[0], descriptor)
+        self.assertEqual(5, attribute_factors.call_count)
+        self.assertTrue(all(
+            call.args[0] is descriptor
+            for call in attribute_factors.call_args_list))
+        dynamic_calls = attribute_factors.call_args_list[1:]
+        self.assertEqual(
+            [(True,), (True,), (False,), (False,)],
+            [tuple(call.kwargs['activity_flags'])
+             for call in dynamic_calls])
+        self.assertEqual(
+            [False, True, False, True],
+            [call.kwargs['is_fire'] for call in dynamic_calls])
         derive_params.assert_called_once_with(descriptor, factors)
-        descriptor.computeBaseInvisibility.assert_called_once_with(0.57, 7)
+        self.assertEqual(5, descriptor.computeBaseInvisibility.call_count)
+        descriptor.computeBaseInvisibility.assert_any_call(0.57, 7)
         self.assertEqual([[1, 20], [2, 10]], result['ammo'])
         self.assertEqual(0.2, result['camouflage']['base_moving'])
         self.assertEqual(0.4, result['camouflage']['shot_factor'])
@@ -145,6 +182,11 @@ class EffectiveParamsContractTests(unittest.TestCase):
         self.assertTrue(all(
             shot['source_shot']['deadeye']
             for shot in result['gun']['shots']))
+        self.assertEqual(['commander'],
+                         result['crew']['dynamic_spotting']['crew'])
+        self.assertEqual(
+            {'0:0', '0:1', '1:0', '1:1'},
+            set(result['crew']['dynamic_spotting']['states']))
 
     def test_complete_snapshot_is_canonical_and_detached(self):
         source = effective_params()
@@ -187,6 +229,15 @@ class EffectiveParamsContractTests(unittest.TestCase):
         duplicate_shot = effective_params()
         duplicate_shot['gun']['shots'][1]['compact_descr'] = 1
         self.assertIsNone(contract.canonical(duplicate_shot))
+
+        incomplete_crew_projection = effective_params()
+        del incomplete_crew_projection['crew'][
+            'dynamic_spotting']['states']['1:1']
+        self.assertIsNone(contract.canonical(incomplete_crew_projection))
+
+        mismatched_crew_roster = effective_params()
+        mismatched_crew_roster['critical']['crew_roster'] = ['driver']
+        self.assertIsNone(contract.canonical(mismatched_crew_roster))
 
     def test_critical_and_equipment_projection_rejects_forged_identity(self):
         unknown = effective_params()

@@ -19,6 +19,8 @@ Brothers in Arms still counts only when every crew member carries it.
 """
 
 
+import copy
+import math
 import sys
 
 try:
@@ -53,14 +55,19 @@ _BIG_REPAIR_KIT_MARKERS = ('largerepairkit',)
 
 
 def _client_modules():
-    """Return ``(items.utils, items.tankmen, VEHICLE_TTC_ASPECTS)`` or None."""
+    """Return the native #1513 factor machinery, or None off the client."""
     try:
         from constants import VEHICLE_TTC_ASPECTS
         from items import tankmen
         from items import utils
+        from items import vehicles
+        from items.qualifiers import QUALIFIER_TYPE
+        from VehicleDescrCrew import VehicleDescrCrew
+        from VehicleQualifiersApplier import VehicleQualifiersApplier
     except Exception:
         return None
-    return utils, tankmen, VEHICLE_TTC_ASPECTS
+    return (utils, tankmen, vehicles, VEHICLE_TTC_ASPECTS, QUALIFIER_TYPE,
+            VehicleDescrCrew, VehicleQualifiersApplier)
 
 
 def crew_compact_descrs(crew):
@@ -122,37 +129,94 @@ def _artefact(value, vehicles_module):
     return None
 
 
-def attribute_factors(descriptor, crew=None, equipments=()):
+def _update_native_attribute_factors(
+        descriptor, compact_descrs, equipments, factors, aspect,
+        activity_flags, is_fire, qualifier_type, crew_class,
+        qualifiers_class):
+    """Run #1513 ``VehicleDescrCrew`` with the actual battle crew state."""
+    factors['crewLevelIncrease'] = sum(filter(
+        None, [getattr(item, 'crewLevelIncrease', None)
+               for item in equipments]))
+    for equipment in equipments:
+        if equipment is not None:
+            equipment.updateVehicleAttrFactors(descriptor, factors, aspect)
+    for device in descriptor.optionalDevices:
+        if device is not None:
+            device.updateVehicleAttrFactors(descriptor, factors, aspect)
+    main_skill_bonuses = qualifiers_class(
+        {}, descriptor)[qualifier_type.MAIN_SKILL]
+    descriptor_crew = crew_class(
+        descriptor, compact_descrs, main_skill_bonuses,
+        activityFlags=activity_flags, isFire=is_fire)
+    for equipment in equipments:
+        if (equipment is not None and
+                'crewSkillBattleBooster' in equipment.tags):
+            descriptor_crew.boostSkillBy(equipment)
+    descriptor_crew.onCollectFactors(factors)
+    factors['camouflage'] = descriptor_crew.camouflageFactor
+    shot_dispersion = [1.0, 0.0]
+    descriptor_crew.onCollectShotDispersionFactors(shot_dispersion)
+    factors['shotDispersion'] = shot_dispersion
+
+
+def _update_native_attribute_factors_with_split(
+        descriptor, compact_descrs, equipments, factors, activity_flags,
+        is_fire, aspects, qualifier_type, crew_class, qualifiers_class):
+    """Apply the stateful crew call in both #1513 attribute aspects."""
+    _update_native_attribute_factors(
+        descriptor, compact_descrs, equipments, factors, aspects.DEFAULT,
+        activity_flags, is_fire, qualifier_type, crew_class,
+        qualifiers_class)
+    still_factors = copy.deepcopy(factors)
+    _update_native_attribute_factors(
+        descriptor, compact_descrs, equipments, still_factors,
+        aspects.WHEN_STILL, activity_flags, is_fire, qualifier_type,
+        crew_class, qualifiers_class)
+    factors['invisibility'] = {
+        aspects.DEFAULT: factors['invisibility'],
+        aspects.WHEN_STILL: still_factors['invisibility'],
+    }
+
+
+def attribute_factors(
+        descriptor, crew=None, equipments=(), activity_flags=None,
+        is_fire=False):
     """Return the exact #1513 ``factors`` dictionary for one loadout.
 
     This is the same chain ``VehicleParameters`` runs for the garage panel:
     the mounted descriptor supplies the optional devices, the crew supplies
     every role and common skill, and the mounted consumables supply their own
-    factors and crew-level increase.  ``None`` means the client modules are
-    unavailable, which is the Python 3 test harness, not a battle.
+    factors and crew-level increase. ``activity_flags`` and ``is_fire`` are
+    passed to the pinned native ``VehicleDescrCrew`` implementation. ``None``
+    means the client machinery is unavailable or rejected the supplied state.
     """
     modules = _client_modules()
     if modules is None or descriptor is None:
         return None
-    utils, tankmen, aspects = modules
-    try:
-        from items import vehicles as vehicles_module
-    except Exception:
-        return None
+    (utils, tankmen, vehicles_module, aspects, qualifier_type, crew_class,
+     qualifiers_class) = modules
     compact_descrs = crew_compact_descrs(crew)
     try:
         roles = descriptor.type.crewRoles
         if len(compact_descrs) != len(roles):
             compact_descrs = utils.generateDefaultCrew(
                 descriptor.type, tankmen.MAX_SKILL_LEVEL)
+        flags = ([True] * len(compact_descrs) if activity_flags is None else
+                 list(activity_flags))
+        if (len(flags) != len(compact_descrs) or
+                any(type(flag) is not bool for flag in flags)):
+            raise ValueError(
+                'activity_flags must contain one bool per crew member')
         mounted = []
         for equipment in (equipments or ()):
             artefact = _artefact(equipment, vehicles_module)
             if artefact is not None:
                 mounted.append(artefact)
         factors = utils.makeDefaultVehicleAttributeFactors()
-        utils.updateAttrFactorsWithSplit(
-            descriptor, list(compact_descrs), mounted, factors)
+        _update_native_attribute_factors_with_split(
+            descriptor, list(compact_descrs), mounted, factors, flags,
+            bool(is_fire), aspects, qualifier_type, crew_class,
+            qualifiers_class)
     except Exception as error:
         sys.stdout.write(
             '[Offline LAN 0.9.22] vehicle attribute factors unavailable: '
@@ -160,6 +224,35 @@ def attribute_factors(descriptor, crew=None, equipments=()):
         return None
     factors['_aspects'] = (aspects.DEFAULT, aspects.WHEN_STILL)
     return factors
+
+
+def _required_number(factors, name):
+    try:
+        value = float(factors[name])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError('missing or invalid factor: %s' % (name,))
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError('non-finite factor: %s' % (name,))
+    return value
+
+
+def _ratio(numerator, denominator, name):
+    if denominator == 0.0:
+        raise ValueError('zero healthy factor: %s' % (name,))
+    return numerator / denominator
+
+
+def dynamic_spotting_ratios(healthy_factors, dynamic_factors):
+    """Return exact native vision/signal/camouflage state multipliers."""
+    result = {}
+    for result_name, factor_name in (
+            ('vision', 'circularVisionRadius'),
+            ('signal', 'radio/distance'),
+            ('camouflage', 'camouflage')):
+        result[result_name] = _ratio(
+            _required_number(dynamic_factors, factor_name),
+            _required_number(healthy_factors, factor_name), factor_name)
+    return result
 
 
 def _factor(factors, name, default=1.0):

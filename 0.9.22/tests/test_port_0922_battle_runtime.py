@@ -1626,12 +1626,33 @@ def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
         'skills': {
             'deadeye': bool(deadeye), 'intuition_chances': 0,
         },
+        'crew': {
+            'members': [{
+                'instance': 'commander', 'roles': ['commander'],
+                'skills': [],
+            }],
+            'dynamic_spotting': {
+                'crew': ['commander'],
+                'states': dict(
+                    ('%d:%d' % (mask, fire), {
+                        'vision': 1.0, 'signal': 1.0,
+                        'camouflage': 1.0,
+                        'base_moving': 0.171,
+                        'base_still': 0.228,
+                        'invisibility_moving': [0.0, 1.0],
+                        'invisibility_still': [0.0, 1.0],
+                    })
+                    for mask in (0, 1) for fire in (0, 1)),
+            },
+        },
         'equipment': [],
         'critical': {
             'devices': [{
                 'name': 'engineHealth', 'max_hp': 100.0,
                 'regen_hp': 50.0,
             }],
+            'activation_targets': [],
+            'crew_roster': ['commander'],
         },
         'gun': {
             'clip_size': 1,

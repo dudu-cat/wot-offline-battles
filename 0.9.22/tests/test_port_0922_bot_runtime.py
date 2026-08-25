@@ -241,6 +241,25 @@ def _effective_params_snapshot(mass=25000.0, base_moving=0.171,
             'shot_factor': float(shot_factor),
         },
         'skills': {'deadeye': False, 'intuition_chances': 0},
+        'crew': {
+            'members': [{
+                'instance': 'commander', 'roles': ['commander'],
+                'skills': [],
+            }],
+            'dynamic_spotting': {
+                'crew': ['commander'],
+                'states': dict(
+                    ('%d:%d' % (mask, fire), {
+                        'vision': 1.0, 'signal': 1.0,
+                        'camouflage': 1.0,
+                        'base_moving': float(base_moving),
+                        'base_still': float(base_still),
+                        'invisibility_moving': [0.0, 1.0],
+                        'invisibility_still': [0.0, 1.0],
+                    })
+                    for mask in (0, 1) for fire in (0, 1)),
+            },
+        },
         'gun': {
             'clip_size': 1,
             'shots': [{
@@ -3319,6 +3338,55 @@ class BotRuntimeTests(unittest.TestCase):
             second_collision['ram_profile'])
         self.assertEqual(((0.31, 0.42), 0.17), first_spotting[:2])
         self.assertEqual(((0.07, 0.11), 0.33), second_spotting[:2])
+
+    def test_player_commander_loss_uses_projected_native_vision_state(self):
+        descriptor = _combat_descriptor()
+        runtime = self.module.BotRuntime(
+            1, player_descriptor_resolver=lambda unused: descriptor)
+        params = _effective_params_snapshot()
+        params['crew']['dynamic_spotting']['states']['1:0']['vision'] = 0.5
+        source = {
+            'id': 1, 'network_id': 1, 'kind': 'human',
+            'vehicle': 'ussr:R11_MS-1', 'speed': 1.0,
+            'effective_params': params,
+            'critical': _critical_payload(),
+        }
+
+        self.assertEqual(445.0, runtime._source_view_range(source, 1.0))
+        source['critical'] = _critical_payload(crew_ko=['commander'])
+        self.assertEqual(222.5, runtime._source_view_range(source, 1.0))
+
+    def test_player_crew_state_selects_matching_camouflage_projection(self):
+        runtime = self.module.BotRuntime(
+            1, player_descriptor_resolver=lambda unused: _combat_descriptor())
+        params = _effective_params_snapshot(
+            base_moving=0.17, base_still=0.23)
+        knocked_out = params['crew']['dynamic_spotting']['states']['1:0']
+        knocked_out.update({
+            'camouflage': 0.5,
+            'base_moving': 0.41,
+            'base_still': 0.52,
+            'invisibility_moving': [0.2, 0.8],
+            'invisibility_still': [0.3, 0.7],
+        })
+        target = {
+            'id': self.module.HUMAN_TARGET_ID_BASE + 1,
+            'network_id': 1, 'kind': 'human',
+            'vehicle': 'ussr:R11_MS-1', 'effective_params': params,
+            'critical': _critical_payload(),
+        }
+
+        healthy = runtime._spotting_profile(target)
+        target['critical'] = _critical_payload(crew_ko=['commander'])
+        injured = runtime._spotting_profile(target)
+
+        self.assertEqual((0.17, 0.23), healthy[0])
+        self.assertEqual((0.41, 0.52), injured[0])
+        self.assertEqual((0.2, 0.8),
+                         injured[2]['invisibility_moving'])
+        self.assertEqual((0.3, 0.7),
+                         injured[2]['invisibility_still'])
+        self.assertEqual(0.285, injured[2]['camouflage_factor'])
 
     def test_player_spotting_rejects_missing_effective_params(self):
         runtime = self.module.BotRuntime(1)
