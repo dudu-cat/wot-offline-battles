@@ -20372,7 +20372,7 @@ class UnusableVehicleTests(unittest.TestCase):
             'ussr:R11_MS-1', bots._descriptors[12].name)
         self.assertIn('germany:broken cannot be loaded', log.getvalue())
 
-    def test_a_bot_keeps_its_slot_empty_when_no_substitute_loads(self):
+    def test_a_bot_descriptor_without_a_substitute_fails_the_batch(self):
         battle = self._battle('germany:broken')
         battle._remote_factory = types.SimpleNamespace(
             prepare_descriptor=lambda descriptor: (_ for _ in ()).throw(
@@ -20386,14 +20386,17 @@ class UnusableVehicleTests(unittest.TestCase):
             direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
             baked_graph=_runtime().navigation_graph_loader('01_karelia'))
 
-        with contextlib.redirect_stdout(io.StringIO()) as log:
+        with self.assertRaisesRegex(
+                RuntimeError,
+                'bot 12 vehicle germany:broken descriptor is unavailable'):
             bots.battle_start({
                 'round_id': 7, 'map': '01_karelia', 'bot_authority_id': 1,
                 'bots': [{'id': 12, 'team': 2, 'slot': 0,
                           'vehicle': 'germany:broken'}]})
 
         self.assertEqual([], sorted(bots.states))
-        self.assertIn('bot 12 dropped', log.getvalue())
+        self.assertFalse(bots._manifest_sent)
+        self.assertIsNone(bots.adapter)
 
 
 class LocalBattleDescriptorTests(unittest.TestCase):
