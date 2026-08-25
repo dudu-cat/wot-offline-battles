@@ -2211,10 +2211,60 @@ class BotRuntimeTests(unittest.TestCase):
 
         hard_runtime.update(.04, 1.0)
 
-        self.assertEqual(1, len(hard_calls))
+        self.assertEqual(5, len(hard_calls))
         self.assertEqual(before_position,
                          (hard_state['x'], hard_state['y'], hard_state['z']))
-        self.assertAlmostEqual(soft_speed * 0.2, hard_state['speed'])
+        self.assertAlmostEqual(
+            self.module.vehicle_physics.hard_contact_step(
+                soft_speed, .04)[0],
+            hard_state['speed'])
+
+    def test_bot_hard_contact_uses_shared_second_glancing_path(self):
+        command = {
+            'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False, 'target_id': None,
+            'fire_range': 0.0, 'combat_mode': 'route',
+            'aim_position': (0.0, 0.0, 200.0),
+            'face_position': (0.0, 0.0, 200.0),
+            'move_position': (0.0, 0.0, 200.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        }
+        statuses = ['hard', 'hard', 'clear']
+        calls = []
+
+        def resolver(*args):
+            calls.append(args)
+            return statuses.pop(0)
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False, 'slope': 0.0},
+            motion_resolver=resolver,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=4.0,
+                     grounded_once=True)
+
+        runtime.update(.04, 1.0)
+
+        contact_speed = calls[0][3]
+        expected_speed, delta_x, delta_z = \
+            self.module.vehicle_physics.hard_contact_step(
+                contact_speed, .04, grinding=False, slide_yaw=-0.55)
+        self.assertEqual(3, len(calls))
+        self.assertEqual([0.0, 0.55, -0.55],
+                         [call[2] for call in calls])
+        self.assertAlmostEqual(expected_speed, state['speed'])
+        self.assertAlmostEqual(delta_x, state['x'])
+        self.assertAlmostEqual(delta_z, state['z'])
+        self.assertEqual(
+            self.module.vehicle_physics.HARD_CONTACT_GRIND_TICKS,
+            runtime._hard_contact_grinds[11])
 
     def test_realised_hard_contact_invalidates_cached_command_and_probe(self):
         attempted_yaw = 0.25

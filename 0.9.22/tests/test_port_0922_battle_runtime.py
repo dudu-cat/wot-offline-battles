@@ -12012,6 +12012,58 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, hard_battle._local_speed)
         self.assertEqual(5, hard_probe.call_count)
 
+    def test_player_hard_contact_uses_shared_second_glancing_path(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=0.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._destructibles = mock.Mock()
+        battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+        battle._motion_is_clear = mock.Mock(
+            side_effect=(False, False, True))
+        battle._update_vertical_motion = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._apply_slope_slide = mock.Mock(
+            side_effect=lambda position, unused_yaw, unused_dt,
+            unused_entity=None: position)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=6.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step', return_value=0.0):
+            battle._drive_local(0.04)
+
+        expected_speed, delta_x, delta_z = \
+            vehicle_physics.hard_contact_step(
+                6.0, 0.04, grinding=False, slide_yaw=-0.55)
+        self.assertAlmostEqual(expected_speed, battle._local_speed)
+        self.assertAlmostEqual(2.0 + delta_x, battle._local_position[0])
+        self.assertAlmostEqual(4.0 + delta_z, battle._local_position[2])
+        self.assertEqual(
+            [0.0, 0.55, -0.55],
+            [call.args[2] for call in battle._motion_is_clear.call_args_list])
+        self.assertEqual(
+            vehicle_physics.HARD_CONTACT_GRIND_TICKS,
+            battle._local_grind)
+
     def test_ground_probe_hands_the_broken_skin_filter_to_the_engine(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

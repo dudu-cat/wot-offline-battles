@@ -98,6 +98,44 @@ class VehiclePhysicsDescriptorTests(unittest.TestCase):
         self.assertEqual(1.15, params['nativePowerRatio'])
 
 
+class VehiclePhysicsHardContactTests(unittest.TestCase):
+
+    def test_candidate_yaws_keep_the_shared_glancing_order(self):
+        candidates = vehicle_physics.hard_contact_candidate_yaws(0.2)
+
+        for expected, actual in zip((0.75, -0.35, 1.2, -0.8), candidates):
+            self.assertAlmostEqual(expected, actual)
+
+    def test_first_glancing_contact_damps_and_advances_on_selected_yaw(self):
+        speed, delta_x, delta_z = vehicle_physics.hard_contact_step(
+            6.0, 0.04, grinding=False, slide_yaw=-0.55)
+        expected = (6.0 * vehicle_physics.HARD_CONTACT_ENTRY_FACTOR *
+                    vehicle_physics.HARD_CONTACT_SLIDE_DECAY ** 2.4)
+
+        self.assertAlmostEqual(expected, speed)
+        self.assertAlmostEqual(math.sin(-0.55) * expected * 0.04, delta_x)
+        self.assertAlmostEqual(math.cos(-0.55) * expected * 0.04, delta_z)
+
+    def test_continuing_glance_skips_the_first_contact_loss(self):
+        speed = vehicle_physics.hard_contact_step(
+            6.0, 0.04, grinding=True, slide_yaw=0.55)[0]
+
+        self.assertAlmostEqual(
+            6.0 * vehicle_physics.HARD_CONTACT_SLIDE_DECAY ** 2.4,
+            speed)
+
+    def test_fully_blocked_contact_uses_shared_brake_and_stop_threshold(self):
+        speed, delta_x, delta_z = vehicle_physics.hard_contact_step(
+            6.0, 0.04)
+
+        self.assertAlmostEqual(
+            6.0 * vehicle_physics.HARD_CONTACT_BRAKE_DECAY ** 2.4,
+            speed)
+        self.assertEqual((0.0, 0.0), (delta_x, delta_z))
+        self.assertEqual(
+            0.0, vehicle_physics.hard_contact_step(6.0, 0.1)[0])
+
+
 class VehiclePhysicsPinnedClimbTests(unittest.TestCase):
 
     PINNED_VEHICLES = (

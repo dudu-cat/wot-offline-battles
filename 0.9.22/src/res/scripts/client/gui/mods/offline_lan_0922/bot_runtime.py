@@ -1565,6 +1565,7 @@ class BotRuntime(object):
         self._visibility_fire = {}
         self._visibility_still = {}
         self._turn_speeds = {}
+        self._hard_contact_grinds = {}
         self._ram_cooldowns = {}
         self._human_ram_cooldowns = {}
         self._ram_contacts = frozenset()
@@ -1993,6 +1994,7 @@ class BotRuntime(object):
             self._visibility_fire = {}
             self._visibility_still = {}
             self._turn_speeds = {}
+            self._hard_contact_grinds = {}
             self._ram_cooldowns = {}
             self._human_ram_cooldowns = {}
             self._ram_contacts = frozenset()
@@ -3740,6 +3742,65 @@ class BotRuntime(object):
         state['roll'] = roll
         state['pose_sample'] = (x, z, yaw)
         return True
+
+    def _passive_motion_status(self, state, position, yaw, speed,
+                               descriptor, step, now):
+        """Resolve glancing travel without enabling active-drive crush."""
+        if not callable(self.motion_resolver):
+            return 'clear'
+        had_movement_dir = 'movement_dir' in state
+        movement_dir = state.get('movement_dir')
+        # BattleRuntime's resolver infers active crush intent from this field.
+        state['movement_dir'] = 0
+        try:
+            if self._probe_clock is None:
+                status = self.motion_resolver(
+                    state['id'], position, yaw, speed,
+                    descriptor, step, now)
+            else:
+                probe_started = self._probe_started()
+                try:
+                    status = self.motion_resolver(
+                        state['id'], position, yaw, speed,
+                        descriptor, step, now)
+                finally:
+                    self._probe_finished(4, probe_started)
+        finally:
+            if had_movement_dir:
+                state['movement_dir'] = movement_dir
+            else:
+                state.pop('movement_dir', None)
+        if status not in ('clear', 'crushed', 'soft', 'hard'):
+            raise RuntimeError(
+                'bot passive motion resolver returned an invalid status')
+        return status
+
+    def _hard_contact_response(self, state, position, yaw, speed,
+                               descriptor, step, now):
+        """Probe the shared glancing paths and apply copied hull damping."""
+        slide_yaw = None
+        for candidate_yaw in vehicle_physics.hard_contact_candidate_yaws(yaw):
+            if callable(self.motion_resolver):
+                status = self._passive_motion_status(
+                    state, position, candidate_yaw, speed,
+                    descriptor, step, now)
+                clear = status in ('clear', 'crushed')
+            else:
+                clear = self._probe_is_clear(self._probe_direction(
+                    position, candidate_yaw, speed, descriptor))
+            if clear:
+                slide_yaw = candidate_yaw
+                break
+        bot_id = int(state['id'])
+        speed, delta_x, delta_z = vehicle_physics.hard_contact_step(
+            speed, step,
+            grinding=self._hard_contact_grinds.get(bot_id, 0) > 0,
+            slide_yaw=slide_yaw)
+        self._hard_contact_grinds[bot_id] = (
+            vehicle_physics.HARD_CONTACT_GRIND_TICKS)
+        return (speed,
+                (position[0] + delta_x, position[1], position[2] + delta_z),
+                slide_yaw is not None)
 
     def _invalidate_realised_motion(self, bot_id, attempted_yaw):
         """Forget a command whose committed pose hit a real obstacle."""
@@ -6235,6 +6296,9 @@ class BotRuntime(object):
                     steer_dir != 0, slope_pitch, step,
                     bool(state.get('airborne', False)), 0, False)
                 state['last_drive_pitch'] = slope_pitch
+                hard_contact = False
+                contact_position = position
+                contact_deflected = False
                 if not path_clear:
                     if probe_deferred:
                         # Native-query scheduling is not a collision.  Pause
@@ -6242,15 +6306,22 @@ class BotRuntime(object):
                         # its real pre-step momentum; never feed the scheduler
                         # into route failure recovery or hard-wall damping.
                         speed = previous_speed
+                    elif (isinstance(motion_probe, dict) and
+                          motion_probe.get('collision', False)):
+                        hard_contact = True
                     else:
+                        # Water, slope and other planner vetoes are not hull
+                        # contacts. Keep their existing AI safety damping.
                         speed *= 0.2
                     state.pop('destructible_contact_speed', None)
                 motion_status = 'clear'
+                resolved_motion = False
                 contact_speed = _number(state.get(
                     'destructible_contact_speed'), speed)
                 contact_v0 = speed
                 if (path_clear and abs(speed) > 0.0001 and
                         callable(self.motion_resolver)):
+                    resolved_motion = True
                     if self._probe_clock is None:
                         motion_status = self.motion_resolver(
                             state['id'], position, state['yaw'], speed,
@@ -6287,17 +6358,31 @@ class BotRuntime(object):
                         elif motion_status == 'hard':
                             self._invalidate_realised_motion(
                                 state['id'], travel_yaw)
-                            speed *= 0.2
+                            hard_contact = True
                             state.pop('destructible_contact_speed', None)
                     else:
                         state.pop('destructible_contact_speed', None)
-                    if callable(self.motion_report):
-                        self.motion_report(
-                            state['id'], motion_status, contact_v0, speed)
+                if (hard_contact and
+                        not state.get('airborne', False)):
+                    speed, contact_position, contact_deflected = \
+                        self._hard_contact_response(
+                            state, position, state['yaw'], speed,
+                            descriptor, step, now)
+                elif motion_status in ('soft', 'cap_crushed'):
+                    self._hard_contact_grinds[state['id']] = 1
+                if resolved_motion and callable(self.motion_report):
+                    self.motion_report(
+                        state['id'], motion_status, contact_v0, speed)
                 state['speed'] = speed
-                if path_clear:
+                if contact_deflected:
+                    state['x'], state['y'], state['z'] = contact_position
+                elif path_clear:
                     state['x'] += math.sin(state['yaw']) * speed * step
                     state['z'] += math.cos(state['yaw']) * speed * step
+                    if abs(speed) > 0.0001:
+                        bot_id = int(state['id'])
+                        self._hard_contact_grinds[bot_id] = max(
+                            0, self._hard_contact_grinds.get(bot_id, 0) - 1)
             ammo_state.publish(state)
             ballistic_solution = self._ballistic_solution(
                 state, target, descriptor, state['shell_index'], now)

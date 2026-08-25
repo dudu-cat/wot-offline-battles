@@ -100,6 +100,15 @@ GROUND_FOLLOW_BASE = 0.6
 GROUND_FOLLOW_MIN = 0.8
 GROUND_FOLLOW_MAX = 2.5
 GROUND_PITCH_LIMIT = 0.96
+# Grounded hulls use the same four glancing directions after an exact hard
+# contact. These angles and decay constants used to live only in the visible
+# player's integrator while copied Bots stopped with a separate fixed factor.
+HARD_CONTACT_YAW_DELTAS = (0.55, -0.55, 1.0, -1.0)
+HARD_CONTACT_ENTRY_FACTOR = 0.60
+HARD_CONTACT_SLIDE_DECAY = 0.85
+HARD_CONTACT_BRAKE_DECAY = 0.35
+HARD_CONTACT_STOP_SPEED = 0.05
+HARD_CONTACT_GRIND_TICKS = 4
 # Downhill slide on a slope the tracks cannot hold. The slide accelerates by the
 # grip-excess g*(sin-coh*cos) but a track drag SLIDE_DRAG*v pulls it to a natural,
 # terrain-dependent TERMINAL speed instead of ramping to a flat cap. SLIDE_MAX is
@@ -176,6 +185,34 @@ def apply_tuning(overrides):
 	# cohesion/gravity override reaches the no-brakeForce fallback too.
 	_DEFAULTS['brakeDecel'] = COHESION * GRAVITY
 	return applied
+
+
+def hard_contact_candidate_yaws(yaw):
+	'''Return the shared ordered glancing paths for one blocked hull heading.'''
+	return tuple(float(yaw) + delta for delta in HARD_CONTACT_YAW_DELTAS)
+
+
+def hard_contact_step(speed, dt, grinding=False, slide_yaw=None):
+	'''Resolve one grounded hard-contact response without probing the world.
+
+	Callers own their native/static collision queries and pass the first clear
+	glancing yaw, if any. The returned tuple is ``(speed, dx, dz)`` so visible
+	players and copied Bots cannot apply different damping or displacement after
+	the same probe result.
+	'''
+	speed = float(speed)
+	dt = max(0.0, float(dt))
+	if slide_yaw is None:
+		speed *= HARD_CONTACT_BRAKE_DECAY ** (dt * 60.0)
+		if abs(speed) < HARD_CONTACT_STOP_SPEED:
+			speed = 0.0
+		return speed, 0.0, 0.0
+	if not grinding:
+		speed *= HARD_CONTACT_ENTRY_FACTOR
+	speed *= HARD_CONTACT_SLIDE_DECAY ** (dt * 60.0)
+	yaw = float(slide_yaw)
+	return (speed, math.sin(yaw) * speed * dt,
+			math.cos(yaw) * speed * dt)
 
 
 def snapshot(p, v, omega, throttle, slope_pitch, airborne, slide_speed, tank='',

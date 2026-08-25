@@ -13924,31 +13924,32 @@ class BattleRuntime(object):
                         world_status=self._local_motion_status)
                 else:
                     deflected = False
-                    for delta_yaw in (0.55, -0.55, 1.0, -1.0):
-                        slide_yaw = yaw + delta_yaw
+                    for slide_yaw in \
+                            vehicle_physics.hard_contact_candidate_yaws(yaw):
                         if self._motion_is_clear(
                                 entity, position, slide_yaw,
                                 self._local_speed, dt):
-                            if self._local_grind <= 0:
-                                self._local_speed *= 0.6
-                            slide_speed = self._local_speed * (
-                                0.85 ** (dt * 60.0))
+                            slide_speed, slide_x, slide_z = \
+                                vehicle_physics.hard_contact_step(
+                                    self._local_speed, dt,
+                                    grinding=self._local_grind > 0,
+                                    slide_yaw=slide_yaw)
                             position = (
-                                position[0] + math.sin(slide_yaw) *
-                                slide_speed * dt,
+                                position[0] + slide_x,
                                 position[1],
-                                position[2] + math.cos(slide_yaw) *
-                                slide_speed * dt)
+                                position[2] + slide_z)
                             self._local_speed = slide_speed
-                            self._local_grind = 4
+                            self._local_grind = (
+                                vehicle_physics.HARD_CONTACT_GRIND_TICKS)
                             deflected = True
                             contact_path = 'deflect'
                             break
                     if not deflected:
-                        self._local_speed *= 0.35 ** (dt * 60.0)
-                        if abs(self._local_speed) < 0.05:
-                            self._local_speed = 0.0
-                        self._local_grind = 4
+                        self._local_speed = \
+                            vehicle_physics.hard_contact_step(
+                                self._local_speed, dt)[0]
+                        self._local_grind = (
+                            vehicle_physics.HARD_CONTACT_GRIND_TICKS)
                         contact_path = 'brake'
 
         if siege_drive_locked or is_tracked or is_engine_dead:
