@@ -1041,12 +1041,54 @@ class BattleProjectileTests(unittest.TestCase):
         args, unused_kwargs = battle.client.resolutions[0]
         self.assertEqual('miss', args[3])
         self.assertIsNone(args[5])
+        self.assertIsNotNone(meta['pending_resolution'])
+        self.assertTrue(meta['awaiting_resolution'])
+
+    def test_terminal_retries_exactly_until_snapshot_acknowledges_it(self):
+        battle, unused_bigworld = _battle()
+        meta = battle._projectile_wire_meta(_event())
+        meta['destructibles_pending'] = [{
+            'destructible_kind': 'fragile', 'chunk_id': 7,
+            'item_index': 3, 'x': 1.0, 'y': 0.5, 'z': 0.0,
+            'fall_yaw': 0.2, 'speed': 12.0, 'is_shot': True,
+        }]
+        meta['pending_resolution'] = {
+            'state': {'elapsed': 0.5, 'distance': 5.0},
+            'outcome': 'impact', 'impact': (5.0, 1.0, 0.0),
+            'direct': None, 'splash': [], 'hit_vehicle': False,
+            'wreck_hit': None,
+        }
+        battle._projectile_meta[meta['projectile_id']] = meta
+        battle._ensure_projectile_visual = lambda unused_meta, unused_now: True
+
+        self.assertTrue(battle._submit_projectile_resolution(meta))
+        first = battle.client.resolutions[0]
+        self.assertTrue(meta['awaiting_resolution'])
+        self.assertIsNotNone(meta['pending_resolution'])
+
+        snapshot_row = dict(_event())
+        snapshot_row['max_distance'] = snapshot_row.pop('maxDistance')
+        snapshot_row.pop('kind')
+        snapshot_row.pop('attacker')
+        snapshot_row.update({
+            'checked_through_ms': 0, 'checked_distance': 0.0,
+            'piercing_loss': 0.0,
+        })
+        self.assertTrue(battle._reconcile_projectile_snapshot({
+            'projectiles': [snapshot_row]}))
+        self.assertEqual(2, len(battle.client.resolutions))
+        self.assertEqual(first, battle.client.resolutions[1])
+        self.assertIsNotNone(meta['pending_resolution'])
+
+        self.assertTrue(battle._reconcile_projectile_snapshot({
+            'projectiles': []}))
+        self.assertNotIn('player:7:1', battle._projectile_meta)
 
     def test_human_record_normalizes_to_player_wire_kind(self):
         battle, unused_bigworld = _battle()
         effect = battle._projectile_effect(
             {'kind': 'human', 'network_id': 9, 'state': {}},
-            12, 2, (1.0, 2.0, 3.0), None, 12)
+            12, 2, (1.0, 2.0, 3.0), None, 12, None)
         self.assertEqual('player', effect['target_kind'])
 
     def test_terminal_event_retires_server_expired_projectile(self):
@@ -1159,7 +1201,8 @@ class BattleProjectileTests(unittest.TestCase):
                     critical_damage, 'propose_direct',
                     side_effect=lambda unused_target, unused_collisions,
                     unused_start, unused_end, damage, unused_shell,
-                    unused_attacker, **unused_kwargs: (damage, None)) as critical:
+                    unused_attacker, **unused_kwargs: (
+                        damage, None, None)) as critical:
             effect = battle._projectile_direct_effect(
                 meta, {'distance': 10.0}, terminal)
 
@@ -1207,7 +1250,7 @@ class BattleProjectileTests(unittest.TestCase):
                     combat_rules, 'damage', return_value=390), \
                 mock.patch.object(
                     critical_damage, 'propose_direct',
-                    return_value=(390, None)) as critical:
+                    return_value=(390, None, None)) as critical:
             effect = battle._projectile_direct_effect(
                 meta, {'distance': 9.8}, terminal)
 
@@ -1262,7 +1305,8 @@ class BattleProjectileTests(unittest.TestCase):
                     critical_damage, 'propose_explosion',
                     side_effect=lambda unused_target, unused_collisions,
                     unused_burst, unused_direction, damage, unused_shell,
-                    unused_attacker, **unused_kwargs: (damage, None)) as cone:
+                    unused_attacker, **unused_kwargs: (
+                        damage, None, None)) as cone:
             effect = battle._projectile_direct_effect(
                 meta, {'distance': 10.0}, terminal)
 

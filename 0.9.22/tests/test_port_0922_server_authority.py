@@ -1676,6 +1676,27 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual('bot_state_rejected', state.battle_result['reason'])
         self.assertFalse(state.result_receipts)
 
+    def test_rejected_projectile_terminal_fences_worker_round(self):
+        state, unused_clock = self._state()
+        worker = state.simulation_worker
+        handler = object.__new__(ClientHandler)
+
+        result = handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, {
+                'type': 'projectile_resolve',
+                'round_id': state.round_id,
+                'projectile_id': 'missing',
+            })
+
+        self.assertEqual('close', result)
+        self.assertFalse(worker.connected)
+        self.assertIsNone(state.simulation_worker)
+        self.assertEqual(
+            'projectile_rejected', state.worker_failure_reason)
+        self.assertEqual(
+            'projectile_rejected', state.battle_result['reason'])
+        self.assertFalse(state.result_receipts)
+
     def test_late_rejected_bot_batch_does_not_replace_terminal_result(self):
         state, unused_clock = self._state()
         worker = state.simulation_worker

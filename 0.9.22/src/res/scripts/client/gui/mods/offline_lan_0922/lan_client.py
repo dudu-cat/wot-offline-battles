@@ -823,9 +823,10 @@ def _strict_projectile_effect(value):
         'critical', 'critical_target_base_revision',
         'critical_target_ack_seq', 'hull_damage', 'critical_delta'))
     stun_fields = frozenset(('stun_end_server_time_ms',))
+    target_pose_fields = frozenset(('target_x', 'target_y', 'target_z'))
     keys = set(value)
     if not required.issubset(keys) or not keys.issubset(
-            required | critical_fields | stun_fields):
+            required | critical_fields | stun_fields | target_pose_fields):
         return None
     kind = value.get('target_kind')
     target_id = _projectile_int_range(
@@ -840,9 +841,11 @@ def _strict_projectile_effect(value):
             3000.0 if axis == 'y' else MAX_PROJECTILE_ORIGIN))
     has_critical = 'critical' in value
     has_stun = 'stun_end_server_time_ms' in value
+    has_target_pose = bool(keys & target_pose_fields)
     expected = (required |
                 (critical_fields if has_critical else frozenset()) |
-                (stun_fields if has_stun else frozenset()))
+                (stun_fields if has_stun else frozenset()) |
+                (target_pose_fields if has_target_pose else frozenset()))
     if (kind not in ('player', 'bot') or target_id is None or
             damage is None or shot_result is None or
             any(component is None for component in position) or
@@ -883,6 +886,20 @@ def _strict_projectile_effect(value):
         if stun_end is None:
             return None
         result['stun_end_server_time_ms'] = stun_end
+    if has_target_pose:
+        target_position = []
+        for axis in ('x', 'y', 'z'):
+            target_position.append(_projectile_float_range(
+                value.get('target_' + axis),
+                -1000.0 if axis == 'y' else -MAX_PROJECTILE_ORIGIN,
+                3000.0 if axis == 'y' else MAX_PROJECTILE_ORIGIN))
+        if any(component is None for component in target_position):
+            return None
+        result.update({
+            'target_x': target_position[0],
+            'target_y': target_position[1],
+            'target_z': target_position[2],
+        })
     return result
 
 
@@ -2128,7 +2145,9 @@ class LANClient(object):
         parsed_direct = None
         if direct is not None:
             parsed_direct = _strict_projectile_effect(direct)
-            if parsed_direct is None:
+            if (parsed_direct is None or
+                    any(name in parsed_direct for name in
+                        ('target_x', 'target_y', 'target_z'))):
                 return False
         parsed_splash = []
         targets = set()
@@ -2137,7 +2156,9 @@ class LANClient(object):
                          parsed_direct['target_id']))
         for effect in splash:
             parsed = _strict_projectile_effect(effect)
-            if parsed is None:
+            if (parsed is None or
+                    not all(name in parsed for name in
+                            ('target_x', 'target_y', 'target_z'))):
                 return False
             target = (parsed['target_kind'], parsed['target_id'])
             if target in targets:

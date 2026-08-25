@@ -5,6 +5,7 @@ from __future__ import print_function
 import base64
 import bisect
 import collections
+import copy
 import math
 import os
 import random
@@ -8591,9 +8592,15 @@ class BattleRuntime(object):
             normalized = self._projectile_wire_meta(raw)
             projectile_id = normalized['projectile_id']
             meta = self._install_projectile_meta(normalized)
-            if (self._projectiles.contains(projectile_id) or
-                    meta.get('awaiting_resolution') or
-                    meta.get('pending_resolution') is not None):
+            if self._projectiles.contains(projectile_id):
+                continue
+            if meta.get('pending_resolution') is not None:
+                # Presence in the next authoritative snapshot means the
+                # server has not committed this exact terminal yet.  Retry
+                # the frozen proposal once for this snapshot; its idempotent
+                # request fingerprint makes a delayed duplicate harmless.
+                meta['awaiting_resolution'] = False
+                self._submit_projectile_resolution(meta)
                 continue
             source = self._projectile_source_entity(meta)
             source_descriptor = (getattr(source, 'typeDescriptor', None)
@@ -9224,7 +9231,8 @@ class BattleRuntime(object):
         return self._server_entity(record.get('engine_id'))
 
     def _projectile_effect(self, record, damage, result, impact,
-                           critical, hull_damage, critical_delta):
+                           critical, hull_damage, critical_delta,
+                           target_position=None):
         target_kind = record.get('kind')
         if target_kind == 'human':
             target_kind = 'player'
@@ -9238,6 +9246,12 @@ class BattleRuntime(object):
             'x': float(impact[0]), 'y': float(impact[1]),
             'z': float(impact[2]),
         }
+        if target_position is not None:
+            effect.update({
+                'target_x': float(target_position[0]),
+                'target_y': float(target_position[1]),
+                'target_z': float(target_position[2]),
+            })
         if isinstance(critical, dict):
             effect['critical'] = critical
             effect.update(self._critical_proposal_contract(
@@ -9371,7 +9385,7 @@ class BattleRuntime(object):
             critical = self._critical_with_crew_roster(target, critical)
             effects.append(self._projectile_effect(
                 record, damage, 2, impact, critical, hull_damage,
-                critical_delta))
+                critical_delta, position))
             if len(effects) >= 30:
                 break
         return effects
@@ -9437,34 +9451,49 @@ class BattleRuntime(object):
     def _submit_projectile_resolution(self, meta):
         pending = meta.get('pending_resolution')
         if (pending is None or meta.get('progress_pending') is not None or
+                meta.get('awaiting_resolution') or
                 not self._projectile_is_authority()):
             return False
-        state = pending['state']
-        elapsed_ms = max(
-            int(meta.get('base_checked_ms', 0)),
-            int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
         sender = getattr(self.client, 'send_projectile_resolve', None)
         if not callable(sender):
             return False
+        wire = pending.get('wire')
+        if wire is None:
+            state = pending['state']
+            base_checked_ms = int(meta.get('base_checked_ms', 0))
+            elapsed_ms = max(
+                base_checked_ms,
+                int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
+            wire = {
+                'authority_epoch': self._projectile_epoch,
+                'projectile_id': meta['projectile_id'],
+                'base_checked_ms': base_checked_ms,
+                'outcome': pending['outcome'],
+                'resolved_time_ms': elapsed_ms,
+                'impact': (list(pending['impact'])
+                           if pending['outcome'] == 'impact' else None),
+                'direct': copy.deepcopy(pending['direct']),
+                'splash': copy.deepcopy(pending['splash']),
+                'checked_distance': float(state.get('distance', 0.0)),
+                'piercing_loss': float(meta.get('piercing_loss', 0.0)),
+                'penetration_factor': float(
+                    meta.get('penetration_factor', 1.0)),
+                'hit_vehicle': bool(pending.get('hit_vehicle')),
+                'wreck_hit': copy.deepcopy(pending.get('wreck_hit')),
+                'destructibles': copy.deepcopy(
+                    list(meta.get('destructibles_pending', ()))),
+            }
+            pending['wire'] = wire
         sent = sender(
-            self._projectile_epoch, meta['projectile_id'],
-            int(meta.get('base_checked_ms', 0)), pending['outcome'],
-            elapsed_ms,
-            (list(pending['impact'])
-             if pending['outcome'] == 'impact' else None),
-            pending['direct'],
-            pending['splash'],
-            checked_distance=float(state.get('distance', 0.0)),
-            piercing_loss=float(meta.get('piercing_loss', 0.0)),
-            penetration_factor=float(
-                meta.get('penetration_factor', 1.0)),
-            hit_vehicle=bool(pending.get('hit_vehicle')),
-            wreck_hit=pending.get('wreck_hit'),
-            destructibles=[dict(value) for value in
-                           meta.get('destructibles_pending', ())])
+            wire['authority_epoch'], wire['projectile_id'],
+            wire['base_checked_ms'], wire['outcome'],
+            wire['resolved_time_ms'], wire['impact'], wire['direct'],
+            wire['splash'], checked_distance=wire['checked_distance'],
+            piercing_loss=wire['piercing_loss'],
+            penetration_factor=wire['penetration_factor'],
+            hit_vehicle=wire['hit_vehicle'], wreck_hit=wire['wreck_hit'],
+            destructibles=wire['destructibles'])
         if sent:
-            meta['destructibles_pending'] = []
-            meta['pending_resolution'] = None
             meta['awaiting_resolution'] = True
         return bool(sent)
 
@@ -9473,7 +9502,8 @@ class BattleRuntime(object):
             return False
         changed = False
         for meta in tuple(self._projectile_meta.values()):
-            if meta.get('pending_resolution') is not None:
+            if (meta.get('pending_resolution') is not None and
+                    not meta.get('awaiting_resolution')):
                 changed = self._submit_projectile_resolution(meta) or changed
         return changed
 

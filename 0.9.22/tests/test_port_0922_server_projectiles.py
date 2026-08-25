@@ -203,12 +203,17 @@ def _launch_authority(state, message):
 
 
 def _effect(target_id=2, target_kind='player', damage=100, x=10.0,
-            **changes):
+            target_pose=None, **changes):
     value = {
         'target_kind': target_kind, 'target_id': target_id,
         'damage': damage, 'shot_result': 2,
         'x': x, 'y': 1.0, 'z': 0.0,
     }
+    if target_pose is not None:
+        value.update({
+            'target_x': target_pose[0], 'target_y': target_pose[1],
+            'target_z': target_pose[2],
+        })
     value.update(changes)
     return value
 
@@ -963,6 +968,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             direct=_effect(stun_end_server_time_ms=101),
             splash=[_effect(
                 target_id=3, damage=50, x=20.0,
+                target_pose=(20.0, 1.0, 0.0),
                 stun_end_server_time_ms=101)])
 
         with mock.patch.object(
@@ -1082,14 +1088,18 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         message = _resolve(
             '1:p:1:1', penetration_factor=0.0,
             direct=_effect(target_id=2, damage=50),
-            splash=[_effect(target_id=2, damage=40, x=10.0)])
+            splash=[_effect(
+                target_id=2, damage=40, x=10.0,
+                target_pose=(10.0, 1.0, 0.0))])
         before = [state.players[index].health for index in (2, 3)]
         self.assertFalse(state.resolve_projectile(SIMULATION_WORKER_AUTHORITY_ID, message))
         self.assertEqual(before,
                          [state.players[index].health for index in (2, 3)])
         self.assertIn('1:p:1:1', state.projectiles)
 
-        message['splash'] = [_effect(target_id=3, damage=40, x=20.0)]
+        message['splash'] = [_effect(
+            target_id=3, damage=40, x=10.0,
+            target_pose=(20.0, 1.0, 0.0))]
         self.assertTrue(state.resolve_projectile(SIMULATION_WORKER_AUTHORITY_ID, message))
         self.assertEqual([950, 960],
                          [state.players[index].health for index in (2, 3)])
@@ -1102,8 +1112,12 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         message = _resolve(
             '1:p:1:1', penetration_factor=0.0,
             direct=_effect(target_id=2, damage=50),
-            splash=[_effect(target_id=3, damage=40, x=12.0),
-                    _effect(target_id=999, damage=30)])
+            splash=[_effect(
+                        target_id=3, damage=40, x=10.0,
+                        target_pose=(12.0, 1.0, 0.0)),
+                    _effect(
+                        target_id=999, damage=30, x=10.0,
+                        target_pose=(12.0, 1.0, 0.0))])
 
         self.assertFalse(state.resolve_projectile(SIMULATION_WORKER_AUTHORITY_ID, message))
         self.assertEqual(1000, state.players[2].health)
@@ -1118,12 +1132,43 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         message = _resolve(
             '1:p:1:1', penetration_factor=0.0,
             direct=_effect(target_id=2, damage=50),
-            splash=[_effect(target_id=3, damage=40, x=20.0)])
+            splash=[_effect(
+                target_id=3, damage=40, x=10.0,
+                target_pose=(20.0, 1.0, 0.0))])
 
         self.assertTrue(state.resolve_projectile(
             SIMULATION_WORKER_AUTHORITY_ID, message))
         self.assertEqual([950, 960],
                          [state.players[index].health for index in (2, 3)])
+
+    def test_splash_rejects_a_worker_pose_outside_the_blast_radius(self):
+        state = _state(players=3)
+        self.assertTrue(_launch_authority(state, _launch(
+            is_he=True, splash_radius=15.0, penetration_factor=0.0)))
+        message = _resolve(
+            '1:p:1:1', penetration_factor=0.0,
+            direct=_effect(target_id=2, damage=50),
+            splash=[_effect(
+                target_id=3, damage=40, x=10.0,
+                target_pose=(30.1, 1.0, 0.0))])
+
+        self.assertFalse(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertEqual([1000, 1000],
+                         [state.players[index].health for index in (2, 3)])
+        self.assertIn('1:p:1:1', state.projectiles)
+
+    def test_direct_effect_rejects_a_splash_target_pose(self):
+        state = _state(players=2)
+        self.assertTrue(_launch_authority(state, _launch()))
+        message = _resolve(
+            '1:p:1:1', direct=_effect(
+                target_id=2, target_pose=(10.0, 1.0, 0.0)))
+
+        self.assertFalse(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertEqual(1000, state.players[2].health)
+        self.assertIn('1:p:1:1', state.projectiles)
 
     def test_expiration_result_and_reset_lifecycle(self):
         state = _state()
@@ -1195,6 +1240,63 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                   if event.get('projectile_id') == '1:p:1:1']
         self.assertEqual(['shot', 'projectile_impact', 'hit'],
                          [event['kind'] for event in events])
+
+    def test_terminal_noops_a_frozen_target_who_disconnected(self):
+        state = _state()
+        for player in state.players.values():
+            player.account_key = 'player-%d' % player.player_id
+        state._freeze_round_participants(list(state.players.values()))
+        self.assertTrue(_launch_authority(state, _launch()))
+        state.remove_player(2)
+        before_events = len(state.pending_events)
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve('1:p:1:1', direct=_effect(target_id=2))))
+
+        self.assertNotIn('1:p:1:1', state.projectiles)
+        self.assertEqual(
+            1000, state._frozen_player_participant(2)['health'])
+        self.assertFalse(any(
+            event.get('projectile_id') == '1:p:1:1' and
+            event.get('kind') == 'hit'
+            for event in state.pending_events[before_events:]))
+        self.assertEqual({}, state.vehicle_interactions)
+
+    def test_terminal_still_rejects_an_unknown_missing_target(self):
+        state = _state()
+        for player in state.players.values():
+            player.account_key = 'player-%d' % player.player_id
+        state._freeze_round_participants(list(state.players.values()))
+        self.assertTrue(_launch_authority(state, _launch()))
+
+        self.assertFalse(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve('1:p:1:1', direct=_effect(target_id=99))))
+
+        self.assertIn('1:p:1:1', state.projectiles)
+
+    def test_terminal_noops_a_frozen_wreck_who_disconnected(self):
+        state = _state()
+        for player in state.players.values():
+            player.account_key = 'player-%d' % player.player_id
+        state.players[2].health = 0
+        state.players[2].alive = False
+        state._freeze_round_participants(list(state.players.values()))
+        self.assertTrue(_launch_authority(state, _launch()))
+        state.remove_player(2)
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve(
+                '1:p:1:1', direct=None, hit_vehicle=True,
+                wreck_hit={'target_kind': 'player', 'target_id': 2})))
+
+        self.assertNotIn('1:p:1:1', state.projectiles)
+        impact = next(
+            event for event in state.pending_events
+            if event.get('kind') == 'projectile_impact')
+        self.assertNotIn('wreck_hit', impact)
 
     def test_disconnected_shooter_projectile_keeps_stun_attribution(self):
         state = _state()

@@ -134,6 +134,19 @@ class LanProtocolTests(unittest.TestCase):
         self.assertIsNone(_strict_projectile_effect(dict(
             effect, stun_duration_ms=7000)))
 
+    def test_projectile_effect_target_pose_is_an_atomic_vector(self):
+        effect = {
+            'target_kind': 'bot', 'target_id': 7,
+            'damage': 30, 'shot_result': 2,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'target_x': 4.0, 'target_y': 5.0, 'target_z': 6.0,
+        }
+
+        self.assertEqual(effect, _strict_projectile_effect(effect))
+        incomplete = dict(effect)
+        incomplete.pop('target_z')
+        self.assertIsNone(_strict_projectile_effect(incomplete))
+
     def test_siege_request_is_an_exact_boolean_input_field(self):
         self.assertTrue(self.client.send_input(
             0.0, 0.0, siege_enabled=True))

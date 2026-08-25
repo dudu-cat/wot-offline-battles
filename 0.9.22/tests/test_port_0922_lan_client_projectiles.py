@@ -411,8 +411,8 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertFalse(client.send_projectile_progress(3, [cursor]))
 
     @staticmethod
-    def effect(kind, target_id, x=10.0):
-        return {
+    def effect(kind, target_id, x=10.0, target_pose=None):
+        effect = {
             'target_kind': kind,
             'target_id': target_id,
             'damage': 120,
@@ -421,11 +421,19 @@ class ProjectileWireTests(unittest.TestCase):
             'y': 2.0,
             'z': 3.0,
         }
+        if target_pose is not None:
+            effect.update({
+                'target_x': target_pose[0],
+                'target_y': target_pose[1],
+                'target_z': target_pose[2],
+            })
+        return effect
 
     def test_resolve_is_atomic_and_rejects_duplicate_targets(self):
         client = self.active_worker_client()
         direct = self.effect('player', 8)
-        splash = [self.effect('bot', 17, 12.0)]
+        splash = [self.effect(
+            'bot', 17, 12.0, target_pose=(12.0, 2.0, 3.0))]
 
         self.assertTrue(client.send_projectile_resolve(
             4, 'player:7:1', 150, 'impact', 180,
@@ -446,6 +454,14 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertFalse(client.send_projectile_resolve(
             4, 'player:7:2', 0, 'impact', 10,
             [0.0, 0.0, 0.0], direct, [duplicate]))
+        self.assertFalse(client.send_projectile_resolve(
+            4, 'player:7:2', 0, 'impact', 10,
+            [0.0, 0.0, 0.0],
+            self.effect('player', 8, target_pose=(1.0, 2.0, 3.0)), []))
+        self.assertFalse(client.send_projectile_resolve(
+            4, 'player:7:2', 0, 'impact', 10,
+            [0.0, 0.0, 0.0], direct,
+            [self.effect('bot', 17, 12.0)]))
         self.assertFalse(client.send_projectile_resolve(
             4, 'player:7:2', 0, 'miss', 10,
             [0.0, 0.0, 0.0], direct, []))

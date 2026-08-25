@@ -5899,6 +5899,7 @@ class BattleState:
             "critical_target_base_revision", "critical_target_ack_seq",
             "hull_damage", "critical_delta", "potential_damage",
             "stun_end_server_time_ms",
+            "target_x", "target_y", "target_z",
         }
         required = {
             "target_kind", "target_id", "damage", "shot_result",
@@ -5922,21 +5923,41 @@ class BattleState:
             (5000.0, 3000.0, 5000.0))
         target = (self.players.get(target_id) if target_kind == "player"
                   else self.bot_states.get(target_id))
-        if target is None:
+        retired_target = False
+        if (target_kind == "player" and
+                (target is None or not target.participating)):
+            frozen_target = self._frozen_player_participant(target_id)
+            if frozen_target is not None:
+                retired_target = True
+                target_team = int(frozen_target.get("team", 0))
+                target_alive = False
+            else:
+                raise ValueError("unknown target")
+        elif target is None:
             raise ValueError("unknown target")
-        target_team = (target.team if target_kind == "player"
-                       else int(target.get("team", 0)))
-        target_alive = (target.alive if target_kind == "player"
-                        else bool(target.get("alive")))
+        else:
+            target_team = (target.team if target_kind == "player"
+                           else int(target.get("team", 0)))
+            target_alive = (target.alive if target_kind == "player"
+                            else bool(target.get("alive")))
         if splash:
+            if not {"target_x", "target_y", "target_z"}.issubset(raw):
+                raise ValueError("splash target pose is missing")
+            target_pose = _bounded_vector(
+                [raw.get("target_x"), raw.get("target_y"),
+                 raw.get("target_z")],
+                (-5000.0, -1000.0, -5000.0),
+                (5000.0, 3000.0, 5000.0))
             # The bundled hidden worker sampled this pose when it resolved
             # the native impact.  Rechecking against the target's mutable
             # receipt-time pose makes a legal high-latency terminal fail.
             distance = math.sqrt(sum(
-                (pose[index] - impact[index]) ** 2
+                (target_pose[index] - impact[index]) ** 2
                 for index in range(3)))
             if distance > record["splash_radius"] + PROJECTILE_TOLERANCE:
                 raise ValueError("splash target outside blast radius")
+        elif set(raw) & {"target_x", "target_y", "target_z"}:
+            raise ValueError("direct effect cannot carry splash target pose")
         elif (target_kind == record["shooter_kind"] and
               target_id == record["shooter_id"]):
             raise ValueError("direct self hit")
@@ -5952,15 +5973,27 @@ class BattleState:
                 raise ValueError("critical tokens missing")
             critical_delta = _critical_damage_delta(
                 raw.get("critical_delta"))
-            expected_base = (
-                target.critical_report_base_revision
-                if target_kind == "player" else
-                int(target.get("combat_base_revision", 0)))
-            expected_ack = (
-                target.critical_ack_seq if target_kind == "player" else
-                int(target.get("combat_ack_seq", 0)))
+            if retired_target:
+                # Validate the exact terminal shape, but a player who really
+                # belonged to this round and has since disconnected no longer
+                # has mutable critical CAS state.  The whole terminal remains
+                # admissible as a no-op instead of wedging the projectile.
+                expected_base = _exact_int(
+                    raw.get("critical_target_base_revision"), 0)
+                expected_ack = _exact_int(
+                    raw.get("critical_target_ack_seq"), 0)
+            else:
+                expected_base = (
+                    target.critical_report_base_revision
+                    if target_kind == "player" else
+                    int(target.get("combat_base_revision", 0)))
+                expected_ack = (
+                    target.critical_ack_seq if target_kind == "player" else
+                    int(target.get("combat_ack_seq", 0)))
             hull_damage, critical_accepted = _critical_proposal_admission(
                 raw, expected_base, expected_ack)
+            if retired_target:
+                critical_accepted = False
         elif set(raw) & {"critical_target_base_revision",
                          "critical_target_ack_seq", "hull_damage",
                          "critical_delta"}:
@@ -5984,6 +6017,7 @@ class BattleState:
             "critical_delta": critical_delta,
             "critical_accepted": critical_accepted,
             "hull_damage": hull_damage, "splash": bool(splash),
+            "retired_target": retired_target,
             "stun_end_server_time_ms": stun_end_server_time_ms,
         }
 
@@ -5992,6 +6026,12 @@ class BattleState:
         target_id = proposal["target_id"]
         target = proposal["target"]
         was_alive = proposal["target_alive"]
+        if proposal.get("retired_target"):
+            # The impact was legal when the worker sampled it, but this
+            # participant left before the terminal arrived.  Commit the
+            # projectile/destructible transaction without inventing a hit,
+            # damage, assist, stun or statistic against an absent vehicle.
+            return
         critical = proposal["critical"]
         critical_noop = bool(
             target_kind == "player" and critical is not None and was_alive and
@@ -6274,9 +6314,14 @@ class BattleState:
                         self.players.get(wreck_id)
                         if wreck_kind == "player" else
                         self.bot_states.get(wreck_id))
-                    if wreck_target is None:
+                    retired_wreck = bool(
+                        wreck_kind == "player" and
+                        (wreck_target is None or
+                         not wreck_target.participating) and
+                        self._frozen_player_participant(wreck_id) is not None)
+                    if wreck_target is None and not retired_wreck:
                         raise ValueError("unknown wreck target")
-                    wreck_alive = (
+                    wreck_alive = (False if retired_wreck else
                         wreck_target.alive if wreck_kind == "player" else
                         bool(wreck_target.get("alive")))
                     if wreck_alive:
@@ -6284,10 +6329,11 @@ class BattleState:
                     if (wreck_kind == record["shooter_kind"] and
                             wreck_id == record["shooter_id"]):
                         raise ValueError("projectile cannot hit its own wreck")
-                    wreck_hit = {
-                        "target_kind": wreck_kind,
-                        "target_id": wreck_id,
-                    }
+                    if not retired_wreck:
+                        wreck_hit = {
+                            "target_kind": wreck_kind,
+                            "target_id": wreck_id,
+                        }
                 if (wreck_hit is not None and
                         (outcome != "impact" or not hit_vehicle or
                          direct_raw is not None)):
@@ -10580,6 +10626,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 authority_id, message)
         elif message_type == "projectile_resolve":
             accepted = server.state.resolve_projectile(authority_id, message)
+            if (not accepted and
+                    server.state.phase in ("loading", "battle") and
+                    server.state.battle_result is None):
+                # A terminal is retained and retried until its projectile
+                # disappears from the snapshot.  An explicit protocol reject
+                # can therefore never self-heal; fail the worker round rather
+                # than eventually filling the active-projectile ledger.
+                server.state.remove_simulation_worker(
+                    worker, "projectile_rejected")
+                return "close"
         elif message_type == "bot_manifest":
             accepted = server.state.update_bot_manifest(
                 authority_id, message)

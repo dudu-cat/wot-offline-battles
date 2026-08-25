@@ -15582,6 +15582,19 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((1.0, 2.0, 3.5), visible._local_position)
         self.assertEqual(8.0, visible._local_speed)
 
+    def test_splash_wire_keeps_impact_and_target_pose_distinct(self):
+        battle = BattleRuntime(_runtime())
+
+        effect = battle._projectile_effect(
+            {'kind': 'bot', 'network_id': 2}, 40, 2,
+            (10.0, 1.0, 0.0), None, None, None,
+            (20.0, 2.0, 0.0))
+
+        self.assertEqual((10.0, 1.0, 0.0), (
+            effect['x'], effect['y'], effect['z']))
+        self.assertEqual((20.0, 2.0, 0.0), (
+            effect['target_x'], effect['target_y'], effect['target_z']))
+
     def test_worker_launch_uses_visible_trigger_ray_not_model_node(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
