@@ -234,6 +234,7 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
                 self.assertTrue(server.update_bot_states(1, {
                     'round_id': server.round_id,
                     'bots': message['bots'],
+                    'sample_time_us': message['sample_time_us'],
                 }), server.last_bot_state_reject)
 
                 if not ignited:
@@ -287,7 +288,8 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
         first = runtime.update(
             1.0 / 24.0, 1.0, players=[human])[0]
         self.assertTrue(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': first['bots']}))
+            'round_id': server.round_id, 'bots': first['bots'],
+            'sample_time_us': first['sample_time_us']}))
 
         critical = {
             'devices': [{
@@ -318,6 +320,7 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
         self.assertEqual(0, wire['combat_seq'])
         self.assertTrue(server.update_bot_states(1, {
             'round_id': server.round_id, 'bots': repeated['bots'],
+            'sample_time_us': repeated['sample_time_us'],
         }), server.last_bot_state_reject)
         for frame in range(1, 25):
             publication = runtime.update(
@@ -326,6 +329,7 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
             self.assertTrue(server.update_bot_states(1, {
                 'round_id': server.round_id,
                 'bots': publication['bots'],
+                'sample_time_us': publication['sample_time_us'],
             }), server.last_bot_state_reject)
             if server.bot_pending_projectile_launches:
                 break
@@ -345,12 +349,15 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
         publication = runtime.update(
             1.0 / 24.0, 1.0, players=[_human()])[0]
         self.assertTrue(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': publication['bots']}))
+            'round_id': server.round_id, 'bots': publication['bots'],
+            'sample_time_us': publication['sample_time_us']}))
 
         malformed = [dict(bot) for bot in publication['bots']]
         malformed[0]['combat_seq'] = 2
+        rejected_sample_time_us = publication['sample_time_us'] + 1
         self.assertFalse(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': malformed}))
+            'round_id': server.round_id, 'bots': malformed,
+            'sample_time_us': rejected_sample_time_us}))
         self.assertEqual('combat_contract', server.last_bot_state_reject_code)
         self.assertIn('bot=11', server.last_bot_state_reject)
         self.assertIn('client_seq=2', server.last_bot_state_reject)
@@ -359,15 +366,18 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
             'bot_state', False))
 
         self.assertFalse(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': malformed}))
+            'round_id': server.round_id, 'bots': malformed,
+            'sample_time_us': rejected_sample_time_us}))
         self.assertFalse(server.should_log_protocol_reject(
             'bot_state', False))
         self.assertTrue(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': publication['bots']}))
+            'round_id': server.round_id, 'bots': publication['bots'],
+            'sample_time_us': rejected_sample_time_us}))
         self.assertFalse(server.should_log_protocol_reject(
             'bot_state', True))
         self.assertFalse(server.update_bot_states(1, {
-            'round_id': server.round_id, 'bots': malformed}))
+            'round_id': server.round_id, 'bots': malformed,
+            'sample_time_us': rejected_sample_time_us + 1}))
         self.assertTrue(server.should_log_protocol_reject(
             'bot_state', False))
 

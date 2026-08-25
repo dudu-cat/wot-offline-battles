@@ -261,6 +261,17 @@ class ServerCaptureTests(unittest.TestCase):
         def projectile_hit(shot_seq, damage):
             state.bot_states[11]['fire_seq'] = shot_seq
             state.bot_pending_projectile_launches.add((11, shot_seq))
+            launch_time_us = shot_seq * 1000
+            if state.bot_launch_clock_offset_us is None:
+                state.bot_launch_clock_offset_us = (
+                    state._server_time_ms() * 1000 - 1000000)
+            state.bot_pending_projectile_metadata[(11, shot_seq)] = {
+                'burst_group_seq': shot_seq,
+                'burst_index': 0, 'burst_count': 1, 'shell_index': 0,
+                'sample_start_us': 0,
+                'sample_end_us': launch_time_us,
+                'launch_clock_offset_us': state.bot_launch_clock_offset_us,
+            }
             launch = {
                 'type': 'projectile_launch', 'round_id': state.round_id,
                 'authority_epoch': state.authority_epoch,
@@ -271,6 +282,8 @@ class ServerCaptureTests(unittest.TestCase):
                 'max_distance': 1000.0, 'max_time_ms': 10000,
                 'is_he': False, 'splash_radius': 0.0,
                 'penetration_factor': 1.0,
+                'launch_time_us': launch_time_us,
+                'launch_pose': [100.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 'source_shot': {
                     'speed': 100.0, 'gravity': 9.81,
                     'maxDistance': 1000.0,
