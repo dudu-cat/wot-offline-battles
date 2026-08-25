@@ -729,6 +729,18 @@ def _component_value(component, name, default=None):
     return getattr(component, name, default)
 
 
+def _component_aim_angles(descriptor, turret_yaw, gun_pitch):
+    """Apply #1513's installed-gun constants to component matrices only."""
+    gun = _component_value(descriptor, 'gun')
+    static_yaw = _component_value(gun, 'staticTurretYaw')
+    static_pitch = _component_value(gun, 'staticPitch')
+    if static_yaw is not None:
+        turret_yaw = static_yaw
+    if static_pitch is not None:
+        gun_pitch = static_pitch
+    return float(turret_yaw), float(gun_pitch)
+
+
 def _pose_components(vehicle, math_module):
     """Build descriptor hit-test transforms from one visible vehicle pose."""
     descriptor = vehicle.typeDescriptor
@@ -1251,9 +1263,12 @@ class RemoteVehicle(object):
                     (2.0 * math.pi) - math.pi)
         self._aim_yaw = float(aim_yaw)
         self._gun_pitch = float(gun_pitch)
-        self.appearance.turretMatrix.setRotateYPR((relative, 0.0, 0.0))
+        component_yaw, component_pitch = _component_aim_angles(
+            self.typeDescriptor, relative, self._gun_pitch)
+        self.appearance.turretMatrix.setRotateYPR((
+            component_yaw, 0.0, 0.0))
         self.appearance.gunMatrix.setRotateYPR(
-            (0.0, self._gun_pitch, 0.0))
+            (0.0, component_pitch, 0.0))
 
     def set_health(self, previous):
         self.isAlive.value = self.health > 0 and self.isCrewActive

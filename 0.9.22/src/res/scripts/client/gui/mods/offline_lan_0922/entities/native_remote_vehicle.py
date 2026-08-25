@@ -13,7 +13,7 @@ from __future__ import print_function
 import math
 
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
-    _RemoteShotPresenter, _blend_angle
+    _RemoteShotPresenter, _blend_angle, _component_aim_angles
 
 
 _MINIMUM_KEYFRAME_SECONDS = 0.001
@@ -463,16 +463,20 @@ class _NativeRemoteState(object):
     def set_aim(self, hull_yaw, aim_yaw, gun_pitch):
         relative = ((float(aim_yaw) - float(hull_yaw) + math.pi) %
                     (2.0 * math.pi) - math.pi)
-        gun_pitch = float(gun_pitch)
-        if relative != self._aim_relative_yaw:
-            self.aim.turretMatrix.setRotateYPR((relative, 0.0, 0.0))
-            self._aim_relative_yaw = relative
-        if gun_pitch != self._aim_gun_pitch:
-            self.aim.gunMatrix.setRotateYPR((0.0, gun_pitch, 0.0))
-            self._aim_gun_pitch = gun_pitch
+        raw_gun_pitch = float(gun_pitch)
+        descriptor = getattr(self.entity, 'typeDescriptor', None)
+        component_yaw, component_pitch = _component_aim_angles(
+            descriptor, relative, raw_gun_pitch)
+        if component_yaw != self._aim_relative_yaw:
+            self.aim.turretMatrix.setRotateYPR((
+                component_yaw, 0.0, 0.0))
+            self._aim_relative_yaw = component_yaw
+        if component_pitch != self._aim_gun_pitch:
+            self.aim.gunMatrix.setRotateYPR((0.0, component_pitch, 0.0))
+            self._aim_gun_pitch = component_pitch
         if self.entity is not None:
             self.entity._aim_yaw = float(aim_yaw)
-            self.entity._gun_pitch = gun_pitch
+            self.entity._gun_pitch = raw_gun_pitch
         return True
 
     def update_tracks(self, left, right, mode):
