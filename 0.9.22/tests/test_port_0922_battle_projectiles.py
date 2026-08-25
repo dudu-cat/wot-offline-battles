@@ -159,7 +159,9 @@ def _event():
                 'damage': [390.0, 150.0], 'explosionRadius': 0.0,
             },
         },
-        'shot_seq': 1, 'shell_index': 0,
+        'shot_seq': 1,
+        'burst_group_seq': 1, 'burst_index': 0, 'burst_count': 1,
+        'shell_index': 0,
         'fire_intent_seq': 1, 'fire_input_seq': 1,
         'origin': [0.0, 1.0, 0.0],
         'velocity': [10.0, 0.0, 0.0],
@@ -1017,6 +1019,7 @@ class BattleProjectileTests(unittest.TestCase):
             event.update({
                 'projectile_id': 'player:7:%d' % shot_seq,
                 'shot_seq': shot_seq,
+                'burst_group_seq': shot_seq,
                 'gravity': 190.0,
                 'maxDistance': 10000.0,
             })
