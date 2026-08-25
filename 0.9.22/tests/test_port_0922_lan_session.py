@@ -746,8 +746,10 @@ class LANSessionTests(unittest.TestCase):
         self.assertEqual({123}, session._completed_results)
 
     def test_lobby_view_notification_starts_postbattle_drain_without_retry(self):
+        store = mock.Mock()
+        store.progress.return_value = {'battles': 0}
         session = self.module.LANSession(
-            {}, postbattle_store=object(), lobby_ready=lambda: True)
+            {}, postbattle_store=store, lobby_ready=lambda: True)
         session._publish_postbattle_progress = mock.Mock(return_value=True)
         session._publish_postbattle_results = mock.Mock(return_value=True)
 
