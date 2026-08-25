@@ -12686,6 +12686,34 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(sensor_call.kwargs['kinetic_commit'])
         self.assertIsNone(sensor_call.kwargs['kinetic_speed'])
 
+    def test_bot_motion_read_only_probe_disables_every_commit_path(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._bots = types.SimpleNamespace(states={
+            11: {'movement_dir': 1, 'airborne': False},
+        })
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_motion_blocked.return_value = {
+            'status': 'clear', 'token': None,
+            'accepted_now': False, 'used_kinetic_speed': False,
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='kinetic') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0, commit_enabled=False)
+
+        self.assertEqual('clear', status)
+        self.assertFalse(world_probe.call_args.kwargs['commit_enabled'])
+        sensor_call = (
+            battle._destructibles._catalog_motion_blocked.call_args)
+        self.assertFalse(sensor_call.kwargs['commit_enabled'])
+        self.assertFalse(sensor_call.kwargs['kinetic_commit'])
+
     def test_bot_clear_catalog_guard_skips_per_frame_world_probe(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

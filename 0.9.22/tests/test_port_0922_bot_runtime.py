@@ -2229,12 +2229,19 @@ class BotRuntimeTests(unittest.TestCase):
             'move_position': (0.0, 0.0, 200.0),
             'recovery_mode': 'drive', 'movement_intent': True,
         }
-        statuses = ['hard', 'hard', 'clear']
         calls = []
+        destroyed = []
 
         def resolver(*args):
-            calls.append(args)
-            return statuses.pop(0)
+            commit_enabled = args[7] if len(args) > 7 else True
+            calls.append((args, commit_enabled))
+            if len(calls) == 1:
+                return 'hard'
+            if commit_enabled:
+                destroyed.append(args[2])
+            if args[2] == -0.55:
+                return 'crushed' if commit_enabled else 'clear'
+            return 'hard'
 
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: _combat_descriptor(),
@@ -2252,13 +2259,16 @@ class BotRuntimeTests(unittest.TestCase):
 
         runtime.update(.04, 1.0)
 
-        contact_speed = calls[0][3]
+        contact_speed = calls[0][0][3]
         expected_speed, delta_x, delta_z = \
             self.module.vehicle_physics.hard_contact_step(
                 contact_speed, .04, grinding=False, slide_yaw=-0.55)
-        self.assertEqual(3, len(calls))
-        self.assertEqual([0.0, 0.55, -0.55],
-                         [call[2] for call in calls])
+        self.assertEqual(4, len(calls))
+        self.assertEqual([0.55, -0.55, -0.55],
+                         [call[0][2] for call in calls[1:]])
+        self.assertEqual([False, False, True],
+                         [call[1] for call in calls[1:]])
+        self.assertEqual([-0.55], destroyed)
         self.assertAlmostEqual(expected_speed, state['speed'])
         self.assertAlmostEqual(delta_x, state['x'])
         self.assertAlmostEqual(delta_z, state['z'])

@@ -12343,8 +12343,8 @@ class BattleRuntime(object):
         return status in ('clear', 'crushed')
 
     def _resolve_bot_motion(self, bot_id, position, yaw, speed,
-                            descriptor, dt, now):
-        """Commit-side Bot contact: static world first, then exact catalog."""
+                            descriptor, dt, now, commit_enabled=True):
+        """Resolve Bot contact: static world first, then exact catalog."""
         pos = self._vector(position)
         bot_state = getattr(self._bots, 'states', {}).get(int(bot_id), {})
         airborne = bool(bot_state.get('airborne', False))
@@ -12380,7 +12380,8 @@ class BattleRuntime(object):
         world_status = world_collision.check_horizontal_collision(
             self._runtime.bigworld, self._runtime.math,
             self._avatar.spaceID, pos, yaw, speed, descriptor, airborne, dt,
-            True, allow_crush_drive, kinetic_speed)
+            True, allow_crush_drive, kinetic_speed,
+            commit_enabled=commit_enabled)
         if isinstance(world_status, bool):
             world_status = 'hard' if world_status else 'clear'
         self._bot_motion_kinds[int(bot_id)] = '-'
@@ -12401,7 +12402,8 @@ class BattleRuntime(object):
         detail = self._destructibles._catalog_motion_blocked(
             self._avatar.spaceID, pos, yaw, speed, descriptor, now,
             dt=dt, kinetic_speed=kinetic_speed, return_detail=True,
-            kinetic_commit=allow_crush_drive)
+            kinetic_commit=allow_crush_drive and commit_enabled,
+            commit_enabled=commit_enabled)
         if isinstance(detail, bool):
             detail = {'status': 'hard' if detail else 'clear'}
         elif isinstance(detail, str):

@@ -3744,7 +3744,7 @@ class BotRuntime(object):
         return True
 
     def _passive_motion_status(self, state, position, yaw, speed,
-                               descriptor, step, now):
+                               descriptor, step, now, commit_enabled=False):
         """Resolve glancing travel without enabling active-drive crush."""
         if not callable(self.motion_resolver):
             return 'clear'
@@ -3756,13 +3756,13 @@ class BotRuntime(object):
             if self._probe_clock is None:
                 status = self.motion_resolver(
                     state['id'], position, yaw, speed,
-                    descriptor, step, now)
+                    descriptor, step, now, commit_enabled)
             else:
                 probe_started = self._probe_started()
                 try:
                     status = self.motion_resolver(
                         state['id'], position, yaw, speed,
-                        descriptor, step, now)
+                        descriptor, step, now, commit_enabled)
                 finally:
                     self._probe_finished(4, probe_started)
         finally:
@@ -3783,13 +3783,20 @@ class BotRuntime(object):
             if callable(self.motion_resolver):
                 status = self._passive_motion_status(
                     state, position, candidate_yaw, speed,
-                    descriptor, step, now)
+                    descriptor, step, now, commit_enabled=False)
                 clear = status in ('clear', 'crushed')
             else:
                 clear = self._probe_is_clear(self._probe_direction(
                     position, candidate_yaw, speed, descriptor))
             if clear:
-                slide_yaw = candidate_yaw
+                if callable(self.motion_resolver):
+                    status = self._passive_motion_status(
+                        state, position, candidate_yaw, speed,
+                        descriptor, step, now, commit_enabled=True)
+                    if status in ('clear', 'crushed'):
+                        slide_yaw = candidate_yaw
+                else:
+                    slide_yaw = candidate_yaw
                 break
         bot_id = int(state['id'])
         speed, delta_x, delta_z = vehicle_physics.hard_contact_step(
