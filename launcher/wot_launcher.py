@@ -1377,8 +1377,18 @@ class LauncherWindow(object):
             selected_profile in self._profile_names
             else None)
         try:
+            session_mode = self.mode.get()
+            if (session_mode == core.MODE_JOIN and
+                    self._server_is_running() and
+                    core.endpoint_for_mode(
+                        session_mode, self.join_address.get()) ==
+                    (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT)):
+                # The Online tab deliberately keeps one Join UI. When this
+                # launcher owns the local server, its player is also the host
+                # and must carry the hidden simulation worker for the room.
+                session_mode = core.MODE_HOST
             session = core.plan_session(
-                status, self.mode.get(), self.join_address.get(),
+                status, session_mode, self.join_address.get(),
                 vehicle_profile=profile_name)
             session[COLLECT_CRASH_REPORTS_SETTING] = bool(
                 self.collect_crash_reports.get())

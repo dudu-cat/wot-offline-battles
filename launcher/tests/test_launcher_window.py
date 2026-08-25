@@ -531,6 +531,27 @@ class WindowTest(unittest.TestCase):
         self.assertEqual(core.MODE_JOIN, plan.call_args.args[1])
         thread.return_value.start.assert_called_once_with()
 
+    def test_local_server_owner_plans_a_host_session_with_worker(self):
+        self._game()
+        self.window.join_address.set(
+            "%s:%d" % (core.LOCAL_HOST, core.DEFAULT_SERVER_PORT))
+        self.window._server = _Process(exit_code=None)
+        self.window._server_persistent = True
+        session = {
+            "client": core.PORT_0_9_22,
+            "mode": core.MODE_HOST,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": True,
+            "vehicle_profile": None,
+        }
+        with mock.patch("core.plan_session", return_value=session) as plan, \
+                mock.patch("wot_launcher.threading.Thread") as thread:
+            self.window._start_network()
+
+        self.assertEqual(core.MODE_HOST, plan.call_args.args[1])
+        thread.return_value.start.assert_called_once_with()
+
     def test_the_address_field_and_test_button_follow_the_mode(self):
         self.window.mode.set(core.MODE_JOIN)
         self.window._refresh_mode()

@@ -1149,8 +1149,8 @@ static int launch_player(const WCHAR *game_path, BOOL paired_worker,
 		}
 	} else {
 		SetEnvironmentVariableW(MULTI_CLIENT_ENV, 0);
-		SetEnvironmentVariableW(SERVER_HOST_ENV, 0);
-		SetEnvironmentVariableW(SERVER_PORT_ENV, 0);
+		/* The launcher supplies the selected LAN endpoint to this process.
+		 * Keep it for the visible client that inherits our environment. */
 	}
 	if (!SetEnvironmentVariableW(WORKER_MODE_ENV, PLAYER_MODE_VALUE)) {
 		log_failure("SetEnvironmentVariableW(player_mode)", GetLastError());

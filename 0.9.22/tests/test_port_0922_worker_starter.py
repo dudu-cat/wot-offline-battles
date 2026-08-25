@@ -94,14 +94,16 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('WoT-0.9.22-LAN-Server.exe', source)
         self.assertIn('local_server_port_in_use', source)
 
-    def test_lan_player_clears_process_local_server_override(self):
+    def test_lan_player_preserves_launcher_server_override(self):
         source = SOURCE.read_text(encoding='utf-8')
         launch = source.split(
             'static int launch_player', 1)[1].split(
                 'int WINAPI wWinMain', 1)[0]
 
-        self.assertIn('SetEnvironmentVariableW(SERVER_HOST_ENV, 0);', launch)
-        self.assertIn('SetEnvironmentVariableW(SERVER_PORT_ENV, 0);', launch)
+        self.assertNotIn(
+            'SetEnvironmentVariableW(SERVER_HOST_ENV, 0);', launch)
+        self.assertNotIn(
+            'SetEnvironmentVariableW(SERVER_PORT_ENV, 0);', launch)
 
     def test_visible_player_job_tracks_client_process_handoffs(self):
         source = SOURCE.read_text(encoding='utf-8')
