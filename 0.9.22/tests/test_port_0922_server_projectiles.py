@@ -640,6 +640,53 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             (2.0, 1.3, 8.0 / 3.6, 2.0),
             SIEGE_VEHICLE_PARAMS['sweden:S22_Strv_S1'])
 
+    def test_bot_siege_transition_publication_cannot_advance_hull_pose(self):
+        identity = {
+            'id': 16, 'team': 2, 'slot': 0, 'name': 'Bot',
+            'vehicle': 'sweden:S11_Strv_103B', 'max_health': 1000,
+        }
+        base = {
+            'id': 16, 'health': 1000, 'alive': True,
+            'x': 10.0, 'y': 1.0, 'z': 20.0, 'yaw': 0.25,
+            'pitch': 0.0, 'roll': 0.0,
+            'speed': 8.0, 'movement_dir': 1, 'rotation_dir': 1,
+            'siege_state': SIEGE_DISABLED,
+            'siege_time_left_ms': 0,
+            'siege_transition_total_ms': 0,
+        }
+        previous = BattleState._sanitize_bot_state(base, identity, None)
+        transition = dict(
+            base, speed=0.0, movement_dir=0, rotation_dir=0,
+            siege_state=SIEGE_SWITCHING_ON,
+            siege_time_left_ms=2000,
+            siege_transition_total_ms=2000,
+            y=0.8, pitch=-0.1, roll=0.05)
+
+        switching = BattleState._sanitize_bot_state(
+            transition, identity, previous)
+        self.assertEqual((0.8, -0.1, 0.05), (
+            switching['y'], switching['pitch'], switching['roll']))
+
+        for field, value in (
+                ('speed', 0.00001), ('movement_dir', 0.005),
+                ('rotation_dir', -0.005), ('x', 10.1),
+                ('z', 20.1), ('yaw', 0.3)):
+            with self.assertRaisesRegex(ValueError, 'Siege transition'):
+                BattleState._sanitize_bot_state(
+                    dict(transition, **{field: value}), identity, previous)
+
+        enabled = dict(
+            transition, siege_state=SIEGE_ENABLED,
+            siege_time_left_ms=0, siege_transition_total_ms=0,
+            y=0.5, pitch=-0.2, roll=0.1)
+        settled = BattleState._sanitize_bot_state(
+            enabled, identity, switching)
+        self.assertEqual((10.0, 20.0, 0.25), (
+            settled['x'], settled['z'], settled['yaw']))
+        with self.assertRaisesRegex(ValueError, 'horizontal pose'):
+            BattleState._sanitize_bot_state(
+                dict(enabled, x=10.1), identity, switching)
+
     def test_siege_request_rejects_non_bool_and_destroyed_engine(self):
         state = _state()
         player = state.players[1]

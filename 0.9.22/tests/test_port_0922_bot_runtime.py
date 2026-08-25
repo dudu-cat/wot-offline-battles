@@ -5780,6 +5780,84 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(2, gun_state.clip)
         self.assertFalse(runtime._burst_states[11].active)
 
+    def test_siege_transition_edge_locks_pose_in_its_starting_tick(self):
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        state.update({
+            'x': 3.0, 'y': 0.0, 'z': 4.0, 'yaw': 0.25,
+            'speed': 8.0, 'grounded_once': True,
+            'push_x': 2.0, 'push_z': -1.0,
+        })
+        self.runtime._turn_speeds[11] = 0.4
+        self.runtime.adapter = _FixedAdapter({
+            'target_yaw': 1.0, 'throttle': 1.0, 'turn': 1.0,
+            'movement_intent': True, 'shell_index': 0,
+            'fire_allowed': False, 'target_id': None,
+            'fire_range': 500.0,
+        })
+
+        def begin_transition(bot, command, unused_target, unused_step):
+            bot['siege_state'] = self.module.siege_mechanics.SWITCHING_ON
+            bot['siege_time_left_ms'] = 2000
+            bot['siege_transition_total_ms'] = 2000
+            command['fire_allowed'] = False
+            return True
+
+        def external_contact(unused_players, unused_now, unused_step):
+            state['x'] += 1.0
+            state['z'] -= 1.0
+            state['yaw'] += 0.5
+            state['speed'] = 3.0
+            return []
+
+        self.runtime._update_bot_siege_intent = begin_transition
+        self.runtime._resolve_tank_contacts = external_contact
+
+        self.runtime.update(0.04, 1.0)
+
+        self.assertEqual((3.0, 4.0, 0.25),
+                         (state['x'], state['z'], state['yaw']))
+        self.assertEqual(0.0, state['speed'])
+        self.assertEqual(0, state['movement_dir'])
+        self.assertEqual(0, state['rotation_dir'])
+        self.assertEqual(0.0, self.runtime._turn_speeds[11])
+        self.assertEqual(0.0, state['push_x'])
+        self.assertEqual(0.0, state['push_z'])
+
+    def test_siege_completion_keeps_its_previous_switching_tick_locked(self):
+        self.runtime.battle_start(self.start)
+        state = self.runtime.states[11]
+        descriptor = self.runtime._descriptors[11]
+        self.runtime._descriptor_pairs[11] = (descriptor, descriptor)
+        state.update({
+            'x': 3.0, 'y': 0.0, 'z': 4.0, 'yaw': 0.25,
+            'speed': 8.0, 'grounded_once': True,
+            'siege_state': self.module.siege_mechanics.SWITCHING_ON,
+            'siege_time_left_ms': 10, '_siege_time_left': 0.01,
+            'siege_transition_total_ms': 2000,
+            '_siege_transition_total': 2.0,
+            '_siege_intent': True,
+        })
+        self.runtime.adapter = _FixedAdapter({
+            'target_yaw': 1.0, 'throttle': 1.0, 'turn': 1.0,
+            'movement_intent': True, 'shell_index': 0,
+            'fire_allowed': False, 'target_id': None,
+            'fire_range': 500.0,
+        })
+        self.runtime._update_bot_siege_intent = (
+            lambda *unused_args: False)
+
+        self.runtime.update(0.04, 1.0)
+
+        self.assertEqual(self.module.siege_mechanics.ENABLED,
+                         state['siege_state'])
+        self.assertEqual((3.0, 4.0, 0.25),
+                         (state['x'], state['z'], state['yaw']))
+        self.assertEqual(0.0, state['speed'])
+        self.assertEqual(0, state['movement_dir'])
+        self.assertEqual(0, state['rotation_dir'])
+        self.assertEqual(0.0, self.runtime._turn_speeds[11])
+
     def test_bot_fire_scatters_with_the_current_dynamic_circle(self):
         descriptor = _combat_descriptor(dispersion=0.01)
         descriptor.gun.shotDispersionFactors = {

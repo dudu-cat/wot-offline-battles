@@ -4429,6 +4429,22 @@ class BattleState:
                 abs(float(result["speed"])) >
                 float(siege_values[2]) + 1.0e-6):
             raise ValueError("bot Siege speed exceeds vehicle law")
+        siege_motion_locked = (
+            siege_state in (SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF) or
+            previous is not None and int(previous.get(
+                "siege_state", SIEGE_DISABLED)) in (
+                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF))
+        if siege_motion_locked:
+            if (abs(_finite_float(raw.get("speed"))) > 1.0e-9 or
+                    abs(_finite_float(raw.get("movement_dir"))) > 1.0e-9 or
+                    abs(_finite_float(raw.get("rotation_dir"))) > 1.0e-9):
+                raise ValueError(
+                    "bot Siege transition advanced motion clocks")
+            if previous is not None and any(
+                    result[name] != previous.get(name)
+                    for name in ("x", "z", "yaw")):
+                raise ValueError(
+                    "bot Siege transition advanced horizontal pose")
         critical = (previous or {}).get("critical")
         if "critical" in raw:
             critical = _critical_state(_critical_payload(raw.get("critical")))

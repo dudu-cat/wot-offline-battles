@@ -6687,6 +6687,7 @@ class BotRuntime(object):
         tick_poses = {}
         tick_safe = {}
         attempted_yaws = {}
+        siege_locked_poses = {}
         integrated = set()
         for state in self.states.values():
             if not state['alive']:
@@ -6711,6 +6712,11 @@ class BotRuntime(object):
             if not state['alive']:
                 self._cancel_active_burst(state)
                 continue
+            tick_siege_yaw = _number(state.get('yaw'))
+            siege_motion_locked = int(state.get(
+                'siege_state', siege_mechanics.DISABLED)) in (
+                    siege_mechanics.SWITCHING_ON,
+                    siege_mechanics.SWITCHING_OFF)
             self._advance_bot_siege(state, step)
             position = _position(state)
             tick_poses[state['id']] = position
@@ -6896,8 +6902,10 @@ class BotRuntime(object):
                 target.get('kind') if target is not None else None)
             state['target_id'] = (
                 target.get('network_id') if target is not None else None)
-            self._update_bot_siege_intent(
-                state, command, target, step)
+            siege_motion_locked = bool(
+                self._update_bot_siege_intent(
+                    state, command, target, step) or
+                siege_motion_locked)
             descriptor = self._descriptors.get(state['id'], {})
             profile = state.get('profile')
             profile = profile if isinstance(profile, dict) else {}
@@ -6976,6 +6984,25 @@ class BotRuntime(object):
                 target is not None and
                 command.get('combat_mode') != 'base_defense')
             state['hull_aiming'] = bool(hull_aiming)
+            if siege_motion_locked:
+                # Stock Siege transitions immobilize the hull for the whole
+                # transition tick, including the publication which starts or
+                # completes the state edge.  Clear both planner intent and the
+                # copied-physics clocks before horizontal integration.
+                command['fire_allowed'] = False
+                command['throttle'] = 0.0
+                command['turn'] = 0.0
+                command['movement_intent'] = False
+                throttle = 0.0
+                turn = 0.0
+                state['speed'] = 0.0
+                state['movement_dir'] = 0
+                state['rotation_dir'] = 0
+                state['push_x'] = 0.0
+                state['push_z'] = 0.0
+                self._turn_speeds[state['id']] = 0.0
+                siege_locked_poses[state['id']] = (
+                    position[0], position[2], tick_siege_yaw)
             unused_devices, destroyed_devices, unused_crew, unused_yellow = (
                 _critical_parts(state))
             if (state.get('_overturned', False) or
@@ -7140,10 +7167,11 @@ class BotRuntime(object):
                 # probes once so signed speed stays correct while coasting and
                 # when a ramp loses support.
                 slope_pitch = travel_sign * -math.atan(slope)
-                turn_speed = vehicle_physics.traverse_step(
-                    params, self._turn_speeds.get(state['id'], 0.0),
-                    turn, _number(state.get('speed')), step,
-                    drive_intent=throttle)
+                turn_speed = (0.0 if siege_motion_locked else
+                    vehicle_physics.traverse_step(
+                        params, self._turn_speeds.get(state['id'], 0.0),
+                        turn, _number(state.get('speed')), step,
+                        drive_intent=throttle))
                 self._turn_speeds[state['id']] = turn_speed
                 state['yaw'] += turn_speed * step
                 while state['yaw'] > math.pi:
@@ -7151,10 +7179,11 @@ class BotRuntime(object):
                 while state['yaw'] < -math.pi:
                     state['yaw'] += math.pi * 2.0
                 previous_speed = _number(state.get('speed'))
-                speed = vehicle_physics.longitudinal_step(
-                    params, previous_speed, throttle,
-                    steer_dir != 0, slope_pitch, step,
-                    bool(state.get('airborne', False)), 0, False)
+                speed = (0.0 if siege_motion_locked else
+                    vehicle_physics.longitudinal_step(
+                        params, previous_speed, throttle,
+                        steer_dir != 0, slope_pitch, step,
+                        bool(state.get('airborne', False)), 0, False))
                 state['last_drive_pitch'] = slope_pitch
                 hard_contact = False
                 contact_position = position
@@ -7456,6 +7485,17 @@ class BotRuntime(object):
                     })
         self._pending_ram_reports.extend(
             self._resolve_tank_contacts(players, now, frame_step))
+        for bot_id, locked_pose in siege_locked_poses.items():
+            state = self.states.get(bot_id)
+            if state is None:
+                continue
+            state['x'], state['z'], state['yaw'] = locked_pose
+            state['speed'] = 0.0
+            state['movement_dir'] = 0
+            state['rotation_dir'] = 0
+            state['push_x'] = 0.0
+            state['push_z'] = 0.0
+            self._turn_speeds[bot_id] = 0.0
         ordered_states = self._ordered_states()
         slope_candidates = []
         for state in ordered_states:
