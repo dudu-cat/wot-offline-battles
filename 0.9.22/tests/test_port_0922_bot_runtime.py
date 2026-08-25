@@ -542,6 +542,36 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(0, takeover['stun_end_server_time_ms'])
         self.assertEqual(1, takeover['equipment_states'][1]['usesLeft'])
 
+    def test_delayed_bot_stun_state_is_fenced_after_server_expiry(self):
+        server, unused_manifest, unused_socket = self._server()
+        stun_end = server._server_time_ms() + 5000
+        self.assertTrue(server._set_canonical_stun(
+            ('player', 2), ('bot', 11), stun_end))
+        delayed = self._publication(server, 1.0)
+
+        self.assertEqual(1, server._expire_stuns(stun_end))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, delayed),
+            server.last_bot_state_reject)
+        self.assertEqual(0, server.bot_states[11][
+            'stun_end_server_time_ms'])
+
+    def test_delayed_bot_stun_state_is_fenced_after_new_server_stun(self):
+        server, unused_manifest, unused_socket = self._server()
+        first_end = server._server_time_ms() + 3000
+        second_end = first_end + 2000
+        self.assertTrue(server._set_canonical_stun(
+            ('player', 2), ('bot', 11), first_end))
+        delayed = self._publication(server, 1.0)
+
+        self.assertTrue(server._set_canonical_stun(
+            ('player', 2), ('bot', 11), second_end))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, delayed),
+            server.last_bot_state_reject)
+        self.assertEqual(second_end, server.bot_states[11][
+            'stun_end_server_time_ms'])
+
     def test_snapshot_carries_real_bot_receipt_time_and_queue_age(self):
         now = [100.0]
         server, _, authority_socket = self._server(

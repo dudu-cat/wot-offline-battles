@@ -179,6 +179,7 @@ def _bot_publication(manifest, x_offset=0.0):
         'reload_duration': entry['reload_duration'],
         'combat_base_revision': 0, 'combat_seq': 0,
         'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
+        'stun_end_server_time_ms': 0,
     } for entry in manifest]
 
 

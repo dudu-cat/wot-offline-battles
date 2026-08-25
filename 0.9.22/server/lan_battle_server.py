@@ -4640,14 +4640,16 @@ class BattleState:
             raise ValueError("bot stun proposal is invalid")
         previous_stun_end = int((previous or {}).get(
             "stun_end_server_time_ms", 0))
-        if (isinstance(raw_stun_end, bool) or proposed_stun_end < 0 or
-                float(raw_stun_end) != proposed_stun_end or
-                proposed_stun_end not in (0, previous_stun_end)):
-            raise ValueError("bot stun proposal is invalid")
         stale_combat_base = bool(
             previous is not None and
             int(_finite_float(raw.get("combat_base_revision"), -1)) <
             int(previous.get("combat_base_revision", 0)))
+        if (isinstance(raw_stun_end, bool) or proposed_stun_end < 0 or
+                proposed_stun_end > PROJECTILE_MAX_ID or
+                float(raw_stun_end) != proposed_stun_end or
+                (not stale_combat_base and
+                 proposed_stun_end not in (0, previous_stun_end))):
+            raise ValueError("bot stun proposal is invalid")
         if (previous_stun_end > 0 and proposed_stun_end == 0 and
                 not stale_combat_base and
                 not BattleState._bot_medkit_activated(previous, result)):
