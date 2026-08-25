@@ -82,6 +82,12 @@ class VehicleOverlayTest(unittest.TestCase):
         chassis_record = packed.PackedElement(children=[
             (b"weight", scalar(packed.TYPE_INTEGER, 1200)),
             (b"maxLoad", scalar(packed.TYPE_INTEGER, 6500)),
+            (b"shotDispersionFactors", element([
+                (b"vehicleMovement", scalar(
+                    packed.TYPE_STRING, b"0.12")),
+                (b"vehicleRotation", scalar(
+                    packed.TYPE_STRING, b"0.08")),
+            ])),
             (b"armor", element([
                 (b"leftTrack", scalar(packed.TYPE_INTEGER, 15)),
                 (b"rightTrack", scalar(packed.TYPE_INTEGER, 15)),
@@ -93,12 +99,18 @@ class VehicleOverlayTest(unittest.TestCase):
         ])
         vehicle = packed.PackedElement(children=[
             (b"speedLimits", element(speed_limits.children)),
+            (b"invisibility", element([
+                (b"moving", scalar(packed.TYPE_STRING, b"0.16")),
+                (b"still", scalar(packed.TYPE_STRING, b"0.22")),
+            ])),
             (b"chassis", element([
                 (b"T-18Bis", element(chassis_record.children)),
             ])),
             (b"turrets0", element([
                 (b"T-18_mod", element([
                     (b"weight", scalar(packed.TYPE_INTEGER, 700)),
+                    (b"circularVisionRadius", scalar(
+                        packed.TYPE_INTEGER, 320)),
                     (b"armor", element([
                         (b"armor_1", scalar(packed.TYPE_INTEGER, 35)),
                         (b"armor_2", element([
@@ -152,7 +164,20 @@ class VehicleOverlayTest(unittest.TestCase):
                 (b"gun", scalar(packed.TYPE_INTEGER, 20)),
             ])),
             (b"reloadTime", scalar(packed.TYPE_STRING, b"2.5")),
+            (b"clip", element([
+                (b"count", scalar(packed.TYPE_INTEGER, 4)),
+                (b"rate", scalar(packed.TYPE_STRING, b"30")),
+            ])),
             (b"aimingTime", scalar(packed.TYPE_STRING, b"1.9")),
+            (b"shotDispersionRadius", scalar(
+                packed.TYPE_STRING, b"0.42")),
+            (b"shotDispersionFactors", element([
+                (b"turretRotation", scalar(
+                    packed.TYPE_STRING, b"0.09")),
+                (b"afterShot", scalar(packed.TYPE_STRING, b"2.4")),
+            ])),
+            (b"invisibilityFactorAtShot", scalar(
+                packed.TYPE_STRING, b"0.35")),
             (b"weight", scalar(packed.TYPE_INTEGER, 200)),
             (b"maxAmmo", scalar(packed.TYPE_INTEGER, 45)),
             (b"shots", element([
@@ -382,6 +407,56 @@ class VehicleOverlayTest(unittest.TestCase):
             vehicle_overlays.list_editable_fields(self.game, self.ENGINES)]
         self.assertNotIn("shared/GAZ-M1/tags", engine_paths)
         self.assertNotIn("ids/GAZ-M1", engine_paths)
+
+    def test_fire_control_vision_and_camouflage_fields_are_editable(self):
+        fields = vehicle_overlays.list_vehicle_field_choices(
+            self.game, self.VEHICLE)
+        records = dict((record["fieldPath"], record) for record in fields)
+        expected = {
+            "invisibility/moving": "Vehicle",
+            "invisibility/still": "Vehicle",
+            "chassis/T-18Bis/shotDispersionFactors/vehicleMovement": "Chassis",
+            "chassis/T-18Bis/shotDispersionFactors/vehicleRotation": "Chassis",
+            "turrets0/T-18_mod/circularVisionRadius": "Turret",
+            "shared/Gun-A/clip/rate": "Gun",
+            "shared/Gun-A/shotDispersionRadius": "Gun",
+            "shared/Gun-A/shotDispersionFactors/turretRotation": "Gun",
+            "shared/Gun-A/shotDispersionFactors/afterShot": "Gun",
+            "shared/Gun-A/invisibilityFactorAtShot": "Gun",
+        }
+        self.assertEqual(set(expected), set(records) & set(expected))
+        for field_path, category in expected.items():
+            self.assertEqual(category, records[field_path]["categoryLabel"])
+        self.assertEqual("30", records["shared/Gun-A/clip/rate"]["originalValue"])
+        self.assertIn(
+            "shorter reload",
+            records["shared/Gun-A/clip/rate"]["fieldLabel"])
+
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.GUNS, "shared/Gun-A/clip/rate", "45",
+            is_running=lambda: False)
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE,
+            "chassis/T-18Bis/shotDispersionFactors/vehicleMovement", "0.2",
+            is_running=lambda: False)
+        self.assertEqual(
+            b"45", self._value(self.GUNS, "shared/Gun-A/clip/rate"))
+        self.assertEqual(
+            b"0.2", self._value(
+                self.VEHICLE,
+                "chassis/T-18Bis/shotDispersionFactors/vehicleMovement"))
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "positive"):
+            vehicle_overlays.apply_vehicle_edit(
+                self.game, self.GUNS, "shared/Gun-A/clip/rate", "0",
+                is_running=lambda: False)
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "non-negative"):
+            vehicle_overlays.apply_vehicle_edit(
+                self.game, self.VEHICLE,
+                "chassis/T-18Bis/shotDispersionFactors/vehicleRotation", "-0.1",
+                is_running=lambda: False)
 
     def test_armor_angles_and_component_weights_preserve_stock_types(self):
         vehicle_root = packed.read_packed_xml(self.members[self.VEHICLE])

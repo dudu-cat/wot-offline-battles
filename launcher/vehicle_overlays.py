@@ -124,7 +124,19 @@ _FIELD_LABELS = {
     "pitchMin": "Minimum pitch",
     "pitchMax": "Maximum pitch",
     "reloadTime": "Reload time",
+    "rate": "Magazine firing rate (higher is a shorter reload)",
     "aimingTime": "Aiming time",
+    "shotDispersionRadius": "Base accuracy",
+    "shotDispersionFactors": "Dispersion factors",
+    "vehicleMovement": "Hull movement dispersion",
+    "vehicleRotation": "Hull rotation dispersion",
+    "turretRotation": "Turret rotation dispersion",
+    "afterShot": "Firing dispersion",
+    "invisibilityFactorAtShot": "Firing camouflage factor",
+    "circularVisionRadius": "View range",
+    "invisibility": "Camouflage",
+    "moving": "Moving camouflage",
+    "still": "Stationary camouflage",
     "maxAmmo": "Ammunition capacity",
     "shots": "Shell",
     "speed": "Projectile speed",
@@ -316,7 +328,7 @@ def _gun_value_rule(parts):
     if len(parts) == 1 and parts[-1] == "rotationSpeed":
         return _NONNEGATIVE
     if len(parts) == 1 and parts[-1] in (
-            "weight", "reloadTime", "aimingTime"):
+            "weight", "reloadTime", "aimingTime", "shotDispersionRadius"):
         return _POSITIVE
     if len(parts) == 1 and parts[-1] == "maxAmmo":
         return _MAX_AMMO
@@ -325,6 +337,13 @@ def _gun_value_rule(parts):
         return _PITCH_CURVE
     if len(parts) == 1 and parts[-1] == "turretYawLimits":
         return _YAW_LIMITS
+    if (len(parts) == 2 and parts[0] == "shotDispersionFactors" and
+            parts[-1] in ("turretRotation", "afterShot")):
+        return _NONNEGATIVE
+    if len(parts) == 2 and parts == ["clip", "rate"]:
+        return _POSITIVE
+    if len(parts) == 1 and parts[-1] == "invisibilityFactorAtShot":
+        return _NONNEGATIVE
     if (len(parts) == 3 and parts[0] == "shots" and
             parts[-1] in ("speed", "maxDistance")):
         return _POSITIVE
@@ -342,6 +361,9 @@ def _field_rule(member, field_path):
     parts = _field_parts(field_path)
 
     if member_kind == "vehicle":
+        if (len(parts) == 2 and parts[0] == "invisibility" and
+                parts[-1] in ("moving", "still")):
+            return _NONNEGATIVE
         if parts in (["speedLimits", "forward"],
                      ["speedLimits", "backward"]):
             return _POSITIVE
@@ -360,6 +382,10 @@ def _field_rule(member, field_path):
                 parts[2] in ("weight", "maxLoad")):
             return _POSITIVE
         if (len(parts) == 4 and parts[0] == "chassis" and
+                parts[2] == "shotDispersionFactors" and
+                parts[-1] in ("vehicleMovement", "vehicleRotation")):
+            return _NONNEGATIVE
+        if (len(parts) == 4 and parts[0] == "chassis" and
                 parts[2] == "armor"):
             return _NONNEGATIVE
         if parts in (["hull", "ammoBayHealth", "maxHealth"],
@@ -373,6 +399,9 @@ def _field_rule(member, field_path):
             return _health_rule(parts[-1])
         if (len(parts) == 3 and re.fullmatch(r"turrets\d+", parts[0]) and
                 parts[-1] == "weight"):
+            return _POSITIVE
+        if (len(parts) == 3 and re.fullmatch(r"turrets\d+", parts[0]) and
+                parts[-1] == "circularVisionRadius"):
             return _POSITIVE
         if (len(parts) == 4 and re.fullmatch(r"turrets\d+", parts[0]) and
                 parts[2] == "armor"):
@@ -391,6 +420,11 @@ def _field_rule(member, field_path):
                 return _NONNEGATIVE
 
     if member_kind == "component":
+        if (component_name == "chassis" and len(parts) == 4 and
+                parts[0] == "shared" and
+                parts[2] == "shotDispersionFactors" and
+                parts[-1] in ("vehicleMovement", "vehicleRotation")):
+            return _NONNEGATIVE
         if (component_name == "engines" and len(parts) == 3 and
                 parts[0] == "shared" and parts[-1] == "power"):
             return _POSITIVE
@@ -406,6 +440,10 @@ def _field_rule(member, field_path):
             rule = _gun_value_rule(parts[2:])
             if rule is not None:
                 return rule
+        if (component_name == "turrets" and len(parts) == 3 and
+                parts[0] == "shared" and
+                parts[-1] == "circularVisionRadius"):
+            return _POSITIVE
         if (component_name in ("chassis", "guns", "turrets") and
                 len(parts) == 4 and parts[0] == "shared" and
                 parts[2] == "armor"):

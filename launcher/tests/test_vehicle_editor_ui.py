@@ -444,6 +444,12 @@ class VehicleEditorWindowTest(unittest.TestCase):
         self.assertEqual(
             "Shell-A / Damage / Module damage",
             self.window._field_label("Shell-A / Damage / Module damage"))
+        self.assertEqual(
+            "弹夹短装填射速（越高越短）",
+            window._field_label(
+                "Magazine firing rate (higher is a shorter reload)"))
+        self.assertEqual(
+            "基础精度", window._field_label("Base accuracy"))
 
         self.assertFalse(window.restore_defaults())
         self.assertIn("清除", messagebox.calls[-1][0][0])
