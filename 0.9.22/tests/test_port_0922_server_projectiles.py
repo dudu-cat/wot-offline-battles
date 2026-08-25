@@ -284,6 +284,96 @@ def _destructible(chunk_id=7, item_index=3, **changes):
 
 
 class ServerProjectileLedgerTests(unittest.TestCase):
+    def test_modern_input_whitelist_rejects_before_state_advances(self):
+        state = _state(players=1)
+        player = state.players[1]
+        base = {
+            'type': 'input', 'round_id': state.round_id,
+            'input_seq': 1,
+            'pose_time_us': state._logical_motion_time_us(),
+            'forward': 0.75, 'turn': -0.25, 'speed': 0.0,
+            'aim_yaw': 0.2, 'gun_pitch': 0.05,
+            'x': player.x, 'y': player.y, 'z': player.z,
+            'yaw': player.yaw, 'pitch': player.pitch,
+            'roll': player.roll, 'fire_seq': 0,
+            'shell_index': 0, 'next_shell_index': 0,
+            'shell_change_pending': False,
+            'gun_checkpoint': _gun_checkpoint(),
+        }
+        before = (
+            player.input_seq, dict(player.input_fingerprints),
+            player.gun_checkpoint_seq, dict(player.gun_checkpoint),
+            player.forward, player.turn, player.health, player.alive,
+        )
+        forbidden = (
+            ('health', 0), ('critical', {'events': []}),
+            ('dead', True), ('damage', 1000), ('death_reason', 2),
+            ('reported_health', 0),
+            ('automatic_equipment_response', {'equipment_id': 21}),
+            ('destructible_verdict', {'destroyed': True}),
+        )
+        for field, value in forbidden:
+            with self.subTest(field=field):
+                message = json.loads(json.dumps(base))
+                message[field] = value
+                self.assertFalse(state.update_input(1, message))
+                self.assertEqual(before, (
+                    player.input_seq, dict(player.input_fingerprints),
+                    player.gun_checkpoint_seq, dict(player.gun_checkpoint),
+                    player.forward, player.turn, player.health, player.alive,
+                ))
+
+        wrong_type = json.loads(json.dumps(base))
+        wrong_type['type'] = 'equipment_intent'
+        self.assertFalse(state.update_input(1, wrong_type))
+        self.assertEqual(0, player.input_seq)
+        self.assertTrue(state.update_input(1, base))
+        self.assertEqual((1, 1, 0.75, -0.25), (
+            player.input_seq, player.gun_checkpoint_seq,
+            player.forward, player.turn))
+
+    def test_modern_input_rejects_inactive_player_atomically(self):
+        for condition in ('waiting', 'loading', 'finished',
+                          'nonparticipating', 'dead'):
+            with self.subTest(condition=condition):
+                state = _state(players=1)
+                player = state.players[1]
+                if condition in ('waiting', 'loading'):
+                    state.phase = condition
+                elif condition == 'finished':
+                    state.battle_result = {'winner': 1}
+                elif condition == 'nonparticipating':
+                    player.participating = False
+                else:
+                    player.alive = False
+                    player.health = 0
+                self.assertFalse(state.update_input(1, {
+                    'type': 'input', 'round_id': state.round_id,
+                    'input_seq': 1, 'forward': 1.0, 'turn': 1.0,
+                }))
+                self.assertEqual((0, {}, 0.0, 0.0), (
+                    player.input_seq, dict(player.input_fingerprints),
+                    player.forward, player.turn))
+
+    def test_leave_filters_participant_and_dead_leave_has_no_death_event(self):
+        state = _state(players=2)
+        departed = state.players[2]
+        departed.alive = False
+        departed.health = 0
+
+        self.assertTrue(state.leave_battle(
+            departed.player_id, {'round_id': state.round_id}))
+
+        self.assertFalse(departed.participating)
+        self.assertFalse(any(
+            event.get('source') == 'player_left'
+            for event in state.pending_events))
+        self.assertEqual([1], [
+            player['id']
+            for player in state.current_battle_message()['players']])
+        self.assertFalse(BattleState._public_player(departed)[
+            'participating'])
+
     def test_fatal_bot_projectile_commits_worker_terminal_critical_once(self):
         state = _state()
         bot = {
@@ -1775,6 +1865,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 PLAYER_FIRE_INTENT_CAPABILITY,
                 PLAYER_ENVIRONMENT_CAPABILITY,
                 EFFECTIVE_PARAMS_CAPABILITY],
+            'max_health': 1000,
             'vehicle_compact_descr': 'dGVzdA==',
             'effective_params': effective_params()})
         self.assertIsNone(player)

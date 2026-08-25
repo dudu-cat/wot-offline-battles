@@ -219,12 +219,15 @@ PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v4"
 PLAYER_ENVIRONMENT_CAPABILITY = "player_environment_v1"
 EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
 TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
-CLIENT_VERDICT_FIELDS = frozenset((
-    "reported_health", "reported_critical", "reported_reason",
-    "reported_display_health", "reported_attacker",
-    "reported_attacker_bot", "reported_critical_base_revision",
-    "reported_critical_seq",
+MODERN_INPUT_FIELDS = frozenset((
+    "type", "round_id", "input_seq",
+    "forward", "turn", "speed", "aim_yaw", "gun_pitch",
+    "x", "y", "z", "yaw", "pitch", "roll", "pose_time_us",
+    "fire_seq", "shell_index", "next_shell_index",
+    "shell_change_pending", "gun_checkpoint", "ram_contacts",
+    "ram_contact", "destructible_contacts", "siege_enabled",
 ))
+MODERN_INPUT_REQUIRED_FIELDS = frozenset(("round_id",))
 SERVER_CAPABILITIES = (
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     LEAN_SNAPSHOT_MANIFEST_CAPABILITY,
@@ -2170,6 +2173,15 @@ class BattleState:
                 outfits = {}
                 vehicle_compact_descr = ""
                 effective_params = {}
+            if client_build == CLIENT_BUILD_0922:
+                try:
+                    max_health = _exact_int(
+                        hello.get("max_health"), 1, 100000)
+                except (TypeError, ValueError, OverflowError):
+                    return None, "invalid_max_health"
+            else:
+                max_health = max(1, min(int(_finite_float(
+                    hello.get("max_health"), 1000)), 100000))
             if (self.client_build is not None and
                     client_build != self.client_build):
                 return None, "incompatible_client_build"
@@ -2217,8 +2229,8 @@ class BattleState:
                 z=z,
                 yaw=yaw,
                 aim_yaw=yaw,
-                health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
-                max_health=max(1, min(int(_finite_float(hello.get("max_health"), 1000)), 100000)),
+                health=max_health,
+                max_health=max_health,
                 capabilities=capabilities,
                 account_key=account_key,
                 outfits=outfits,
@@ -2429,9 +2441,17 @@ class BattleState:
             if (player is None or not player.connected or
                     self.phase != "waiting"):
                 return False
+            if self.client_build == CLIENT_BUILD_0922:
+                try:
+                    max_health = _exact_int(
+                        message.get("max_health"), 1, 100000)
+                except (TypeError, ValueError, OverflowError):
+                    return False
+            else:
+                max_health = max(1, min(int(_finite_float(
+                    message.get("max_health"), player.max_health)),
+                    100000))
             vehicle = _safe_vehicle(message.get("vehicle"), player.vehicle)
-            max_health = max(1, min(int(_finite_float(
-                message.get("max_health"), player.max_health)), 100000))
             try:
                 outfits = _validated_outfits(message.get("outfits"))
                 vehicle_compact_descr = \
@@ -3464,16 +3484,17 @@ class BattleState:
             player.forward = 0.0
             player.turn = 0.0
             self.state_revision += 1
-            self.pending_events.append({
-                "kind": "health",
-                "target": player.player_id,
-                "damage": previous_health,
-                "health": 0,
-                "dead": True,
-                "attack_reason": None,
-                "death_reason": 0,
-                "source": "player_left",
-            })
+            if was_alive:
+                self.pending_events.append({
+                    "kind": "health",
+                    "target": player.player_id,
+                    "damage": previous_health,
+                    "health": 0,
+                    "dead": True,
+                    "attack_reason": None,
+                    "death_reason": 0,
+                    "source": "player_left",
+                })
             if player_id == self.bot_authority_id:
                 self._elect_bot_authority()
             if self.phase == "loading":
@@ -3509,7 +3530,9 @@ class BattleState:
         with self.lock:
             if self.phase != "battle":
                 return None
-            connected = [p for p in self.players.values() if p.connected]
+            connected = [
+                p for p in self.players.values()
+                if p.connected and p.participating]
             takeover_manifest = []
             for identity in self.bot_manifest:
                 entry = dict(identity)
@@ -3935,7 +3958,8 @@ class BattleState:
                 return False
             players = [
                 self._public_player(p, include_outfits=False)
-                for p in self.players.values() if p.connected]
+                for p in self.players.values()
+                if p.connected and p.participating]
             known_targets = self.bot_planner.known_targets(list(self.bot_states.values()), players)
             known_players = dict(
                 (int(player.player_id), player)
@@ -7551,14 +7575,19 @@ class BattleState:
                 return False
             player = self.players.get(player_id)
             if player is None or not player.connected:
-                return
-            if (self.client_build == CLIENT_BUILD_0922 and
-                    (CLIENT_VERDICT_FIELDS.intersection(message) or
-                     "ram_contact" in message)):
-                # A visible modern client contributes controls and timed pose
-                # samples only. Canonical HP, critical state, death and combat
-                # attribution are never accepted as client verdicts.
                 return False
+            if self.client_build == CLIENT_BUILD_0922:
+                fields = set(message)
+                if (("type" in message and
+                     message.get("type") != "input") or
+                        not MODERN_INPUT_REQUIRED_FIELDS.issubset(fields) or
+                        fields - MODERN_INPUT_FIELDS or
+                        self.phase != "battle" or
+                        self.battle_result is not None or
+                        not player.participating or not player.alive):
+                    # Reject the whole transaction before sequence, gun,
+                    # controls or pose state can advance.
+                    return False
             shell_selection = None
             gun_checkpoint = None
             has_next_shell = "next_shell_index" in message
@@ -7677,10 +7706,10 @@ class BattleState:
                     if (isinstance(candidate, list) and
                             len(candidate) <= 16):
                         raw_contacts = candidate
-                elif (self.client_build != CLIENT_BUILD_0922 and
-                      isinstance(message.get("ram_contact"), dict)):
+                elif isinstance(message.get("ram_contact"), dict):
                     # Protocol-v5 compatibility: older clients repeat one
-                    # latest receipt. Store it in the same pending ledger.
+                    # latest receipt. Current senders retain the same one-row
+                    # fallback when no batch is available.
                     raw_contacts = [message.get("ram_contact")]
                 if raw_contacts is not None:
                     authority = (self.simulation_worker if
@@ -9964,7 +9993,8 @@ class BattleState:
                 self.bot_orders = self.bot_planner.build_orders(
                     self.bot_manifest, list(self.bot_states.values()),
                     [self._public_player(p, include_outfits=False)
-                     for p in self.players.values() if p.connected],
+                     for p in self.players.values()
+                     if p.connected and p.participating],
                     time.monotonic(), self._bot_defense_context())
             tick_server_time_ms = None
             if self.client_build == CLIENT_BUILD_0922:
@@ -9995,7 +10025,8 @@ class BattleState:
                 "map": self.map_name,
                 "bot_authority_id": self.bot_authority_id,
                 "players": [self._public_player(p, include_outfits=False)
-                            for p in self.players.values() if p.connected],
+                            for p in self.players.values()
+                            if p.connected and p.participating],
                 "bots": [self.bot_states[key] for key in sorted(self.bot_states)],
                 "bot_state_revision": self.bot_state_revision,
                 "bot_manifest": list(self.bot_manifest),
@@ -10159,6 +10190,7 @@ class BattleState:
             "vehicle_compact_descr": player.vehicle_compact_descr,
             "team": player.team,
             "slot": player.slot,
+            "participating": bool(player.participating),
             "world_pose": player.client_position,
             "spawn_x": BattleState._spawn_x_for(player.slot),
             "spawn_z": BattleState._spawn_z_for(player.team),
@@ -10841,6 +10873,7 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "invalid_account_key": "invalid offline account identity",
                     "duplicate_account_key": "offline account identity is already connected",
                     "invalid_outfits": "invalid vehicle customization data",
+                    "invalid_max_health": "invalid vehicle maximum health",
                     "invalid_effective_params":
                         "invalid effective vehicle parameters",
                 }

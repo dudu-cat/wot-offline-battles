@@ -10680,6 +10680,8 @@ class BattleRuntime(object):
             for raw in snapshot_players:
                 if not isinstance(raw, dict):
                     continue
+                if raw.get('participating') is not True:
+                    continue
                 try:
                     player_id = int(raw.get('id'))
                 except (TypeError, ValueError, OverflowError):
@@ -10696,6 +10698,8 @@ class BattleRuntime(object):
         local_found = False
         for raw in snapshot_players:
             if not isinstance(raw, dict) or raw.get('id') is None:
+                continue
+            if raw.get('participating') is not True:
                 continue
             state = dict(raw)
             if int(state['id']) != local_id:

@@ -11599,12 +11599,18 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._sender = _LANInputSender(battle)
         battle._sender.align_aim(0.2, -0.05)
         battle._last_snapshot = {'players': [
-            {'id': 1, 'team': 1, 'slot': 0, 'world_pose': False,
+            {'id': 1, 'team': 1, 'slot': 0, 'participating': True,
+             'world_pose': False,
              'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0},
-            {'id': 2, 'team': 2, 'slot': 0, 'world_pose': False,
+            {'id': 2, 'team': 2, 'slot': 0, 'participating': True,
+             'world_pose': False,
              'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0},
-            {'id': 3, 'team': 2, 'slot': 1, 'world_pose': True,
+            {'id': 3, 'team': 2, 'slot': 1, 'participating': True,
+             'world_pose': True,
              'x': -300.0, 'y': 2.0, 'z': 100.0, 'yaw': 1.0},
+            {'id': 4, 'team': 2, 'slot': 2, 'participating': False,
+             'world_pose': True,
+             'x': -250.0, 'y': 2.0, 'z': 90.0, 'yaw': 1.0},
         ]}
 
         players = battle._authority_players()
@@ -11628,8 +11634,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._last_snapshot = {'players': [
             {'id': -1, 'world_pose': True, 'x': 0.0, 'y': -500.0,
              'z': 0.0},
-            {'id': 1, 'world_pose': True, 'x': 5.0, 'y': 0.0, 'z': 8.0},
-            {'id': 2, 'world_pose': False, 'x': 0.0, 'y': 0.0, 'z': 0.0},
+            {'id': 1, 'participating': True, 'world_pose': True,
+             'x': 5.0, 'y': 0.0, 'z': 8.0},
+            {'id': 2, 'participating': True, 'world_pose': False,
+             'x': 0.0, 'y': 0.0, 'z': 0.0},
+            {'id': 3, 'participating': False, 'world_pose': True,
+             'x': 7.0, 'y': 0.0, 'z': 9.0},
+            {'id': 4, 'world_pose': True,
+             'x': 9.0, 'y': 0.0, 'z': 11.0},
             {'id': 0, 'world_pose': True, 'x': 1.0, 'y': 0.0, 'z': 1.0},
         ]}
 

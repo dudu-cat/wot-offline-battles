@@ -248,6 +248,49 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(150, self.client.max_health)
         self.assertFalse(self.client.select_vehicle('germany:G01_PzI', 150))
 
+    def test_modern_vehicle_change_rejects_non_exact_health_atomically(self):
+        invalid_values = (
+            ('missing', None), ('bool', True), ('float', 150.0),
+            ('string', '150'), ('zero', 0), ('negative', -1),
+            ('overflow', 100001),
+        )
+        for name, value in invalid_values:
+            with self.subTest(name=name):
+                state = self._room_with_one_player()
+                player = state.players[1]
+                message = {
+                    'vehicle': 'germany:G01_PzI',
+                    'vehicle_compact_descr': 'cHpp',
+                    'effective_params': effective_params(),
+                }
+                if name != 'missing':
+                    message['max_health'] = value
+                before = (
+                    player.vehicle, player.health, player.max_health,
+                    dict(player.outfits), player.vehicle_compact_descr,
+                    player.siege_state, state.state_revision,
+                )
+
+                self.assertFalse(state.select_vehicle(1, message))
+
+                self.assertEqual(before, (
+                    player.vehicle, player.health, player.max_health,
+                    dict(player.outfits), player.vehicle_compact_descr,
+                    player.siege_state, state.state_revision,
+                ))
+
+    def test_legacy_vehicle_change_keeps_health_coercion(self):
+        state = self._room_with_one_player()
+        state.client_build = CLIENT_BUILD_082
+
+        self.assertTrue(state.select_vehicle(1, {
+            'vehicle': 'germany:G01_PzI', 'max_health': 150.75,
+            'vehicle_compact_descr': 'cHpp',
+            'effective_params': effective_params()}))
+
+        self.assertEqual((150, 150), (
+            state.players[1].health, state.players[1].max_health))
+
     def test_vehicle_selection_is_refused_outside_the_waiting_room(self):
         self.client.phase = 'battle'
 

@@ -14,7 +14,7 @@ sys.path.insert(0, str(SERVER_ROOT))
 
 import lan_battle_server as server_module  # noqa: E402
 from lan_battle_server import (  # noqa: E402
-    BattleState, CLIENT_BUILD_0922, ClientHandler,
+    BattleState, CLIENT_BUILD_082, CLIENT_BUILD_0922, ClientHandler,
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY, PROJECTILE_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY,
     LEAN_SNAPSHOT_MANIFEST_CAPABILITY, Player, PREBATTLE_SECONDS,
@@ -202,6 +202,45 @@ class SimulationWorkerStateTests(unittest.TestCase):
 
         self.assertIsNone(worker)
         self.assertEqual('unsupported_capabilities', error)
+
+    def test_modern_player_join_requires_exact_max_health_before_mutation(self):
+        invalid_values = (
+            ('missing', None), ('bool', True), ('float', 90.0),
+            ('string', '90'), ('zero', 0), ('negative', -1),
+            ('overflow', 100001),
+        )
+        for name, value in invalid_values:
+            with self.subTest(name=name):
+                state = BattleState(map_name='01_karelia')
+                hello = _player_hello()
+                if name == 'missing':
+                    hello.pop('max_health')
+                else:
+                    hello['max_health'] = value
+                revision = state.state_revision
+
+                player, error = state.add_player(
+                    _Connection(), ('127.0.0.1', 1000), hello)
+
+                self.assertIsNone(player)
+                self.assertEqual('invalid_max_health', error)
+                self.assertEqual({}, state.players)
+                self.assertEqual(1, state.next_id)
+                self.assertIsNone(state.client_build)
+                self.assertEqual(revision, state.state_revision)
+
+    def test_legacy_player_join_keeps_health_coercion(self):
+        state = BattleState(map_name='01_karelia')
+
+        player, error = state.add_player(
+            _Connection(), ('127.0.0.1', 1000), {
+                'type': 'hello', 'protocol': 5,
+                'client_build': CLIENT_BUILD_082, 'name': 'Legacy',
+                'max_health': 90.75,
+            })
+
+        self.assertIsNone(error)
+        self.assertEqual((90, 90), (player.health, player.max_health))
 
     def test_lifecycle_broadcasts_do_not_wait_for_a_slow_socket(self):
         def assert_nonblocking(publish):

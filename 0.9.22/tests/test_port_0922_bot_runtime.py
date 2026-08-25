@@ -896,6 +896,14 @@ class ServerBotObservationRelayTests(unittest.TestCase):
 
         self.assertIs(True, relay)
 
+    def test_nonparticipating_human_is_not_an_observation_target(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        server.players[2].participating = False
+
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id, target_id=2)))
+
 
 class BotRuntimeTests(unittest.TestCase):
     def setUp(self):
