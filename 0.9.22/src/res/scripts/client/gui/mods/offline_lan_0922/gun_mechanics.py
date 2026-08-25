@@ -12,6 +12,7 @@ offline approximation.
 import math
 import random
 
+from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import loadout
 
 
@@ -38,6 +39,10 @@ class GunState(object):
             _field(gun, 'shotDispersionAngle', 0.1), 0.1)
         factors = _field(gun, 'shotDispersionFactors', {}) or {}
         self.after_shot = _positive(_field(factors, 'afterShot', 1.5), 1.5)
+        self.after_shot_in_burst = burst_mechanics.after_shot_factor(
+            gun, False)
+        self.burst_count, self.burst_interval = \
+            burst_mechanics.descriptor_burst(gun)
         self.aim_time = _positive(_field(gun, 'aimingTime', 2.0), 2.0)
         self.reload = _positive(_field(gun, 'reloadTime', 5.0), 5.0)
         clip = _field(gun, 'clip', (1, 2.0)) or (1, 2.0)
@@ -98,6 +103,8 @@ class GunState(object):
         self.dispersion = self.base_dispersion
         self.load_started = False
         self.pending_index = None
+        self._burst_remaining = 0
+        self._burst_total = 0
 
     @staticmethod
     def _shot_compact_descrs(shots):
@@ -131,6 +138,8 @@ class GunState(object):
             _positive(_field(gun, 'shotDispersionAngle', 0.1), 0.1) *
             self._dispersion_factor)
         after_shot = _positive(_field(factors, 'afterShot', 1.5), 1.5)
+        after_shot_in_burst = burst_mechanics.after_shot_factor(gun, False)
+        burst_count, burst_interval = burst_mechanics.descriptor_burst(gun)
         aim_time = (_positive(_field(gun, 'aimingTime', 2.0), 2.0) *
                     self._aim_time_factor)
         reload_time = (_positive(_field(gun, 'reloadTime', 5.0), 5.0) *
@@ -140,17 +149,25 @@ class GunState(object):
             clip_reload = _positive(clip[1], 2.0)
         except (TypeError, ValueError, IndexError):
             clip_reload = 2.0
-        previous = (self.base_dispersion, self.after_shot, self.aim_time,
-                    self.reload, self.clip_reload)
+        previous = (
+            self.base_dispersion, self.after_shot,
+            self.after_shot_in_burst, self.burst_count,
+            self.burst_interval, self.aim_time, self.reload,
+            self.clip_reload)
         self.shots = shots
         self.base_dispersion = base_dispersion
         self.after_shot = after_shot
+        self.after_shot_in_burst = after_shot_in_burst
+        self.burst_count = burst_count
+        self.burst_interval = burst_interval
         self.aim_time = aim_time
         self.reload = reload_time
         self.clip_reload = clip_reload
         return previous != (
-            self.base_dispersion, self.after_shot, self.aim_time,
-            self.reload, self.clip_reload)
+            self.base_dispersion, self.after_shot,
+            self.after_shot_in_burst, self.burst_count,
+            self.burst_interval, self.aim_time, self.reload,
+            self.clip_reload)
 
     def _layout_ammo(self, ammo_layout):
         """Map a garage shell layout onto this gun's shot order.
@@ -245,6 +262,8 @@ class GunState(object):
                     break
         self.clip = 0
         self.pending_index = None
+        self._burst_remaining = 0
+        self._burst_total = 0
         self._client_gun_contract = contract
         return True
 
@@ -347,23 +366,60 @@ class GunState(object):
         return True
 
     def can_fire(self, battle_live=True):
-        if not battle_live or not self.shots or self.reload_time > 0.0:
+        if (not battle_live or not self.shots or self.reload_time > 0.0 or
+                self._burst_remaining > 0):
             return False
         if self.shot_index >= len(self.ammo):
             return False
         return self.clip > 0 and self.ammo[self.shot_index] > 0
 
     def commit_fire(self, reload_factor=1.0):
+        if not self.begin_burst(1):
+            return False
+        return self.commit_burst_round(True, reload_factor)
+
+    def begin_burst(self, count):
+        """Freeze the loaded portion consumed by one native trigger."""
         if not self.can_fire(True):
             return False
+        try:
+            count = int(count)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        available = (self.ammo[self.shot_index]
+                     if self.shot_index < len(self.ammo) else 0)
+        count = min(count, self.clip, available)
+        if count <= 0:
+            return False
+        self._burst_total = count
+        self._burst_remaining = count
+        return True
+
+    def commit_burst_round(self, final_round, reload_factor=1.0):
+        """Debit one real burst shell and start reload only after the last."""
+        if self._burst_remaining <= 0:
+            return False
+        expected_final = self._burst_remaining == 1
+        if bool(final_round) != expected_final:
+            return False
         index = self.shot_index
+        if (index >= len(self.ammo) or self.ammo[index] <= 0 or
+                self.clip <= 0):
+            return False
         self.ammo[index] -= 1
         self.clip -= 1
-        jump = self.base_dispersion * self.after_shot
+        bloom = (self.after_shot if expected_final else
+                 self.after_shot_in_burst)
+        jump = self.base_dispersion * bloom
         self.dispersion = math.sqrt(
             self.dispersion ** 2 + jump ** 2)
         self.dispersion = min(
             self.dispersion, self.base_dispersion * 15.0)
+        self._burst_remaining -= 1
+        if not expected_final:
+            self.reload_time = 0.0
+            return True
+        self._burst_total = 0
         if self.clip > 0:
             self.reload_time = self.clip_reload
             self.reload_duration = self.clip_reload
@@ -388,6 +444,20 @@ class GunState(object):
             self.reload_time = self.reload
             self.reload_duration = self.reload
             self.load_started = False
+        return True
+
+    def cancel_burst(self, reload_factor=1.0):
+        """End an unlaunched tail after a final physical fire gate closes."""
+        if self._burst_remaining <= 0:
+            return False
+        self._burst_remaining = 0
+        self._burst_total = 0
+        if self.clip > 0:
+            self.reload_time = self.clip_reload
+            self.reload_duration = self.clip_reload
+        else:
+            self.reload_time = self.reload * max(0.0, float(reload_factor))
+            self.reload_duration = self.reload_time
         return True
 
     def tick(self, dt, battle_live, move_speed, rotation_speed,
