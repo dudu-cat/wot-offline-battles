@@ -539,11 +539,18 @@ class _Vehicle(object):
         self.track_scrolls = []
         self.engine_modes = []
         self.aim_targets = []
+        self.visibility_changes = []
+
+        def change_visibility(visible):
+            self.visibility_changes.append(bool(visible))
+            self.model.visible = bool(visible)
+
         self.appearance = types.SimpleNamespace(
             compoundModel=self.model, turretMatrix=_Matrix(),
             gunMatrix=_Matrix(),
             waterSensor=None, isInWater=False, isUnderwater=False,
             onModelChanged=_Signal(),
+            changeVisibility=change_visibility,
             _CompoundAppearance__trackScrollCtl=_TrackScroll(),
             setupGunMatrixTargets=lambda target:
                 self.aim_targets.append(target),
@@ -563,10 +570,11 @@ class _Vehicle(object):
             notifyInputKeysDown=mock.Mock())
         self.ammo_bay_effects = []
         self.shows = []
+        self.draw_pass_visible = True
 
     def show(self, visible):
         self.shows.append(bool(visible))
-        self.model.visible = bool(visible)
+        self.draw_pass_visible = bool(visible)
 
     def teleport(self, position, rotation):
         self.position = position
@@ -13155,11 +13163,45 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([], enemy.targetCaps)
         self.assertFalse(enemy._spot_visible)
         self.assertFalse(enemy._offlineNativeDrawVisible)
+        self.assertEqual([False], enemy.visibility_changes)
+        self.assertEqual([False], enemy.shows)
         self.assertFalse(battle._records['bot:2']['visual_started'])
         self.assertTrue(battle._records['bot:1']['native_minimap_rebound'])
 
         battle._reset_prebattle_native_visuals()
         battle._binding.refresh_vehicle_minimap.assert_called_once_with(10)
+
+    def test_native_reveal_restores_draw_pass_after_initial_enemy_hide(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        enemy = _Vehicle(
+            1000, _Descriptor(), _Vector(100.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0), {'health': 500})
+        battle._remote_factory = types.SimpleNamespace(
+            get=lambda entity_id: enemy if entity_id == 1000 else None)
+        record = {
+            'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
+            'ready': True, 'local': False, 'presentation': True,
+            'native_remote': True, 'visual_started': False,
+            'spot_visible': False, 'spot_marker_visible': False,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+
+        # Exact #1513's initial compatibility gate calls Vehicle.show(False),
+        # selecting its shadow-only draw pass before runtime spotting starts.
+        enemy.show(False)
+        enemy.appearance.changeVisibility(False)
+        self.assertFalse(enemy.draw_pass_visible)
+        self.assertFalse(enemy.model.visible)
+
+        self.assertTrue(battle._set_record_spot_visibility(
+            record, True, True))
+
+        self.assertTrue(enemy.draw_pass_visible)
+        self.assertTrue(enemy.model.visible)
+        self.assertEqual([False, True], enemy.shows)
+        self.assertEqual([False, True], enemy.visibility_changes)
 
     def test_native_reverse_sample_preserves_yaw_component_order(self):
         runtime = _runtime()

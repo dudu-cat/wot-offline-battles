@@ -19,6 +19,24 @@ from gui.mods.offline_lan_0922.entities.remote_vehicle import \
 _MINIMUM_KEYFRAME_SECONDS = 0.001
 
 
+def set_draw_visibility(entity, visible):
+    """Use the stock compound gate so a hidden tank cannot cast a shadow."""
+    show = getattr(entity, 'show', None)
+    appearance = getattr(entity, 'appearance', None)
+    change_visibility = getattr(appearance, 'changeVisibility', None)
+    if not callable(show) or not callable(change_visibility):
+        raise RuntimeError(
+            '#1513 native vehicle visibility gate is unavailable')
+    visible = bool(visible)
+    # Vehicle.show controls the model draw pass while CompoundAppearance owns
+    # the compound, stickers and crashed-track visibility.  Keep both native
+    # layers symmetric: the initial enemy gate may already have selected the
+    # shadow-only pass, which changeVisibility(True) cannot restore by itself.
+    show(visible)
+    change_visibility(visible)
+    return True
+
+
 class _AimTarget(object):
 
     def __init__(self, math_module):
@@ -409,7 +427,7 @@ class _NativeRemoteState(object):
                 # streaming refresh.  Stock startVisual makes that replacement
                 # visible again, so restore the runtime-owned spotting gates
                 # after every relink without touching marker registration.
-                self.entity.show(bool(getattr(
+                set_draw_visibility(self.entity, bool(getattr(
                     self.entity, '_offlineNativeDrawVisible', True)))
                 self.entity.targetCaps = ([1] if bool(getattr(
                     self.entity, '_spot_visible', True)) else [])

@@ -27,7 +27,7 @@ from gui.mods.offline_lan_0922.entities.avatar_server import AvatarServerBridge
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
 from gui.mods.offline_lan_0922.entities.native_remote_vehicle import \
-    NativeRemoteVehicleFactory
+    NativeRemoteVehicleFactory, set_draw_visibility
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
     RemoteVehicleFactory, collide_vehicle_at_matrix, pose_animation_writes,
     reset_pose_animation_writes)
@@ -2825,7 +2825,7 @@ class BattleRuntime(object):
             record['direct_spot_visible'] = False
             vehicle._spot_visible = False
             vehicle._offlineNativeDrawVisible = False
-            vehicle.show(False)
+            set_draw_visibility(vehicle, False)
             vehicle.targetCaps = []
             # Runtime state may say it already stopped the marker while a
             # later stock visual callback registered it again.  At this final
@@ -14091,7 +14091,7 @@ class BattleRuntime(object):
                     record['simulation_entity'] = True
                 elif record.get('native_remote'):
                     vehicle._offlineNativeDrawVisible = initially_visible
-                    vehicle.show(initially_visible)
+                    set_draw_visibility(vehicle, initially_visible)
                     vehicle.targetCaps = [1] if initially_visible else []
                     # The compatibility enter-world gate may already have
                     # stopped an enemy marker before this asynchronous ready
@@ -14415,7 +14415,7 @@ class BattleRuntime(object):
         if signature != record.get('_spot_presentation_signature'):
             if record.get('native_remote'):
                 vehicle._offlineNativeDrawVisible = draw_vehicle
-                vehicle.show(draw_vehicle)
+                set_draw_visibility(vehicle, draw_vehicle)
                 vehicle.targetCaps = [1] if visible else []
             else:
                 vehicle.appearance.changeVisibility(draw_vehicle)
