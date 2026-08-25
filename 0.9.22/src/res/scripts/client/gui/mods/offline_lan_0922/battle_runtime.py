@@ -1164,6 +1164,7 @@ class BattleRuntime(object):
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_drive_turn = 0.0
+        self._local_siege_pending = None
         self._local_push_x = 0.0
         self._local_push_z = 0.0
         self._local_ram_cooldowns = {}
@@ -1407,6 +1408,7 @@ class BattleRuntime(object):
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_drive_turn = 0.0
+        self._local_siege_pending = None
         self._local_push_x = 0.0
         self._local_push_z = 0.0
         self._local_ram_cooldowns = {}
@@ -5634,7 +5636,18 @@ class BattleRuntime(object):
             descriptor = getattr(entity, 'typeDescriptor', None)
             if not bool(getattr(descriptor, 'hasSiegeMode', False)):
                 return False
-            return self._sender.send_current(siege_enabled=bool(value))
+            if not self._sender.send_current(siege_enabled=bool(value)):
+                return False
+            request_seq = getattr(self.client, '_input_seq', None)
+            if (isinstance(request_seq, bool) or
+                    not isinstance(request_seq, _INTEGER_TYPES) or
+                    request_seq <= 0):
+                request_seq = None
+            # The server echo can be one or more snapshots behind this
+            # request. Keep the drivetrain locked from the successful send
+            # edge until a stable snapshot acknowledges this exact input.
+            self._local_siege_pending = (bool(value), request_seq)
+            return True
         if code == getattr(settings, 'ACTIVATE_EQUIPMENT', None):
             return self._activate_equipment(value)
         partial_clip = getattr(settings, 'RELOAD_PARTIAL_CLIP', None)
@@ -12711,6 +12724,17 @@ class BattleRuntime(object):
             return autorotation_turn
         return turn
 
+    def _local_siege_drive_locked(self, entity):
+        """Return whether Siege transition owns the local drivetrain."""
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        if self._local_siege_pending is not None:
+            return True
+        states = self._runtime.constants.VEHICLE_SIEGE_STATE
+        return getattr(entity, 'siegeState', states.DISABLED) in (
+            states.SWITCHING_ON, states.SWITCHING_OFF)
+
     def _drive_local(self, elapsed):
         """Advance local copied physics through all elapsed battle time."""
         if self._sender is None or self._server is None:
@@ -12784,10 +12808,12 @@ class BattleRuntime(object):
             reader()
         slope_pitch = (0.0 if self._local_airborne else
                        self._smoothed_drive_pitch(position, yaw))
-        throttle = self._sender.forward
-        turn = self._local_autorotation_turn(
-            entity, self._sender.turn, throttle,
-            tracks_blocked=self._sender.handbrake)
+        siege_drive_locked = self._local_siege_drive_locked(entity)
+        throttle = 0.0 if siege_drive_locked else self._sender.forward
+        turn = (0.0 if siege_drive_locked else
+                self._local_autorotation_turn(
+                    entity, self._sender.turn, throttle,
+                    tracks_blocked=self._sender.handbrake))
         is_tracked = bool(getattr(entity, 'is_tracked', False))
         is_engine_dead = bool(getattr(entity, 'is_engine_dead', False))
         if is_tracked or is_engine_dead:
@@ -12799,16 +12825,23 @@ class BattleRuntime(object):
         # torque, so existing momentum continues to coast.
         handbrake = bool(self._sender.handbrake) or is_tracked
         previous_speed = self._local_speed
-        drive_physics = self._local_physics
-        power_factor = self._active_engine_power_factor()
-        if power_factor != 1.0:
-            drive_physics = dict(drive_physics)
-            drive_physics['powerW'] *= power_factor
-        self._local_speed = vehicle_physics.longitudinal_step(
-            drive_physics, self._local_speed,
-            throttle, turn != 0.0,
-            slope_pitch, dt, self._local_airborne, 0,
-            handbrake)
+        if siege_drive_locked:
+            # Freeze only powered longitudinal/traverse motion. Gravity,
+            # cross-slope slip, tank separation and destructible contact keep
+            # running through the remainder of this physics frame.
+            self._local_speed = 0.0
+            self._local_turn_speed = 0.0
+        else:
+            drive_physics = self._local_physics
+            power_factor = self._active_engine_power_factor()
+            if power_factor != 1.0:
+                drive_physics = dict(drive_physics)
+                drive_physics['powerW'] *= power_factor
+            self._local_speed = vehicle_physics.longitudinal_step(
+                drive_physics, self._local_speed,
+                throttle, turn != 0.0,
+                slope_pitch, dt, self._local_airborne, 0,
+                handbrake)
 
         if abs(self._local_speed) > 0.0001 and dt > 0.0:
             if self._motion_is_clear(
@@ -12869,16 +12902,17 @@ class BattleRuntime(object):
                         self._local_grind = 4
                         contact_path = 'brake'
 
-        if is_tracked or is_engine_dead:
+        if siege_drive_locked or is_tracked or is_engine_dead:
             turn = 0.0
             self._local_turn_speed = 0.0
         self._local_drive_turn = turn
-        self._local_turn_speed = vehicle_physics.traverse_step(
-            self._local_physics, self._local_turn_speed,
-            turn, self._local_speed, dt,
-            drive_intent=throttle)
-        self._local_turn_speed *= critical_damage.stat_factor(
-            entity, 'traverse')
+        if not siege_drive_locked:
+            self._local_turn_speed = vehicle_physics.traverse_step(
+                self._local_physics, self._local_turn_speed,
+                turn, self._local_speed, dt,
+                drive_intent=throttle)
+            self._local_turn_speed *= critical_damage.stat_factor(
+                entity, 'traverse')
         yaw += self._local_turn_speed * dt
         while yaw > math.pi:
             yaw -= 2.0 * math.pi
@@ -14397,6 +14431,20 @@ class BattleRuntime(object):
                 (not switching and time_left_ms != 0)):
             raise RuntimeError(
                 'LAN snapshot has an inconsistent siege transition')
+        if record.get('local') and self._local_siege_pending is not None:
+            unused_enabled, request_seq = self._local_siege_pending
+            acknowledged = request_seq is None
+            snapshot_seq = state.get('input_seq')
+            if (not isinstance(snapshot_seq, bool) and
+                    isinstance(snapshot_seq, _INTEGER_TYPES)):
+                acknowledged = bool(
+                    request_seq is None or snapshot_seq >= request_seq)
+            # A switching echo keeps the pending edge latched. A stable echo
+            # at or beyond the request sequence either confirms the target or
+            # explicitly reflects a server rejection (for example, a dead
+            # engine); both outcomes release local controls safely.
+            if acknowledged and not switching:
+                self._local_siege_pending = None
         if record.get('presented_siege_state') == siege_state:
             return False
         # Vehicle construction already seeds DISABLED.  Skipping that first
@@ -16388,6 +16436,7 @@ class BattleRuntime(object):
         self._local_speed = 0.0
         self._local_turn_speed = 0.0
         self._local_drive_turn = 0.0
+        self._local_siege_pending = None
         self._local_push_x = 0.0
         self._local_push_z = 0.0
         self._local_physics = None

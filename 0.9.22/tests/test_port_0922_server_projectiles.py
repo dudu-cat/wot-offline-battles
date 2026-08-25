@@ -249,10 +249,30 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         player.vehicle = 'sweden:S21_UDES_03'
 
         _update_player_input(
-            state, 1, siege_enabled=True, speed=99.0)
+            state, 1, siege_enabled=True, forward=1.0, turn=1.0,
+            speed=99.0, x=10.0, y=4.0, z=11.0, yaw=0.5)
 
         self.assertEqual(SIEGE_SWITCHING_ON, player.siege_state)
         self.assertEqual(60, player.siege_transition_ticks)
+        self.assertEqual((0.0, 0.0, 0.0), (
+            player.forward, player.turn, player.speed))
+        self.assertEqual((10.0, 4.0, 11.0, 0.5), (
+            player.x, player.y, player.z, player.yaw))
+        _update_player_input(
+            state, 1, forward=-1.0, turn=-1.0, speed=-99.0,
+            x=12.0, y=3.5, z=13.0, yaw=0.6)
+        self.assertEqual((0.0, 0.0, 0.0), (
+            player.forward, player.turn, player.speed))
+        self.assertEqual((12.0, 3.5, 13.0, 0.6), (
+            player.x, player.y, player.z, player.yaw))
+        player.forward = 1.0
+        player.turn = 1.0
+        player.speed = 99.0
+        state._apply_movement(player, 1.0)
+        self.assertEqual((0.0, 0.0, 0.0), (
+            player.forward, player.turn, player.speed))
+        self.assertEqual((12.0, 3.5, 13.0, 0.6), (
+            player.x, player.y, player.z, player.yaw))
         self.assertEqual(2000, state._public_player(
             player)['siege_time_left_ms'])
         for unused_tick in range(59):
@@ -261,10 +281,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         state._advance_siege_states()
         self.assertEqual(SIEGE_ENABLED, player.siege_state)
 
-        _update_player_input(state, 1, speed=99.0)
+        _update_player_input(state, 1, forward=1.0, turn=1.0, speed=99.0)
+        self.assertEqual((1.0, 1.0), (player.forward, player.turn))
         self.assertAlmostEqual(5.0 / 3.6, player.speed)
         _update_player_input(state, 1, siege_enabled=False)
         self.assertEqual(SIEGE_SWITCHING_OFF, player.siege_state)
+        self.assertEqual((0.0, 0.0, 0.0), (
+            player.forward, player.turn, player.speed))
         for unused_tick in range(60):
             state._advance_siege_states()
         self.assertEqual(SIEGE_DISABLED, player.siege_state)

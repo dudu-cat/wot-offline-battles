@@ -12475,6 +12475,108 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, turn.call_args[0][1])
         self.assertEqual(0.0, turn.call_args.kwargs['drive_intent'])
 
+    def test_siege_request_locks_drive_until_ack_but_keeps_world_physics(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor('sweden:S21_UDES_03')
+        descriptor.hasSiegeMode = True
+        entity = _Vehicle(10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
+                          {'health': 500})
+        entity.siegeState = runtime.constants.VEHICLE_SIEGE_STATE.DISABLED
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = _LANInputSender(battle)
+        battle._sender.forward = 1.0
+        battle._sender.turn = 1.0
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = descriptor
+        battle._attach_local_presentation()
+        setting = runtime.constants.VEHICLE_SETTING.SIEGE_MODE_ENABLED
+
+        self.assertTrue(battle.change_vehicle_setting(setting, True))
+        self.assertEqual((True, 1), battle._local_siege_pending)
+        self.assertEqual((1.0, 1.0), (
+            battle._sender.forward, battle._sender.turn))
+
+        with mock.patch.object(
+                battle, '_update_vertical_motion',
+                return_value=(2.0, 2.5, 4.0)) as vertical, \
+                mock.patch.object(
+                    battle, '_ground_pitch', return_value=0.0), \
+                mock.patch.object(
+                    battle, '_apply_slope_slide',
+                    return_value=(2.5, 2.5, 4.0)) as slope, \
+                mock.patch.object(
+                    battle, '_resolve_local_tank_contacts',
+                    return_value=(2.5, 2.5, 4.5)) as contacts, \
+                mock.patch.object(
+                    vehicle_physics, 'longitudinal_step') as drive, \
+                mock.patch.object(
+                    vehicle_physics, 'traverse_step') as traverse:
+            battle._drive_local(0.1)
+
+        drive.assert_not_called()
+        traverse.assert_not_called()
+        vertical.assert_called_once()
+        slope.assert_called_once()
+        contacts.assert_called_once()
+        self.assertEqual((2.5, 2.5, 4.5), battle._local_position)
+        self.assertEqual((0.0, 0.0), (
+            battle._local_speed, battle._local_turn_speed))
+        self.assertEqual((1.0, 1.0), (
+            battle._sender.forward, battle._sender.turn))
+
+        def update_siege(unused_id, state, unused_time_left):
+            entity.siegeState = state
+            return True
+
+        battle._binding = types.SimpleNamespace(
+            update_vehicle_siege_state=mock.Mock(
+                side_effect=update_siege))
+        record = {'engine_id': 10, 'local': True}
+        self.assertFalse(battle._apply_siege_state(record, {
+            'input_seq': 0, 'siege_state': 0,
+            'siege_time_left_ms': 0}))
+        self.assertEqual((True, 1), battle._local_siege_pending)
+        self.assertTrue(battle._apply_siege_state(record, {
+            'input_seq': 1, 'siege_state': 1,
+            'siege_time_left_ms': 2000}))
+        self.assertEqual((True, 1), battle._local_siege_pending)
+        self.assertTrue(battle._apply_siege_state(record, {
+            'input_seq': 1, 'siege_state': 2,
+            'siege_time_left_ms': 0}))
+        self.assertIsNone(battle._local_siege_pending)
+
+        with mock.patch.object(
+                battle, '_motion_is_clear', return_value=True), \
+                mock.patch.object(
+                    battle, '_update_vertical_motion',
+                    side_effect=lambda unused_entity, position,
+                    unused_yaw, unused_dt: position), \
+                mock.patch.object(
+                    battle, '_ground_pitch', return_value=0.0), \
+                mock.patch.object(
+                    battle, '_apply_slope_slide',
+                    side_effect=lambda position, unused_yaw, unused_dt,
+                    unused_entity=None: position), \
+                mock.patch.object(
+                    battle, '_resolve_local_tank_contacts',
+                    side_effect=lambda unused_entity, position,
+                    unused_yaw, unused_dt: position), \
+                mock.patch.object(
+                    vehicle_physics, 'longitudinal_step',
+                    return_value=2.0) as drive, \
+                mock.patch.object(
+                    vehicle_physics, 'traverse_step',
+                    return_value=1.0) as traverse:
+            battle._drive_local(0.1)
+
+        self.assertEqual(1.0, drive.call_args[0][2])
+        self.assertEqual(1.0, traverse.call_args[0][2])
+        self.assertEqual(1.0, traverse.call_args.kwargs['drive_intent'])
+
     def test_yellow_tracks_keep_full_local_drive_and_traverse(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

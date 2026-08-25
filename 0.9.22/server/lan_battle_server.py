@@ -7782,15 +7782,26 @@ class BattleState:
                 player.turn = 0.0
                 return
             if player.alive:
-                if "forward" in message:
-                    player.forward = _clamp(_finite_float(message.get("forward")), -1.0, 1.0)
-                if "turn" in message:
-                    player.turn = _clamp(_finite_float(message.get("turn")), -1.0, 1.0)
-                if "speed" in message:
-                    speed_limit = self._siege_speed_limit(player)
-                    player.speed = _clamp(
-                        _finite_float(message.get("speed")),
-                        -speed_limit, speed_limit)
+                siege_switching = player.siege_state in (
+                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF)
+                if siege_switching:
+                    player.forward = 0.0
+                    player.turn = 0.0
+                    player.speed = 0.0
+                else:
+                    if "forward" in message:
+                        player.forward = _clamp(
+                            _finite_float(message.get("forward")),
+                            -1.0, 1.0)
+                    if "turn" in message:
+                        player.turn = _clamp(
+                            _finite_float(message.get("turn")),
+                            -1.0, 1.0)
+                    if "speed" in message:
+                        speed_limit = self._siege_speed_limit(player)
+                        player.speed = _clamp(
+                            _finite_float(message.get("speed")),
+                            -speed_limit, speed_limit)
                 if "aim_yaw" in message:
                     player.aim_yaw = _finite_float(message.get("aim_yaw"), player.aim_yaw)
                 if "gun_pitch" in message:
@@ -8052,10 +8063,16 @@ class BattleState:
         player.siege_state = next_state
         player.siege_transition_ticks = max(
             1, int(round(float(duration) * TICK_HZ)))
+        player.forward = 0.0
+        player.turn = 0.0
+        player.speed = 0.0
         return True
 
     def _siege_speed_limit(self, player):
         params = self._siege_params(player)
+        if player.siege_state in (
+                SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
+            return 0.0
         if params is not None and player.siege_state == SIEGE_ENABLED:
             return float(params[2])
         return 200.0
@@ -9347,6 +9364,14 @@ class BattleState:
 
     def _apply_movement(self, player, dt):
         if not player.alive or self.battle_result is not None:
+            return
+        if player.siege_state in (SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
+            # Transition lock suppresses drivetrain output only. Client-owned
+            # gravity, slope and contact resolution still arrives as a legal
+            # world pose through update_input and must not be rewound here.
+            player.forward = 0.0
+            player.turn = 0.0
+            player.speed = 0.0
             return
         if not player.client_position:
             player.yaw += player.turn * 0.85 * dt
