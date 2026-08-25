@@ -17,6 +17,7 @@ from gui.mods.offline_lan_0922 import ballistics
 from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import effective_params
+from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import gun_pitch_limits
 from gui.mods.offline_lan_0922 import hull_aiming
 from gui.mods.offline_lan_0922 import prebaked_navigation
@@ -685,7 +686,8 @@ def _apply_combat_record(state, record):
 class _BotCriticalVehicle(object):
     """Detached adapter for the copied 0.8.2 repair and fire functions."""
 
-    def __init__(self, state, descriptor, fire_started, fire_timer):
+    def __init__(self, state, descriptor, fire_started, fire_timer,
+                 equipment_passives=None):
         payload = state.get('critical') or {}
         devices = {}
         for record in payload.get('devices') or ():
@@ -710,6 +712,11 @@ class _BotCriticalVehicle(object):
         self._fire_started = fire_started
         self._fire_timer = max(0.0, float(fire_timer or 0.0))
         self._offline_proposal_only = True
+        equipment_passives = equipment_passives or {}
+        self._fire_starting_chance_factor = max(0.0, _number(
+            equipment_passives.get('fireStartingChanceFactor'), 1.0))
+        self._medkit_bonus_value = max(0.0, _number(
+            equipment_passives.get('medkitBonusValue'), 0.0))
         self.is_tracked = False
         self.is_engine_dead = False
         self.is_gun_destroyed = False
@@ -1615,7 +1622,8 @@ class BotRuntime(object):
                  native_motion=False, baked_graph=None, probe_clock=None,
                  motion_resolver=None, motion_report=None,
                  world_receipt_probe=None, probe_timing_seconds=0.0,
-                 water_depth_probe=None, ram_contact_probe=None):
+                 water_depth_probe=None, ram_contact_probe=None,
+                 bot_equipment_resolver=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.player_descriptor_resolver = player_descriptor_resolver
@@ -1682,6 +1690,9 @@ class BotRuntime(object):
         self.world_receipt_probe = world_receipt_probe
         self.ram_contact_probe = (
             ram_contact_probe if callable(ram_contact_probe) else None)
+        self.bot_equipment_resolver = (
+            bot_equipment_resolver if callable(bot_equipment_resolver) else
+            (lambda: ()))
         self._water_depth_probe = (
             water_depth_probe if callable(water_depth_probe) else
             (lambda unused_position: -1.0))
@@ -1719,6 +1730,9 @@ class BotRuntime(object):
         self._gun_states = {}
         self._ammo_states = {}
         self._burst_states = {}
+        self._equipment_states = {}
+        self._equipment_passives = {}
+        self._equipment_now = 0.0
         self._pending_launches = []
         self._pending_launch_keys = {}
         self._pending_launch_by_bot = {}
@@ -2173,6 +2187,66 @@ class BotRuntime(object):
                 descriptor)
         return True
 
+    def _bot_equipment_contracts(self, snapshots=None):
+        raw = tuple(self.bot_equipment_resolver() or ())
+        contracts = ()
+        if raw:
+            contracts = equipment_mechanics.bot_consumable_contracts({
+                'botConsumables': raw})
+        if snapshots is not None:
+            restored_contracts = \
+                equipment_mechanics.bot_consumable_contracts(
+                    None, snapshot=snapshots)
+            if contracts and restored_contracts != contracts:
+                raise ValueError('bot equipment contracts changed')
+            if not contracts:
+                contracts = restored_contracts
+        return contracts
+
+    def _install_bot_equipments(self, bot_id, snapshots=None):
+        """Create one independent exact consumable ledger for each bot."""
+        bot_id = int(bot_id)
+        contracts = self._bot_equipment_contracts(snapshots)
+        existing = self._equipment_states.get(bot_id)
+        if existing is not None:
+            existing_contracts = tuple(
+                value.contract for value in existing)
+            if contracts and existing_contracts != contracts:
+                raise ValueError('bot equipment contracts changed')
+            if snapshots is not None:
+                # Repeated manifests validate the canonical snapshot without
+                # rewinding clocks already owned by this worker process.
+                equipment_mechanics.restore_equipment_states(
+                    snapshots, contracts=existing_contracts,
+                    now=self._equipment_now)
+        elif snapshots is None:
+            existing = [equipment_mechanics.EquipmentState(
+                contract, self._equipment_now) for contract in contracts]
+            self._equipment_states[bot_id] = existing
+        else:
+            existing = equipment_mechanics.restore_equipment_states(
+                snapshots, contracts=contracts, now=self._equipment_now)
+            self._equipment_states[bot_id] = existing
+        states = self._equipment_states.get(bot_id, ())
+        self._equipment_passives[bot_id] = \
+            equipment_mechanics.passive_effects(states)
+        return states
+
+    def _advance_equipment_clock(self, step):
+        """Advance cooldowns on simulation time, never wall-clock time."""
+        self._equipment_now += max(0.0, _number(step))
+        return self._equipment_now
+
+    def _publish_equipment_state(self, state):
+        states = self._equipment_states.get(int(state['id']), ())
+        state['equipment_states'] = [
+            equipment.snapshot(self._equipment_now) for equipment in states]
+        return True
+
+    def bot_equipment_passives(self, bot_id):
+        return dict(self._equipment_passives.get(
+            int(bot_id), equipment_mechanics.passive_effects(())))
+
     def _set_bot_siege_state(self, state, siege_state, duration=0.0,
                              transition_total=None):
         siege_state = int(siege_state)
@@ -2311,6 +2385,9 @@ class BotRuntime(object):
             self._gun_states = {}
             self._ammo_states = {}
             self._burst_states = {}
+            self._equipment_states = {}
+            self._equipment_passives = {}
+            self._equipment_now = 0.0
             self._pending_launches = []
             self._pending_launch_keys = {}
             self._pending_launch_by_bot = {}
@@ -2569,6 +2646,10 @@ class BotRuntime(object):
             state.setdefault('_overturn_time', 0.0)
             state.setdefault('_overturn_level', 0)
             state.setdefault('_overturned', False)
+            self._install_bot_equipments(
+                bot_id, raw.get('equipment_states')
+                if 'equipment_states' in raw else None)
+            self._publish_equipment_state(state)
             state['siege_state'] = siege_state
             state['siege_time_left_ms'] = wire_time
             state['_siege_time_left'] = siege_time_left
@@ -2908,10 +2989,13 @@ class BotRuntime(object):
         sync['base_revision'] = base_revision
         sync['authority_handoff_pending'] = False
 
-        for replay_step, replay_now, replay_fire in replay_steps:
+        for replay in replay_steps:
+            replay_step, replay_now, replay_fire = replay[:3]
+            replay_equipment = replay[3] if len(replay) > 3 else ()
             self._advance_bot_critical(
                 state, replay_step, replay_now, record_step=False,
-                advance_fire=replay_fire)
+                advance_fire=replay_fire,
+                equipment_effects=replay_equipment)
         replayed_signature = _combat_signature(state)
         if replayed_signature != signature:
             # A replay is local work, not a wire publication. Reserving its
@@ -2936,8 +3020,54 @@ class BotRuntime(object):
             sync['server_tick'] = server_tick
         return True
 
+    def _apply_bot_equipment_effect(self, state, descriptor, effect,
+                                    strict=False):
+        """Apply one already-authorized bot consumable through shared law."""
+        action = str((effect or {}).get('action') or '')
+        shadow = _BotCriticalVehicle(
+            state, descriptor, None,
+            _number(state.get('combat_fire_timer')),
+            self._equipment_passives.get(int(state['id'])))
+        if action == 'extinguish_fire':
+            payload = critical_damage.use_extinguisher(shadow)
+        elif action == 'repair_devices':
+            payload = critical_damage.repair_device(
+                shadow, effect.get('selected'),
+                bool(effect.get('repairAll', False)))
+        elif action == 'restore_crew':
+            payload = critical_damage.restore_crew(
+                shadow, effect.get('selected'),
+                bool(effect.get('repairAll', False)))
+        else:
+            if strict:
+                raise RuntimeError('bot equipment action is unsupported')
+            return False
+        if payload is None:
+            if strict:
+                raise RuntimeError('bot equipment effect could not be applied')
+            return False
+        state['critical'] = _canonical_critical(payload)
+        if action == 'extinguish_fire':
+            state['combat_fire_elapsed'] = 0.0
+            state['combat_fire_timer'] = 0.0
+        return True
+
+    def _poll_bot_equipments(self, state, descriptor):
+        """Run fixed bot kit policy and return replayable effect records."""
+        effects = []
+        for equipment in self._equipment_states.get(int(state['id']), ()):
+            effect = equipment.poll_bot(
+                self._equipment_now, state.get('critical'))
+            if effect is None:
+                continue
+            self._apply_bot_equipment_effect(
+                state, descriptor, effect, strict=True)
+            effects.append(dict(effect))
+        self._publish_equipment_state(state)
+        return effects
+
     def _advance_bot_critical(self, state, step, now, record_step=True,
-                              advance_fire=True):
+                              advance_fire=True, equipment_effects=None):
         payload = state.get('critical')
         if not isinstance(payload, dict) or not payload:
             return False
@@ -2945,6 +3075,15 @@ class BotRuntime(object):
         was_on_fire = bool(payload.get('fire', False))
         sync = self._combat_sync_state(state)
         descriptor = self._descriptors.get(state['id'], {})
+        if equipment_effects is None:
+            equipment_effects = (
+                self._poll_bot_equipments(state, descriptor)
+                if record_step else ())
+        else:
+            for effect in equipment_effects:
+                self._apply_bot_equipment_effect(
+                    state, descriptor, effect, strict=False)
+        payload = state.get('critical') or {}
         fire_elapsed = round(max(0.0, min(
             FIRE_DURATION_SECONDS,
             _number(state.get('combat_fire_elapsed')))), 6)
@@ -2956,7 +3095,8 @@ class BotRuntime(object):
                 FIRE_DURATION_SECONDS, fire_elapsed + float(step))
             if was_on_fire and advance_fire else None)
         shadow = _BotCriticalVehicle(
-            state, descriptor, fire_started, fire_timer)
+            state, descriptor, fire_started, fire_timer,
+            self._equipment_passives.get(int(state['id'])))
         repair_payload = critical_damage.tick_repair(
             shadow, step,
             repair_factor=self._bot_repair_factor(state['id'], descriptor))
@@ -2999,9 +3139,11 @@ class BotRuntime(object):
         changed = _combat_signature(state) != before_signature
         if (record_step and
                 (changed or was_on_fire or
-                 bool((state.get('critical') or {}).get('fire', False)))):
+                 bool((state.get('critical') or {}).get('fire', False)) or
+                 equipment_effects)):
             sync['unpublished_steps'].append(
-                (float(step), float(now), bool(was_on_fire)))
+                (float(step), float(now), bool(was_on_fire),
+                 tuple(dict(effect) for effect in equipment_effects)))
         return changed
 
     def _advance_bot_drowning(self, state, step):
@@ -3234,12 +3376,14 @@ class BotRuntime(object):
         return True
 
     def _manifest_entry(self, state):
+        self._publish_equipment_state(state)
         keys = ('id', 'team', 'slot', 'name', 'vehicle', 'health',
                 'max_health', 'x', 'y', 'z', 'yaw', 'profile', 'fire_seq',
                 'shell_index', 'next_shell_index', 'ammo_remaining',
                 'ammo_reload_pending', 'reload_time', 'reload_duration',
                 'clip', 'clip_size', 'siege_state',
-                'siege_time_left_ms', 'siege_transition_total_ms')
+                'siege_time_left_ms', 'siege_transition_total_ms',
+                'equipment_states')
         result = dict((key, state[key]) for key in keys)
         descriptor = self._descriptors.get(state['id'], {})
         terminal = _terminal_critical(state, descriptor, 'shot')
@@ -6801,6 +6945,7 @@ class BotRuntime(object):
         while self._next_publication <= now + 1e-9:
             self._next_publication += PUBLICATION_SECONDS
         self._advance_probe_timing(now)
+        self._advance_equipment_clock(frame_step)
         players = list(players or [])
         live_players = None
         live_probe_targets = {}
@@ -7687,6 +7832,7 @@ class BotRuntime(object):
             burst_state = self._burst_states.get(int(state['id']))
             if burst_state is not None:
                 burst_state.publish(state)
+            self._publish_equipment_state(state)
             projected = lan_client.project_bot_state(state)
             if projected is None:
                 raise RuntimeError('bot publication projection failed')

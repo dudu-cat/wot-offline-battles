@@ -2698,6 +2698,8 @@ class BattleRuntime(object):
                 world_receipt_probe=self._direction_world_receipt,
                 water_depth_probe=self._water_depth,
                 ram_contact_probe=self._bot_ram_contact_armor,
+                bot_equipment_resolver=(
+                    self._default_bot_equipment_contracts),
                 baked_graph=self._navigation_graph,
                 # Keep the mature 0.8.2 authority model: the copied physics
                 # integrator owns bot poses and the engine interpolates those
@@ -5270,6 +5272,17 @@ class BattleRuntime(object):
                 continue
             result.append(equipment_mechanics.EquipmentState(contract))
         return result
+
+    def _default_bot_equipment_contracts(self):
+        """Resolve the fixed bot loadout from this exact #1513 item cache."""
+        cache = self._runtime.vehicles.g_cache
+        # Engine-free tests expose only the cache surfaces they exercise.
+        # The real #1513 cache always owns both lookup methods below.
+        if (not callable(getattr(cache, 'equipmentIDs', None)) or
+                not callable(getattr(cache, 'equipments', None))):
+            return ()
+        return tuple(equipment_mechanics.default_bot_consumables(
+            cache))
 
     def _restore_local_equipment_snapshot(self, snapshot, present=False):
         """Restore the visible replica from one complete canonical ledger."""

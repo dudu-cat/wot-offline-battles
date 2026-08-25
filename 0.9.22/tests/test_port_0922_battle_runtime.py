@@ -6008,6 +6008,37 @@ class BattleRuntimeContractTests(unittest.TestCase):
             runtime.bigworld.avatar.ammo_updates[-1])
         self.assertFalse(battle._activate_equipment(17))
 
+    def test_bot_consumables_are_resolved_from_the_exact_client_cache(self):
+        runtime = _runtime()
+        descriptors = {}
+        identifiers = {}
+        for index, name in enumerate(
+                equipment_mechanics.DEFAULT_BOT_CONSUMABLE_NAMES, 1):
+            identifiers[name] = index
+            descriptors[index] = types.SimpleNamespace(
+                id=(11, 20 + index), compactDescr=420 + index,
+                name=name,
+                tags=(('medkit',) if name == 'largeMedkit' else
+                      ('repairkit',) if name == 'largeRepairkit' else ()),
+                reuseCount=1, cooldownSeconds=90.0,
+                autoactivate=name == 'autoExtinguishers',
+                repairAll=name != 'autoExtinguishers',
+                fireStartingChanceFactor=(
+                    0.9 if name == 'autoExtinguishers' else 1.0))
+        runtime.vehicles.g_cache = types.SimpleNamespace(
+            equipmentIDs=lambda: identifiers,
+            equipments=lambda: descriptors)
+        battle = BattleRuntime(runtime)
+
+        contracts = battle._default_bot_equipment_contracts()
+
+        self.assertEqual(
+            equipment_mechanics.DEFAULT_BOT_CONSUMABLE_NAMES,
+            tuple(value['name'] for value in contracts))
+        self.assertEqual(
+            ('extinguisher', 'medkit', 'repairkit'),
+            tuple(value['kind'] for value in contracts))
+
     def test_removed_rpm_limiter_is_not_a_permanent_passive_factor(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

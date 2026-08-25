@@ -127,7 +127,7 @@ _BOT_STATE_WIRE_FIELDS = (
     'siege_state', 'siege_time_left_ms', 'siege_transition_total_ms',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',
-    'death_reason', 'display_health', 'world_pose')
+    'death_reason', 'display_health', 'world_pose', 'equipment_states')
 STATE_BARRIER_TYPES = frozenset((
     'welcome', 'roster', 'battle_start', 'battle_live',
     'start_denied', 'team_denied', 'team_size_denied',
@@ -517,6 +517,22 @@ def _valid_player_equipment_contract(state, required=False):
     return True
 
 
+def _valid_bot_equipment_contract(state, required=False):
+    snapshots = state.get('equipment_states')
+    if snapshots is None:
+        return not required and 'equipment_states' not in state
+    if not isinstance(snapshots, list):
+        return False
+    try:
+        contracts = equipment_mechanics.bot_consumable_contracts(
+            None, snapshot=snapshots)
+        equipment_mechanics.restore_equipment_states(
+            snapshots, contracts=contracts, now=0.0)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _valid_player_environment_contract(state, required=False):
     """Validate the canonical pose and landing frontier in a player row."""
     required_fields = {
@@ -598,6 +614,9 @@ def project_bot_state(state):
         burst_mechanics.BurstClock().restore(
             projected, projected.get('fire_seq', 0))
     except ValueError:
+        return None
+    if ('equipment_states' in state and
+            not _valid_bot_equipment_contract(state)):
         return None
     return projected
 

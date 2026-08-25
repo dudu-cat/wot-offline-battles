@@ -187,6 +187,28 @@ def _critical_payload(*records, **values):
     }
 
 
+def _bot_equipment_contracts(module, reuse_count=1):
+    descriptors = (
+        types.SimpleNamespace(
+            id=(11, 21), compactDescr=421,
+            name='autoExtinguishers', tags=(),
+            reuseCount=reuse_count, cooldownSeconds=90.0,
+            autoactivate=True, fireStartingChanceFactor=0.9),
+        types.SimpleNamespace(
+            id=(11, 22), compactDescr=422,
+            name='largeMedkit', tags=('medkit',),
+            reuseCount=reuse_count, cooldownSeconds=90.0,
+            repairAll=True, bonusValue=0.30),
+        types.SimpleNamespace(
+            id=(11, 23), compactDescr=423,
+            name='largeRepairkit', tags=('repairkit',),
+            reuseCount=reuse_count, cooldownSeconds=90.0,
+            repairAll=True, bonusValue=0.10),
+    )
+    return tuple(module.equipment_mechanics.project_equipment(value)
+                 for value in descriptors)
+
+
 def _effective_params_snapshot(mass=25000.0, base_moving=0.171,
                                base_still=0.228, shot_factor=0.10,
                                ramming_bonus=0.0,
@@ -6876,6 +6898,95 @@ class BotRuntimeTests(unittest.TestCase):
             blocked = runtime.update(
                 .20, 2.4 + index * .20, players=[player])[0]['bots'][0]
         self.assertEqual(1, blocked['fire_seq'])
+
+    def test_bot_consumables_use_independent_inventory_and_cooldowns(self):
+        contracts = _bot_equipment_contracts(self.module)
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _critical_descriptor(),
+            adapter_factory=lambda *unused: _Adapter(),
+            direction_probe=lambda *unused: {'clear': True},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            bot_equipment_resolver=lambda: contracts)
+        runtime.battle_start(dict(self.start, bots=[
+            {'id': 11, 'team': 2, 'slot': 0, 'name': 'First'},
+            {'id': 12, 'team': 2, 'slot': 1, 'name': 'Second'},
+        ]))
+        state = runtime.states[11]
+        state['critical'] = _critical_payload(
+            {'name': 'leftTrackHealth', 'hp': 0.0, 'max_hp': 170.0,
+             'state': 'destroyed'},
+            destroyed=('leftTrackHealth',), crew_ko=('commander',),
+            fire=True)
+
+        runtime._advance_equipment_clock(0.2)
+        self.assertTrue(runtime._advance_bot_critical(
+            state, 0.2, 0.2))
+        self.assertFalse(state['critical']['fire'])
+        self.assertEqual(['commander'], state['critical']['crew_ko'])
+        self.assertIn(
+            'leftTrackHealth', state['critical']['destroyed'])
+
+        runtime._advance_equipment_clock(0.2)
+        self.assertTrue(runtime._advance_bot_critical(
+            state, 0.2, 0.4))
+        self.assertEqual([], state['critical']['crew_ko'])
+        self.assertEqual([], state['critical']['destroyed'])
+        self.assertEqual(
+            [1, 1, 1],
+            [value.uses_left for value in runtime._equipment_states[11]])
+        self.assertEqual(
+            [2, 2, 2],
+            [value.uses_left for value in runtime._equipment_states[12]])
+        self.assertFalse(runtime._equipment_states[11][1].ready(0.4))
+        self.assertFalse(runtime._equipment_states[11][2].ready(0.4))
+        snapshots = state['equipment_states']
+        self.assertAlmostEqual(90.0, snapshots[1]['cooldownTimeLeft'])
+        self.assertAlmostEqual(90.0, snapshots[2]['cooldownTimeLeft'])
+        self.assertAlmostEqual(
+            0.9, runtime.bot_equipment_passives(11)[
+                'fireStartingChanceFactor'])
+
+    def test_bot_equipment_takeover_restores_once_without_clock_rewind(self):
+        contracts = _bot_equipment_contracts(self.module)
+
+        def new_runtime():
+            return self.module.BotRuntime(
+                1, descriptor_resolver=lambda unused: _critical_descriptor(),
+                adapter_factory=lambda *unused: _Adapter(),
+                direction_probe=lambda *unused: {'clear': True},
+                ground_probe=lambda *unused: 0.0,
+                physics_ground_probe=lambda *unused: 0.0,
+                spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+                bot_equipment_resolver=lambda: contracts)
+
+        first = new_runtime()
+        first.battle_start(self.start)
+        repair = first._equipment_states[11][2]
+        critical = _critical_payload(
+            {'name': 'leftTrackHealth', 'hp': 0.0, 'max_hp': 170.0,
+             'state': 'destroyed'}, destroyed=('leftTrackHealth',))
+        self.assertIsNotNone(repair.activate(0.0, critical))
+        first._advance_equipment_clock(12.0)
+        manifest = first._manifest_entry(first.states[11])
+        self.assertAlmostEqual(
+            78.0,
+            manifest['equipment_states'][2]['cooldownTimeLeft'])
+
+        restored = new_runtime()
+        resume = dict(self.start, bots=[], bot_manifest=[manifest])
+        restored.battle_start(resume)
+        restored_repair = restored._equipment_states[11][2]
+        self.assertAlmostEqual(78.0, restored_repair.ready_at)
+        restored._advance_equipment_clock(10.0)
+        restored.battle_start(resume)
+        self.assertAlmostEqual(78.0, restored_repair.ready_at)
+        restored._publish_equipment_state(restored.states[11])
+        self.assertAlmostEqual(
+            68.0,
+            restored.states[11]['equipment_states'][2][
+                'cooldownTimeLeft'])
 
     def test_destroyed_bot_track_repairs_to_regen_cap(self):
         descriptor = _critical_descriptor()
