@@ -3771,6 +3771,8 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertTrue(server.update_bot_states(1, {
                     'round_id': server.round_id,
                     'sample_time_us': bot_state['sample_time_us'],
+                    'source_batch_horizon_us':
+                        bot_state['source_batch_horizon_us'],
                     'bots': bot_state['bots'],
                 }))
                 accepted += 1
@@ -3872,6 +3874,8 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertTrue(server.update_bot_states(1, {
                     'round_id': server.round_id,
                     'sample_time_us': message['sample_time_us'],
+                    'source_batch_horizon_us':
+                        message['source_batch_horizon_us'],
                     'bots': message['bots'],
                 }), server.last_bot_state_reject)
                 runtime.apply_snapshot({
@@ -9698,6 +9702,8 @@ class BotRuntimeTests(unittest.TestCase):
                 'round_id': server.round_id,
                 'bots': publication['bots'],
                 'sample_time_us': publication['sample_time_us'],
+                'source_batch_horizon_us':
+                    publication['source_batch_horizon_us'],
             }), server.last_bot_state_reject)
         start = server.current_battle_message()
         start['bot_authority_id'] = 1
