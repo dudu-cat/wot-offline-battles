@@ -18833,6 +18833,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         }
         battle._avatar.playerVehicleID = 10
         battle._synchronise_player_identity(10)
+        presentation_order = []
+        battle._binding.arena_vehicle_killed.side_effect = (
+            lambda *args: presentation_order.append(('killed', args)))
+        present_health = battle._avatar.guiSessionProvider.setVehicleHealth
+        present_health.side_effect = (
+            lambda *args: presentation_order.append(('health', args)))
 
         self.assertTrue(battle._apply_combat_event({
             'kind': 'bot_hit', 'attacker': 1, 'target_bot': 2,
@@ -18842,10 +18848,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'shell_index': 0, 'shot_result': 2, 'damage': 500}))
 
         self.assertEqual((0, 10, 0), target.health_change)
-        present_health = battle._avatar.guiSessionProvider.setVehicleHealth
         present_health.assert_called_once_with(False, 11, 0, 10, 0)
         battle._binding.arena_vehicle_killed.assert_called_once_with(
             11, 10, 3)
+        self.assertEqual([
+            ('killed', (11, 10, 3)),
+            ('health', (False, 11, 0, 10, 0)),
+        ], presentation_order)
 
     def test_server_owned_frag_and_team_killer_updates_use_native_arena(self):
         runtime = _runtime()

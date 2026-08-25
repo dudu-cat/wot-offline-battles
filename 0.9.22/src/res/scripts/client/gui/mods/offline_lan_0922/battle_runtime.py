@@ -16933,6 +16933,21 @@ class BattleRuntime(object):
                 retain_wreck()
             return
         entity.health = native_health
+        publish_local_kill = bool(
+            not previous_dead and dead and
+            not suppress_combat_presentation and
+            not record.get('local') and
+            int(attacker_id or 0) > 0 and
+            int(attacker_id) == int(
+                getattr(self._avatar, 'playerVehicleID', 0) or 0))
+        if publish_local_kill:
+            # ``VEHICLE_KILLED`` synchronously refreshes the marker's dead
+            # state.  Publish that state before the health update which the
+            # marker classifies as FROM_PLAYER, otherwise the terminal refresh
+            # replaces the local-kill colour with the generic enemy one.
+            killed = getattr(self._binding, 'arena_vehicle_killed', None)
+            if callable(killed):
+                killed(engine_id, int(attacker_id), int(reason_id))
         health_changed = getattr(entity, 'onHealthChanged', None)
         if (not suppress_combat_presentation and
                 callable(health_changed)):
@@ -16995,9 +17010,10 @@ class BattleRuntime(object):
                 not suppress_combat_presentation and
                 self._combat_target_is_spotted(record))
             if not suppress_combat_presentation:
-                killed = getattr(self._binding, 'arena_vehicle_killed', None)
-                if callable(killed):
-                    killed(engine_id, int(attacker_id), int(reason_id))
+                if not publish_local_kill:
+                    killed = getattr(self._binding, 'arena_vehicle_killed', None)
+                    if callable(killed):
+                        killed(engine_id, int(attacker_id), int(reason_id))
                 if not record.get('local'):
                     self._fallback_postmortem_viewpoint(engine_id)
         if (record.get('presentation') and self._remote_factory is not None and
