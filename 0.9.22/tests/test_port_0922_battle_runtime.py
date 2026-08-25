@@ -6059,6 +6059,33 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(snapshot, restored.snapshot(500.0))
         self.assertEqual(4, battle._equipment_revision)
 
+    def test_critical_proposal_uses_target_equipment_snapshot_factors(self):
+        extinguisher = types.SimpleNamespace(
+            id=(11, 21), compactDescr=421,
+            name='autoExtinguishers', tags=(), reuseCount=0,
+            cooldownSeconds=90.0, autoactivate=True,
+            fireStartingChanceFactor=0.8)
+        medkit = types.SimpleNamespace(
+            id=(11, 22), compactDescr=422,
+            name='largeMedkit', tags=('medkit',), reuseCount=0,
+            cooldownSeconds=90.0, repairAll=True, bonusValue=0.30)
+        snapshots = [
+            equipment_mechanics.EquipmentState(
+                equipment_mechanics.project_equipment(value)).snapshot()
+            for value in (extinguisher, medkit)]
+        battle = BattleRuntime(_runtime())
+        entity = types.SimpleNamespace()
+        record = {
+            'kind': 'bot', 'network_id': 3,
+            'state': {'equipment_states': snapshots},
+        }
+
+        self.assertTrue(battle._install_critical_equipment_effects(
+            record, entity))
+        self.assertAlmostEqual(
+            0.8, entity._fire_starting_chance_factor)
+        self.assertAlmostEqual(0.30, entity._medkit_bonus_value)
+
     def test_removed_rpm_limiter_toggles_stock_trigger_stage(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

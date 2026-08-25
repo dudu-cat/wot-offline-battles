@@ -5694,6 +5694,26 @@ class BattleRuntime(object):
                 self._equipment_state or ()).get(
                     'enginePowerFactor'), 1.0))
 
+    def _install_critical_equipment_effects(self, record, entity):
+        """Bind exact target-owned consumable factors to a crit proposal."""
+        if record is None or entity is None:
+            return False
+        state = record.get('state') or {}
+        if record.get('local') and self._equipment_state is not None:
+            equipments = self._equipment_state
+        else:
+            snapshots = state.get('equipment_states') or ()
+            equipments = [
+                value.get('equipment') for value in snapshots
+                if isinstance(value, dict) and
+                isinstance(value.get('equipment'), dict)]
+        passives = equipment_mechanics.passive_effects(equipments)
+        entity._fire_starting_chance_factor = max(0.0, _number(
+            passives.get('fireStartingChanceFactor'), 1.0))
+        entity._medkit_bonus_value = max(0.0, _number(
+            passives.get('medkitBonusValue'), 0.0))
+        return True
+
     def _tick_rpm_limiter(self, record, entity, dt, now):
         """Removed RPM Limiter damage is advanced only by BattleState."""
         return False
@@ -10351,6 +10371,7 @@ class BattleRuntime(object):
         if int(result) == 0:
             damage = 0
             hull_damage = 0
+        self._install_critical_equipment_effects(record, critical_target)
         if int(result) != 0 and combat_rules.is_he(shot):
             damage, critical, critical_delta = (
                 critical_damage.propose_explosion(
@@ -10420,6 +10441,7 @@ class BattleRuntime(object):
             if damage <= 0:
                 continue
             hull_damage = damage
+            self._install_critical_equipment_effects(record, target)
             damage, critical, critical_delta = (
                 critical_damage.propose_explosion(
                     target, combat_rules.collision_layers(collisions),
@@ -15194,6 +15216,7 @@ class BattleRuntime(object):
             target_descriptor=getattr(hit_entity, 'typeDescriptor', None))
         impact = start + direction.scale(distance)
         hull_damage = damage
+        self._install_critical_equipment_effects(hit_record, hit_entity)
         damage, critical, critical_delta = self._critical_hit(
             hit_entity, source.typeDescriptor, target_collisions,
             trace_start, trace_end,
@@ -17115,6 +17138,7 @@ class BattleRuntime(object):
             target_descriptor=getattr(target, 'typeDescriptor', None))
         impact = start + direction.scale(distance)
         hull_damage = damage
+        self._install_critical_equipment_effects(target_record, target)
         damage, critical, critical_delta = self._critical_hit(
             target, entity.typeDescriptor, target_collisions,
             trace_start, trace_end,
@@ -17289,6 +17313,7 @@ class BattleRuntime(object):
             if damage <= 0:
                 continue
             hull_damage = damage
+            self._install_critical_equipment_effects(record, target)
             damage, critical, critical_delta = (
                 critical_damage.propose_explosion(
                     target, combat_rules.collision_layers(collisions),

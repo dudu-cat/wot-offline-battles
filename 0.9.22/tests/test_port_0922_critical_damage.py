@@ -759,6 +759,77 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertFalse(any(
             event['kind'] == 'fire' for event in payload['events']))
 
+    def test_engine_uses_its_descriptor_fire_damage_threshold(self):
+        descriptor = _descriptor()
+        descriptor.engine['fireStartingChance'] = 1.0
+        descriptor.engine['minFireStartingDamage'] = 30.0
+        collision = (1.0, 1.0, _Material('engineHealth'), None)
+
+        below = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=descriptor)
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=29.0), \
+                mock.patch('random.random', return_value=0.0):
+            critical_damage.apply_direct(
+                below, (collision,), object(), object(), 0,
+                {'damage': (100.0, 29.0)}, attacker_id=2,
+                penetrated=False)
+        self.assertFalse(below.is_on_fire)
+
+        threshold = types.SimpleNamespace(
+            id=2, health=500, typeDescriptor=descriptor)
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=30.0), \
+                mock.patch('random.random', side_effect=(0.0, 0.0)):
+            critical_damage.apply_direct(
+                threshold, (collision,), object(), object(), 0,
+                {'damage': (100.0, 30.0)}, attacker_id=2,
+                penetrated=False)
+        self.assertTrue(threshold.is_on_fire)
+
+    def test_equipment_factor_reduces_engine_fire_roll_in_proposals(self):
+        descriptor = _descriptor()
+        descriptor.engine['fireStartingChance'] = 1.0
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=descriptor,
+            position=object(), matrix=object(), getComponents=lambda: (),
+            _fire_starting_chance_factor=0.9)
+        collision = (1.0, 1.0, _Material('engineHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=25.0), \
+                mock.patch('random.random', side_effect=(0.0, 0.95)):
+            unused_damage, payload = critical_damage.propose_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 25.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertFalse(payload['fire'])
+        self.assertFalse(hasattr(vehicle, 'is_on_fire'))
+
+    def test_large_medkit_reduces_crew_knockout_chance_in_proposals(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor(),
+            position=object(), matrix=object(), getComponents=lambda: (),
+            _medkit_bonus_value=0.30)
+        collision = (
+            1.0, 1.0, _Material('commanderHealth', chance=0.33), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=5.0), \
+                mock.patch('random.random', return_value=0.30):
+            unused_damage, payload = critical_damage.propose_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 5.0)}, attacker_id=2,
+                penetrated=False)
+
+        self.assertIsNone(payload)
+        self.assertFalse(hasattr(vehicle, '_crew_ko'))
+
     def test_fuel_tank_ignites_only_when_module_hp_reaches_zero(self):
         vehicle = types.SimpleNamespace(
             id=1, health=500, typeDescriptor=_descriptor(),

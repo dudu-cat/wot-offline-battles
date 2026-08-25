@@ -21,6 +21,29 @@ def _descriptor_value(value, name, default=None):
     return getattr(value, name, default)
 
 
+def _fire_starting_chance_factor(vehicle):
+    """Return the target's mounted-equipment fire chance multiplier."""
+    try:
+        value = float(getattr(
+            vehicle, '_fire_starting_chance_factor', 1.0))
+    except (TypeError, ValueError, OverflowError):
+        return 1.0
+    if value < 0.0 or value != value or value == float('inf'):
+        return 1.0
+    return value
+
+
+def _medkit_bonus_value(vehicle):
+    """Return the mounted medkit's raw #1513 descriptor bonus value."""
+    try:
+        value = float(getattr(vehicle, '_medkit_bonus_value', 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if value != value or value in (float('inf'), -float('inf')):
+        return 0.0
+    return max(0.0, min(2.0, value))
+
+
 def LOG_DEBUG(*unused_args):
     # The user explicitly requested no trace-heavy battle output.
     return None
@@ -950,6 +973,10 @@ def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell,
 				_rolled_names.add(_name)
 				_chance = min(1.0, _device_damage.saving_throw(
 					h_mat, _name, by_explosion) + _deadeye_bonus)
+				# #1513 stores 0.30 for the advertised 15% large-medkit
+				# protection. Apply the artefact value at the crew-hit roll.
+				_chance *= max(
+					0.0, 1.0 - 0.5 * _medkit_bonus_value(target_mock))
 				if _crew_on and random.random() < _chance:
 					if _knock_out_crew(target_mock, _name[:-6], is_player_target):
 						_crew_hit = True
@@ -1028,19 +1055,23 @@ def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell,
 					'fuel' in _name.lower() and
 					not getattr(target_mock, 'is_on_fire', False)):
 				_offh_ignite(target_mock, is_player_target, _name + ' destroyed')
-			elif (_hp_lost and
-					_shell_dmg >= _device_damage.MIN_FIRE_STARTING_DAMAGE and
-					'engine' in _name.lower() and
+			elif (_hp_lost and 'engine' in _name.lower() and
 					not getattr(target_mock, 'is_on_fire', False)):
 				_fsc = 0.15
+				_min_fire_damage = _device_damage.MIN_FIRE_STARTING_DAMAGE
 				try:
 					_eng = getattr(td, 'engine', None)
 					if _eng is not None:
 						_fsc = float(_descriptor_value(
 							_eng, 'fireStartingChance', 0.15))
+						_min_fire_damage = float(_descriptor_value(
+							_eng, 'minFireStartingDamage',
+							_device_damage.MIN_FIRE_STARTING_DAMAGE))
 				except Exception:
 					pass
-				if _fsc > 0.0 and random.random() < _fsc:
+				_fsc *= _fire_starting_chance_factor(target_mock)
+				if (_shell_dmg >= max(0.0, _min_fire_damage) and
+						_fsc > 0.0 and random.random() < _fsc):
 					_offh_ignite(target_mock, is_player_target,
 						_name + ' damaged')
 		if _blocked:
@@ -1239,7 +1270,8 @@ class _CriticalProposalVehicle(object):
         'is_on_fire', '_ammo_rack_death', '_fire_started', '_fire_timer',
         '_is_killed', 'last_sound', 'is_tracked', 'is_engine_dead',
         'is_gun_destroyed', 'is_turret_locked', '_offline_proposal_only',
-        '_components')
+        '_components', '_fire_starting_chance_factor',
+        '_medkit_bonus_value')
 
     def __init__(self, source):
         self.id = source.id
@@ -1271,6 +1303,9 @@ class _CriticalProposalVehicle(object):
         self.is_turret_locked = bool(
             getattr(source, 'is_turret_locked', False))
         self._offline_proposal_only = True
+        self._fire_starting_chance_factor = \
+            _fire_starting_chance_factor(source)
+        self._medkit_bonus_value = _medkit_bonus_value(source)
         self._components = tuple(source.getComponents())
 
     def getComponents(self):
