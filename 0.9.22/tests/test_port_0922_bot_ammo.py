@@ -165,6 +165,33 @@ class BotAmmunitionTests(unittest.TestCase):
         self.assertEqual('full', boundary)
         self.assertEqual((1, 2, 3), (ammo.loaded, ammo.next, gun.clip))
 
+    def test_autoloader_exhausted_shell_discards_clip_for_full_reload(self):
+        descriptor = _descriptor(6, clip=(3, 0.2))
+        ammo = self.runtime_module._BotAmmoState(descriptor, _profile())
+        gun = self.runtime_module._BotGunState(descriptor)
+        runtime = self.runtime_module.BotRuntime(1)
+        runtime.round_id = 7
+        ammo.remaining = [1, 2, 3]
+        state = {
+            'id': 11, 'fire_seq': 0, 'shell_index': 0,
+            'aim_yaw': 0.0, 'gun_pitch': 0.0,
+            'critical': {}, 'profile': _profile(),
+        }
+        gun.elapsed = 10.0
+
+        self.assertTrue(runtime._fire(
+            state, gun, 1.0, descriptor, ammo_state=ammo))
+        self.assertEqual((0, 'full'), (gun.clip, gun.reload_kind))
+        self.assertEqual((0, 1, [0, 2, 3]), (
+            ammo.loaded, ammo.next, ammo.remaining))
+
+        gun.tick(1.01)
+        boundary = gun.complete_reload(1.0, ammo.planned_rounds())
+        ammo.stage(2, boundary is not None, boundary == 'full')
+        self.assertEqual('full', boundary)
+        self.assertEqual((1, 2, 2), (ammo.loaded, ammo.next, gun.clip))
+        self.assertTrue(ammo.can_fire())
+
     def test_takeover_restores_inventory_without_consuming_again(self):
         ammo = self.runtime_module._BotAmmoState(
             _descriptor(60), _profile(), {
@@ -276,6 +303,96 @@ class BotAmmunitionTests(unittest.TestCase):
         with self.assertRaisesRegex(
                 ValueError, 'inventory is not conserved'):
             BattleState._validate_bot_ammo_transition(previous, invalid)
+
+    def test_server_accepts_planned_fallback_when_shot_exhausts_shell(self):
+        identity = {
+            'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot',
+            'vehicle': 'ussr:R11_MS-1', 'max_health': 1000,
+            'profile': _profile(),
+        }
+        previous = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 0, 'shell_index': 0, 'next_shell_index': 0,
+            'ammo_remaining': [1, 20, 10],
+            'ammo_reload_pending': False,
+        }, identity, None)
+        fallback = BattleState._sanitize_bot_state({
+            'id': 11, 'health': 1000, 'alive': True,
+            'fire_seq': 1, 'shell_index': 0, 'next_shell_index': 1,
+            'ammo_remaining': [0, 20, 10],
+            'ammo_reload_pending': True,
+        }, identity, previous)
+
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            previous, fallback))
+
+        still_available = dict(previous)
+        still_available['ammo_remaining'] = [2, 20, 10]
+        consumed = dict(fallback, ammo_remaining=[1, 20, 10])
+        with self.assertRaisesRegex(
+                ValueError, 'planned shell changed outside reload'):
+            BattleState._validate_bot_ammo_transition(
+                still_available, consumed)
+
+        last_round = dict(
+            previous, shell_index=2, next_shell_index=2,
+            ammo_remaining=[0, 0, 1])
+        empty = dict(
+            fallback, shell_index=2, next_shell_index=0,
+            ammo_remaining=[0, 0, 0])
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            last_round, empty))
+
+    def test_server_accepts_initial_reload_planning_boundaries(self):
+        previous = {
+            'fire_seq': 0, 'shell_index': 0, 'next_shell_index': 0,
+            'ammo_remaining': [2, 2, 1],
+            'ammo_reload_pending': False,
+            'clip': 1, 'clip_size': 1,
+            'reload_time': 0.1, 'reload_duration': 1.0,
+        }
+        ready = dict(
+            previous, next_shell_index=1,
+            reload_time=0.0, reload_duration=1.0)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            previous, ready))
+
+        fired = dict(
+            previous, fire_seq=1, next_shell_index=1,
+            ammo_remaining=[1, 2, 1],
+            ammo_reload_pending=True,
+            reload_time=1.0, reload_duration=1.0)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            previous, fired))
+
+        not_ready = dict(ready, reload_time=0.05)
+        with self.assertRaisesRegex(
+                ValueError, 'planned shell changed outside reload'):
+            BattleState._validate_bot_ammo_transition(
+                previous, not_ready)
+
+    def test_server_accepts_autoloader_shell_exhaustion_full_reload(self):
+        previous = {
+            'fire_seq': 0, 'shell_index': 0, 'next_shell_index': 0,
+            'ammo_remaining': [1, 2, 3],
+            'ammo_reload_pending': False,
+            'clip': 3, 'clip_size': 3,
+            'reload_time': 0.0, 'reload_duration': 0.2,
+        }
+        pending = dict(
+            previous, fire_seq=1, next_shell_index=1,
+            ammo_remaining=[0, 2, 3],
+            ammo_reload_pending=True,
+            clip=0, reload_time=1.0, reload_duration=1.0)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            previous, pending))
+
+        ready = dict(
+            pending, shell_index=1, next_shell_index=2,
+            ammo_reload_pending=False,
+            clip=2, reload_time=0.0, reload_duration=1.0)
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            pending, ready))
 
     def test_server_accepts_only_explicit_reload_boundary_promotion(self):
         identity = {

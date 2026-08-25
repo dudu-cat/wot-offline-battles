@@ -1506,6 +1506,24 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual(
             'human_collision_manifest', state.battle_result['reason'])
 
+    def test_rejected_bot_batch_fences_worker_and_terminates_round(self):
+        state, unused_clock = self._state()
+        worker = state.simulation_worker
+        handler = object.__new__(ClientHandler)
+
+        result = handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, {
+                'type': 'bot_state', 'round_id': state.round_id,
+                'bots': [{'id': 99}],
+            })
+
+        self.assertEqual('close', result)
+        self.assertFalse(worker.connected)
+        self.assertIsNone(state.simulation_worker)
+        self.assertEqual('bot_state_rejected', state.worker_failure_reason)
+        self.assertEqual('bot_state_rejected', state.battle_result['reason'])
+        self.assertFalse(state.result_receipts)
+
     def test_sustained_overlap_without_contact_armor_never_damages(self):
         state, clock = self._state()
         sequence = {1: 0, 2: 0}

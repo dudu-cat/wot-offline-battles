@@ -4512,6 +4512,8 @@ class BattleState:
         previous_pending = bool(previous.get(
             "ammo_reload_pending", False))
         pending = bool(current.get("ammo_reload_pending", False))
+        previous_reload_time = float(previous.get("reload_time", 0.0))
+        reload_time = float(current.get("reload_time", 0.0))
         clip_size = int(current.get("clip_size", 1))
         previous_clip_size = int(previous.get("clip_size", 1))
         clip = int(current.get("clip", clip_size))
@@ -4537,17 +4539,37 @@ class BattleState:
                 raise ValueError("bot fired from an empty clip")
             if loaded != expected_loaded:
                 raise ValueError("bot loaded shell changed while firing")
-            if clip_size > 1 and clip != expected_clip:
+            if loaded >= len(expected) or expected[loaded] <= 0:
+                raise ValueError("bot fired an exhausted shell")
+            expected[loaded] -= 1
+            exhausted_clip_switch = (
+                clip_size > 1 and expected_clip > 0 and
+                expected[loaded] == 0 and sum(expected) > 0)
+            if (clip_size > 1 and clip != expected_clip and
+                    not (exhausted_clip_switch and clip == 0)):
                 raise ValueError(
                     "bot clip did not consume one round (%d -> %d, "
                     "expected %d)" % (
                         previous_clip, clip, expected_clip))
-            if loaded >= len(expected) or expected[loaded] <= 0:
-                raise ValueError("bot fired an exhausted shell")
-            expected[loaded] -= 1
             if not previous_pending and next_shell != previous_next:
-                raise ValueError(
-                    "bot planned shell changed outside reload")
+                # The worker must keep ``next`` usable in every atomic ammo
+                # snapshot.  Consuming the last round of the planned shell
+                # therefore selects its fallback in the same fire update,
+                # before the reload edge.  That is the only legal planned
+                # selection change outside a completed reload.
+                planned_was_consumed = (
+                    previous_next == loaded and
+                    expected[previous_next] == 0)
+                fallback_is_usable = (
+                    (sum(expected) == 0 and next_shell == 0) or
+                    (0 <= next_shell < len(expected) and
+                     expected[next_shell] > 0))
+                initial_reload_completed = previous_reload_time > 0.0
+                if (not fallback_is_usable or not (
+                        planned_was_consumed or
+                        initial_reload_completed)):
+                    raise ValueError(
+                        "bot planned shell changed outside reload")
         elif not previous_pending:
             if pending:
                 raise ValueError("bot reload started without a shot")
@@ -4556,8 +4578,15 @@ class BattleState:
             if clip_size > 1 and clip != previous_clip:
                 raise ValueError("bot clip changed outside reload")
             if next_shell != previous_next:
-                raise ValueError(
-                    "bot planned shell changed outside reload")
+                planned_is_usable = (
+                    (sum(expected) == 0 and next_shell == 0) or
+                    (0 <= next_shell < len(expected) and
+                     expected[next_shell] > 0))
+                initial_reload_completed = (
+                    previous_reload_time > 0.0 and reload_time == 0.0)
+                if not initial_reload_completed or not planned_is_usable:
+                    raise ValueError(
+                        "bot planned shell changed outside reload")
         elif pending:
             if loaded != previous_loaded:
                 raise ValueError("bot loaded shell changed before reload")
@@ -4569,7 +4598,8 @@ class BattleState:
             if loaded != previous_next:
                 raise ValueError(
                     "bot loaded shell skipped its planned boundary")
-            if clip_size > 1 and clip != clip_size:
+            refill = min(clip_size, after[loaded])
+            if clip_size > 1 and clip != refill:
                 raise ValueError("bot full reload did not refill its clip")
         else:
             if loaded != previous_loaded:
@@ -10520,6 +10550,15 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         authority_id,
                         server.state.last_bot_state_reject_code,
                         server.state.last_bot_state_reject))
+            if not accepted:
+                # A bot publication is one atomic canonical batch.  Keeping
+                # the previous snapshot after rejecting it leaves every Bot
+                # frozen while the worker advances beyond the server's
+                # lineage.  Fence the producer and use the existing explicit
+                # infrastructure-failure result instead.
+                server.state.remove_simulation_worker(
+                    worker, "bot_state_rejected")
+                return "close"
         elif message_type == "bot_observation":
             relay = server.state.update_bot_observation(
                 authority_id, message)

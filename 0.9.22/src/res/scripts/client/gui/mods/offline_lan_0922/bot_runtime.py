@@ -802,13 +802,23 @@ class _BotGunState(object):
         return self.elapsed > (
             self.reload_duration * max(0.0, float(reload_factor)))
 
-    def complete_reload(self, reload_factor=1.0):
+    def complete_reload(self, reload_factor=1.0,
+                        available_rounds=None):
         """Return the completed boundary and refill only an empty clip."""
         if not self.ready(reload_factor):
             return None
         if self.reload_kind == 'full' and self.clip == 0:
-            self.clip = self.clip_size
+            refill = self.clip_size
+            if available_rounds is not None:
+                refill = min(refill, max(0, int(available_rounds)))
+            self.clip = refill
         return self.reload_kind
+
+    def require_full_reload(self):
+        """Discard unusable clip slots before changing shell type."""
+        self.clip = 0
+        self.reload_kind = 'full'
+        self.reload_duration = self.reload_full
 
     def shell_index(self, requested):
         return max(0, min(int(_number(requested)), self.shell_count - 1))
@@ -1060,6 +1070,16 @@ class _BotAmmoState(object):
         self.reload_pending = True
         self.plan_pending = False
         return True
+
+    def planned_rounds(self):
+        if 0 <= self.next < len(self.remaining):
+            return self.remaining[self.next]
+        return 0
+
+    def loaded_shell_requires_full_reload(self):
+        return (0 <= self.loaded < len(self.remaining) and
+                self.remaining[self.loaded] <= 0 and
+                sum(self.remaining) > 0)
 
     def publish(self, state):
         state['shell_index'] = int(self.loaded)
@@ -5376,6 +5396,11 @@ class BotRuntime(object):
             return False
         if not ammo_state.consume_loaded():
             raise RuntimeError('bot ammunition changed during atomic fire')
+        if ammo_state.loaded_shell_requires_full_reload():
+            # #1513 discards the unusable remainder of an autoloader clip
+            # when its current shell type is exhausted.  The fallback shell
+            # becomes usable only after a full magazine reload.
+            gun_state.require_full_reload()
         state['fire_seq'] = next_fire_seq
         for name in (
                 'shot_origin', 'shot_velocity', 'shot_gravity',
@@ -5706,7 +5731,8 @@ class BotRuntime(object):
                 state, descriptor, 'reload')
             gun_state.rescale_reload(reload_factor)
             gun_state.tick(step)
-            reload_kind = gun_state.complete_reload(reload_factor)
+            reload_kind = gun_state.complete_reload(
+                reload_factor, ammo_state.planned_rounds())
             ammo_state.stage(
                 gun_state.shell_index(command.get('shell_index', 0)),
                 reload_kind is not None, reload_kind == 'full')
