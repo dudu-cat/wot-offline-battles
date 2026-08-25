@@ -389,7 +389,7 @@ class TankCollisionTests(unittest.TestCase):
         self.assertGreater(event['contact_penetration'], 0.0)
         self.assertEqual(4.5, event['closing_speed'])
 
-    def test_ram_uses_full_relative_velocity_not_only_normal_component(self):
+    def test_ram_uses_normal_closing_speed_not_tangential_scrape(self):
         light = _tank(
             4, 0.0, 0.0, mass=10000.0, vx=3.0, vz=30.0)
         heavy = _tank(9, 0.8, 0.0, mass=60000.0)
@@ -400,9 +400,14 @@ class TankCollisionTests(unittest.TestCase):
         self.assertAlmostEqual(math.hypot(3.0, 30.0),
                                event['relative_speed'])
         self.assertEqual(3.0, event['closing_speed'])
+        self.assertEqual(3.0, event['impact_speed'])
+        self.assertEqual(
+            tank_collision.ram_damage(
+                3.0, 10000.0, 60000.0, 100.0, 100.0),
+            (event['damage_to_other'], event['damage_to_self']))
         self.assertGreater(event['damage_to_self'], 0)
 
-    def test_ram_relative_velocity_includes_native_vertical_component(self):
+    def test_ram_ignores_vertical_relative_speed_for_hull_damage(self):
         falling = _tank(
             4, 0.0, 0.0, mass=10000.0, vx=3.0, vz=0.0)
         falling['vy'] = -12.0
@@ -413,8 +418,22 @@ class TankCollisionTests(unittest.TestCase):
 
         self.assertAlmostEqual(math.hypot(3.0, 12.0),
                                event['relative_speed'])
+        self.assertEqual(3.0, event['impact_speed'])
+        self.assertEqual(
+            tank_collision.ram_damage(
+                3.0, 10000.0, 60000.0, 100.0, 100.0),
+            (event['damage_to_other'], event['damage_to_self']))
         self.assertEqual(-12.0, event['velocity_y_self'])
         self.assertEqual(0.0, event['velocity_y_other'])
+
+    def test_high_speed_side_scrape_does_not_create_a_ram_event(self):
+        light = _tank(
+            4, 0.0, 0.0, mass=10000.0, vx=0.2, vz=30.0)
+        heavy = _tank(9, 0.8, 0.0, mass=60000.0)
+
+        result = tank_collision.resolve_tank(light, (heavy,), now=10.0)
+
+        self.assertEqual((), result['ram_events'])
 
     def test_head_on_diagnostic_records_both_moving_bodies(self):
         first = _tank(4, 0.0, 0.0, mass=25000.0, vx=6.0)

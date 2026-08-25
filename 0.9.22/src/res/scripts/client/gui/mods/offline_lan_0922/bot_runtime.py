@@ -4319,11 +4319,11 @@ class BotRuntime(object):
                                     bot_id, player_id, seq)]
                         else:
                             # The immutable receipt already proves one contact
-                            # episode and its real armour layers. Do not ask a
-                            # second, independently interpolated planar SAT
-                            # normal to admit HP again: that drops valid glancing
-                            # and vertical impacts. OBB remains validation and
-                            # presentation response only.
+                            # episode and its real armour layers.  Its frozen
+                            # poses provide a stable horizontal contact normal;
+                            # use that for impact energy instead of allowing
+                            # tangential or vertical relative velocity to turn
+                            # a scrape into a high-damage ram.
                             bot_profile = bot.get('ram_profile') or {}
                             bot_spall = _number(bot_profile.get(
                                 'spall_coefficient'), -1.0)
@@ -4335,16 +4335,24 @@ class BotRuntime(object):
                                     self._terminal_human_ram_report(
                                         bot_id, player_id, seq)]
                             else:
-                                relative_x = bot_vx - player_vx
-                                relative_y = bot_vy - player_vy
-                                relative_z = bot_vz - player_vz
-                                relative_speed = math.sqrt(
-                                    relative_x * relative_x +
-                                    relative_y * relative_y +
-                                    relative_z * relative_z)
+                                normal_x = bot['x'] - player['x']
+                                normal_z = bot['z'] - player['z']
+                                normal_length = math.sqrt(
+                                    normal_x * normal_x +
+                                    normal_z * normal_z)
+                                if normal_length > 0.000001:
+                                    normal_x /= normal_length
+                                    normal_z /= normal_length
+                                else:
+                                    normal_x, normal_z = 0.0, 0.0
+                                closing_speed = (
+                                    tank_collision.planar_closing_speed(
+                                        (bot_vx, bot_vz),
+                                        (player_vx, player_vz),
+                                        (normal_x, normal_z)))
                                 damage_player, damage_bot = (
                                     tank_collision.ram_damage(
-                                        relative_speed,
+                                        closing_speed,
                                         bot['mass'], player['mass'],
                                         bot_armor, player_armor,
                                         bot_spall, player_spall,
@@ -4359,16 +4367,6 @@ class BotRuntime(object):
                                         current, response, step,
                                         advance_push=False,
                                         apply_correction=False)
-                                normal_x = bot['x'] - player['x']
-                                normal_z = bot['z'] - player['z']
-                                normal_length = math.sqrt(
-                                    normal_x * normal_x +
-                                    normal_z * normal_z)
-                                if normal_length > 0.000001:
-                                    normal_x /= normal_length
-                                    normal_z /= normal_length
-                                else:
-                                    normal_x, normal_z = 0.0, 0.0
                                 event = {
                                     'self_id': bot['id'],
                                     'other_id': player['id'],
@@ -4385,7 +4383,7 @@ class BotRuntime(object):
                                     'contact_normal': (
                                         normal_x, normal_z),
                                     'contact_penetration': 0.0,
-                                    'closing_speed': relative_speed,
+                                    'closing_speed': closing_speed,
                                     'damage_to_self': damage_bot,
                                     'damage_to_other': damage_player,
                                 }

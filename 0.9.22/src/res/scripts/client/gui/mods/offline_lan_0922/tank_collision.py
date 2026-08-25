@@ -360,6 +360,20 @@ def obb_contact(x_a, z_a, yaw_a, shape_a,
     return best_x, best_z, best_overlap
 
 
+def planar_closing_speed(velocity_a, velocity_b, normal):
+    """Return the horizontal speed compressing an already-contacting pair.
+
+    Tangential motion is a scrape, not impact energy.  Keeping this planar is
+    deliberate: vertical landing/world impacts follow their own damage path
+    and must not turn a side contact into a high-speed ram.
+    """
+    normal_x, normal_z = normal[0], normal[1]
+    normal_velocity = (
+        (velocity_a[0] - velocity_b[0]) * normal_x +
+        (velocity_a[1] - velocity_b[1]) * normal_z)
+    return max(0.0, -normal_velocity)
+
+
 def pair_response(contact, inverse_a, inverse_b, velocity_a, velocity_b,
                   slop=POSITION_SLOP, percent=POSITION_PERCENT):
     """Return inverse-mass corrections and e=0 impulses for both bodies."""
@@ -611,10 +625,10 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             delta_velocity_x += response[2]
             delta_velocity_z += response[3]
 
-        normal_velocity = (
-            (velocity_x - other_velocity_x) * contact[0] +
-            (velocity_z - other_velocity_z) * contact[1])
-        if normal_velocity >= 0.0:
+        closing_speed = planar_closing_speed(
+            (velocity_x, velocity_z),
+            (other_velocity_x, other_velocity_z), contact)
+        if closing_speed <= 0.0:
             continue
 
         if other_is_wreck or now is None:
@@ -624,7 +638,6 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         # armour ray or damage recomputation is needed while it persists.
         if pair in previous_contacts:
             continue
-        closing_speed = -normal_velocity
         own_ram_inputs = _contact_ram_inputs(tank)
         other_ram_inputs = _contact_ram_inputs(other)
         if ((own_ram_inputs is None or other_ram_inputs is None) and
@@ -651,15 +664,15 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         relative_velocity_x = velocity_x - other_velocity_x
         relative_velocity_y = velocity_y - other_velocity_y
         relative_velocity_z = velocity_z - other_velocity_z
-        # #1513's native collision callback measures the full Vector3
-        # relative velocity. Keep the planar normal only as the test that the
-        # hulls are compressing; kinetic energy uses the complete magnitude.
+        # Preserve full relative speed for diagnostics, but only the contact
+        # normal's closing component is impact energy.  A high-speed side
+        # scrape or vertical motion cannot amplify a shallow hull contact.
         relative_speed = math.sqrt(
             relative_velocity_x * relative_velocity_x +
             relative_velocity_y * relative_velocity_y +
             relative_velocity_z * relative_velocity_z)
         damage_other, damage_self = ram_damage(
-            relative_speed, mass_self, mass_other,
+            closing_speed, mass_self, mass_other,
             armor_self, armor_other,
             spall_self, spall_other,
             bonus_self, bonus_other,
@@ -696,6 +709,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             'contact_penetration': contact[2],
             'closing_speed': closing_speed,
             'relative_speed': relative_speed,
+            'impact_speed': closing_speed,
             'armor_self': armor_self,
             'armor_other': armor_other,
             'spall_self': spall_self,
