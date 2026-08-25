@@ -24,6 +24,31 @@ from lan_battle_server import (
 from effective_params_fixture import effective_params
 
 
+def _player_equipment_contract():
+    return {
+        'equipment_states': [],
+        'equipment_revision': 0,
+        'equipment_intent_seq': 0,
+        'equipment_intent_result': {
+            'intent_seq': 0, 'accepted': False, 'reason': ''},
+    }
+
+
+def _snapshot_player(player_id=1, **changes):
+    player = {
+        'id': player_id,
+        'critical_revision': 0,
+        'critical_base_revision': 0,
+        'critical_ack_seq': 0,
+        'input_seq': 0,
+        'up_cosine': 1.0,
+        'landing_observation_seq': 0,
+    }
+    player.update(_player_equipment_contract())
+    player.update(changes)
+    return player
+
+
 class _Socket(object):
     def sendall(self, unused_payload):
         pass
@@ -239,10 +264,11 @@ class LanProtocolTests(unittest.TestCase):
             'state_revision': 9, 'phase': 'waiting', 'map': '01_karelia',
             'host_player_id': 1, 'authority_epoch': 0,
             'bot_authority_id': -1,
-            'players': [{'id': 1, 'vehicle': 'germany:G01_PzI',
-                         'max_health': 150,
-                         'vehicle_compact_descr': 'cHpp',
-                         'effective_params': effective_params()}]})
+            'players': [dict(
+                _player_equipment_contract(), id=1,
+                vehicle='germany:G01_PzI', max_health=150,
+                vehicle_compact_descr='cHpp',
+                effective_params=effective_params())]})
 
         self.assertEqual('germany:G01_PzI', self.client.vehicle)
         self.assertEqual(150, self.client.max_health)
@@ -797,10 +823,7 @@ class LanProtocolTests(unittest.TestCase):
     def test_lean_snapshot_inherits_the_last_static_bot_manifest(self):
         self.client.server_capabilities = (
             LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
-        player = {
-            'id': 1, 'critical_revision': 0,
-            'critical_base_revision': 0, 'critical_ack_seq': 0,
-        }
+        player = _snapshot_player()
         manifest = [{'id': 11, 'vehicle': 'ussr:R11_MS-1'}]
         first = {
             'type': 'snapshot', 'protocol': 5, 'round_id': 7,
@@ -825,14 +848,7 @@ class LanProtocolTests(unittest.TestCase):
         self.client.connected = False
         self.client.bigworld = mock.Mock()
         self.client.bigworld.callback.return_value = 1
-        player = {
-            'id': 1, 'critical_revision': 0,
-            'critical_base_revision': 0, 'critical_ack_seq': 0,
-            'equipment_states': [], 'equipment_revision': 0,
-            'equipment_intent_seq': 0,
-            'equipment_intent_result': {
-                'intent_seq': 0, 'accepted': False, 'reason': ''},
-        }
+        player = _snapshot_player()
         manifest = [{'id': 11, 'vehicle': 'ussr:R11_MS-1'}]
         first = {
             'type': 'snapshot', 'protocol': 5, 'round_id': 7,
@@ -1037,8 +1053,9 @@ class LanProtocolTests(unittest.TestCase):
             'state_revision': 7, 'phase': 'battle',
             'map': '01_karelia', 'host_player_id': 1,
             'bot_authority_id': -1,
-            'players': [{'id': 1,
-                         'effective_params': effective_params()}]})
+            'players': [dict(
+                _player_equipment_contract(), id=1,
+                effective_params=effective_params())]})
         live = {
             'type': 'battle_live', 'protocol': 5, 'round_id': 7,
             'server_tick': 0, 'state_revision': 6,
@@ -1099,10 +1116,10 @@ class LanProtocolTests(unittest.TestCase):
         self.assertFalse(self.client.is_bot_authority())
 
     def test_same_round_waiting_roster_cannot_demote_accepted_battle(self):
-        players = [{
-            'id': 1, 'team': 1, 'slot': 0, 'name': 'P',
-            'vehicle': 'ussr:MS-1', 'x': 0, 'y': 0, 'z': 0,
-            'effective_params': effective_params()}]
+        players = [dict(
+            _player_equipment_contract(), id=1, team=1, slot=0, name='P',
+            vehicle='ussr:MS-1', x=0, y=0, z=0,
+            effective_params=effective_params())]
         self.client._handle_message({
             'type': 'battle_start', 'protocol': 5, 'round_id': 7,
             'state_revision': 5,
@@ -1125,10 +1142,10 @@ class LanProtocolTests(unittest.TestCase):
             'state_revision': 7,
             'phase': 'waiting', 'map': '05_prohorovka',
             'bot_authority_id': -1,
-            'host_player_id': 1, 'players': [{
-                'id': 1, 'team': 1, 'slot': 0, 'name': 'Changed',
-                'vehicle': 'ussr:MS-1', 'x': 1, 'y': 0, 'z': 1,
-                'effective_params': effective_params()}]})
+            'host_player_id': 1, 'players': [dict(
+                _player_equipment_contract(), id=1, team=1, slot=0,
+                name='Changed', vehicle='ussr:MS-1', x=1, y=0, z=1,
+                effective_params=effective_params())]})
 
         self.assertEqual('battle', self.client.phase)
         self.assertEqual('01_karelia', self.client.map_name)
