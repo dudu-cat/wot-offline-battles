@@ -772,6 +772,10 @@ def _selected_vehicle(config, restore_saved=True):
 def _on_lobby_view_loaded(event):
     global _lobby_view_loaded
     _lobby_view_loaded = True
+    session = _session
+    notify = getattr(session, 'on_lobby_view_loaded', None)
+    if callable(notify):
+        notify()
 
 
 def _install_lobby_listener():
@@ -1116,7 +1120,6 @@ def _wait_for_lobby():
                 _lobby_is_ready(g_appLoader, lobby)):
             if _session is None:
                 raise RuntimeError('LAN session is not installed')
-            _remove_lobby_listener()
             if _client_mode == port_config.SIMULATION_WORKER_MODE:
                 if not _session.start():
                     raise RuntimeError('simulation worker did not start')

@@ -696,6 +696,20 @@ class LANSession(object):
         self._published_progress_battles = battles
         return True
 
+    def on_lobby_view_loaded(self):
+        """Drain a completed battle as soon as the rebuilt lobby can do so.
+
+        The receipt itself is already durable while the battle space is
+        leaving.  Waiting only for the periodic retry leaves a small window in
+        which the player can open the LAN waiting room before the stock
+        Account update and result request begin.
+        """
+        if self._stopped:
+            return False
+        progress_published = self._publish_postbattle_progress()
+        results_published = self._publish_postbattle_results()
+        return bool(progress_published or results_published)
+
     def _publish_selected_vehicle(self):
         """Send the current garage tank so the next round uses it."""
         client = self.client

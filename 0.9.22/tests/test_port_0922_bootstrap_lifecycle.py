@@ -820,6 +820,19 @@ class BootstrapLifecycleTests(unittest.TestCase):
             self.assertIsNone(bootstrap._cleanup_runtime())
         self.assertEqual('uninstall_announcement_router', events[-1])
 
+    def test_lobby_view_load_immediately_notifies_the_lan_session(self):
+        (bootstrap, unused_callbacks, unused_compatibility,
+         unused_app_loader, unused_spaces, unused_events,
+         unused_modules) = self._load()
+        notified = []
+        bootstrap._session = types.SimpleNamespace(
+            on_lobby_view_loaded=lambda: notified.append(True))
+
+        bootstrap._on_lobby_view_loaded(None)
+
+        self.assertTrue(bootstrap._lobby_view_loaded)
+        self.assertEqual([True], notified)
+
     def test_cleanup_retains_session_until_stop_can_be_retried(self):
         (bootstrap, unused_callbacks, unused_compatibility,
          unused_app_loader, unused_spaces, unused_events,
