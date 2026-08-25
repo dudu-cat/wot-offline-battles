@@ -1881,6 +1881,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 PLAYER_ENVIRONMENT_CAPABILITY,
                 EFFECTIVE_PARAMS_CAPABILITY,
                 RICOCHET_CONTINUATION_CAPABILITY],
+            'max_health': 1000,
             'vehicle_compact_descr': 'dGVzdA==',
             'effective_params': effective_params()})
         self.assertIsNotNone(player)
