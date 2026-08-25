@@ -11729,6 +11729,41 @@ class BattleRuntimeContractTests(unittest.TestCase):
             call.kwargs['commit_enabled'] is False
             for call in static_probe.call_args_list))
 
+    def test_visible_crush_prediction_precedes_the_static_recast(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._clock = lambda: 10.0
+        battle._sender = types.SimpleNamespace(
+            send_current=mock.Mock(return_value=True))
+        battle._local_physics = _effective_params_snapshot()['physics']
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        predicted = []
+        battle._destructibles = types.SimpleNamespace(
+            _catalog_motion_proposal=mock.Mock(return_value={
+                'status': 'crushed', 'token': ((22, 37, None),),
+                'accepted_now': False, 'used_kinetic_speed': True,
+                'kinds': 'fragile', 'requires_commit': True,
+            }),
+            begin_local_prediction=lambda token: predicted.append(token) or True,
+            clear_local_prediction=mock.Mock(return_value=True))
+
+        def static_recast(*unused_args, **unused_kwargs):
+            self.assertEqual([((22, 37, None),)], predicted)
+            return 'clear'
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                side_effect=static_recast):
+            self.assertTrue(battle._motion_is_clear(
+                entity, (1.0, 2.0, 3.0), 0.25, 4.0, 0.04,
+                allow_crush_drive=True))
+
+        self.assertEqual([1], list(battle._local_destructible_contacts))
+        battle._destructibles.clear_local_prediction.assert_not_called()
+
     def test_visible_crush_proposal_keeps_a_backing_wall_hard(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -11739,6 +11774,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._local_physics = _effective_params_snapshot()['physics']
         entity = _Vehicle(
             10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        clear_prediction = mock.Mock(return_value=True)
         battle._destructibles = types.SimpleNamespace(
             _catalog_motion_proposal=mock.Mock(return_value={
                 'status': 'crushed',
@@ -11747,7 +11783,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'used_kinetic_speed': True,
                 'kinds': 'structure',
                 'requires_commit': True,
-            }))
+            }),
+            begin_local_prediction=mock.Mock(return_value=True),
+            clear_local_prediction=clear_prediction)
 
         with mock.patch(
                 'gui.mods.offline_lan_0922.battle_runtime.'
@@ -11762,6 +11800,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._sender.send_current.assert_not_called()
         self.assertEqual('hard', battle._local_motion_status)
         self.assertFalse(static_probe.call_args.kwargs['commit_enabled'])
+        clear_prediction.assert_called_once_with(((22, 37, None),))
 
     def test_drive_sends_new_destructible_before_advancing_safe_pose(self):
         runtime = _runtime()
@@ -11863,6 +11902,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_destructible_snapshot_rejection_rolls_back_earliest_safe_pose(self):
         battle = BattleRuntime(_runtime())
         battle.client = _Client()
+        clear_prediction = mock.Mock(return_value=True)
+        battle._destructibles = types.SimpleNamespace(
+            clear_local_prediction=clear_prediction)
         detail = {
             'requires_commit': True,
             'token': ((22, 37, None),),
@@ -11896,6 +11938,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
              battle._local_push_z))
         self.assertEqual([], list(battle._local_destructible_contacts))
         self.assertEqual([], list(battle._local_destructible_safe_poses))
+        self.assertEqual([
+            mock.call(((22, 37, None),)),
+            mock.call(((22, 38, None),)),
+        ], clear_prediction.call_args_list)
 
     def test_direct_destructible_rejection_uses_admitted_pose_once(self):
         battle = BattleRuntime(_runtime())
@@ -13977,6 +14023,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(True, args[4])
         battle._destructibles.note_destroyed.assert_called_once_with(
             'fragile', 3, 9, None, runtime.bigworld.now)
+        battle._destructibles.clear_local_prediction.assert_called_once_with(
+            ((3, 9, None),))
 
         invalid = dict(event)
         del invalid['is_shot']
@@ -14016,6 +14064,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         authority.is_destroyed.assert_not_called()
         authority.destroy_fragile.assert_not_called()
         battle._destructibles.note_destroyed.assert_not_called()
+        battle._destructibles.clear_local_prediction.assert_called_once_with(
+            ((3, 9, None),))
 
     def test_server_disabled_destructibles_stop_the_sensor_once(self):
         runtime = _runtime()

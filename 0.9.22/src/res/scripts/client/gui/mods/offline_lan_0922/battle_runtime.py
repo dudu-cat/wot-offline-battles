@@ -6933,9 +6933,13 @@ class BattleRuntime(object):
         is_isolated = getattr(
             self._destructibles, 'is_isolated_1513', None)
         if callable(is_isolated) and is_isolated(chunk_id, item_index):
+            self._clear_local_destructible_prediction(
+                ((chunk_id, item_index, mat_kind),))
             # Runtime validation already logged and quarantined this native
             # identity. Never re-enter it through canonical event replay.
             return False
+        self._clear_local_destructible_prediction(
+            ((chunk_id, item_index, mat_kind),))
         if destructibles_authority.is_destroyed(
                 chunk_id, item_index, mat_kind):
             return False
@@ -11157,6 +11161,13 @@ class BattleRuntime(object):
                 self._local_motion_kinds = str(
                     proposal.get('kinds', '-'))
                 self._local_motion_status = 'kinetic'
+                token = self._destructible_contact_token(
+                    proposal.get('token'))
+                predictor = getattr(
+                    self._destructibles, 'begin_local_prediction', None)
+                predicted = bool(
+                    token is not None and callable(predictor) and
+                    predictor(token))
                 world_status = world_collision.check_horizontal_collision(
                     self._runtime.bigworld, self._runtime.math,
                     self._avatar.spaceID, self._vector(position), yaw, speed,
@@ -11165,11 +11176,15 @@ class BattleRuntime(object):
                 if isinstance(world_status, bool):
                     world_status = 'hard' if world_status else 'clear'
                 if world_status not in ('clear', 'kinetic'):
+                    if predicted:
+                        self._clear_local_destructible_prediction(token)
                     self._local_motion_status = 'hard'
                     return False
                 previous_seq = self._local_destructible_contact_seq
                 if not self._queue_local_destructible_contact(
                         proposal, position, yaw, speed, dt):
+                    if predicted:
+                        self._clear_local_destructible_prediction(token)
                     return False
                 if self._local_destructible_contact_seq != previous_seq:
                     sender = getattr(self._sender, 'send_current', None)
@@ -11180,6 +11195,8 @@ class BattleRuntime(object):
                         self._local_destructible_safe_poses.pop(
                             failed_seq, None)
                         self._local_destructible_contact_seq = previous_seq
+                        if predicted:
+                            self._clear_local_destructible_prediction(token)
                         self._local_destructible_send_failed = True
                         return False
                     # The pre-advance pose and proposal now precede every
@@ -12257,6 +12274,12 @@ class BattleRuntime(object):
         if (sequence not in self._local_destructible_contacts or
                 sequence not in self._local_destructible_safe_poses):
             return False
+        # Later proposals were sampled beyond this rejected object. Their
+        # temporary collision bypasses are invalid as well.
+        for seq, pending in self._local_destructible_contacts.items():
+            if seq >= sequence:
+                self._clear_local_destructible_prediction(
+                    self._destructible_contact_token(pending.get('token')))
         self._report_destructible_verdict(
             'visible_rollback', sequence, False,
             self._destructible_contact_token(
@@ -12283,6 +12306,14 @@ class BattleRuntime(object):
             if seq >= sequence:
                 self._local_destructible_safe_poses.pop(seq, None)
         return True
+
+    def _clear_local_destructible_prediction(self, token):
+        """Release a visible-only collision bypass after a terminal verdict."""
+        clearer = getattr(
+            self._destructibles, 'clear_local_prediction', None)
+        if callable(clearer):
+            return bool(clearer(token))
+        return False
 
     def _terrain_support(self, position, yaw, descriptor=None,
                          maximum_y=None):

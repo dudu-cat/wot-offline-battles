@@ -107,6 +107,11 @@ def _drop_isolated_destructible_1513(chunk_id, item_index=None):
 		if (key[0] == chunk_id and
 				(identity is None or key[:2] == identity)):
 			pending.pop(key, None)
+	speculative = globals().get('g_offh_destr_speculative', set())
+	for key in list(speculative):
+		if (key[0] == chunk_id and
+				(identity is None or key[:2] == identity)):
+			speculative.discard(key)
 	globals().get('g_offh_destr_broken_cache', {}).pop(chunk_id, None)
 	if identity is None:
 		state = globals().get('g_offh_tree_state')
@@ -385,6 +390,7 @@ def _clear_runtime_registry():
 			'g_offh_tree_state', 'g_offh_destr_ordered',
 			'g_offh_destr_chunks', 'g_offh_destr_instances',
 			'g_offh_destr_contact_bins', 'g_offh_destr_pending',
+			'g_offh_destr_speculative',
 			'g_offh_destr_falling_active', 'g_offh_destr_ground_skips',
 			'g_offh_destr_broken_cache',
 			'g_offh_destr_isolated_chunks',
@@ -1329,6 +1335,55 @@ def note_destroyed(kind, chunkID, itemIndex, matKind=None, now=None):
 	return True
 
 
+def begin_local_prediction(token):
+	"""Temporarily hide exact fragile/module collision before LAN commit.
+
+	The visible player keeps moving while the worker verifies its proposal, but
+	does not mutate or animate the local object. The canonical event remains the
+	sole owner of shared state and presentation. Falling columns and
+	unclassified geometry stay solid.
+	"""
+	instances = globals().get('g_offh_destr_instances', {})
+	predicted = globals().setdefault('g_offh_destr_speculative', set())
+	changed = False
+	for raw in token or ():
+		try:
+			chunk_id = int(raw[0])
+			item_index = int(raw[1])
+			mat_kind = None if raw[2] is None else int(raw[2])
+		except (IndexError, TypeError, ValueError, OverflowError):
+			continue
+		instance = instances.get((chunk_id, item_index))
+		if not isinstance(instance, dict):
+			continue
+		kind = instance.get('kind')
+		if ((kind == 'fragile' and mat_kind is None) or
+				(kind == 'structure' and mat_kind is not None)):
+			key = (chunk_id, item_index, mat_kind)
+			if key not in predicted:
+				predicted.add(key)
+				changed = True
+	return changed
+
+
+def clear_local_prediction(token):
+	"""Stop hiding exact speculative collision after a terminal outcome."""
+	predicted = globals().get('g_offh_destr_speculative')
+	if not predicted:
+		return False
+	changed = False
+	for raw in token or ():
+		try:
+			key = (int(raw[0]), int(raw[1]),
+				None if raw[2] is None else int(raw[2]))
+		except (IndexError, TypeError, ValueError, OverflowError):
+			continue
+		if key in predicted:
+			predicted.remove(key)
+			changed = True
+	return changed
+
+
 def _catalog_contact_candidates(vehicle_box):
 	instances = globals().get('g_offh_destr_instances', {})
 	contact_bins = globals().get('g_offh_destr_contact_bins', {})
@@ -1549,7 +1604,7 @@ def _motion_travel_reach(vel, dt):
 
 
 def _broken_collision_filter(members):
-	"""Return one native filter for the exact broken identities in ``members``."""
+	"""Filter exact broken or locally predicted identities in ``members``."""
 	if not members:
 		return None
 	authority = _get_destr_authority()
@@ -1558,11 +1613,16 @@ def _broken_collision_filter(members):
 	# ``is_destroyed`` result that cannot enumerate structure materials.
 	if not callable(getattr(authority, 'destroyed_keys', None)):
 		return None
+	member_ids = set((int(chunk_id), int(item_index))
+		for chunk_id, item_index in members)
 	broken = set()
-	for chunk_id, item_index in members:
+	for chunk_id, item_index in member_ids:
 		for mat_kind in _broken_item_materials_1513(
 				authority, chunk_id).get(int(item_index), ()):
 			broken.add((int(chunk_id), int(item_index), mat_kind))
+	broken.update(key for key in
+		globals().get('g_offh_destr_speculative', set())
+		if key[:2] in member_ids)
 	if not broken:
 		return None
 

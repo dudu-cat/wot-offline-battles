@@ -182,6 +182,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                      'g_offh_destr_chunks', 'g_offh_destr_instances',
                      'g_offh_destr_contact_bins',
                      'g_offh_destr_pending',
+                     'g_offh_destr_speculative',
                      'g_offh_destr_falling_active',
                      'g_offh_destr_isolated_chunks',
                      'g_offh_destr_isolated_slots',
@@ -4550,6 +4551,52 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 return_value=authority):
             destructibles_sensor.reset(1)
         self.assertNotIn('g_offh_destr_pending', destructibles_sensor.__dict__)
+
+    def test_local_prediction_filters_only_exact_registered_surfaces(self):
+        destructibles_sensor.g_offh_destr_instances = {
+            (22, 37): {'kind': 'fragile'},
+            (22, 38): {'kind': 'structure'},
+            (22, 39): {'kind': 'falling'},
+        }
+
+        self.assertTrue(destructibles_sensor.begin_local_prediction((
+            (22, 37, None), (22, 38, 5), (22, 38, None),
+            (22, 39, None), (22, 99, None))))
+        self.assertEqual({(22, 37, None), (22, 38, 5)},
+                         destructibles_sensor.g_offh_destr_speculative)
+        authority = types.SimpleNamespace(
+            destroyed_keys=lambda unused_chunk: ())
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            collision_filter = destructibles_sensor._broken_collision_filter(
+                {(22, 37), (22, 38), (22, 39)})
+
+        self.assertFalse(collision_filter(73, 0, 37, 22))
+        self.assertFalse(collision_filter(5, 0, 38, 22))
+        self.assertTrue(collision_filter(6, 0, 38, 22))
+        self.assertTrue(collision_filter(73, 0, 39, 22))
+        self.assertTrue(collision_filter(73, 0, 99, 22))
+        self.assertTrue(destructibles_sensor.clear_local_prediction(
+            ((22, 37, None), (22, 38, 5))))
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority):
+            self.assertIsNone(destructibles_sensor._broken_collision_filter(
+                {(22, 37), (22, 38)}))
+
+    def test_isolation_clears_matching_local_prediction(self):
+        destructibles_sensor.g_offh_destr_instances = {
+            (22, 37): {'kind': 'fragile', 'bin_keys': []},
+            (22, 38): {'kind': 'structure', 'bin_keys': []},
+        }
+        destructibles_sensor.g_offh_destr_speculative = {
+            (22, 37, None), (22, 38, 5)}
+
+        destructibles_sensor._drop_isolated_destructible_1513(22, 37)
+
+        self.assertEqual({(22, 38, 5)},
+                         destructibles_sensor.g_offh_destr_speculative)
 
     def test_felled_column_never_blocks_and_keeps_its_resting_obb(self):
         destructibles_sensor.xrange = range
