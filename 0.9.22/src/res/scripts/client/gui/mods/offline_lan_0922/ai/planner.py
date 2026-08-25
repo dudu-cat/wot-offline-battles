@@ -20,6 +20,8 @@ TARGET_HYSTERESIS_BONUS = 18.0
 LOCAL_FORCE_RADIUS = 185.0
 BATTLE_TIER_RADIUS = 1
 MATCH_CLASSES = ('heavyTank', 'mediumTank', 'AT-SPG', 'lightTank', 'SPG')
+CLASS_ROUTE_AFFINITY_WEIGHT = 42.0
+ARTILLERY_ROUTE_REPEAT_PENALTY = 120.0
 
 BOT_TIER_MODE_RANDOM = 'random'
 BOT_TIER_MODE_SAME = 'same'
@@ -755,13 +757,16 @@ def _angle_delta(target, current):
 
 
 def _map_data_with_baked_routes(map_data, baked_routes):
-	"""Return tactical metadata with graph-validated locomotion waypoints."""
+	"""Combine current strategy with graph-validated locomotion waypoints."""
 	if map_data is None or not isinstance(baked_routes, dict):
 		return map_data
 	result = dict(map_data)
 	routes = {}
 	for team in (1, 2):
 		converted = []
+		strategy_routes = dict(
+			(route.get('id'), route) for route in
+			map_data.get('routes', {}).get(team, ()) or ())
 		values = baked_routes.get(str(team), baked_routes.get(team, ())) or ()
 		for raw in values:
 			if not isinstance(raw, dict):
@@ -776,7 +781,22 @@ def _map_data_with_baked_routes(map_data, baked_routes):
 			if not waypoints:
 				continue
 			route = dict(raw)
-			route['role_weights'] = dict(raw.get('role_weights', {}) or {})
+			# Navigation graphs prove geometry. Strategy remains source data so a
+			# map-guide update cannot be masked by metadata copied into an older
+			# bake. Unknown custom route ids retain their baked fallback metadata.
+			strategy = strategy_routes.get(raw.get('id'))
+			if strategy is not None:
+				for key in ('capacity', 'risk'):
+					if key in strategy:
+						route[key] = strategy[key]
+				for key in ('role_weights', 'class_weights'):
+					if key in strategy:
+						route[key] = dict(strategy.get(key, {}) or {})
+			route['role_weights'] = dict(
+				route.get('role_weights', {}) or {})
+			if 'class_weights' in route:
+				route['class_weights'] = dict(
+					route.get('class_weights', {}) or {})
 			route['waypoints'] = tuple(waypoints)
 			converted.append(route)
 		routes[team] = tuple(converted)
@@ -814,6 +834,7 @@ class BattleDirector(object):
 		self.agents = {}
 		self.contacts = {1: {}, 2: {}}
 		self.route_usage = {}
+		self.artillery_route_usage = {}
 
 	def register(self, bot_id, team, descriptor, display_name='Bot'):
 		return self.register_profile(
@@ -856,47 +877,74 @@ class BattleDirector(object):
 		routes = self._routes_for(agent['team'])
 		if not routes:
 			return None
+		profile = agent['profile']
+		is_artillery = profile.get('class_tag') == 'SPG'
 		# Capacities are a lane distribution contract, not a soft preference.
 		# Without this gate a strongly specialised lineup can all choose the same
-		# corridor even though the map advertises several viable approaches.
-		open_routes = []
-		for route in routes:
-			key = (agent['team'], route.get('id'))
-			capacity = max(1, int(route.get('capacity', 1)))
-			if int(self.route_usage.get(key, 0)) < capacity:
-				open_routes.append(route)
-		if open_routes:
-			routes = tuple(open_routes)
-		profile = agent['profile']
+		# corridor even though the map advertises several viable approaches. SPGs
+		# stage on a rear route anchor and therefore do not consume a front-line
+		# lane slot.
+		if not is_artillery:
+			open_routes = []
+			for route in routes:
+				key = (agent['team'], route.get('id'))
+				capacity = max(1, int(route.get('capacity', 1)))
+				if int(self.route_usage.get(key, 0)) < capacity:
+					open_routes.append(route)
+			if open_routes:
+				routes = tuple(open_routes)
 		personality = agent['personality']
 		best = None
 		best_score = -1e18
 		for route in routes:
 			role_weights = route.get('role_weights', {})
-			score = 0.0
-			for role_name, vehicle_score in profile['roles'].items():
-				score += vehicle_score * _number(role_weights.get(role_name, 0.0)) * 18.0
 			risk = _number(route.get('risk', 0.5), 0.5)
-			score += risk * personality['aggression'] * 16.0
-			score -= risk * personality['caution'] * 13.0
-			score += personality['initiative'] * risk * 5.0
-			score += personality['route_jitter']
-			key = (agent['team'], route.get('id'))
-			used = int(self.route_usage.get(key, 0))
-			capacity = max(1, int(route.get('capacity', 1)))
-			score -= (float(used) / float(capacity)) * 28.0
-			if used >= capacity:
-				score -= 34.0
+			if is_artillery:
+				# Prefer an explicit battery route, then the least exposed early
+				# segment. The server chooses the exact graph-validated rear anchor.
+				key = (agent['team'], route.get('id'))
+				score = (_number(role_weights.get('artillery', 0.0)) *
+				         100.0 - risk * 24.0 -
+				         int(self.artillery_route_usage.get(key, 0)) *
+				         ARTILLERY_ROUTE_REPEAT_PENALTY)
+			else:
+				score = 0.0
+				for role_name, vehicle_score in profile['roles'].items():
+					score += (vehicle_score *
+					          _number(role_weights.get(role_name, 0.0)) * 18.0)
+				class_weights = route.get('class_weights', {}) or {}
+				score += (_number(class_weights.get(
+					profile.get('class_tag'), 0.0)) *
+					CLASS_ROUTE_AFFINITY_WEIGHT)
+				score += risk * personality['aggression'] * 16.0
+				score -= risk * personality['caution'] * 13.0
+				score += personality['initiative'] * risk * 5.0
+				score += personality['route_jitter']
+				key = (agent['team'], route.get('id'))
+				used = int(self.route_usage.get(key, 0))
+				capacity = max(1, int(route.get('capacity', 1)))
+				score -= (float(used) / float(capacity)) * 28.0
+				if used >= capacity:
+					score -= 34.0
 			if score > best_score:
 				best_score = score
 				best = route
 		if best is not None:
-			key = (agent['team'], best.get('id'))
-			self.route_usage[key] = int(self.route_usage.get(key, 0)) + 1
+			if is_artillery:
+				key = (agent['team'], best.get('id'))
+				self.artillery_route_usage[key] = int(
+					self.artillery_route_usage.get(key, 0)) + 1
+			else:
+				key = (agent['team'], best.get('id'))
+				self.route_usage[key] = int(
+					self.route_usage.get(key, 0)) + 1
 			if self._routes_are_baked:
 				result = dict(best)
 				result['role_weights'] = dict(
 					best.get('role_weights', {}) or {})
+				if 'class_weights' in best:
+					result['class_weights'] = dict(
+						best.get('class_weights', {}) or {})
 				result['waypoints'] = tuple(
 					tuple(point) for point in
 					best.get('waypoints', ()) or ())

@@ -3515,6 +3515,13 @@ class BotRuntime(object):
                  'hold': bool(point[2]) if len(point) > 2 else False}
                 for point in waypoints],
         }
+        for key in ('capacity', 'risk'):
+            if key in route:
+                result['route'][key] = route[key]
+        for key in ('role_weights', 'class_weights'):
+            values = route.get(key)
+            if isinstance(values, dict):
+                result['route'][key] = dict(values)
         return result
 
     def _player_collision_manifest(self, players):

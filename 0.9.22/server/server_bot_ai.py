@@ -38,6 +38,8 @@ ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
 MAX_BASE_DEFENDERS = 3
 MAX_BASE_CAPTURERS = 3
+CAPTURE_STAGING_RADIUS = 30.0
+MIN_ROUTE_CLASS_AFFINITY = 0.20
 RECENT_HIT_SECONDS = 6.0
 RECENT_ATTACKER_SCORE_BONUS = 140.0
 LOW_HEALTH_BASE_FRACTION = 0.18
@@ -790,6 +792,29 @@ class BotPlanner(object):
         state["bot_ids"] = selected
         return set(selected)
 
+    def _capture_staged(self, bot, route_index):
+        """Return whether a capturer has followed its lane to the last screen."""
+        assignment = self._route_assignments.get(bot["id"])
+        route = assignment.get("route") if isinstance(
+            assignment, dict) else None
+        if not isinstance(route, dict):
+            route = bot.get("route") if isinstance(
+                bot.get("route"), dict) else {}
+        waypoints = route.get("waypoints")
+        if not isinstance(waypoints, list) or not waypoints:
+            # Legacy manifests without a usable corridor retain the direct
+            # capture behaviour instead of leaving the vehicle stranded.
+            return True
+        staging_index = max(0, len(waypoints) - 2)
+        if route_index < staging_index:
+            return False
+        point = waypoints[staging_index]
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        return math.hypot(
+            _number(point.get("x")) - _number(state.get("x")),
+            _number(point.get("z")) - _number(state.get("z"))) <= (
+                CAPTURE_STAGING_RADIUS)
+
     def _prioritize_base_invaders(self, team, bots, contacts, assignments,
                                   defenders, defense):
         if not defenders or not isinstance(defense, dict):
@@ -1290,8 +1315,13 @@ class BotPlanner(object):
             pressure[route_id] += max(0.3, health_fraction)
         if not pressure or max(pressure.values()) <= 0.0:
             return
+        # SPGs stage behind a lane and do not provide its front-line coverage.
+        # Counting them here made a road look defended while also preventing
+        # the artillery itself from ever being selected as a donor.
         counts = dict((route_id, 0) for route_id in catalog)
         for bot in bots:
+            if str(bot.get("profile", {}).get("class_tag") or "") == "SPG":
+                continue
             assignment = self._route_assignments.get(bot["id"], {})
             route = assignment.get("route") if isinstance(assignment, dict) else None
             if not isinstance(route, dict):
@@ -1302,6 +1332,11 @@ class BotPlanner(object):
         target_route = max(sorted(catalog), key=lambda route_id:
                            pressure[route_id] - counts[route_id] * 0.45)
         if pressure[target_route] - counts[target_route] * 0.45 <= 0.0:
+            return
+        target_record = catalog[target_route]
+        if ("capacity" in target_record and
+                counts[target_route] >= max(
+                    1, _integer(target_record.get("capacity"), 1))):
             return
         # Re-evaluation happens before a temporary assignment expires. Renew
         # the same pressured route in place so its waypoint index survives;
@@ -1326,14 +1361,31 @@ class BotPlanner(object):
             current_id = str(current.get("id") or "")
             if current_id == target_route or counts.get(current_id, 0) <= 1:
                 continue
-            roles = bot.get("profile", {}).get("roles") or {}
+            profile = bot.get("profile", {})
+            roles = profile.get("roles") or {}
+            class_weights = target_record.get("class_weights")
+            class_affinity = 0.5
+            if isinstance(class_weights, dict):
+                class_tag = str(profile.get("class_tag") or "")
+                if class_tag in class_weights:
+                    class_affinity = _clamp(
+                        _number(class_weights.get(class_tag)), 0.0, 1.0)
+                    if class_affinity < MIN_ROUTE_CLASS_AFFINITY:
+                        continue
+            route_roles = target_record.get("role_weights")
+            role_affinity = 0.0
+            if isinstance(route_roles, dict):
+                role_affinity = sum(
+                    _number(value) * _number(route_roles.get(name))
+                    for name, value in roles.items())
             mobility = max(_number(roles.get("support")),
                            _number(roles.get("flanker")),
                            _number(roles.get("scout")))
             personality = self._personality(bot["id"])
             score = (mobility * 2.0 + personality["adaptability"] -
                      _number(roles.get("brawler")) * 0.65 -
-                     pressure.get(current_id, 0.0) * 0.7)
+                     pressure.get(current_id, 0.0) * 0.7 +
+                     class_affinity * 1.8 + role_affinity * 1.2)
             candidates.append((score, -bot["id"], bot))
         if not candidates:
             return
@@ -1344,7 +1396,7 @@ class BotPlanner(object):
         }
         self._route_states.pop(donor["id"], None)
 
-    def _route(self, bot, now):
+    def _route(self, bot, now, stop_before_objective=False):
         assignment = self._route_assignments.get(bot["id"])
         route = assignment.get("route") if isinstance(assignment, dict) else None
         if not isinstance(route, dict):
@@ -1359,6 +1411,9 @@ class BotPlanner(object):
                      "z": round(direction * 18.0, 3)}
             return route_id, 0, point, point, False
         route_id = str(route.get("id") or "uploaded_route")
+        route_limit = len(waypoints) - 1
+        if stop_before_objective and len(waypoints) > 1:
+            route_limit -= 1
         state = self._route_states.get(bot["id"])
         if state is None or state.get("route_id") != route_id:
             bx = _number(bot["state"].get("x"))
@@ -1372,7 +1427,8 @@ class BotPlanner(object):
             # and visit its own base before it may advance toward the enemy flag.
             if nearest == 0 and len(waypoints) > 1:
                 index = 1
-            while (index + 1 < len(waypoints) and
+            index = min(index, route_limit)
+            while (index < route_limit and
                    math.hypot(_number(waypoints[index].get("x")) - bx,
                               _number(waypoints[index].get("z")) - bz) < 30.0):
                 index += 1
@@ -1380,7 +1436,7 @@ class BotPlanner(object):
             # routes. Skip only a truly rear-facing connector; a side road remains a
             # valid lane opening and must not be flattened into the next macro point.
             yaw = _number(bot["state"].get("yaw"))
-            while index + 1 < len(waypoints):
+            while index < route_limit:
                 point = waypoints[index]
                 bearing = math.atan2(_number(point.get("x")) - bx,
                                      _number(point.get("z")) - bz)
@@ -1394,14 +1450,15 @@ class BotPlanner(object):
                                      "y": _number(bot["state"].get("y")),
                                      "z": bz}}
             self._route_states[bot["id"]] = state
-        index = min(max(0, _integer(state.get("index"))), len(waypoints) - 1)
+        index = min(max(0, _integer(state.get("index"))), route_limit)
+        state["index"] = index
         point = _point(waypoints[index])
         bx = _number(bot["state"].get("x"))
         bz = _number(bot["state"].get("z"))
         reached = math.hypot(point["x"] - bx, point["z"] - bz) <= 13.0
         # Macro points describe the lane, not parking places.  Tanks keep
         # advancing until combat, safety or the final destination stops them.
-        if reached and index + 1 < len(waypoints):
+        if reached and index < route_limit:
             index += 1
             state["index"] = index
             point = _point(waypoints[index])
@@ -1745,7 +1802,12 @@ class BotPlanner(object):
     def _order_for(self, bot, index, count, focus, contacts, now,
                    travel_override=None, team_axis=None, team_bots=None,
                    capture_target=None, no_known_enemies=False):
-        route_id, route_index, move, route_anchor, route_join = self._route(bot, now)
+        capture_screen = bool(
+            capture_target is not None and not contacts and
+            not no_known_enemies and
+            str(bot.get("profile", {}).get("class_tag") or "") != "SPG")
+        route_id, route_index, move, route_anchor, route_join = self._route(
+            bot, now, stop_before_objective=capture_screen)
         retreat_point = self._retreat_point(bot, route_anchor)
         profile = dict(bot["profile"])
         desired_range = max(10.0, _number(profile.get("desired_range"), 180.0))
@@ -1789,7 +1851,8 @@ class BotPlanner(object):
                          bot["id"] in (observers or ())))
             self._apply_base_defense_order(order, bot, travel_override)
             return order
-        if no_known_enemies and capture_target is not None:
+        if (no_known_enemies and capture_target is not None and
+                self._capture_staged(bot, route_index)):
             self._apply_base_capture_order(order, bot, capture_target)
             return order
         if str(profile.get("class_tag") or "") == "SPG":
@@ -1804,6 +1867,13 @@ class BotPlanner(object):
 
         if focus is None:
             self._engage_anchors.pop(bot["id"], None)
+            if (capture_screen and
+                    math.hypot(move["x"] - _number(state.get("x")),
+                               move["z"] - _number(state.get("z"))) <= 15.0):
+                order["combat_mode"] = "base_screen"
+                order["face_position"] = dict(capture_target["point"])
+                order["throttle_override"] = 0.0
+                return order
             if threat_contact is not None:
                 observers = threat_contact.get("shootable_by_bot_ids")
                 self._set_target(

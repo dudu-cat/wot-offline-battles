@@ -25,14 +25,22 @@ def _profile(class_tag='SPG', roles=None):
     }
 
 
-def _route(route_id, points):
-    return {
+def _route(route_id, points, capacity=None, class_weights=None,
+           role_weights=None):
+    result = {
         'id': route_id,
         'waypoints': [
             {'x': float(x), 'y': 0.0, 'z': float(z), 'hold': bool(hold)}
             for x, z, hold in points
         ],
     }
+    if capacity is not None:
+        result['capacity'] = int(capacity)
+    if class_weights is not None:
+        result['class_weights'] = dict(class_weights)
+    if role_weights is not None:
+        result['role_weights'] = dict(role_weights)
+    return result
 
 
 def _bot(bot_id, team, slot, route, class_tag='SPG', roles=None):
@@ -187,12 +195,21 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual({'x': 0.0, 'y': 0.0, 'z': -100.0},
                          order['move_position'])
 
-    def test_contact_free_bots_capture_the_authoritative_enemy_base(self):
+    def test_contact_free_capturer_follows_lane_before_enemy_base(self):
         planner = BotPlanner()
         defense = _capture_defense()
 
-        order = planner.build_orders(
+        approach = planner.build_orders(
             self.manifest, self.states, [], 1.0, defense)['orders'][0]
+
+        self.assertEqual('route', approach['combat_mode'])
+        self.assertEqual({'x': 0.0, 'y': 0.0, 'z': 100.0},
+                         approach['move_position'])
+        self.assertNotIn('capture_base_id', approach)
+
+        self.states[0]['z'] = 100.0
+        order = planner.build_orders(
+            self.manifest, self.states, [], 2.0, defense)['orders'][0]
 
         self.assertEqual('base_capture', order['combat_mode'])
         self.assertEqual('2:0', order['capture_base_id'])
@@ -212,18 +229,28 @@ class ServerBotTacticsTests(unittest.TestCase):
             for index, bot in enumerate(manifest)
         ]
 
-        orders = planner.build_orders(
+        approach = planner.build_orders(
             manifest, states, [], 1.0, _capture_defense())['orders']
+        selected_ids = set(planner._base_capture[1]['bot_ids'])
+        self.assertEqual(3, len(selected_ids))
+        self.assertFalse(any(order['combat_mode'] == 'base_capture'
+                             for order in approach))
+
+        for state in states:
+            state['z'] = 100.0
+        orders = planner.build_orders(
+            manifest, states, [], 2.0, _capture_defense())['orders']
         capture = [order for order in orders
                    if order['combat_mode'] == 'base_capture']
-        routed = [order for order in orders
-                  if order['combat_mode'] == 'route']
+        screen = [order for order in orders
+                  if order['combat_mode'] == 'base_screen']
 
         self.assertEqual(3, len(capture))
-        self.assertEqual(12, len(routed))
-        self.assertTrue(all(order['route_id'] == 'lane' for order in routed))
+        self.assertEqual(selected_ids, {order['id'] for order in capture})
+        self.assertEqual(12, len(screen))
+        self.assertTrue(all(order['route_id'] == 'lane' for order in screen))
         self.assertTrue(all('capture_base_id' not in order
-                            for order in routed))
+                            for order in screen))
 
     def test_spgs_yield_capture_slots_to_regular_vehicles(self):
         planner = BotPlanner()
@@ -236,12 +263,9 @@ class ServerBotTacticsTests(unittest.TestCase):
         ]
         states = [_state(bot['id'], 1, 0, 0) for bot in manifest]
 
-        orders = planner.build_orders(
+        planner.build_orders(
             manifest, states, [], 1.0, _capture_defense())['orders']
-        capture_ids = {
-            order['id'] for order in orders
-            if order['combat_mode'] == 'base_capture'
-        }
+        capture_ids = set(planner._base_capture[1]['bot_ids'])
 
         self.assertEqual({201, 202}, capture_ids)
 
@@ -256,12 +280,8 @@ class ServerBotTacticsTests(unittest.TestCase):
             for index, bot in enumerate(manifest)
         ]
         defense = _capture_defense()
-        initial = planner.build_orders(
-            manifest, states, [], 1.0, defense)['orders']
-        initial_ids = {
-            order['id'] for order in initial
-            if order['combat_mode'] == 'base_capture'
-        }
+        planner.build_orders(manifest, states, [], 1.0, defense)
+        initial_ids = set(planner._base_capture[1]['bot_ids'])
         self.assertEqual(3, len(initial_ids))
 
         contact = _contact(900, 0, 400, [])
@@ -275,12 +295,8 @@ class ServerBotTacticsTests(unittest.TestCase):
 
         for state in states:
             state['z'] = (-900.0 if state['id'] in initial_ids else 450.0)
-        resumed = planner.build_orders(
-            manifest, states, players, 10.1, defense)['orders']
-        resumed_ids = {
-            order['id'] for order in resumed
-            if order['combat_mode'] == 'base_capture'
-        }
+        planner.build_orders(manifest, states, players, 10.1, defense)
+        resumed_ids = set(planner._base_capture[1]['bot_ids'])
         self.assertEqual(initial_ids, resumed_ids)
 
     def test_capture_squad_replaces_only_a_dead_member(self):
@@ -294,24 +310,16 @@ class ServerBotTacticsTests(unittest.TestCase):
             for index, bot in enumerate(manifest)
         ]
         defense = _capture_defense()
-        initial = planner.build_orders(
-            manifest, states, [], 1.0, defense)['orders']
-        initial_ids = {
-            order['id'] for order in initial
-            if order['combat_mode'] == 'base_capture'
-        }
+        planner.build_orders(manifest, states, [], 1.0, defense)
+        initial_ids = set(planner._base_capture[1]['bot_ids'])
         lost_id = min(initial_ids)
         for state in states:
             if state['id'] == lost_id:
                 state['alive'] = False
                 break
 
-        updated = planner.build_orders(
-            manifest, states, [], 2.0, defense)['orders']
-        updated_ids = {
-            order['id'] for order in updated
-            if order['combat_mode'] == 'base_capture'
-        }
+        planner.build_orders(manifest, states, [], 2.0, defense)
+        updated_ids = set(planner._base_capture[1]['bot_ids'])
 
         self.assertEqual(3, len(updated_ids))
         self.assertEqual(initial_ids - {lost_id},
@@ -600,11 +608,15 @@ class ServerBotArtilleryTests(unittest.TestCase):
             _bot(13, 1, 2, route_b, 'mediumTank', {
                 'support': 0.5,
             }),
+            _bot(14, 1, 3, route_a, 'mediumTank', {
+                'support': 1.0, 'flanker': 1.0,
+            }),
         ]
         states = [
             _state(11, 1, -100, 0),
             _state(12, 1, -100, 0),
             _state(13, 1, 100, 0),
+            _state(14, 1, -100, 0),
         ]
         enemy = {'id': 2, 'team': 2, 'alive': True}
         self.assertEqual(1, planner.report_contacts([{
@@ -626,8 +638,83 @@ class ServerBotArtilleryTests(unittest.TestCase):
                           manifest, states, [enemy], 1.0)['orders'])
 
         self.assertEqual('a', orders[11]['route_id'])
-        self.assertEqual('b', orders[12]['route_id'])
         self.assertEqual('b', orders[13]['route_id'])
+        self.assertEqual(1, sum(
+            orders[bot_id]['route_id'] == 'b' for bot_id in (12, 14)))
+
+    def test_rebalance_keeps_scouts_off_an_incompatible_heavy_lane(self):
+        planner = BotPlanner()
+        middle = _route('middle', [
+            (0, 0, False), (0, 100, False), (0, 500, False),
+        ], capacity=4,
+            class_weights={'lightTank': 1.0, 'heavyTank': 0.02},
+            role_weights={'scout': 1.0})
+        heavy = _route('heavy', [
+            (100, 0, False), (100, 100, False), (100, 500, False),
+        ], capacity=6,
+            class_weights={'lightTank': 0.12, 'heavyTank': 1.0},
+            role_weights={'brawler': 1.0})
+        manifest = [
+            _bot(20 + value, 1, value, middle, 'lightTank', {'scout': 1.0})
+            for value in range(4)
+        ] + [
+            _bot(30 + value, 1, 4 + value, heavy, 'heavyTank',
+                 {'brawler': 1.0})
+            for value in range(5)
+        ]
+        states = [
+            _state(bot['id'], 1,
+                   0 if bot['profile']['class_tag'] == 'lightTank' else 100,
+                   0)
+            for bot in manifest
+        ]
+        bots = planner._alive_bots(manifest, states)
+        contacts = [{
+            'position': {'x': 100.0, 'y': 0.0, 'z': 250.0},
+            'health': 1000.0,
+            'max_health': 1000.0,
+        } for unused in range(4)]
+
+        planner._rebalance_routes(1, bots, contacts, 1.0)
+
+        self.assertTrue(all(
+            planner._route_assignments[bot_id]['route']['id'] == 'middle'
+            for bot_id in range(20, 24)))
+
+    def test_spg_does_not_fill_frontline_capacity_during_rebalance(self):
+        planner = BotPlanner()
+        source = _route('source', [
+            (-100, 0, False), (-100, 100, False), (-100, 500, False),
+        ], capacity=4)
+        target = _route('target', [
+            (100, 0, False), (100, 100, False), (100, 500, False),
+        ], capacity=1)
+        manifest = [
+            _bot(41, 1, 0, source, 'mediumTank', {'support': 1.0}),
+            _bot(42, 1, 1, source, 'mediumTank', {'support': 0.9}),
+            _bot(43, 1, 2, target, 'SPG', {'artillery': 1.0}),
+        ]
+        states = [
+            _state(41, 1, -100, 0),
+            _state(42, 1, -100, 0),
+            _state(43, 1, 100, 0),
+        ]
+        bots = planner._alive_bots(manifest, states)
+        contacts = [{
+            'position': {'x': 100.0, 'y': 0.0, 'z': 250.0},
+            'health': 1000.0,
+            'max_health': 1000.0,
+        }]
+
+        planner._rebalance_routes(1, bots, contacts, 1.0)
+        planner._rebalance_routes(1, bots, contacts, 5.0)
+
+        assigned = dict((bot_id, value['route']['id'])
+                        for bot_id, value in
+                        planner._route_assignments.items())
+        self.assertEqual('target', assigned[43])
+        self.assertEqual(1, sum(
+            assigned[bot_id] == 'target' for bot_id in (41, 42)))
 
 
 if __name__ == '__main__':

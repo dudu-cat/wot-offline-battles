@@ -17,8 +17,10 @@ from gui.mods.offline_lan_0922.ai.driver import WAYPOINT_ARRIVAL_RADIUS
 
 SQRT_TWO = math.sqrt(2.0)
 BAKED_FATAL_HAZARDS = 1 | 2
+# The bake retains this bit for diagnostics. In #1513 shallow water is a
+# supported locomotion cell, so routing treats it like other passable terrain.
 BAKED_SHALLOW_WATER = 4
-BAKED_SHALLOW_WATER_PENALTY = 4.0
+BAKED_SHALLOW_WATER_PENALTY = 0.25
 BAKED_EDGE_CLEARANCE_WEIGHT = 0.20
 BAKED_FORMAT_NAME = 'offline-lan-0922-navgraph'
 BAKED_FORMAT_VERSION = 2
@@ -570,6 +572,8 @@ class TerrainGrid(object):
 			index = self._baked_index(cell)
 			if (index is not None and
 					int(self._baked_hazards[index]) & BAKED_SHALLOW_WATER):
+				# Preserve a small traction preference for dry ground without
+				# turning an easy ford into a strategic detour.
 				penalty += self.cell_size * BAKED_SHALLOW_WATER_PENALTY
 		if not avoid_points:
 			return penalty
@@ -615,8 +619,6 @@ class TerrainGrid(object):
 					continue
 				candidate = (x, y, z)
 				if (self.segment_penalty(current, candidate, now) > 0.0 or
-						self.segment_has_baked_hazard(
-							current, candidate, BAKED_SHALLOW_WATER) or
 						not self.segment_clear(current, candidate)):
 					continue
 				cell = self.cell_for(candidate)
@@ -778,8 +780,6 @@ class TerrainGrid(object):
 						self.shortcut_preserves_climb_approach(
 						path, index, furthest) and
 						self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
-						not self.segment_has_baked_hazard(
-							path[index], path[furthest], BAKED_SHALLOW_WATER) and
 						self.segment_clear(path[index], path[furthest])):
 					break
 				furthest -= 1
@@ -1051,8 +1051,6 @@ class TerrainNavigator(object):
 			# Most annotated segments are already open roads. Avoid invoking A*
 			# when one continuous support/collision check proves the direct link.
 			if (self.grid.segment_penalty(start, goal, now) <= 0.0 and
-					not self.grid.segment_has_baked_hazard(
-						start, goal, BAKED_SHALLOW_WATER) and
 					self.grid.segment_clear(start, goal)):
 				path = (tuple(start), tuple(goal))
 				self.paths[key] = path

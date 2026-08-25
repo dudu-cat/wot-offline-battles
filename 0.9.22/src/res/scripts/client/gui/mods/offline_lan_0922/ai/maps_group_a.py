@@ -30,6 +30,8 @@ def _route(route_id, kind, capacity, risk, waypoints):
 def _reverse(route):
 	result = dict(route)
 	result['role_weights'] = dict(route['role_weights'])
+	if 'class_weights' in route:
+		result['class_weights'] = dict(route['class_weights'])
 	result['waypoints'] = tuple(reversed(route['waypoints']))
 	return result
 
@@ -44,11 +46,66 @@ def _map(name, bounds, base1, base2, routes):
 	}
 
 
+# Karelia needs map-specific strategy rather than the generic corridor labels:
+# scouts work the central marsh, heavy armour takes the southeast mountains,
+# and mobile support or tank destroyers use the northwest plateau. Class
+# affinity is deliberately a preference; the role vector still distinguishes
+# fast heavies, armoured destroyers, and other vehicle-specific variants.
+_KARELIA_STRATEGY = {
+	'west_ridge': {
+		'capacity': 5, 'risk': 0.62,
+		'role_weights': {
+			'brawler': 0.35, 'support': 0.78, 'flanker': 0.82,
+			'sniper': 0.72, 'scout': 0.24, 'artillery': 0.00,
+		},
+		'class_weights': {
+			'heavyTank': 0.35, 'mediumTank': 1.00, 'lightTank': 0.10,
+			'AT-SPG': 0.85, 'SPG': 0.00,
+		},
+	},
+	'middle_road': {
+		'capacity': 4, 'risk': 0.56,
+		'role_weights': {
+			'brawler': 0.02, 'support': 0.28, 'flanker': 0.50,
+			'sniper': 0.22, 'scout': 1.00, 'artillery': 0.00,
+		},
+		'class_weights': {
+			'heavyTank': 0.02, 'mediumTank': 0.30, 'lightTank': 1.00,
+			'AT-SPG': 0.25, 'SPG': 0.00,
+		},
+	},
+	'east_shelf': {
+		'capacity': 6, 'risk': 0.74,
+		'role_weights': {
+			'brawler': 1.00, 'support': 0.72, 'flanker': 0.62,
+			'sniper': 0.25, 'scout': 0.12, 'artillery': 0.00,
+		},
+		'class_weights': {
+			'heavyTank': 1.00, 'mediumTank': 0.70, 'lightTank': 0.12,
+			'AT-SPG': 0.35, 'SPG': 0.00,
+		},
+	},
+}
+
+
+def _karelia_route(route_id, waypoints):
+	strategy = _KARELIA_STRATEGY[route_id]
+	return {
+		'id': route_id,
+		'capacity': strategy['capacity'],
+		'risk': strategy['risk'],
+		'hold': True,
+		'role_weights': dict(strategy['role_weights']),
+		'class_weights': dict(strategy['class_weights']),
+		'waypoints': tuple(waypoints),
+	}
+
+
 KARELIA = _map('01_karelia', (-500.0, -500.0, 500.0, 500.0),
 	(-401.3, -399.9), (397.6, 402.6), (
-		_route('west_ridge', 'brawl', 5, 0.62, ((-390, -380, 0), (-330, -280, 0), (-260, -155, 1), (-190, -30, 1), (-125, 115, 1), (-35, 255, 0))),
-		_route('middle_road', 'fire', 4, 0.56, ((-370, -365, 0), (-250, -285, 0), (-105, -185, 1), (35, -55, 1), (150, 95, 1), (270, 275, 0))),
-		_route('east_shelf', 'flank', 4, 0.74, ((-355, -385, 0), (-225, -360, 0), (-75, -295, 1), (95, -180, 1), (230, -15, 1), (345, 180, 0))),
+		_karelia_route('west_ridge', ((-390, -380, 0), (-330, -280, 0), (-260, -155, 1), (-190, -30, 1), (-125, 115, 1), (-35, 255, 0))),
+		_karelia_route('middle_road', ((-370, -365, 0), (-250, -285, 0), (-105, -185, 1), (35, -55, 1), (150, 95, 1), (270, 275, 0))),
+		_karelia_route('east_shelf', ((-355, -385, 0), (-225, -360, 0), (-75, -295, 1), (95, -180, 1), (230, -15, 1), (345, 180, 0))),
 	))
 
 CAMPANIA = _map('03_campania', (-300.0, -300.0, 300.0, 300.0),

@@ -3903,6 +3903,23 @@ class BattleState:
         raw = raw if isinstance(raw, dict) else {}
         route = {"id": _safe_name(raw.get("id"), "server_route"),
                  "waypoints": []}
+        if "capacity" in raw:
+            route["capacity"] = int(_clamp(
+                _finite_float(raw.get("capacity"), 1.0), 1.0, 15.0))
+        if "risk" in raw:
+            route["risk"] = round(_clamp(
+                _finite_float(raw.get("risk")), 0.0, 1.0), 3)
+        for field in ("role_weights", "class_weights"):
+            if field not in raw:
+                continue
+            weights = raw.get(field)
+            sanitized = {}
+            if isinstance(weights, dict):
+                for key, value in list(weights.items())[:8]:
+                    name = _safe_name(key, "unknown")
+                    sanitized[name] = round(_clamp(
+                        _finite_float(value), 0.0, 1.0), 3)
+            route[field] = sanitized
         waypoints = raw.get("waypoints") or []
         if not isinstance(waypoints, (list, tuple)):
             waypoints = []

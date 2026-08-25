@@ -247,6 +247,131 @@ class BotAiPortTests(unittest.TestCase):
              'penetration': 50.0, 'damage': 430.0, 'speed': 640.0},
         ), profile['shells'])
 
+    @staticmethod
+    def _strategy_profile(class_tag, speed, armor):
+        return build_vehicle_profile({
+            'type': {'name': class_tag, 'tags': (class_tag,)},
+            'physics': {'speedLimits': (speed, 6.0)},
+            'hull': {'primaryArmor': armor},
+            'turret': {'primaryArmor': armor},
+            'gun': {'shots': ()},
+        })
+
+    def test_karelia_strategy_matches_vehicle_classes_from_both_spawns(self):
+        profiles = {
+            'H': self._strategy_profile('heavyTank', 12.0, 180.0),
+            'L': self._strategy_profile('lightTank', 20.0, 35.0),
+            'M': self._strategy_profile('mediumTank', 18.0, 85.0),
+            'T': self._strategy_profile('AT-SPG', 11.0, 110.0),
+            'S': self._strategy_profile('SPG', 10.0, 30.0),
+        }
+        expected = {
+            'H': 'east_shelf',
+            'L': 'middle_road',
+            'M': 'west_ridge',
+            'T': 'west_ridge',
+            'S': 'middle_road',
+        }
+
+        for team in (1, 2):
+            for label, profile in profiles.items():
+                director = BattleDirector('01_karelia', 41)
+                agent = director.register_profile(
+                    100 + team, team, profile, label)
+                with self.subTest(team=team, vehicle_class=label):
+                    self.assertEqual(expected[label], agent['route']['id'])
+
+    def test_karelia_common_lineup_orders_keep_primary_class_lanes(self):
+        profiles = {
+            'H': self._strategy_profile('heavyTank', 12.0, 180.0),
+            'L': self._strategy_profile('lightTank', 20.0, 35.0),
+            'M': self._strategy_profile('mediumTank', 18.0, 85.0),
+            'T': self._strategy_profile('AT-SPG', 11.0, 110.0),
+            'S': self._strategy_profile('SPG', 10.0, 30.0),
+        }
+        expected = {
+            'H': 'east_shelf', 'L': 'middle_road',
+            'M': 'west_ridge', 'T': 'west_ridge',
+            'S': 'middle_road',
+        }
+        lineups = (
+            'HHHHHLLLLMMMTTS',
+            'LLLLMMMTTSHHHHH',
+        )
+
+        for team in (1, 2):
+            for lineup in lineups:
+                director = BattleDirector('01_karelia', 73)
+                assigned = []
+                for index, label in enumerate(lineup):
+                    agent = director.register_profile(
+                        index + 1, team, profiles[label],
+                        '%s-%d' % (label, index))
+                    assigned.append((label, agent['route']['id']))
+                with self.subTest(team=team, lineup=lineup):
+                    self.assertEqual(
+                        [(label, expected[label]) for label in lineup],
+                        assigned)
+                    # The SPG uses a rear staging anchor on middle_road without
+                    # consuming one of its four front-line slots.
+                    self.assertEqual(
+                        4, director.route_usage[(team, 'middle_road')])
+
+    def test_spg_uses_battery_route_without_consuming_frontline_capacity(self):
+        director = BattleDirector('04_himmelsdorf', 29)
+        profile = self._strategy_profile('SPG', 10.0, 30.0)
+
+        first = director.register_profile(501, 1, profile, 'Battery one')
+        second = director.register_profile(502, 1, profile, 'Battery two')
+
+        self.assertEqual('rear_guard', first['route']['id'])
+        self.assertNotEqual(first['route']['id'], second['route']['id'])
+        self.assertEqual({}, director.route_usage)
+
+    def test_baked_route_geometry_uses_current_static_strategy_metadata(self):
+        baked = {'1': [], '2': []}
+        route_ids = ('west_ridge', 'middle_road', 'east_shelf')
+        for team in (1, 2):
+            for index, route_id in enumerate(route_ids):
+                baked[str(team)].append({
+                    'id': route_id,
+                    'capacity': 1,
+                    'risk': 0.01,
+                    'role_weights': {'scout': 0.0},
+                    'waypoints': (
+                        (float(index), float(team), False),
+                        (float(index + 10), float(team), True),
+                    ),
+                })
+            baked[str(team)].append({
+                'id': 'custom_route',
+                'capacity': 9,
+                'risk': 0.33,
+                'role_weights': {'support': 0.77},
+                'waypoints': ((20.0, float(team), False),),
+            })
+
+        director = BattleDirector(
+            '01_karelia', 19, baked_routes=baked)
+
+        for team in (1, 2):
+            routes = dict((route['id'], route)
+                          for route in director._routes_for(team))
+            with self.subTest(team=team):
+                self.assertEqual(
+                    baked[str(team)][1]['waypoints'],
+                    routes['middle_road']['waypoints'])
+                self.assertEqual(6, routes['east_shelf']['capacity'])
+                self.assertEqual(
+                    1.0, routes['middle_road']['role_weights']['scout'])
+                self.assertEqual(
+                    1.0,
+                    routes['middle_road']['class_weights']['lightTank'])
+                self.assertEqual(9, routes['custom_route']['capacity'])
+                self.assertEqual(
+                    {'support': 0.77},
+                    routes['custom_route']['role_weights'])
+
     def test_adapter_preserves_face_and_commanded_hold_semantics(self):
         descriptor = {'type': {'name': 'MS-1', 'tags': ('mediumTank',)},
                       'physics': {'speedLimits': (18.0,)}, 'hull': {},
@@ -343,7 +468,7 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0, 0.0), path[0])
         self.assertEqual((8.0, 0.0, 0.0), path[-1])
 
-    def test_prebaked_shortcuts_do_not_cut_across_shallow_water(self):
+    def test_prebaked_shortcuts_use_passable_shallow_water(self):
         graph = self._baked_graph(5, 3)
         graph['hazards'] = [
             0, 4, 4, 4, 0,
@@ -358,11 +483,43 @@ class BotAiPortTests(unittest.TestCase):
         unused_key, path = navigator._path(
             ('route', 1, 'dry-detour'), start, goal, 1.0, None)
 
+        self.assertTrue(navigator.grid.segment_has_baked_hazard(
+            start, goal, BAKED_SHALLOW_WATER))
+        self.assertEqual((start, goal), path)
+
+    def test_prebaked_astar_prefers_short_shallow_water_crossing(self):
+        graph = self._baked_graph(5, 3)
+        graph['hazards'] = [
+            0, 4, 4, 4, 0,
+            0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ]
+        grid = TerrainGrid(lambda *unused: None, baked_graph=graph)
+        grid._smooth = lambda path, *unused, **unused_keywords: path
+
+        path = grid.plan(
+            (10.0, 0.0, 20.0), (26.0, 0.0, 20.0),
+            prefer_clearance=False)
+
         self.assertTrue(path)
-        self.assertGreater(max(point[2] for point in path), 20.0)
-        for first, second in zip(path, path[1:]):
-            self.assertFalse(navigator.grid.segment_has_baked_hazard(
-                first, second, BAKED_SHALLOW_WATER))
+        self.assertEqual({20.0}, set(point[2] for point in path))
+
+    def test_prebaked_smoothing_and_local_recovery_allow_shallow_water(self):
+        graph = self._baked_graph(5, 5)
+        graph['hazards'] = [4] * 25
+        graph['hazards'][2 * 5 + 2] = 0
+        grid = TerrainGrid(lambda *unused: None, baked_graph=graph)
+        start = (18.0, 0.0, 28.0)
+        middle = (22.0, 0.0, 28.0)
+        goal = (26.0, 0.0, 28.0)
+
+        self.assertEqual(
+            (start, goal),
+            grid._smooth((start, middle, goal), prefer_clearance=False))
+        local = grid.safe_local_target(start, goal, 1.0)
+        self.assertIsNotNone(local)
+        self.assertTrue(grid.segment_has_baked_hazard(
+            start, local, BAKED_SHALLOW_WATER))
 
     def test_prebaked_hazard_check_allows_tank_to_leave_shallow_water(self):
         graph = self._baked_graph(3, 1)

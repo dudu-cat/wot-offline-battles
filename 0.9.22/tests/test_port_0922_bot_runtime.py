@@ -11151,6 +11151,63 @@ class BotRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '16-waypoint'):
             self.runtime._manifest_entry(state)
 
+    def test_route_strategy_metadata_survives_the_server_manifest_boundary(self):
+        self.runtime.battle_start(self.start)
+        state = dict(self.runtime.states[11])
+        state['route'] = {
+            'id': 'middle_road', 'capacity': 4, 'risk': 0.56,
+            'role_weights': {'scout': 1.0, 'brawler': 0.02},
+            'class_weights': {'lightTank': 1.0, 'heavyTank': 0.02},
+            'waypoints': ((0.0, 0.0, False), (8.0, 0.0, True)),
+        }
+
+        manifest = self.runtime._manifest_entry(state)
+
+        self.assertEqual({
+            'id': 'middle_road', 'capacity': 4, 'risk': 0.56,
+            'role_weights': {'scout': 1.0, 'brawler': 0.02},
+            'class_weights': {'lightTank': 1.0, 'heavyTank': 0.02},
+            'waypoints': [
+                {'x': 0.0, 'y': 0.0, 'z': 0.0, 'hold': False},
+                {'x': 8.0, 'y': 0.0, 'z': 0.0, 'hold': True},
+            ],
+        }, manifest['route'])
+
+        server = BattleState(map_name='01_karelia')
+        server.client_build = CLIENT_BUILD_0922
+        server.phase = 'battle'
+        server.players[1] = Player(
+            1, _CaptureSocket(), ('127.0.0.1', 1), team=1, slot=0)
+        server.bot_authority_id = 1
+        server.bot_roster = [
+            {'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot'}]
+
+        self.assertTrue(server.update_bot_manifest(1, {
+            'round_id': server.round_id, 'bots': [manifest],
+        }))
+        self.assertEqual(manifest['route'],
+                         server.bot_manifest[0]['route'])
+
+    def test_server_route_metadata_is_bounded_and_legacy_compatible(self):
+        legacy = BattleState._sanitize_bot_route({
+            'id': 'legacy', 'waypoints': [],
+        })
+        self.assertEqual({'id': 'legacy', 'waypoints': []}, legacy)
+
+        sanitized = BattleState._sanitize_bot_route({
+            'id': 'strategy', 'capacity': 99, 'risk': -2.0,
+            'role_weights': {'scout': 4.0, 'brawler': -1.0},
+            'class_weights': {'lightTank': float('nan')},
+            'waypoints': [],
+        })
+        self.assertEqual(15, sanitized['capacity'])
+        self.assertEqual(0.0, sanitized['risk'])
+        self.assertEqual(
+            {'scout': 1.0, 'brawler': 0.0},
+            sanitized['role_weights'])
+        self.assertEqual({'lightTank': 0.0},
+                         sanitized['class_weights'])
+
     def test_probe_rejects_water_collision_and_steep_slope(self):
         for probe in ({'clear': True, 'water': True}, {'clear': True, 'collision': True}, {'clear': True, 'slope': .7}):
             runtime = self.module.BotRuntime(1, direction_probe=lambda *unused, value=probe: value)
