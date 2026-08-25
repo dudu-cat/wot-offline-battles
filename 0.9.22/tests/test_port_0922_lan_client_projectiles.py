@@ -372,6 +372,26 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual(2, queued['input_seq'])
         self.assertEqual(25.0, queued['impact_speed'])
 
+    def test_landing_result_accepts_only_receive_timestamp_metadata(self):
+        client = self.active_client()
+        self.assertTrue(self.send_player_input(client))
+        self.assertEqual(1, client.send_landing_observation(20.0))
+        result = {
+            'type': 'landing_observation_result', 'round_id': 3,
+            'authority_epoch': 4, 'observation_seq': 1,
+            'input_seq': 1, 'committed_seq': 1,
+            'accepted': True, 'reason': '',
+            '_client_received_time': 10.0,
+        }
+
+        client._handle_message(result)
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client._landing_observation_pending)
+        invalid = dict(result)
+        invalid['unexpected'] = True
+        self.assertFalse(client._handle_landing_observation_result(invalid))
+
     def test_failed_landing_enqueue_retries_same_physical_observation(self):
         client = self.active_client()
         self.assertTrue(self.send_player_input(client))

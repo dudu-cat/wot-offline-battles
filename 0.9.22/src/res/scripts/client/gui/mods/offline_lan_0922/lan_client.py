@@ -2053,7 +2053,11 @@ class LANClient(object):
         required = {
             'type', 'round_id', 'authority_epoch', 'observation_seq',
             'input_seq', 'committed_seq', 'accepted', 'reason'}
-        if not isinstance(message, dict) or set(message) != required:
+        if not isinstance(message, dict):
+            return False
+        fields = set(message)
+        fields.discard('_client_received_time')
+        if fields != required:
             return False
         authority_epoch = _projectile_int_range(
             message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
