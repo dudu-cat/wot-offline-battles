@@ -758,6 +758,27 @@ def _knock_out_crew(mock, crew_name, is_player_target):
 	return True
 
 
+def _record_proposal_crew_damage(mock, crew_name):
+	operations = getattr(mock, '_critical_damage_operations', None)
+	if operations is not None:
+		operations['crew_ko'].add(str(crew_name))
+
+
+def _record_proposal_device_damage(mock, name, amount, maximum):
+	operations = getattr(mock, '_critical_damage_operations', None)
+	if operations is None:
+		return
+	try:
+		maximum = max(1.0, float(maximum))
+		amount = max(0.0, min(maximum, float(amount)))
+	except (TypeError, ValueError, OverflowError):
+		return
+	if amount <= 0.0005:
+		return
+	previous = float(operations['devices'].get(name, 0.0) or 0.0)
+	operations['devices'][str(name)] = min(maximum, previous + amount)
+
+
 def _dev_destroyed_set(mock):
 	s = getattr(mock, '_destroyed_devices', None)
 	if s is None:
@@ -978,6 +999,7 @@ def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell,
 				_chance *= max(
 					0.0, 1.0 - 0.5 * _medkit_bonus_value(target_mock))
 				if _crew_on and random.random() < _chance:
+					_record_proposal_crew_damage(target_mock, _name[:-6])
 					if _knock_out_crew(target_mock, _name[:-6], is_player_target):
 						_crew_hit = True
 						target_mock.last_sound = 'armor_pierced_crit_by_player' if is_player_attacker else 'armor_pierced_crit'
@@ -997,6 +1019,8 @@ def _apply_module_damage(target_mock, all_hits, start_pos, end_pos, dmg, _shell,
 			max_hp = _device_damage.device_max_hp(td, _name)
 			if max_hp is None:
 				max_hp = 100
+			_record_proposal_device_damage(
+				target_mock, _name, _shell_dmg, max_hp)
 			previous_hp = target_mock.devices_hp.get(_name, max_hp)
 			current_hp = previous_hp - _shell_dmg
 			# Clamp at 0 so auto-repair does not have to climb out of a deficit.
@@ -1124,7 +1148,7 @@ def _device_record(name, hp, descriptor, destroyed, critical):
     }
 
 
-def _payload(before, after, descriptor, cause=None):
+def _payload(before, after, descriptor, cause=None, force=False):
     names = sorted(set(before['devices']) | set(after['devices']) |
                    set(before['critical']) | set(after['critical']) |
                    set(before['destroyed']) | set(after['destroyed']))
@@ -1180,7 +1204,7 @@ def _payload(before, after, descriptor, cause=None):
                before['critical'] != after['critical'] or
                before['crew_ko'] != after['crew_ko'] or
                before['ammo_rack_death'] != after['ammo_rack_death'])
-    if not changed:
+    if not changed and not force:
         return None
     return {
         'devices': device_records,
@@ -1192,38 +1216,53 @@ def _payload(before, after, descriptor, cause=None):
     }
 
 
-def _damage_delta(before, after, descriptor):
-    """Describe only irreversible damage introduced by one proposal.
+def _damage_delta(before, after, descriptor, operations=None):
+    """Describe irreversible operations introduced by one proposal.
 
     The full critical payload remains useful for presentation, but it cannot
-    be installed after unrelated server-owned repair/fire progress: doing so
-    would restore the proposal's stale snapshot.  This compact delta keeps the
-    native #1513 result while making that merge field-local.
+    be installed after unrelated authority-owned repair/fire progress: doing so
+    would restore the proposal's stale snapshot. Device and crew entries record
+    the successful native operation before the detached target's stale HP/KO
+    state can clamp it away. The fire bit deliberately retains its existing
+    state-transition meaning until ignition receives its own conditional receipt.
     """
     devices = []
-    names = sorted(set(before['devices']) | set(after['devices']) |
-                   set(before['critical']) | set(after['critical']) |
-                   set(before['destroyed']) | set(after['destroyed']))
-    for name in names:
-        maximum = _device_damage.device_max_hp(descriptor, name)
-        if maximum is None:
-            continue
-        maximum = max(1.0, float(maximum))
-        before_hp = max(0.0, min(
-            maximum, float(before['devices'].get(name, maximum))))
-        after_hp = max(0.0, min(
-            maximum, float(after['devices'].get(name, before_hp))))
-        hp_loss = max(0.0, before_hp - after_hp)
-        if hp_loss <= 0.0005:
-            continue
-        devices.append({
-            'name': str(name),
-            'hp_loss': round(hp_loss, 3),
-        })
+    crew_ko = []
+    if isinstance(operations, dict):
+        for name in sorted(operations.get('devices') or {}):
+            hp_loss = float(operations['devices'][name])
+            if hp_loss > 0.0005:
+                devices.append({
+                    'name': str(name),
+                    'hp_loss': round(hp_loss, 3),
+                })
+        crew_ko = sorted(str(name) for name in
+                         (operations.get('crew_ko') or ()))
+    else:
+        names = sorted(set(before['devices']) | set(after['devices']) |
+                       set(before['critical']) | set(after['critical']) |
+                       set(before['destroyed']) | set(after['destroyed']))
+        for name in names:
+            maximum = _device_damage.device_max_hp(descriptor, name)
+            if maximum is None:
+                continue
+            maximum = max(1.0, float(maximum))
+            before_hp = max(0.0, min(
+                maximum, float(before['devices'].get(name, maximum))))
+            after_hp = max(0.0, min(
+                maximum, float(after['devices'].get(name, before_hp))))
+            hp_loss = max(0.0, before_hp - after_hp)
+            if hp_loss <= 0.0005:
+                continue
+            devices.append({
+                'name': str(name),
+                'hp_loss': round(hp_loss, 3),
+            })
+        crew_ko = sorted(str(name) for name in
+                         (after['crew_ko'] - before['crew_ko']))
     result = {
         'devices': devices,
-        'crew_ko': sorted(str(name) for name in
-                          (after['crew_ko'] - before['crew_ko'])),
+        'crew_ko': crew_ko,
         'ignite': bool(after['fire'] and not before['fire']),
     }
     return result
@@ -1271,7 +1310,7 @@ class _CriticalProposalVehicle(object):
         '_is_killed', 'last_sound', 'is_tracked', 'is_engine_dead',
         'is_gun_destroyed', 'is_turret_locked', '_offline_proposal_only',
         '_components', '_fire_starting_chance_factor',
-        '_medkit_bonus_value')
+        '_medkit_bonus_value', '_critical_damage_operations')
 
     def __init__(self, source):
         self.id = source.id
@@ -1306,6 +1345,8 @@ class _CriticalProposalVehicle(object):
         self._fire_starting_chance_factor = \
             _fire_starting_chance_factor(source)
         self._medkit_bonus_value = _medkit_bonus_value(source)
+        self._critical_damage_operations = {
+            'devices': {}, 'crew_ko': set()}
         self._components = tuple(source.getComponents())
 
     def getComponents(self):
@@ -1324,8 +1365,16 @@ def propose_direct(vehicle, collisions, start_pos, end_pos, hull_damage,
         shadow, collisions, start_pos, end_pos, hull_damage, shell,
         attacker_id, penetrated, by_explosion, deadeye)
     if with_delta:
-        return (damage, payload,
-                _damage_delta(before, _state(shadow), shadow.typeDescriptor))
+        after = _state(shadow)
+        delta = _damage_delta(
+            before, after, shadow.typeDescriptor,
+            shadow._critical_damage_operations)
+        if (payload is None and
+                (delta['devices'] or delta['crew_ko'])):
+            payload = _payload(
+                before, after, shadow.typeDescriptor,
+                'explosion' if by_explosion else 'shot', force=True)
+        return damage, payload, delta
     return damage, payload
 
 
@@ -1374,8 +1423,16 @@ def propose_explosion(vehicle, collisions, burst, direction, hull_damage,
         shadow, collisions, burst, direction, hull_damage, shell,
         attacker_id, deadeye)
     if with_delta:
-        return (damage, payload,
-                _damage_delta(before, _state(shadow), shadow.typeDescriptor))
+        after = _state(shadow)
+        delta = _damage_delta(
+            before, after, shadow.typeDescriptor,
+            shadow._critical_damage_operations)
+        if (payload is None and
+                (delta['devices'] or delta['crew_ko'])):
+            payload = _payload(
+                before, after, shadow.typeDescriptor,
+                'explosion', force=True)
+        return damage, payload, delta
     return damage, payload
 
 

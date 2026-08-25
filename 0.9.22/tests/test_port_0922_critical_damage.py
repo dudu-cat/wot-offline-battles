@@ -891,6 +891,61 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertTrue(payload['ammo_rack_death'])
         self.assertEqual('ammo_rack', payload['events'][-1]['kind'])
 
+    def test_proposal_records_module_operation_before_stale_hp_clamp(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor(),
+            position=object(), matrix=object(),
+            devices_hp={'engineHealth': 0.0},
+            _destroyed_devices=set(['engineHealth']),
+            _critical_devices=set(), _crew_ko=set(),
+            is_on_fire=False, getComponents=lambda: ())
+        collision = (1.0, 1.0, _Material('engineHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=25.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, payload, delta = critical_damage.propose_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 25.0)}, attacker_id=2,
+                penetrated=False, with_delta=True)
+
+        self.assertEqual({
+            'devices': [{'name': 'engineHealth', 'hp_loss': 25.0}],
+            'crew_ko': [], 'ignite': False,
+        }, delta)
+        self.assertIsInstance(payload, dict)
+        self.assertEqual([], payload['events'])
+        self.assertEqual(0.0, payload['devices'][0]['hp'])
+        self.assertEqual({'engineHealth': 0.0}, vehicle.devices_hp)
+        self.assertEqual(set(['engineHealth']), vehicle._destroyed_devices)
+
+    def test_proposal_records_crew_operation_before_stale_ko_guard(self):
+        vehicle = types.SimpleNamespace(
+            id=1, health=500, typeDescriptor=_descriptor(),
+            position=object(), matrix=object(), devices_hp={},
+            _destroyed_devices=set(), _critical_devices=set(),
+            _crew_ko=set(['driver']), is_on_fire=False,
+            getComponents=lambda: ())
+        collision = (1.0, 1.0, _Material('driverHealth'), None)
+
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': self.bigworld, 'Math': self.math}), \
+                mock.patch('random.uniform', return_value=25.0), \
+                mock.patch('random.random', return_value=0.0):
+            unused_damage, payload, delta = critical_damage.propose_direct(
+                vehicle, (collision,), object(), object(), 0,
+                {'damage': (100.0, 25.0)}, attacker_id=2,
+                penetrated=False, with_delta=True)
+
+        self.assertEqual({
+            'devices': [], 'crew_ko': ['driver'], 'ignite': False,
+        }, delta)
+        self.assertIsInstance(payload, dict)
+        self.assertEqual([], payload['events'])
+        self.assertEqual(['driver'], payload['crew_ko'])
+        self.assertEqual(set(['driver']), vehicle._crew_ko)
+
     def test_payload_is_installed_without_reroll(self):
         vehicle = types.SimpleNamespace(
             typeDescriptor=_descriptor(), health=500)

@@ -290,6 +290,96 @@ def _destructible(chunk_id=7, item_index=3, **changes):
 
 
 class ServerProjectileLedgerTests(unittest.TestCase):
+    @staticmethod
+    def _critical_record():
+        return {
+            'shooter_kind': 'player', 'shooter_id': 1, 'team': 1,
+            'projectile_id': '1:p:1:1', 'shot_seq': 1,
+            'shell_index': 0,
+        }
+
+    def test_stale_destroyed_snapshot_damages_repaired_canonical_module(self):
+        state = _state()
+        target = state.players[2]
+        target.critical = {
+            'devices': [{
+                'name': 'engineHealth', 'hp': 100.0,
+                'max_hp': 100.0, 'state': 'normal',
+            }],
+            'destroyed': [], 'crew_ko': [],
+            'crew_roster': ['commander'], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        target.critical_report_base_revision = 4
+        target.critical_ack_seq = 2
+        critical = {
+            'devices': [{
+                'name': 'engineHealth', 'hp': 0.0,
+                'max_hp': 100.0, 'state': 'destroyed',
+            }],
+            'destroyed': ['engineHealth'], 'crew_ko': [],
+            'crew_roster': ['commander'], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        raw = _effect(
+            damage=0, critical=critical,
+            critical_target_base_revision=3,
+            critical_target_ack_seq=1, hull_damage=0,
+            critical_delta={
+                'devices': [{
+                    'name': 'engineHealth', 'hp_loss': 60.0,
+                }],
+                'crew_ko': [], 'ignite': False,
+            })
+        record = self._critical_record()
+
+        proposal = state._normalize_projectile_effect(
+            raw, record, (10.0, 1.0, 0.0), False)
+        self.assertFalse(proposal['critical_accepted'])
+        state._apply_projectile_effect(record, proposal)
+
+        engine = next(row for row in target.critical['devices']
+                      if row['name'] == 'engineHealth')
+        self.assertEqual((40.0, 'critical'),
+                         (engine['hp'], engine['state']))
+        self.assertTrue(state.pending_events[-1]['critical_accepted'])
+
+    def test_stale_crew_snapshot_reknocks_only_newly_hit_member(self):
+        state = _state()
+        target = state.players[2]
+        target.effective_params['critical']['crew_roster'] = [
+            'commander', 'driver']
+        target.critical = {
+            'devices': [], 'destroyed': [], 'crew_ko': [],
+            'crew_roster': ['commander', 'driver'], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        target.critical_report_base_revision = 7
+        target.critical_ack_seq = 3
+        critical = {
+            'devices': [], 'destroyed': [], 'crew_ko': ['commander'],
+            'crew_roster': ['commander', 'driver'], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        raw = _effect(
+            damage=0, critical=critical,
+            critical_target_base_revision=6,
+            critical_target_ack_seq=2, hull_damage=0,
+            critical_delta={
+                'devices': [], 'crew_ko': ['commander'],
+                'ignite': False,
+            })
+        record = self._critical_record()
+
+        proposal = state._normalize_projectile_effect(
+            raw, record, (10.0, 1.0, 0.0), False)
+        self.assertFalse(proposal['critical_accepted'])
+        state._apply_projectile_effect(record, proposal)
+
+        self.assertEqual(['commander'], target.critical['crew_ko'])
+        self.assertTrue(target.alive)
+        self.assertTrue(state.pending_events[-1]['critical_accepted'])
+
     def test_modern_input_admits_bounded_world_up_atomically(self):
         state = _state()
         player = state.players[1]
