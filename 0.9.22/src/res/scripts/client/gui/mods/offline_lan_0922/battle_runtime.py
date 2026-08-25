@@ -12502,12 +12502,15 @@ class BattleRuntime(object):
         self._local_support_rise_blocked = False
         highest, centre = self._terrain_support(
             position, yaw, entity.typeDescriptor)
+        # Front/rear hits keep a hull supported across a narrow ditch, but the
+        # real distance to that support decides whether it can still be
+        # followed.
         ground = centre if centre is not None else highest
         if ground is not None:
-            snap_gap = max(
-                0.8, min(2.5, abs(self._local_speed) * dt * 2.0 + 0.6))
+            snap_gap = vehicle_physics.ground_follow_gap(
+                self._local_speed, self._local_last_pitch, dt)
             max_climb = max(0.6, abs(self._local_speed) * dt * 2.5)
-            com_gap = snap_gap if centre is None else position[1] - centre
+            com_gap = position[1] - ground
             land_y = ground if centre is None else centre
             if not self._local_fall_armed:
                 position = (position[0], land_y, position[2])
@@ -12543,8 +12546,7 @@ class BattleRuntime(object):
                         return position
                     highest, centre = lower_highest, lower_centre
                     ground = lower_ground
-                    com_gap = (snap_gap if centre is None
-                               else position[1] - centre)
+                    com_gap = position[1] - ground
                     land_y = ground if centre is None else centre
                 if (position[1] <= ground or
                         (com_gap <= snap_gap and
@@ -12567,9 +12569,9 @@ class BattleRuntime(object):
                 else:
                     if not self._local_airborne:
                         self._local_vertical_speed = (
-                            self._local_speed *
-                            math.sin(-self._local_last_pitch)
-                            if self._local_last_pitch < 0.0 else 0.0)
+                            vehicle_physics.launch_vertical_speed(
+                                self._local_speed,
+                                self._local_last_pitch))
                     self._local_airborne = True
                     substeps = min(8, max(
                         1, int(abs(self._local_vertical_speed * dt) /
@@ -12590,6 +12592,10 @@ class BattleRuntime(object):
                             break
                     position = (position[0], next_y, position[2])
         elif self._local_fall_armed:
+            if not self._local_airborne:
+                self._local_vertical_speed = (
+                    vehicle_physics.launch_vertical_speed(
+                        self._local_speed, self._local_last_pitch))
             self._local_airborne = True
             self._local_vertical_speed -= vehicle_physics.GRAVITY * dt
             position = (position[0],
@@ -12646,22 +12652,56 @@ class BattleRuntime(object):
         if old_plane is None:
             return position
         descriptor = getattr(entity, 'typeDescriptor', None)
-        candidate = self._sample_ground_plane(
-            (next_x, position[1], next_z), yaw, descriptor)
-        if candidate is None:
-            return position
         dx = next_x - position[0]
         dz = next_z - position[2]
         expected_y = (float(old_plane['center_y']) +
                       float(old_plane['gradient_x']) * dx +
                       float(old_plane['gradient_z']) * dz)
-        if (abs(float(candidate['center_y']) - expected_y) >
-                GROUND_PLANE_EPSILON):
-            return position
-        self._commit_ground_plane(candidate, force_raw=True)
-        self._local_vertical_speed = 0.0
-        self._local_airborne = False
-        return (next_x, float(candidate['center_y']), next_z)
+        slide_pitch = math.atan(
+            self._local_slope_tangent * abs(slide_dot))
+        follow_gap = vehicle_physics.ground_follow_gap(
+            lateral_speed, slide_pitch, dt)
+        candidate = self._sample_ground_plane(
+            (next_x, position[1], next_z), yaw, descriptor)
+        if candidate is None:
+            # A missing centre plane is ambiguous: a narrow ditch can still
+            # have front/rear track support. Reuse the established multi-probe
+            # support seam instead of turning one missing point into free fall.
+            highest, centre = self._terrain_support(
+                (next_x, position[1], next_z), yaw, descriptor)
+            support = centre if centre is not None else highest
+            if (support is not None and
+                    support > expected_y + GROUND_PLANE_EPSILON):
+                return position
+            if (support is not None and
+                    expected_y - support <= follow_gap):
+                bridged = dict(old_plane)
+                bridged['center_y'] = expected_y
+                self._commit_ground_plane(bridged, force_raw=True)
+                self._local_vertical_speed = 0.0
+                self._local_airborne = False
+                return (next_x, expected_y, next_z)
+        else:
+            candidate_y = float(candidate['center_y'])
+            disagreement = candidate_y - expected_y
+            if abs(disagreement) <= GROUND_PLANE_EPSILON:
+                self._commit_ground_plane(candidate, force_raw=True)
+                self._local_vertical_speed = 0.0
+                self._local_airborne = False
+                return (next_x, candidate_y, next_z)
+            if disagreement >= -follow_gap:
+                # Preserve the current fail-closed response to an upper layer or
+                # a small discontinuity that is not one drivable ground plane.
+                return position
+        # No nearby multi-point support remains. Commit the clear lateral motion
+        # and start the same semi-implicit ballistic phase as forward travel.
+        self._local_ground_plane = None
+        self._local_surface_up_cosine = None
+        self._local_vertical_speed = -vehicle_physics.GRAVITY * dt
+        self._local_airborne = True
+        return (next_x,
+                position[1] + self._local_vertical_speed * dt,
+                next_z)
 
     def _local_autorotation_turn(self, entity, turn, drive_intent=0.0,
                                  tracks_blocked=False):

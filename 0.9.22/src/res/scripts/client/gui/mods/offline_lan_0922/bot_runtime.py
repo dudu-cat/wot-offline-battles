@@ -3562,12 +3562,17 @@ class BotRuntime(object):
                                 attempted_yaw=None):
         """Run grounded/ballistic phases and reject false raised support."""
         highest, centre = self._terrain_support(state)
+        # Front/rear hits keep a bot supported across a narrow ditch, but use
+        # their real CoM distance below so a remote valley floor cannot pull
+        # the bot down in one tick.
         ground = centre if centre is not None else highest
         if ground is not None:
             speed = abs(_number(state.get('speed')))
-            snap_gap = max(0.8, min(2.5, speed * step * 2.0 + 0.6))
+            snap_gap = vehicle_physics.ground_follow_gap(
+                _number(state.get('speed')),
+                _number(state.get('last_drive_pitch')), step)
             max_climb = max(0.6, speed * step * 2.5)
-            com_gap = snap_gap if centre is None else state['y'] - centre
+            com_gap = state['y'] - ground
             land_y = ground if centre is None else centre
             if not state.get('grounded_once', False):
                 state['y'] = land_y
@@ -3611,8 +3616,8 @@ class BotRuntime(object):
                 if not state.get('airborne', False):
                     pitch = _number(state.get('last_drive_pitch'))
                     state['vertical_speed'] = (
-                        _number(state.get('speed')) * math.sin(-pitch)
-                        if pitch < 0.0 else 0.0)
+                        vehicle_physics.launch_vertical_speed(
+                            _number(state.get('speed')), pitch))
                 state['airborne'] = True
                 substeps = min(8, max(
                     1, int(abs(_number(state.get('vertical_speed')) * step) /
@@ -3628,6 +3633,11 @@ class BotRuntime(object):
                         state['airborne'] = False
                         break
         elif state.get('grounded_once', False):
+            if not state.get('airborne', False):
+                state['vertical_speed'] = (
+                    vehicle_physics.launch_vertical_speed(
+                        _number(state.get('speed')),
+                        _number(state.get('last_drive_pitch'))))
             state['airborne'] = True
             state['vertical_speed'] -= vehicle_physics.GRAVITY * step
             state['y'] += state['vertical_speed'] * step
@@ -5806,7 +5816,11 @@ class BotRuntime(object):
             elif abs(throttle) > 0.01:
                 throttle *= _critical_factor(
                     state, descriptor, 'mobility')
-            travel_yaw = (state['yaw'] if throttle >= 0.0
+            travel_sign = -1.0 if (
+                throttle < 0.0 or
+                (abs(throttle) <= 0.01 and
+                 _number(state.get('speed')) < 0.0)) else 1.0
+            travel_yaw = (state['yaw'] if travel_sign > 0.0
                           else state['yaw'] + math.pi)
             attempted_yaws[state['id']] = travel_yaw
             cached_motion_probe = self._motion_probe_cache.get(state['id'])
@@ -5950,7 +5964,11 @@ class BotRuntime(object):
                 # render-thread work for every moving bot.
                 slope = (_number(motion_probe.get('slope'))
                          if isinstance(motion_probe, dict) else 0.0)
-                slope_pitch = -math.atan(slope)
+                # Direction probes follow travel_yaw, while copied physics and
+                # stored pose pitch use the hull-forward axis. Convert reverse
+                # probes once so signed speed stays correct while coasting and
+                # when a ramp loses support.
+                slope_pitch = travel_sign * -math.atan(slope)
                 turn_speed = vehicle_physics.traverse_step(
                     params, self._turn_speeds.get(state['id'], 0.0),
                     turn, _number(state.get('speed')), step,

@@ -88,6 +88,15 @@ SCROLL_CAP = 0.995
 # linear in the excess. 10 m fall ~ 17% HP, 20 m ~ 38%.
 FALL_SAFE_SPEED = 10.0
 FALL_DMG_PER_MS = 0.03
+# Ground following may bridge small suspension seams, but the allowance must
+# describe the old supporting slope rather than grow with absolute road speed.
+# Otherwise a faster tank is pulled farther down a cliff each frame and never
+# enters the airborne phase. The bounds preserve the copied integration
+# envelope while keeping flat-ground tolerance independent of speed.
+GROUND_FOLLOW_BASE = 0.6
+GROUND_FOLLOW_MIN = 0.8
+GROUND_FOLLOW_MAX = 2.5
+GROUND_PITCH_LIMIT = 0.96
 # Downhill slide on a slope the tracks cannot hold. The slide accelerates by the
 # grip-excess g*(sin-coh*cos) but a track drag SLIDE_DRAG*v pulls it to a natural,
 # terrain-dependent TERMINAL speed instead of ramping to a flat cap. SLIDE_MAX is
@@ -689,6 +698,28 @@ def slope_slide_speed(cur, slope_tan, dt):
 	elif cur > SLIDE_MAX:
 		cur = SLIDE_MAX
 	return cur
+
+
+def ground_follow_gap(speed, slope_pitch, dt):
+	'''Maximum supported drop for one grounded copied-pose step.
+
+	``speed`` is signed along the same axis used by ``slope_pitch`` and the pose
+	integrator moves x/z by ``speed * dt``. The old surface contributes
+	``speed * tan(pitch) * dt`` only when travel is downhill. Gravity adds the
+	same semi-implicit one-step sag used by the airborne integrator.
+	'''
+	step = max(0.0, float(dt))
+	pitch = max(-GROUND_PITCH_LIMIT, min(
+		GROUND_PITCH_LIMIT, float(slope_pitch)))
+	tangent_drop = max(0.0, float(speed) * math.tan(pitch) * step)
+	gap = GROUND_FOLLOW_BASE + tangent_drop + GRAVITY * step * step
+	return max(GROUND_FOLLOW_MIN, min(GROUND_FOLLOW_MAX, gap))
+
+
+def launch_vertical_speed(speed, slope_pitch):
+	'''Upward velocity retained when signed travel loses ground support.'''
+	vertical = float(speed) * math.sin(-float(slope_pitch))
+	return vertical if vertical > 0.0 else 0.0
 
 
 def fall_damage(maxHealth, impact_speed):

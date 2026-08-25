@@ -13722,6 +13722,56 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle._local_fall_armed)
         self.assertFalse(battle._local_support_rise_blocked)
 
+    def test_grounded_hull_uses_real_gap_for_remote_edge_support(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_fall_armed = True
+        battle._local_speed = 15.0
+        battle._terrain_support = mock.Mock(return_value=(-20.0, None))
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+
+        position = battle._update_vertical_motion(
+            entity, (0.0, 0.0, 0.0), 0.0, 0.04)
+
+        self.assertTrue(battle._local_airborne)
+        self.assertLess(battle._local_vertical_speed, 0.0)
+        self.assertGreater(position[1], -1.0)
+
+    def test_grounded_hull_keeps_near_support_across_narrow_gap(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_fall_armed = True
+        battle._terrain_support = mock.Mock(return_value=(0.0, None))
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+
+        position = battle._update_vertical_motion(
+            entity, (0.0, 0.0, 0.0), 0.0, 0.04)
+
+        self.assertEqual((0.0, 0.0, 0.0), position)
+        self.assertFalse(battle._local_airborne)
+
+    def test_high_speed_cliff_pitch_does_not_snap_to_lower_ground(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._local_fall_armed = True
+        battle._local_speed = 20.0
+        battle._local_last_pitch = math.atan(0.5)
+        battle._terrain_support = mock.Mock(return_value=(-2.0, -2.0))
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+
+        position = battle._update_vertical_motion(
+            entity, (0.0, 0.0, 0.0), 0.0, 0.1)
+
+        self.assertTrue(battle._local_airborne)
+        self.assertLess(battle._local_vertical_speed, 0.0)
+        self.assertGreater(position[1], -2.0)
+
     def test_armed_ledge_fall_uses_copied_damage_and_reason(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -13737,6 +13787,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'kind': 'player', 'network_id': 1, 'local': True}}
         battle._local_fall_armed = True
         position = (0.0, 20.0, 0.0)
+        entity.onHealthChanged = mock.Mock(wraps=entity.onHealthChanged)
 
         for unused in range(30):
             position = battle._update_vertical_motion(
@@ -13752,6 +13803,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(battle._local_damage_report)
         self.assertEqual(entity.health,
                          battle._records['player:1']['state']['health'])
+        landed_health = entity.health
+        for unused in range(10):
+            position = battle._update_vertical_motion(
+                entity, position, 0.0, 0.1)
+        self.assertEqual(landed_health, entity.health)
+        self.assertEqual(1, entity.onHealthChanged.call_count)
 
     def test_cross_heading_steep_slope_uses_copied_slide_law(self):
         runtime = _runtime()
@@ -13821,6 +13878,58 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((0.2, 10.0, -0.1), position)
         self.assertEqual(0.0, battle._local_slide_speed)
         self.assertEqual((1.99, -0.995), battle._local_air_lateral)
+
+    def test_cross_slope_slide_carries_off_a_cliff_with_ground_plane(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        battle._ground_y = lambda x, unused_z, unused_hint=0.0, \
+            **unused: -0.8 * x
+        battle._ground_pitch((0.0, 0.0, 0.0), 0.0,
+                             entity.typeDescriptor)
+        battle._sample_ground_plane = mock.Mock(return_value=None)
+        battle._terrain_support = mock.Mock(return_value=(-20.0, None))
+        battle._motion_is_clear = mock.Mock(return_value=True)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.slope_slide_speed', return_value=15.0):
+            position = battle._apply_slope_slide(
+                (0.0, 0.0, 0.0), 0.0, 0.1, entity)
+
+        self.assertGreater(position[0], 0.0)
+        self.assertLess(position[1], 0.0)
+        self.assertTrue(battle._local_airborne)
+        self.assertLess(battle._local_vertical_speed, 0.0)
+        self.assertGreater(battle._local_air_lateral[0], 0.0)
+        battle._terrain_support.assert_called_once()
+
+    def test_cross_slope_slide_keeps_near_multipoint_gap_support(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        battle._ground_y = lambda x, unused_z, unused_hint=0.0, \
+            **unused: -0.8 * x
+        battle._ground_pitch((0.0, 0.0, 0.0), 0.0,
+                             entity.typeDescriptor)
+        battle._sample_ground_plane = mock.Mock(return_value=None)
+        battle._terrain_support = mock.Mock(return_value=(-0.16, None))
+        battle._motion_is_clear = mock.Mock(return_value=True)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.slope_slide_speed', return_value=2.0):
+            position = battle._apply_slope_slide(
+                (0.0, 0.0, 0.0), 0.0, 0.1, entity)
+
+        self.assertAlmostEqual(0.2, position[0])
+        self.assertAlmostEqual(-0.16, position[1])
+        self.assertFalse(battle._local_airborne)
+        battle._terrain_support.assert_called_once()
 
     def test_cross_slope_slide_cannot_bypass_horizontal_collision(self):
         runtime = _runtime()

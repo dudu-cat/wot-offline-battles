@@ -296,5 +296,52 @@ class VehiclePhysicsCoastTests(unittest.TestCase):
                                places=3)
 
 
+class VehiclePhysicsAirborneTests(unittest.TestCase):
+
+    def test_fall_damage_has_safe_threshold_and_signed_speed_symmetry(self):
+        self.assertEqual(0, vehicle_physics.fall_damage(1000, 10.0))
+        self.assertEqual(30, vehicle_physics.fall_damage(1000, 11.0))
+        self.assertEqual(30, vehicle_physics.fall_damage(1000, -11.0))
+
+    def test_flat_ledge_follow_gap_does_not_grow_with_road_speed(self):
+        slow = vehicle_physics.ground_follow_gap(4.0, 0.0, 0.1)
+        fast = vehicle_physics.ground_follow_gap(15.0, 0.0, 0.1)
+
+        self.assertEqual(slow, fast)
+        self.assertEqual(vehicle_physics.GROUND_FOLLOW_MIN, fast)
+
+    def test_continuous_downhill_tangent_extends_the_follow_gap(self):
+        pitch = math.atan(0.5)
+
+        forward = vehicle_physics.ground_follow_gap(10.0, pitch, 0.1)
+        reverse = vehicle_physics.ground_follow_gap(-10.0, -pitch, 0.1)
+
+        self.assertGreater(
+            forward,
+            vehicle_physics.ground_follow_gap(10.0, 0.0, 0.1))
+        self.assertAlmostEqual(forward, reverse)
+
+    def test_continuous_downhill_drop_fits_supported_frame_steps(self):
+        speed = 15.0
+        pitch = math.atan(0.5)
+
+        for step in (1.0 / 60.0, 1.0 / 30.0, 0.1, 0.2):
+            expected_drop = speed * math.tan(pitch) * step
+            self.assertGreaterEqual(
+                vehicle_physics.ground_follow_gap(speed, pitch, step),
+                expected_drop)
+
+    def test_launch_velocity_handles_forward_and_reverse_uphill_travel(self):
+        pitch = math.radians(20.0)
+
+        forward = vehicle_physics.launch_vertical_speed(12.0, -pitch)
+        reverse = vehicle_physics.launch_vertical_speed(-12.0, pitch)
+
+        self.assertGreater(forward, 0.0)
+        self.assertAlmostEqual(forward, reverse)
+        self.assertEqual(
+            0.0, vehicle_physics.launch_vertical_speed(12.0, pitch))
+
+
 if __name__ == '__main__':
     unittest.main()

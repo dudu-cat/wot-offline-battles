@@ -7151,6 +7151,58 @@ class BotRuntimeTests(unittest.TestCase):
             'recovery_mode': 'arrived', 'movement_intent': False,
         }
 
+    def test_reverse_probe_pitch_is_stored_in_hull_coordinates(self):
+        command = self._stationary_command()
+        command.update({
+            'throttle': -1.0,
+            'combat_mode': 'route',
+            'move_position': (0.0, 0.0, -100.0),
+            'recovery_mode': 'drive',
+            'movement_intent': True,
+        })
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {
+                'clear': True, 'slope': 0.2},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+
+        runtime.update(0.04, 1.0)
+
+        state = runtime.states[11]
+        self.assertLess(state['speed'], 0.0)
+        self.assertAlmostEqual(math.atan(0.2), state['last_drive_pitch'])
+
+    def test_reverse_coast_uses_signed_speed_for_travel_pitch(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.2},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: -20.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(
+            speed=-12.0, y=0.0, vertical_speed=0.0,
+            airborne=False, grounded_once=True,
+            last_drive_pitch=math.atan(0.2))
+
+        runtime.update(0.04, 1.0)
+
+        self.assertLess(state['speed'], 0.0)
+        self.assertAlmostEqual(math.atan(0.2),
+                               state['last_drive_pitch'])
+        self.assertTrue(state['airborne'])
+        self.assertGreater(state['vertical_speed'], 0.0)
+        self.assertGreater(state['y'], 0.0)
+
     def test_overlapping_bots_are_separated_without_spawn_deadlock(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
@@ -10069,6 +10121,72 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertTrue(state['airborne'])
         self.assertLess(state['vertical_speed'], 0.0)
         self.assertLess(state['y'], 0.0)
+
+    def test_grounded_bot_uses_real_gap_for_remote_edge_support(self):
+        runtime = self.module.BotRuntime(
+            1, physics_ground_probe=lambda x, unused_z, unused_y: (
+                None if abs(x) < 0.1 else -20.0))
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': math.pi * 0.5, 'speed': 15.0, 'half_length': 1.5,
+            'vertical_speed': 0.0, 'airborne': False,
+            'grounded_once': True, 'last_drive_pitch': 0.0,
+        }
+
+        runtime._update_vertical_motion(state, 0.04)
+
+        self.assertTrue(state['airborne'])
+        self.assertLess(state['vertical_speed'], 0.0)
+        self.assertGreater(state['y'], -1.0)
+
+    def test_grounded_bot_keeps_near_support_across_narrow_gap(self):
+        runtime = self.module.BotRuntime(
+            1, physics_ground_probe=lambda x, unused_z, unused_y: (
+                None if abs(x) < 0.1 else 0.0))
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': math.pi * 0.5, 'speed': 0.0, 'half_length': 1.5,
+            'vertical_speed': 0.0, 'airborne': False,
+            'grounded_once': True, 'last_drive_pitch': 0.0,
+        }
+
+        runtime._update_vertical_motion(state, 0.04)
+
+        self.assertFalse(state['airborne'])
+        self.assertEqual(0.0, state['y'])
+
+    def test_high_speed_bot_does_not_snap_down_a_flat_ledge(self):
+        runtime = self.module.BotRuntime(
+            1, physics_ground_probe=lambda *unused: -2.0)
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 15.0, 'half_length': 1.5,
+            'vertical_speed': 0.0, 'airborne': False,
+            'grounded_once': True, 'last_drive_pitch': 0.0,
+        }
+
+        runtime._update_vertical_motion(state, 0.1)
+
+        self.assertTrue(state['airborne'])
+        self.assertLess(state['vertical_speed'], 0.0)
+        self.assertGreater(state['y'], -2.0)
+
+    def test_reverse_uphill_bot_keeps_hull_axis_launch_velocity(self):
+        runtime = self.module.BotRuntime(
+            1, physics_ground_probe=lambda *unused: -20.0)
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': -12.0, 'half_length': 1.5,
+            'vertical_speed': 0.0, 'airborne': False,
+            'grounded_once': True,
+            'last_drive_pitch': math.radians(20.0),
+        }
+
+        runtime._update_vertical_motion(state, 0.04)
+
+        self.assertTrue(state['airborne'])
+        self.assertGreater(state['vertical_speed'], 0.0)
+        self.assertGreater(state['y'], 0.0)
 
     def test_realised_hazard_guard_never_rewinds_an_already_fallen_bot(self):
         graph = _graph()
