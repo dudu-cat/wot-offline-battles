@@ -88,6 +88,9 @@ SCROLL_CAP = 0.995
 # linear in the excess. 10 m fall ~ 17% HP, 20 m ~ 38%.
 FALL_SAFE_SPEED = 10.0
 FALL_DMG_PER_MS = 0.03
+# #1513 classifies overturn from the hull world-up cosine.
+OVERTURN_WARNING_COSINE = math.cos(math.radians(70.0))
+OVERTURN_DANGER_COSINE = math.cos(math.radians(80.0))
 # Ground following may bridge small suspension seams, but the allowance must
 # describe the old supporting slope rather than grow with absolute road speed.
 # Otherwise a faster tank is pulled farther down a cliff each frame and never
@@ -720,6 +723,28 @@ def launch_vertical_speed(speed, slope_pitch):
 	'''Upward velocity retained when signed travel loses ground support.'''
 	vertical = float(speed) * math.sin(-float(slope_pitch))
 	return vertical if vertical > 0.0 else 0.0
+
+
+def overturn_level_from_up_cosine(up_cosine, warning_cosine=None,
+			danger_cosine=None):
+	'''Return 0=safe, 1=caution or 2=danger from hull world-up cosine.'''
+	warning = (OVERTURN_WARNING_COSINE if warning_cosine is None else
+	           float(warning_cosine))
+	danger = (OVERTURN_DANGER_COSINE if danger_cosine is None else
+	          float(danger_cosine))
+	up_cosine = max(-1.0, min(1.0, float(up_cosine)))
+	if up_cosine <= danger:
+		return 2
+	if up_cosine <= warning:
+		return 1
+	return 0
+
+
+def overturn_level(pitch, roll, warning_cosine=None, danger_cosine=None):
+	'''Classify an Euler hull pose when a world-up cosine is unavailable.'''
+	return overturn_level_from_up_cosine(
+		math.cos(float(pitch)) * math.cos(float(roll)),
+		warning_cosine, danger_cosine)
 
 
 def fall_damage(maxHealth, impact_speed):

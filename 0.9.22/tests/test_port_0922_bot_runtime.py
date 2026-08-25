@@ -154,6 +154,7 @@ def _combat_descriptor(reload_time=0.5, clip=(2, 0.2),
         hitTester=_HitTester1513(
             (-1.5, -0.8, -3.5), (1.5, 0.8, 3.5)),
         hullPosition=(0.0, 0.6, 0.0), rotationSpeed=0.75,
+        topRightCarryingPoint=(1.5, 3.5),
         shotDispersionFactors=(0.14, 0.14),
         maxHealth=170, maxRegenHealth=130)
     hull = _Strict1513Component(
@@ -1045,14 +1046,15 @@ class BotRuntimeTests(unittest.TestCase):
             {'name': 'engineHealth', 'hp': 0.0, 'max_hp': 100.0,
              'state': 'destroyed'},
             destroyed=('engineHealth',), crew_ko=('commander', 'driver'))
-        original = self.module.critical_damage.apply_drowning
+        original = self.module.critical_damage.apply_death
         drowning_calls = []
 
-        def apply_drowning(shadow):
+        def apply_death(shadow, cause):
             drowning_calls.append(shadow.health)
+            self.assertEqual('drowning', cause)
             return payload
 
-        self.module.critical_damage.apply_drowning = apply_drowning
+        self.module.critical_damage.apply_death = apply_death
         try:
             for unused in range(20):
                 self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
@@ -1066,7 +1068,7 @@ class BotRuntimeTests(unittest.TestCase):
             self.assertTrue(state['alive'])
             self.assertTrue(runtime._advance_bot_drowning(state, 0.3))
         finally:
-            self.module.critical_damage.apply_drowning = original
+            self.module.critical_damage.apply_death = original
 
         self.assertEqual([640], drowning_calls)
         self.assertEqual(0, state['health'])
@@ -1115,6 +1117,82 @@ class BotRuntimeTests(unittest.TestCase):
 
         self.assertEqual(1.25, state['_drown_time'])
         self.assertEqual(0.0, state['_drown_check'])
+
+    def test_bot_water_sensor_uses_turret_boundary_pose_and_recovery(self):
+        depth = [1.6]
+        descriptor = _critical_descriptor()
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused: _Adapter(),
+            direction_probe=lambda *unused: {'clear': True},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            water_depth_probe=lambda unused_position: depth[0])
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update({
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+        })
+
+        turret_offset, carrying_point = self.module._water_sensor_geometry(
+            descriptor)
+        self.assertEqual((0.0, 1.6, 0.0), turret_offset)
+        self.assertEqual((1.5, 3.5), carrying_point)
+        self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+        self.assertFalse(state['_drowning'])
+
+        depth[0] = 1.600001
+        self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+        self.assertTrue(state['_drowning'])
+        self.assertEqual(0.3, state['_drown_time'])
+        depth[0] = 1.6
+        self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+        self.assertFalse(state['_drowning'])
+        self.assertEqual(0.0, state['_drown_time'])
+
+        state['pitch'] = math.pi * 0.5
+        depth[0] = 0.01
+        self.assertFalse(runtime._advance_bot_drowning(state, 0.3))
+        self.assertTrue(state['_drowning'])
+
+    def test_bot_overturn_matches_ignore_recovery_and_death_law(self):
+        runtime = self.module.BotRuntime(1)
+        runtime._descriptors[11] = _critical_descriptor()
+        state = {
+            'id': 11, 'alive': True, 'health': 640,
+            'display_health': 640, 'pitch': math.radians(71.0),
+            'roll': 0.0, 'speed': 7.0, 'movement_dir': 1,
+            'rotation_dir': -1, 'target_kind': 'human', 'target_id': 2,
+            'critical': {}, 'combat_fire_timer': 0.0,
+        }
+        runtime._turn_speeds[11] = 0.4
+
+        self.assertFalse(runtime._advance_bot_overturn(state, 0.099))
+        self.assertEqual(0, state.get('_overturn_level', 0))
+        self.assertFalse(runtime._advance_bot_overturn(state, 0.001))
+        self.assertEqual(1, state['_overturn_level'])
+        self.assertFalse(state['_overturned'])
+        state['pitch'] = 0.0
+        self.assertFalse(runtime._advance_bot_overturn(state, 0.01))
+        self.assertEqual((0.0, 0.0, 0, False), (
+            state['_overturn_check'], state['_overturn_time'],
+            state['_overturn_level'], state['_overturned']))
+
+        state['pitch'] = math.radians(81.0)
+        self.assertFalse(runtime._advance_bot_overturn(state, 0.1))
+        self.assertTrue(state['_overturned'])
+        self.assertEqual((0.0, 0, 0, 0.0), (
+            state['speed'], state['movement_dir'], state['rotation_dir'],
+            runtime._turn_speeds[11]))
+        state['_overturn_time'] = 29.9
+        self.assertTrue(runtime._advance_bot_overturn(state, 0.1))
+        self.assertEqual((0, False, 0, 7), (
+            state['health'], state['alive'], state['display_health'],
+            state['death_reason']))
+        self.assertIsNone(state['target_kind'])
+        self.assertIsNone(state['target_id'])
 
     def test_countdown_prewarms_all_receipts_and_all_bots_start_together(self):
         command = {
@@ -2515,6 +2593,59 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertTrue(falling['airborne'])
         self.assertLess(falling['vertical_speed'], 0.0)
         self.assertLess(falling['y'], 3.0)
+
+    def test_bot_landing_applies_the_shared_fall_damage_once(self):
+        runtime = self.module.BotRuntime(
+            1, physics_ground_probe=lambda *unused: 0.0)
+        runtime._descriptors[11] = _critical_descriptor()
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'speed': 0.0, 'half_length': 3.0,
+            'health': 1000, 'max_health': 1000,
+            'display_health': 1000, 'alive': True, 'critical': {},
+            'vertical_speed': -20.0, 'airborne': True,
+            'grounded_once': True, 'last_drive_pitch': 0.0,
+        }
+
+        runtime._update_vertical_motion(state, 0.1)
+
+        self.assertEqual(700, state['health'])
+        self.assertEqual(700, state['display_health'])
+        self.assertTrue(state['alive'])
+        self.assertEqual(0.0, state['vertical_speed'])
+        self.assertFalse(state['airborne'])
+        runtime._update_vertical_motion(state, 0.1)
+        self.assertEqual(700, state['health'])
+
+    def test_fatal_bot_landing_uses_world_collision_terminal_state(self):
+        runtime = self.module.BotRuntime(
+            1, physics_ground_probe=lambda *unused: 0.0)
+        runtime._descriptors[11] = _critical_descriptor()
+        state = {
+            'id': 11, 'x': 0.0, 'y': 0.2, 'z': 0.0,
+            'speed': 3.0, 'half_length': 3.0,
+            'health': 1000, 'max_health': 1000,
+            'display_health': 1000, 'alive': True, 'critical': {},
+            'movement_dir': 1, 'rotation_dir': -1,
+            'push_x': 0.5, 'push_z': -0.5,
+            'target_kind': 'human', 'target_id': 2,
+            'combat_fire_timer': 1.0,
+            'vertical_speed': -50.0, 'airborne': True,
+            'grounded_once': True, 'last_drive_pitch': 0.0,
+        }
+        runtime._turn_speeds[11] = 0.4
+
+        runtime._update_vertical_motion(state, 0.1)
+
+        self.assertEqual((0, False, 0, 3), (
+            state['health'], state['alive'], state['display_health'],
+            state['death_reason']))
+        self.assertEqual((0.0, 0, 0, 0.0, 0.0, 0.0), (
+            state['speed'], state['movement_dir'], state['rotation_dir'],
+            state['push_x'], state['push_z'], runtime._turn_speeds[11]))
+        self.assertIsNone(state['target_kind'])
+        self.assertIsNone(state['target_id'])
+        self.assertIn('devices', state['critical'])
 
     def test_probe_clock_failure_never_changes_probe_result_or_call_count(self):
         calls = []

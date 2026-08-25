@@ -27,7 +27,7 @@ LEAN_SNAPSHOT_MANIFEST_CAPABILITY = 'lean_snapshot_manifest_v1'
 RAM_CONTACT_LEDGER_CAPABILITY = 'ram_contact_ledger_v2'
 HUMAN_RAM_TIMELINE_CAPABILITY = 'human_ram_timeline_v1'
 PLAYER_FIRE_INTENT_CAPABILITY = 'player_fire_intent_v4'
-PLAYER_ENVIRONMENT_CAPABILITY = 'player_environment_v1'
+PLAYER_ENVIRONMENT_CAPABILITY = 'player_environment_v2'
 EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
 SIMULATION_WORKER_CAPABILITY = 'simulation_worker_v1'
 CLIENT_CAPABILITIES = (
@@ -55,6 +55,8 @@ MAX_PROJECTILE_BATCH = 30
 MAX_HUMAN_RAM_PROBES = 64
 MAX_PROJECTILE_DESTRUCTIBLES = 64
 MAX_PROJECTILE_ID = 2147483647
+PLAYER_LANDING_MAX_IMPACT_SPEED = 200.0
+MAX_LANDING_OBSERVATION_QUEUE = 32
 # A process-relative microsecond clock fits comfortably in this bound for
 # centuries while remaining an exact JSON integer on Python 2 and Python 3.
 MAX_MOTION_TIME_US = 10000000000000000
@@ -126,6 +128,7 @@ STATE_BARRIER_TYPES = frozenset((
     'bot_tier_mode_denied', 'events', 'error'))
 ORDERED_RECEIVE_TYPES = STATE_BARRIER_TYPES | frozenset((
     'battle_receipt', 'fire_intent', 'fire_intent_result',
+    'landing_observation_result',
     'player_destructible_contact',
     'player_destructible_contact_result'))
 SERVER_STATE_TYPES = frozenset((
@@ -490,6 +493,22 @@ def _valid_player_equipment_contract(state, required=False):
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _valid_player_environment_contract(state, required=False):
+    """Validate the canonical pose and landing frontier in a player row."""
+    required_fields = {
+        'input_seq', 'up_cosine', 'landing_observation_seq'}
+    if not required_fields.issubset(state):
+        return not required and not (set(state) & required_fields)
+    input_sequence = _projectile_int_range(
+        state.get('input_seq'), 0, MAX_PROJECTILE_ID)
+    landing_sequence = _projectile_int_range(
+        state.get('landing_observation_seq'), 0, MAX_PROJECTILE_ID)
+    up_cosine = _exact_finite_float(state.get('up_cosine'))
+    return bool(
+        input_sequence is not None and landing_sequence is not None and
+        up_cosine is not None and -1.0 <= up_cosine <= 1.0)
 
 
 def _mapping_list(value, limit=30):
@@ -1363,6 +1382,10 @@ class LANClient(object):
         self._equipment_intent_seq = 0
         self._input_seq = 0
         self._input_seq_round = None
+        self._landing_observation_seq = 0
+        self._landing_observation_round = None
+        self._landing_observation_pending = None
+        self._landing_observation_queue = []
         self._projectile_lock = threading.Lock()
 
     def start(self):
@@ -1388,6 +1411,10 @@ class LANClient(object):
             self.minimum_rtt_ms = None
             self._input_seq = 0
             self._input_seq_round = None
+            self._landing_observation_seq = 0
+            self._landing_observation_round = None
+            self._landing_observation_pending = None
+            self._landing_observation_queue = []
         with self._pending_lock:
             self._pending = []
             self._recv_buffer = u''
@@ -1671,12 +1698,17 @@ class LANClient(object):
                    destructible_contacts=None,
                    siege_enabled=None,
                    pitch=None, roll=None,
-                   gun_checkpoint=None):
+                   gun_checkpoint=None, up_cosine=None):
         if not self.ready or self.phase != 'battle':
             return False
         if self._input_seq_round != self.round_id:
             self._input_seq_round = self.round_id
             self._input_seq = 0
+        if self._landing_observation_round != self.round_id:
+            self._landing_observation_round = self.round_id
+            self._landing_observation_seq = 0
+            self._landing_observation_pending = None
+            self._landing_observation_queue = []
         next_input_seq = self._input_seq + 1
         message = {
             'type': 'input',
@@ -1703,6 +1735,14 @@ class LANClient(object):
             if roll is not None:
                 message['roll'] = max(
                     -0.61, min(0.61, _finite_float(roll)))
+            if up_cosine is not None:
+                if (isinstance(up_cosine, bool) or
+                        not isinstance(up_cosine, integer_types + (float,))):
+                    return False
+                parsed_up_cosine = _finite_float(up_cosine, 2.0)
+                if not -1.0 <= parsed_up_cosine <= 1.0:
+                    return False
+                message['up_cosine'] = parsed_up_cosine
             if timeline_enabled and pose_time_us is not None:
                 parsed_pose_time = _exact_int(pose_time_us)
                 if (parsed_pose_time is None or
@@ -1759,6 +1799,14 @@ class LANClient(object):
         if not self._send(message):
             return False
         self._input_seq = next_input_seq
+        pending_landing = self._landing_observation_pending
+        if (isinstance(pending_landing, dict) and
+                pending_landing.get('retry_on_input', False) and
+                not pending_landing.get('sent', False)):
+            if pending_landing.get('refresh_input_on_retry', False):
+                pending_landing['input_seq'] = int(self._input_seq)
+                pending_landing.pop('wire', None)
+            self._send_pending_landing_observation(rebind=True)
         return True
 
     def send_track_repair(self, tracks, base_revision, repair_seq):
@@ -1808,7 +1856,7 @@ class LANClient(object):
         })
 
     def send_player_environment(self, observations, sample_seq):
-        """Publish bounded water observations from the hidden worker only."""
+        """Publish bounded environment classifications from the worker."""
         sequence = _projectile_int_range(
             sample_seq, 1, MAX_PROJECTILE_ID)
         epoch = _projectile_int_range(
@@ -1857,6 +1905,205 @@ class LANClient(object):
             'sample_seq': sequence,
             'observations': rows,
         })
+
+    def _send_pending_landing_observation(self, rebind=False):
+        pending = self._landing_observation_pending
+        if not isinstance(pending, dict):
+            return False
+        if (self.phase != 'battle' or self.round_id is None or
+                self.authority_epoch is None or
+                self._input_seq_round != self.round_id or
+                self._input_seq <= 0):
+            return False
+        wire = pending.get('wire')
+        if rebind or not isinstance(wire, dict):
+            wire = {
+                'type': 'landing_observation',
+                'round_id': self.round_id,
+                'authority_epoch': int(self.authority_epoch),
+                'observation_seq': int(pending['observation_seq']),
+                'input_seq': int(pending['input_seq']),
+                'impact_speed': float(pending['impact_speed']),
+            }
+            pending['wire'] = wire
+        sent = bool(self._send(dict(wire)))
+        pending['sent'] = sent
+        if sent:
+            pending.pop('retry_on_input', None)
+            pending.pop('refresh_input_on_retry', None)
+        return sent
+
+    def send_landing_observation(self, impact_speed):
+        """Publish one physical landing observation, never a damage verdict."""
+        if (isinstance(impact_speed, bool) or
+                not isinstance(impact_speed, integer_types + (float,))):
+            return False
+        impact_speed = float(impact_speed)
+        if (math.isnan(impact_speed) or math.isinf(impact_speed) or
+                not 0.0 <= impact_speed <=
+                PLAYER_LANDING_MAX_IMPACT_SPEED or
+                self.phase != 'battle' or not self.ready or
+                self.player_id is None or self.player_id <= 0 or
+                PLAYER_ENVIRONMENT_CAPABILITY not in self.capabilities or
+                PLAYER_ENVIRONMENT_CAPABILITY not in
+                self.server_capabilities):
+            return False
+        if self._landing_observation_round != self.round_id:
+            self._landing_observation_round = self.round_id
+            self._landing_observation_seq = 0
+            self._landing_observation_pending = None
+            self._landing_observation_queue = []
+        if self._landing_observation_pending is not None:
+            pending = self._landing_observation_pending
+            if not pending.get('reported', False):
+                if not pending.get('sent', False):
+                    pending['input_seq'] = int(self._input_seq)
+                    pending.pop('wire', None)
+                    if not self._send_pending_landing_observation(
+                            rebind=True):
+                        return False
+                pending['reported'] = True
+                return int(pending['observation_seq'])
+            if len(self._landing_observation_queue) >= \
+                    MAX_LANDING_OBSERVATION_QUEUE:
+                return False
+            self._landing_observation_queue.append({
+                'input_seq': int(self._input_seq),
+                'impact_speed': round(impact_speed, 6),
+            })
+            if (not pending.get('sent', False) and
+                    pending.get('retry_on_input', False)):
+                if pending.get('refresh_input_on_retry', False):
+                    pending['input_seq'] = int(self._input_seq)
+                    pending.pop('wire', None)
+                self._send_pending_landing_observation(rebind=True)
+            return int(pending['observation_seq'])
+        pending = {
+            'observation_seq': self._landing_observation_seq + 1,
+            'input_seq': int(self._input_seq),
+            'impact_speed': round(impact_speed, 6),
+            'sent': False,
+            'reported': False,
+        }
+        self._landing_observation_pending = pending
+        if not self._send_pending_landing_observation():
+            return False
+        pending['reported'] = True
+        return int(pending['observation_seq'])
+
+    def _start_queued_landing_observation(self):
+        if not self._landing_observation_queue:
+            return False
+        queued = self._landing_observation_queue.pop(0)
+        pending = {
+            'observation_seq': self._landing_observation_seq + 1,
+            'input_seq': int(queued['input_seq']),
+            'impact_speed': float(queued['impact_speed']),
+            'sent': False,
+            'reported': True,
+        }
+        self._landing_observation_pending = pending
+        sent = self._send_pending_landing_observation()
+        if not sent:
+            pending['retry_on_input'] = True
+        return sent
+
+    def _adopt_player_input_frontier(self, players):
+        """Recover input and landing sequence frontiers from a snapshot."""
+        own = next((row for row in players or ()
+                    if _exact_int(row.get('id')) == self.player_id), None)
+        if own is None:
+            return False
+        input_seq = _projectile_int_range(
+            own.get('input_seq'), 0, MAX_PROJECTILE_ID)
+        landing_seq = _projectile_int_range(
+            own.get('landing_observation_seq'), 0, MAX_PROJECTILE_ID)
+        if input_seq is None or landing_seq is None:
+            return False
+        if self._input_seq_round != self.round_id:
+            self._input_seq_round = self.round_id
+            self._input_seq = input_seq
+        else:
+            self._input_seq = max(self._input_seq, input_seq)
+        if self._landing_observation_round != self.round_id:
+            self._landing_observation_round = self.round_id
+            self._landing_observation_seq = landing_seq
+            self._landing_observation_pending = None
+            self._landing_observation_queue = []
+            return True
+        self._landing_observation_seq = max(
+            self._landing_observation_seq, landing_seq)
+        pending = self._landing_observation_pending
+        if (isinstance(pending, dict) and
+                int(pending['observation_seq']) <= landing_seq):
+            self._landing_observation_pending = None
+            self._start_queued_landing_observation()
+        elif (isinstance(pending, dict) and
+              isinstance(pending.get('wire'), dict) and
+              int(pending['wire'].get('authority_epoch', -1)) !=
+              int(self.authority_epoch)):
+            pending['observation_seq'] = self._landing_observation_seq + 1
+            pending.pop('wire', None)
+            pending['sent'] = False
+            pending['retry_on_input'] = True
+            self._send_pending_landing_observation(rebind=True)
+        return True
+
+    def _handle_landing_observation_result(self, message):
+        required = {
+            'type', 'round_id', 'authority_epoch', 'observation_seq',
+            'input_seq', 'committed_seq', 'accepted', 'reason'}
+        if not isinstance(message, dict) or set(message) != required:
+            return False
+        authority_epoch = _projectile_int_range(
+            message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+        sequence = _projectile_int_range(
+            message.get('observation_seq'), 1, MAX_PROJECTILE_ID)
+        input_seq = _projectile_int_range(
+            message.get('input_seq'), 1, MAX_PROJECTILE_ID)
+        committed = _projectile_int_range(
+            message.get('committed_seq'), 0, MAX_PROJECTILE_ID)
+        accepted = message.get('accepted')
+        reason = _safe_text(message.get('reason'), '', 32)
+        retryable = ('stale_authority', 'sequence_gap', 'stale_input')
+        terminal = ('identity_conflict', 'player_dead', 'not_active')
+        if (message.get('round_id') != self.round_id or
+                authority_epoch is None or sequence is None or
+                input_seq is None or committed is None or
+                not isinstance(accepted, bool) or
+                (accepted and (reason or committed != sequence)) or
+                (not accepted and reason not in retryable + terminal) or
+                (self.authority_epoch is not None and
+                 authority_epoch < self.authority_epoch)):
+            return False
+        self.authority_epoch = authority_epoch
+        self._landing_observation_seq = max(
+            self._landing_observation_seq, committed)
+        pending = self._landing_observation_pending
+        if not isinstance(pending, dict):
+            return True
+        if int(pending['observation_seq']) != sequence:
+            return sequence <= self._landing_observation_seq
+        if accepted:
+            self._landing_observation_pending = None
+            self._start_queued_landing_observation()
+            return True
+        if reason in retryable:
+            pending['observation_seq'] = self._landing_observation_seq + 1
+            pending.pop('wire', None)
+            pending['sent'] = False
+            pending['retry_on_input'] = True
+            if reason == 'stale_input':
+                pending['refresh_input_on_retry'] = True
+                if self._input_seq > input_seq:
+                    pending['input_seq'] = int(self._input_seq)
+                    self._send_pending_landing_observation(rebind=True)
+            else:
+                self._send_pending_landing_observation(rebind=True)
+            return True
+        self._landing_observation_pending = None
+        self._landing_observation_queue = []
+        return True
 
     def send_battle_ready(self, bases=None):
         """Join the server-owned #1513 load barrier exactly once per round."""
@@ -3656,6 +3903,9 @@ class LANClient(object):
             player_equipment_contract = all(
                 _valid_player_equipment_contract(player, required=True)
                 for player in players or ())
+            player_environment_contract = all(
+                _valid_player_environment_contract(player, required=True)
+                for player in players or ())
             player_siege_contract = all(
                 _valid_player_siege_contract(player)
                 for player in players or ())
@@ -3754,6 +4004,8 @@ class LANClient(object):
                 invalid_reasons.append('player_critical')
             if not player_equipment_contract:
                 invalid_reasons.append('player_equipment')
+            if not player_environment_contract:
+                invalid_reasons.append('player_environment')
             if not player_siege_contract:
                 invalid_reasons.append('player_siege')
             if not player_gun_checkpoint_contract:
@@ -3843,6 +4095,12 @@ class LANClient(object):
                 'bot_authority_id', self.bot_authority_id)
             if authority_epoch is not None:
                 self.authority_epoch = authority_epoch
+            self._adopt_player_input_frontier(players)
+        elif kind == 'landing_observation_result':
+            if not self._handle_landing_observation_result(message):
+                self.last_error = 'invalid landing observation result'
+                self.stop()
+                return
         elif kind == 'events':
             round_id = _exact_int(message.get('round_id'))
             if round_id is None:

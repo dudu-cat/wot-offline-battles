@@ -320,6 +320,82 @@ class ProjectileWireTests(unittest.TestCase):
             0.0, 0.0, shell_index=0, next_shell_index=0,
             shell_change_pending=1))
 
+    def test_visible_input_carries_full_world_up_without_expanding_euler(self):
+        client = self.active_client()
+        up_cosine = math.cos(math.radians(85.0))
+
+        self.assertTrue(client.send_input(
+            0.0, 0.0, position=[1.0, 2.0, 3.0], yaw=0.0,
+            pitch=1.5, roll=-1.5, up_cosine=up_cosine,
+            pose_time_us=1000, shell_index=0, next_shell_index=0,
+            shell_change_pending=False,
+            gun_checkpoint=self.gun_checkpoint()))
+
+        message = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual(0.61, message['pitch'])
+        self.assertEqual(-0.61, message['roll'])
+        self.assertAlmostEqual(up_cosine, message['up_cosine'])
+        count = len(client._outbound_queue)
+        for invalid in (True, '0.5', float('nan'), float('inf'), -1.01, 1.01):
+            with self.subTest(up_cosine=invalid):
+                self.assertFalse(client.send_input(
+                    0.0, 0.0, position=[1.0, 2.0, 3.0], yaw=0.0,
+                    up_cosine=invalid, pose_time_us=1001,
+                    shell_index=0, next_shell_index=0,
+                    shell_change_pending=False,
+                    gun_checkpoint=self.gun_checkpoint()))
+        self.assertEqual(count, len(client._outbound_queue))
+
+    def test_landing_observations_are_sequenced_and_acknowledged(self):
+        client = self.active_client()
+        self.assertTrue(self.send_player_input(client))
+
+        self.assertEqual(1, client.send_landing_observation(20.1256789))
+        message = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual({
+            'type', 'round_id', 'authority_epoch', 'observation_seq',
+            'input_seq', 'impact_speed'}, set(message))
+        self.assertEqual(1, message['observation_seq'])
+        self.assertEqual(1, message['input_seq'])
+        self.assertEqual(20.125679, message['impact_speed'])
+
+        self.assertTrue(self.send_player_input(client))
+        self.assertEqual(1, client.send_landing_observation(25.0))
+        self.assertTrue(client._handle_landing_observation_result({
+            'type': 'landing_observation_result', 'round_id': 3,
+            'authority_epoch': 4, 'observation_seq': 1,
+            'input_seq': 1, 'committed_seq': 1,
+            'accepted': True, 'reason': '',
+        }))
+        queued = wire_copy(client._outbound_queue[-1][1])
+        self.assertEqual(2, queued['observation_seq'])
+        self.assertEqual(2, queued['input_seq'])
+        self.assertEqual(25.0, queued['impact_speed'])
+
+    def test_failed_landing_enqueue_retries_same_physical_observation(self):
+        client = self.active_client()
+        self.assertTrue(self.send_player_input(client))
+        attempts = []
+
+        def send(message):
+            attempts.append(wire_copy(message))
+            return len(attempts) > 1
+
+        client._send = send
+        self.assertFalse(client.send_landing_observation(18.0))
+        self.assertTrue(client.send_input(
+            0.0, 0.0, position=[1.0, 2.0, 3.0], yaw=0.0,
+            pose_time_us=2000, shell_index=0, next_shell_index=0,
+            shell_change_pending=False,
+            gun_checkpoint=self.gun_checkpoint()))
+        self.assertEqual(1, client.send_landing_observation(18.0))
+        self.assertEqual(
+            ['landing_observation', 'input', 'landing_observation'],
+            [value['type'] for value in attempts])
+        self.assertEqual(1, attempts[0]['observation_seq'])
+        self.assertEqual(1, attempts[2]['observation_seq'])
+        self.assertEqual(2, attempts[2]['input_seq'])
+
     def test_visible_client_cannot_publish_player_projectile_launch(self):
         client = self.active_client()
 
@@ -829,6 +905,9 @@ class ProjectileWireTests(unittest.TestCase):
             'bot_manifest': [],
             'players': [{
                 'id': 7,
+                'input_seq': 0,
+                'up_cosine': 1.0,
+                'landing_observation_seq': 0,
                 'critical_revision': 0,
                 'critical_base_revision': 0,
                 'critical_ack_seq': 0,
@@ -878,6 +957,8 @@ class ProjectileWireTests(unittest.TestCase):
             'bot_manifest': [], 'bots': [],
             'players': [{
                 'id': 7,
+                'input_seq': 0, 'up_cosine': 1.0,
+                'landing_observation_seq': 0,
                 'critical_revision': 0, 'critical_base_revision': 0,
                 'critical_ack_seq': 0,
                 'equipment_states': [], 'equipment_revision': 4,

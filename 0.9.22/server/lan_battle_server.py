@@ -45,6 +45,7 @@ from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
 from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import player_critical_mechanics
+from gui.mods.offline_lan_0922 import vehicle_physics
 from gui.mods.offline_lan_0922.ai import planner as bot_planner
 from gui.mods.offline_lan_0922.ai.maps import get_tactical_map
 from gui.mods.offline_lan_0922.ai.maps_0922_extra import (
@@ -64,7 +65,11 @@ RESULT_RESET_SECONDS = 5.0
 PREBATTLE_SECONDS = 15.0
 BATTLE_DURATION_SECONDS = 900.0
 PLAYER_DROWNING_SECONDS = 10.0
+PLAYER_OVERTURN_IGNORE_SECONDS = 0.10
+PLAYER_OVERTURN_DEATH_SECONDS = 30.0
 PLAYER_ENVIRONMENT_STALE_TICKS = int(round(TICK_HZ))
+PLAYER_LANDING_MAX_IMPACT_SPEED = 200.0
+PLAYER_LANDING_HISTORY = 64
 BOT_FIRE_DURATION_SECONDS = 10.0
 BOT_FIRE_TICK_SECONDS = 1.0
 MAX_LINE_BYTES = 256 * 1024
@@ -170,12 +175,13 @@ ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "rules_state", "destructible",
     "player_destructible_contact_result",
     "battle_result", "leave_battle", "battle_ready", "simulation_progress",
-    "player_environment",
+    "player_environment", "landing_observation",
     "track_repair",
     "equipment_intent",
 ))
 MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
-    "input", "fire_intent", "start_battle", "battle_ready", "leave_battle",
+    "input", "fire_intent", "landing_observation", "start_battle",
+    "battle_ready", "leave_battle",
     "battle_receipt_ack", "descriptor_catalog", "select_vehicle",
     "select_team", "set_team_size", "set_bot_tier_mode",
     "ping", "leave",
@@ -216,7 +222,7 @@ LEAN_SNAPSHOT_MANIFEST_CAPABILITY = "lean_snapshot_manifest_v1"
 RAM_CONTACT_LEDGER_CAPABILITY = "ram_contact_ledger_v2"
 HUMAN_RAM_TIMELINE_CAPABILITY = "human_ram_timeline_v1"
 PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v4"
-PLAYER_ENVIRONMENT_CAPABILITY = "player_environment_v1"
+PLAYER_ENVIRONMENT_CAPABILITY = "player_environment_v2"
 EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
 TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
 MODERN_INPUT_FIELDS = frozenset((
@@ -226,6 +232,7 @@ MODERN_INPUT_FIELDS = frozenset((
     "fire_seq", "shell_index", "next_shell_index",
     "shell_change_pending", "gun_checkpoint", "ram_contacts",
     "ram_contact", "destructible_contacts", "siege_enabled",
+    "up_cosine",
 ))
 MODERN_INPUT_REQUIRED_FIELDS = frozenset(("round_id",))
 SERVER_CAPABILITIES = (
@@ -1489,6 +1496,7 @@ class Player(_EndpointSendMixin):
     yaw: float = 0.0
     pitch: float = 0.0
     roll: float = 0.0
+    up_cosine: float = 1.0
     aim_yaw: float = 0.0
     gun_pitch: float = 0.0
     forward: float = 0.0
@@ -1554,6 +1562,12 @@ class Player(_EndpointSendMixin):
         default_factory=OrderedDict, repr=False)
     input_seq: int = 0
     input_fingerprints: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
+    landing_observation_seq: int = 0
+    landing_observation_input_seq: int = 0
+    landing_observation_fingerprints: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
+    landing_observation_results: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
     gun_checkpoint_seq: int = 0
     gun_checkpoint: dict = field(default_factory=dict, repr=False)
@@ -1695,6 +1709,7 @@ class BattleState:
         self.player_environment_seq = -1
         self.player_environment_authority_epoch = -1
         self.player_drowning_seconds = {}
+        self.player_overturn_state = {}
         self.rules_state = {"bases": {
             "1": {"points": 0, "time_left": 0.0,
                   "invaders": 0, "stopped": False},
@@ -1960,10 +1975,15 @@ class BattleState:
                     "combat event attacker/cause does not match source %s" %
                     source)
         elif source == "environment":
-            if (has_attacker or attack_reason != 5 or death_reason != 5 or
-                    not bool(event.get("dead", False))):
+            dead = bool(event.get("dead", False))
+            valid_reason = (
+                (attack_reason == 3 and
+                 death_reason == (3 if dead else 0)) or
+                (attack_reason in (5, 7) and dead and
+                 death_reason == attack_reason))
+            if has_attacker or not valid_reason:
                 raise RuntimeError(
-                    "environment event must be a drowning death")
+                    "environment event has invalid attacker or cause")
         elif has_attacker:
             raise RuntimeError(
                 "client_simulation event must not have an attacker")
@@ -2502,6 +2522,7 @@ class BattleState:
             self.player_spotted.pop(player_id, None)
             self.player_environment.pop(player_id, None)
             self.player_drowning_seconds.pop(player_id, None)
+            self.player_overturn_state.pop(player_id, None)
             self.vehicle_catalogs.pop(player_id, None)
             if player_id == self.host_player_id:
                 self._elect_room_host()
@@ -2640,6 +2661,10 @@ class BattleState:
             player.destructible_contact_rejections.clear()
             player.input_seq = 0
             player.input_fingerprints.clear()
+            player.landing_observation_seq = 0
+            player.landing_observation_input_seq = 0
+            player.landing_observation_fingerprints.clear()
+            player.landing_observation_results.clear()
             player.gun_checkpoint_seq = 0
             player.gun_checkpoint = {}
             player.gun_checkpoints.clear()
@@ -2651,6 +2676,7 @@ class BattleState:
             player.aim_yaw = player.yaw
             player.pitch = 0.0
             player.roll = 0.0
+            player.up_cosine = 1.0
             player.gun_pitch = 0.0
             player.bot_order_revision_sent = -1
             player.destructible_revision_sent = -1
@@ -2706,6 +2732,7 @@ class BattleState:
         self.player_environment_seq = -1
         self.player_environment_authority_epoch = -1
         self.player_drowning_seconds = {}
+        self.player_overturn_state = {}
         self.rules_state = {"bases": {
             "1": {"points": 0, "time_left": 0.0,
                   "invaders": 0, "stopped": False},
@@ -4936,10 +4963,241 @@ class BattleState:
             self.pending_events.append(event)
             self.player_environment.pop(player.player_id, None)
             self.player_drowning_seconds.pop(player.player_id, None)
+            self.player_overturn_state.pop(player.player_id, None)
             deaths += 1
             if self._maybe_finish_battle():
                 break
         return deaths
+
+    def _commit_player_environment_damage(
+            self, player, damage, reason, display_health=None):
+        """Apply one server-decided fall or overturn HP delta atomically."""
+        if player is None or not player.alive or player.health <= 0:
+            return False
+        damage = min(max(0, int(damage)), int(player.health))
+        if damage <= 0:
+            return False
+        reason = int(reason)
+        critical_before = player.critical
+        health = max(0, int(player.health) - damage)
+        dead = health <= 0
+        player.health = health
+        player.alive = not dead
+        if dead:
+            player.display_health = max(
+                0, int(health if display_health is None else display_health))
+            player.death_reason = reason
+            player.death_attacker_kind = ""
+            player.death_attacker_id = 0
+            player.forward = 0.0
+            player.turn = 0.0
+            player.speed = 0.0
+            player.pending_fire_intents.clear()
+        else:
+            player.display_health = int(player.health)
+        self._record_damage(
+            None, ("player", player.player_id), damage, critical_before)
+        self._drop_capture_for_vehicle("player", player.player_id)
+        self.pending_events.append({
+            "kind": "health",
+            "target": player.player_id,
+            "damage": damage,
+            "health": int(player.health),
+            "dead": dead,
+            "display_health": (
+                int(player.display_health) if dead else int(player.health)),
+            "attack_reason": reason,
+            "death_reason": reason if dead else 0,
+            "source": "environment",
+        })
+        return True
+
+    def _player_overturn_danger(self, player_id):
+        state = self.player_overturn_state.get(int(player_id))
+        return bool(
+            isinstance(state, dict) and int(state.get("level", 0)) == 2 and
+            float(state.get("check", 0.0)) + 0.000001 >=
+            PLAYER_OVERTURN_IGNORE_SECONDS)
+
+    def _tick_player_overturn(self, dt):
+        """Own the shared ignore gate and thirty-second terminal countdown."""
+        if not self._combat_accepting() or self.battle_result is not None:
+            return 0
+        deaths = 0
+        step = max(0.0, float(dt))
+        for player in list(self.players.values()):
+            if (not player.connected or not player.participating or
+                    not player.alive):
+                self.player_overturn_state.pop(player.player_id, None)
+                continue
+            level = vehicle_physics.overturn_level_from_up_cosine(
+                float(player.up_cosine))
+            if level == 0:
+                self.player_overturn_state.pop(player.player_id, None)
+                continue
+            state = self.player_overturn_state.setdefault(
+                player.player_id,
+                {"check": 0.0, "time": 0.0, "level": 0})
+            state["check"] = float(state.get("check", 0.0)) + step
+            if (state["check"] + 0.000001 <
+                    PLAYER_OVERTURN_IGNORE_SECONDS):
+                continue
+            if level != int(state.get("level", 0)):
+                state["level"] = level
+                state["time"] = 0.0
+            if level != 2:
+                state["time"] = 0.0
+                continue
+            player.forward = 0.0
+            player.turn = 0.0
+            player.speed = 0.0
+            state["time"] = float(state.get("time", 0.0)) + step
+            if (state["time"] + 0.000001 <
+                    PLAYER_OVERTURN_DEATH_SECONDS):
+                continue
+            if self._commit_player_environment_damage(
+                    player, int(player.health), 7, display_health=0):
+                deaths += 1
+            self.player_environment.pop(player.player_id, None)
+            self.player_drowning_seconds.pop(player.player_id, None)
+            self.player_overturn_state.pop(player.player_id, None)
+            if self._maybe_finish_battle():
+                break
+        return deaths
+
+    def _landing_observation_result(
+            self, player, observation_seq, input_seq, accepted, reason):
+        return {
+            "type": "landing_observation_result",
+            "round_id": int(self.round_id),
+            "authority_epoch": int(self.authority_epoch),
+            "observation_seq": int(observation_seq),
+            "input_seq": int(input_seq),
+            "committed_seq": int(player.landing_observation_seq),
+            "accepted": bool(accepted),
+            "reason": str(reason or "")[:32],
+        }
+
+    @staticmethod
+    def _offer_landing_observation_result(player, result):
+        return bool(player is not None and player.connected and
+                    player.offer_reliable(dict(result)))
+
+    def submit_landing_observation(self, player_id, message):
+        """Apply fall damage from one sequenced physical impact sample."""
+        with self.lock:
+            player = self.players.get(player_id)
+            if (self.client_build != CLIENT_BUILD_0922 or
+                    player is None or not player.connected or
+                    PLAYER_ENVIRONMENT_CAPABILITY not in
+                    player.capabilities or
+                    not isinstance(message, dict) or
+                    set(message) != {
+                        "type", "round_id", "authority_epoch",
+                        "observation_seq", "input_seq", "impact_speed"} or
+                    message.get("type") != "landing_observation" or
+                    not self._message_round_matches(message)):
+                return False
+            try:
+                authority_epoch = _exact_int(
+                    message.get("authority_epoch"), 0, PROJECTILE_MAX_ID)
+                observation_seq = _exact_int(
+                    message.get("observation_seq"), 1, PROJECTILE_MAX_ID)
+                input_seq = _exact_int(
+                    message.get("input_seq"), 1, PROJECTILE_MAX_ID)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            raw_impact_speed = message.get("impact_speed")
+            if (isinstance(raw_impact_speed, bool) or
+                    not isinstance(raw_impact_speed, (int, float)) or
+                    not math.isfinite(float(raw_impact_speed)) or
+                    not 0.0 <= float(raw_impact_speed) <=
+                    PLAYER_LANDING_MAX_IMPACT_SPEED):
+                return False
+            impact_speed = round(float(raw_impact_speed), 6)
+            normalized = {
+                "authority_epoch": authority_epoch,
+                "observation_seq": observation_seq,
+                "input_seq": input_seq,
+                "impact_speed": impact_speed,
+            }
+            fingerprint = _message_fingerprint(normalized)
+            previous = player.landing_observation_fingerprints.get(
+                observation_seq)
+            if previous is not None:
+                if previous != fingerprint:
+                    result = self._landing_observation_result(
+                        player, observation_seq, input_seq, False,
+                        "identity_conflict")
+                    self._offer_landing_observation_result(player, result)
+                    return False
+                result = player.landing_observation_results.get(
+                    observation_seq)
+                if result is None:
+                    return False
+                replay = dict(result)
+                replay["authority_epoch"] = int(self.authority_epoch)
+                return self._offer_landing_observation_result(player, replay)
+            if authority_epoch != self.authority_epoch:
+                result = self._landing_observation_result(
+                    player, observation_seq, input_seq, False,
+                    "stale_authority")
+                self._offer_landing_observation_result(player, result)
+                return False
+            if observation_seq != player.landing_observation_seq + 1:
+                result = self._landing_observation_result(
+                    player, observation_seq, input_seq, False,
+                    "sequence_gap")
+                self._offer_landing_observation_result(player, result)
+                return False
+            if (not self._combat_accepting() or
+                    self.battle_result is not None or
+                    not player.participating):
+                result = self._landing_observation_result(
+                    player, observation_seq, input_seq, False,
+                    "not_active")
+                self._offer_landing_observation_result(player, result)
+                return False
+            if not player.alive or player.health <= 0:
+                result = self._landing_observation_result(
+                    player, observation_seq, input_seq, False,
+                    "player_dead")
+                self._offer_landing_observation_result(player, result)
+                return False
+            known_input = bool(
+                input_seq == player.input_seq or
+                input_seq in player.input_fingerprints)
+            if (not known_input or
+                    input_seq <= player.landing_observation_input_seq):
+                result = self._landing_observation_result(
+                    player, observation_seq, input_seq, False,
+                    "stale_input")
+                self._offer_landing_observation_result(player, result)
+                return False
+            damage = vehicle_physics.fall_damage(
+                int(player.max_health), impact_speed)
+            self._commit_player_environment_damage(
+                player, damage, 3, display_health=0)
+            player.landing_observation_seq = observation_seq
+            player.landing_observation_input_seq = input_seq
+            player.landing_observation_fingerprints[
+                observation_seq] = fingerprint
+            result = self._landing_observation_result(
+                player, observation_seq, input_seq, True, "")
+            player.landing_observation_results[observation_seq] = result
+            while (len(player.landing_observation_fingerprints) >
+                   PLAYER_LANDING_HISTORY):
+                old_seq, unused = \
+                    player.landing_observation_fingerprints.popitem(
+                        last=False)
+                player.landing_observation_results.pop(old_seq, None)
+            offered = self._offer_landing_observation_result(player, result)
+            if not player.alive:
+                self.player_environment.pop(player.player_id, None)
+                self.player_drowning_seconds.pop(player.player_id, None)
+                self.player_overturn_state.pop(player.player_id, None)
+                self._maybe_finish_battle()
+            return offered
 
     @staticmethod
     def _projectile_message_fits(message):
@@ -4992,6 +5250,7 @@ class BattleState:
                 SIMULATION_WORKER_AUTHORITY_ID)
             if (player is None or not player.connected or
                     not player.participating or not player.alive or
+                    self._player_overturn_danger(player_id) or
                     not worker_mode):
                 return False
             try:
@@ -7629,6 +7888,16 @@ class BattleState:
                         message.get("gun_checkpoint"))
                 except (TypeError, ValueError, OverflowError):
                     return False
+            reported_up_cosine = None
+            if (self.client_build == CLIENT_BUILD_0922 and
+                    "up_cosine" in message):
+                raw_up_cosine = message.get("up_cosine")
+                if (isinstance(raw_up_cosine, bool) or
+                        not isinstance(raw_up_cosine, (int, float)) or
+                        not math.isfinite(float(raw_up_cosine)) or
+                        not -1.0 <= float(raw_up_cosine) <= 1.0):
+                    return False
+                reported_up_cosine = float(raw_up_cosine)
             if HUMAN_RAM_TIMELINE_CAPABILITY in player.capabilities:
                 accepted, duplicate = self._admit_player_input(
                     player, message)
@@ -7695,6 +7964,8 @@ class BattleState:
                         player.roll = _clamp(
                             _finite_float(message.get("roll"), player.roll),
                             -0.61, 0.61)
+                    if reported_up_cosine is not None:
+                        player.up_cosine = round(reported_up_cosine, 6)
                     player.client_position = True
                     if (HUMAN_RAM_TIMELINE_CAPABILITY in
                             player.capabilities):
@@ -9988,6 +10259,7 @@ class BattleState:
             self._tick_player_critical(dt)
             self._tick_player_fire(dt)
             self._tick_player_drowning(dt)
+            self._tick_player_overturn(dt)
             self._expire_projectiles()
             if self.battle_result is None:
                 self.bot_orders = self.bot_planner.build_orders(
@@ -10200,12 +10472,15 @@ class BattleState:
             "yaw": round(player.yaw, 5),
             "pitch": round(player.pitch, 5),
             "roll": round(player.roll, 5),
+            "up_cosine": round(player.up_cosine, 6),
             "aim_yaw": round(player.aim_yaw, 5),
             "gun_pitch": round(player.gun_pitch, 5),
             "forward": round(player.forward, 4),
             "turn": round(player.turn, 4),
             "speed": round(player.speed, 4),
             "input_seq": int(player.input_seq),
+            "landing_observation_seq": int(
+                player.landing_observation_seq),
             "siege_state": int(player.siege_state),
             "siege_time_left_ms": int(math.ceil(
                 max(0, int(player.siege_transition_ticks)) *
@@ -10967,6 +11242,15 @@ class ClientHandler(socketserver.BaseRequestHandler):
                                 "EQUIPMENT INTENT rejected sender=%d seq=%s" % (
                                     player.player_id,
                                     message.get("intent_seq")))
+                    elif message_type == "landing_observation":
+                        if not server.state.submit_landing_observation(
+                                player.player_id, message):
+                            _server_log_limited(
+                                "landing-observation:%d" % player.player_id,
+                                "LANDING OBSERVATION rejected sender=%d "
+                                "seq=%s" % (
+                                    player.player_id,
+                                    message.get("observation_seq")))
                     elif message_type == "hit_report":
                         if not server.state.report_hit(player.player_id, message):
                             _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (

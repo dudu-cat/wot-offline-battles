@@ -25,6 +25,7 @@ from lan_battle_server import (  # noqa: E402
     SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
     SIEGE_SWITCHING_ON, SIEGE_VEHICLE_PARAMS, TICK_HZ,
 )
+from gui.mods.offline_lan_0922 import vehicle_physics
 from effective_params_fixture import effective_params
 
 
@@ -284,6 +285,71 @@ def _destructible(chunk_id=7, item_index=3, **changes):
 
 
 class ServerProjectileLedgerTests(unittest.TestCase):
+    def test_modern_input_admits_bounded_world_up_atomically(self):
+        state = _state()
+        player = state.players[1]
+
+        self.assertTrue(_update_player_input(
+            state, 1, up_cosine=0.1256789))
+        self.assertEqual(0.125679, player.up_cosine)
+        before = (
+            player.input_seq, dict(player.input_fingerprints),
+            player.up_cosine)
+        for invalid in (True, '0.5', float('nan'), float('inf'), -1.01, 1.01):
+            with self.subTest(up_cosine=invalid):
+                self.assertFalse(_update_player_input(
+                    state, 1, up_cosine=invalid))
+                self.assertEqual(before, (
+                    player.input_seq, dict(player.input_fingerprints),
+                    player.up_cosine))
+
+    def test_landing_observation_applies_one_sequenced_server_delta(self):
+        state = _state()
+        player = state.players[1]
+        results = []
+        player.offer_reliable = lambda message: results.append(message) or True
+        self.assertTrue(_update_player_input(state, 1, up_cosine=1.0))
+        message = {
+            'type': 'landing_observation', 'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+            'observation_seq': 1, 'input_seq': player.input_seq,
+            'impact_speed': 20.0,
+        }
+
+        self.assertTrue(state.submit_landing_observation(1, message))
+        expected = vehicle_physics.fall_damage(player.max_health, 20.0)
+        self.assertEqual(player.max_health - expected, player.health)
+        self.assertEqual(1, player.landing_observation_seq)
+        self.assertEqual(expected, state.pending_events[-1]['damage'])
+        self.assertEqual('environment', state.pending_events[-1]['source'])
+        event_count = len(state.pending_events)
+        self.assertTrue(state.submit_landing_observation(1, message))
+        self.assertEqual(event_count, len(state.pending_events))
+        self.assertFalse(state.submit_landing_observation(
+            1, dict(message, impact_speed=21.0)))
+        self.assertFalse(state.submit_landing_observation(
+            1, dict(message, observation_seq=2, damage=999)))
+        self.assertTrue(results[-1]['accepted'] is False)
+
+    def test_server_overturn_owns_control_lock_and_terminal_death(self):
+        state = _state()
+        player = state.players[1]
+        self.assertTrue(_update_player_input(
+            state, 1, up_cosine=0.0, forward=1.0, turn=1.0,
+            speed=20.0))
+
+        self.assertEqual(0, state._tick_player_overturn(0.1))
+        self.assertTrue(state._player_overturn_danger(1))
+        self.assertEqual((0.0, 0.0, 0.0),
+                         (player.forward, player.turn, player.speed))
+        self.assertFalse(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual(1, state._tick_player_overturn(29.9))
+        self.assertFalse(player.alive)
+        self.assertEqual(0, player.health)
+        self.assertEqual(7, player.death_reason)
+        self.assertEqual('environment', state.pending_events[-1]['source'])
+        self.assertEqual(7, state.pending_events[-1]['attack_reason'])
+
     def test_modern_input_whitelist_rejects_before_state_advances(self):
         state = _state(players=1)
         player = state.players[1]

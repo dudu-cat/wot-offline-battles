@@ -125,6 +125,7 @@ PREBATTLE_SECONDS = 15.0
 BATTLE_SECONDS = 900.0
 BOT_SPAWN_SECONDS = 0.30
 PLAYER_ENVIRONMENT_SECONDS = 0.3
+MAX_PENDING_LANDING_IMPACTS = 32
 _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
 # Ordered kinds that carry no shot or combat contract.  An unknown kind still
 # fails the round closed: the stream also carries health and kills, and a
@@ -1067,6 +1068,12 @@ class _LANInputSender(object):
             'ram_contacts': ram_contacts,
             'destructible_contacts': destructible_contacts,
         }
+        up_cosine = getattr(self.owner, '_local_surface_up_cosine', None)
+        if up_cosine is None:
+            up_cosine = math.cos(keyword_args['pitch']) * math.cos(
+                keyword_args['roll'])
+        keyword_args['up_cosine'] = max(
+            -1.0, min(1.0, float(up_cosine)))
         gun_state = getattr(self.owner, '_gun_state', None)
         if (gun_state is not None and
                 getattr(self.owner, '_gun_last_tick', None) is not None):
@@ -1273,6 +1280,7 @@ class BattleRuntime(object):
         self._local_ground_plane = None
         self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
+        self._pending_landing_impacts = []
         self._input_accumulator = 0.0
         self._gun_state = None
         self._gun_last_tick = None
@@ -1523,6 +1531,7 @@ class BattleRuntime(object):
         self._local_ground_plane = None
         self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
+        self._pending_landing_impacts = []
         self._input_accumulator = 0.0
         self._gun_state = None
         self._gun_last_tick = None
@@ -4421,7 +4430,7 @@ class BattleRuntime(object):
         return True
 
     def _tick_overturn(self, dt, now):
-        """Present #1513 overturn warning and its 30 second self-destruction."""
+        """Present #1513 overturn warning without deciding canonical death."""
         if dt <= 0.0 or self._server is None:
             return False
         record = self._records.get('player:%s' % self.client.player_id)
@@ -4450,12 +4459,8 @@ class BattleRuntime(object):
         if up_cosine is None:
             up_cosine = math.cos(float(self._local_pitch)) * math.cos(
                 float(self._local_roll))
-        if up_cosine <= onboard_cosine:
-            level = 2
-        elif up_cosine <= warning_cosine:
-            level = 1
-        else:
-            level = 0
+        level = vehicle_physics.overturn_level_from_up_cosine(
+            up_cosine, warning_cosine, onboard_cosine)
         if level == 0:
             self._overturn_check = 0.0
             self._overturn_time = 0.0
@@ -4481,21 +4486,9 @@ class BattleRuntime(object):
             self._overturn_time = 0.0
             self._overturn_started = None
             return False
-        self._overturn_time += float(dt)
-        if self._overturn_time + 0.000001 < 30.0:
-            return False
-        overturn_reason = self._attack_reason('OVERTURN', 7)
-        state = dict(record.get('state') or {})
-        state['health'] = 0
-        state['alive'] = False
-        state['display_health'] = 0
-        state['death_reason'] = overturn_reason
-        record['state'] = state
-        self._queue_local_damage_report(
-            reason=overturn_reason, display_health=0,
-            attribute_attacker=False)
-        self._apply_health(record, state, 0, overturn_reason)
-        return True
+        self._overturn_time = min(
+            30.0, self._overturn_time + float(dt))
+        return False
 
     def _has_los(self, observer, target):
         start = self._vector((observer[0], observer[1] + 2.5,
@@ -7603,12 +7596,19 @@ class BattleRuntime(object):
         if source == 'client_simulation':
             return reason_id
         if source == 'environment':
-            expected_reason = self._attack_reason('DROWNING', 5)
-            if (reason_id != expected_reason or
-                    event.get('death_reason') != expected_reason or
-                    not bool(event.get('dead', False))):
+            dead = bool(event.get('dead', False))
+            world_collision = self._attack_reason('WORLD_COLLISION', 3)
+            drowning = self._attack_reason('DROWNING', 5)
+            overturn = self._attack_reason('OVERTURN', 7)
+            valid = (
+                (reason_id == world_collision and
+                 event.get('death_reason') ==
+                 (world_collision if dead else 0)) or
+                (reason_id in (drowning, overturn) and dead and
+                 event.get('death_reason') == reason_id))
+            if not valid:
                 raise RuntimeError(
-                    'environment event must be a drowning death')
+                    'environment event has invalid cause')
             return reason_id
         if reason_id != expected[source]:
             raise RuntimeError(
@@ -13453,24 +13453,33 @@ class BattleRuntime(object):
         return highest, centre
 
     def _apply_fall_damage(self, entity, impact_speed):
-        """Apply the exact copied fall-damage function through native HP."""
+        """Queue a physical impact observation without mutating canonical HP."""
         maximum = max(1, int(getattr(
             entity.typeDescriptor, 'maxHealth', getattr(entity, 'health', 1))))
         damage = vehicle_physics.fall_damage(maximum, impact_speed)
         if damage <= 0:
             return 0
-        local_record = self._records.get('player:%s' % self.client.player_id)
-        if local_record is None:
-            return 0
-        state = dict(local_record.get('state') or {})
-        state['health'] = max(0, int(getattr(entity, 'health', maximum)) - damage)
-        state['alive'] = state['health'] > 0
-        local_record['state'] = state
-        reason = self._attack_reason('WORLD_COLLISION', 3)
-        self._queue_local_damage_report(
-            reason=reason, attribute_attacker=False)
-        self._apply_health(local_record, state, 0, reason)
+        impact_speed = min(
+            lan_protocol.PLAYER_LANDING_MAX_IMPACT_SPEED,
+            abs(float(impact_speed)))
+        if len(self._pending_landing_impacts) >= \
+                MAX_PENDING_LANDING_IMPACTS:
+            raise RuntimeError('landing observation queue exceeded limit')
+        self._pending_landing_impacts.append(impact_speed)
         return damage
+
+    def _flush_landing_observation(self):
+        """Bind a queued landing to the next admitted local pose sample."""
+        if not self._pending_landing_impacts or self._sender is None:
+            return False
+        impact_speed = self._pending_landing_impacts[0]
+        sender = getattr(self._sender, 'send_current', None)
+        publish = getattr(self.client, 'send_landing_observation', None)
+        if (not callable(sender) or not callable(publish) or
+                not sender() or not publish(impact_speed)):
+            return False
+        del self._pending_landing_impacts[0]
+        return True
 
     def _apply_landing_impact(self, entity, vertical_speed):
         """Copy combined vertical/lateral impact and retained landing skid."""
@@ -13780,7 +13789,9 @@ class BattleRuntime(object):
             stopped = bool(self._drive_local_step(step))
             remaining = max(0.0, remaining - step)
         if stopped:
-            if (self._local_damage_report is not None or
+            if self._pending_landing_impacts:
+                self._flush_landing_observation()
+            elif (self._local_damage_report is not None or
                     self._drown_level == 2 or self._overturn_level == 2):
                 self._sender.send_current()
             return
@@ -13788,7 +13799,10 @@ class BattleRuntime(object):
             self._input_accumulator = 0.0
         else:
             self._input_accumulator += elapsed
-        if (not self._local_input_sent_during_drive and
+        if self._pending_landing_impacts:
+            if self._flush_landing_observation():
+                self._input_accumulator %= NETWORK_INPUT_SECONDS
+        elif (not self._local_input_sent_during_drive and
                 self._input_accumulator >= NETWORK_INPUT_SECONDS):
             # Publish only the final integrated pose. Physics still consumes
             # every substep, but a slow render callback must not burst stale
@@ -17716,6 +17730,7 @@ class BattleRuntime(object):
         self._local_ground_plane = None
         self._local_surface_up_cosine = None
         self._local_air_lateral = (0.0, 0.0)
+        self._pending_landing_impacts = []
         self._local_pitch = 0.0
         self._local_roll = 0.0
         self._input_accumulator = 0.0

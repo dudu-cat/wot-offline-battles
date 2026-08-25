@@ -8663,7 +8663,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          battle._avatar.misc_status)
         self.assertEqual(0.0, battle._overturn_time)
 
-    def test_local_overturn_destroys_after_thirty_seconds_without_attacker(self):
+    def test_local_overturn_never_decides_death_after_thirty_seconds(self):
         runtime = _runtime()
         runtime.bigworld.serverTime = lambda: 900.0
         battle = BattleRuntime(runtime)
@@ -8680,24 +8680,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'kind': 'player', 'network_id': 1, 'local': True}}
         battle._local_pitch = math.radians(90.0)
         battle._local_last_attacker = ('player', 9)
-        critical = {
-            'devices': [], 'destroyed': [], 'crew_ko': [],
-            'fire': False, 'ammo_rack_death': False,
-            'events': []}
+        self.assertFalse(battle._tick_overturn(0.1, 1.0))
+        self.assertEqual((10, 3, 2, (900.0, 30.0)),
+                         battle._avatar.misc_status)
+        battle._overturn_time = 29.95
+        self.assertFalse(battle._tick_overturn(0.1, 1.1))
 
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'critical_damage.apply_death', return_value=critical) as death:
-            self.assertFalse(battle._tick_overturn(0.1, 1.0))
-            self.assertEqual((10, 3, 2, (900.0, 30.0)),
-                             battle._avatar.misc_status)
-            battle._overturn_time = 29.95
-            self.assertTrue(battle._tick_overturn(0.1, 1.1))
-
-        death.assert_called_once_with(entity, 'overturn')
-        self.assertEqual(0, entity.health)
-        self.assertEqual((10, 0, 7, False, False),
-                         battle._avatar.health_update)
+        self.assertEqual(500, entity.health)
+        self.assertEqual(30.0, battle._overturn_time)
         self.assertIsNone(battle._local_damage_report)
 
     def test_visible_input_never_carries_a_local_damage_verdict(self):
@@ -14124,7 +14114,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertLess(battle._local_vertical_speed, 0.0)
         self.assertGreater(position[1], -2.0)
 
-    def test_armed_ledge_fall_uses_copied_damage_and_reason(self):
+    def test_armed_ledge_fall_only_queues_an_impact_observation(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.client = _Client()
@@ -14150,17 +14140,38 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(0.0, position[1])
         self.assertFalse(battle._local_airborne)
-        self.assertLess(entity.health, 500)
-        self.assertEqual(3, entity.health_change[2])
+        self.assertEqual(500, entity.health)
         self.assertIsNone(battle._local_damage_report)
-        self.assertEqual(entity.health,
+        self.assertEqual(500,
                          battle._records['player:1']['state']['health'])
+        self.assertEqual(1, len(battle._pending_landing_impacts))
+        self.assertGreater(battle._pending_landing_impacts[0], 10.0)
         landed_health = entity.health
         for unused in range(10):
             position = battle._update_vertical_motion(
                 entity, position, 0.0, 0.1)
         self.assertEqual(landed_health, entity.health)
-        self.assertEqual(1, entity.onHealthChanged.call_count)
+        self.assertEqual(0, entity.onHealthChanged.call_count)
+
+    def test_landing_publish_sends_pose_first_and_retries_without_loss(self):
+        battle = BattleRuntime(_runtime())
+        calls = []
+        landing_results = [False, 1]
+        battle._sender = types.SimpleNamespace(
+            send_current=lambda: calls.append('pose') or True)
+        battle.client = types.SimpleNamespace(
+            send_landing_observation=lambda speed: (
+                calls.append(('landing', speed)) or
+                landing_results.pop(0)))
+        battle._pending_landing_impacts = [18.5, 22.0]
+
+        self.assertFalse(battle._flush_landing_observation())
+        self.assertEqual([18.5, 22.0], battle._pending_landing_impacts)
+        self.assertTrue(battle._flush_landing_observation())
+        self.assertEqual([22.0], battle._pending_landing_impacts)
+        self.assertEqual([
+            'pose', ('landing', 18.5),
+            'pose', ('landing', 18.5)], calls)
 
     def test_cross_heading_steep_slope_uses_copied_slide_law(self):
         runtime = _runtime()

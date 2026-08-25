@@ -115,9 +115,13 @@ FIRE_DURATION_SECONDS = 10.0
 FIRE_TICK_SECONDS = 1.0
 BOT_WATER_AVOID_DEPTH = 0.90
 BOT_DROWNING_PROBE_SECONDS = 0.30
-BOT_DROWNING_DEPTH = 1.60
 BOT_DROWNING_SECONDS = 10.0
 BOT_DROWNING_DEATH_REASON = 5
+BOT_OVERTURN_IGNORE_SECONDS = 0.10
+BOT_OVERTURN_WARNING_COSINE = vehicle_physics.OVERTURN_WARNING_COSINE
+BOT_OVERTURN_DANGER_COSINE = vehicle_physics.OVERTURN_DANGER_COSINE
+BOT_OVERTURN_DEATH_SECONDS = 30.0
+BOT_OVERTURN_DEATH_REASON = 7
 
 
 def _cache_deadline(now, entity_id, interval, salt=0, stagger=False):
@@ -155,6 +159,77 @@ def _value(value, name, default=None):
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _water_sensor_vector(value, count, label):
+    """Validate one vector consumed by #1513's native WaterSensor."""
+    try:
+        values = tuple(value)
+    except (TypeError, ValueError):
+        raise ValueError('%s is not a %d-component vector' % (label, count))
+    if len(values) != count:
+        raise ValueError('%s is not a %d-component vector' % (label, count))
+    result = []
+    for index, raw in enumerate(values):
+        if isinstance(raw, bool):
+            raise ValueError('%s[%d] is not finite' % (label, index))
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('%s[%d] is not finite' % (label, index))
+        if math.isnan(number) or math.isinf(number):
+            raise ValueError('%s[%d] is not finite' % (label, index))
+        result.append(number)
+    return tuple(result)
+
+
+def _water_sensor_geometry(descriptor):
+    """Return the exact local underwater point donated to WaterSensor."""
+    chassis = _value(descriptor, 'chassis')
+    hull = _value(descriptor, 'hull')
+    if chassis is None or hull is None:
+        raise ValueError('descriptor has no WaterSensor chassis or hull')
+    hull_position = _water_sensor_vector(
+        _value(chassis, 'hullPosition'), 3, 'chassis.hullPosition')
+    turret_positions = _value(hull, 'turretPositions')
+    try:
+        turret_position = turret_positions[0]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError('hull.turretPositions has no index 0')
+    turret_position = _water_sensor_vector(
+        turret_position, 3, 'hull.turretPositions[0]')
+    carrying_point = _water_sensor_vector(
+        _value(chassis, 'topRightCarryingPoint'), 2,
+        'chassis.topRightCarryingPoint')
+    return (
+        (hull_position[0] + turret_position[0],
+         hull_position[1] + turret_position[1],
+         hull_position[2] + turret_position[2]),
+        carrying_point,
+    )
+
+
+def _vehicle_local_height(point, pitch, roll):
+    """Return world-up height after the pinned roll-then-pitch transform."""
+    x_value, y_value, z_value = point
+    roll_sine, roll_cosine = math.sin(roll), math.cos(roll)
+    rolled_y = roll_sine * x_value + roll_cosine * y_value
+    pitch_sine, pitch_cosine = math.sin(pitch), math.cos(pitch)
+    return pitch_cosine * rolled_y - pitch_sine * z_value
+
+
+def _water_sensor_level(state, descriptor, water_depth):
+    """Mirror #1513 WaterSensor's in-water and underwater predicates."""
+    depth = float(water_depth)
+    if math.isnan(depth) or math.isinf(depth):
+        raise ValueError('water depth is not finite')
+    if depth < 0.0:
+        return 0
+    turret_offset, unused_carrying_point = _water_sensor_geometry(descriptor)
+    turret_height = _vehicle_local_height(
+        turret_offset, _number(state.get('pitch')),
+        _number(state.get('roll')))
+    return 2 if depth > turret_height else 1
 
 
 def _player_effective_params(raw):
@@ -2086,9 +2161,18 @@ class BotRuntime(object):
                 'ram_profile': tank_collision.descriptor_ram_profile(
                     descriptor),
                 'push_x': 0.0, 'push_z': 0.0,
+                'air_lateral_x': 0.0, 'air_lateral_z': 0.0,
+                'slide_speed': 0.0,
                 'vertical_speed': 0.0, 'airborne': False,
                 'grounded_once': False, 'last_drive_pitch': 0.0,
                 'pitch': 0.0, 'roll': 0.0,
+                '_drown_check': 0.0,
+                '_drown_time': 0.0,
+                '_drowning': False,
+                '_overturn_check': 0.0,
+                '_overturn_time': 0.0,
+                '_overturn_level': 0,
+                '_overturned': False,
                 'critical': (dict(raw.get('critical'))
                              if isinstance(raw.get('critical'), dict) else {}),
                 'combat_revision': max(0, int(_number(
@@ -2107,6 +2191,10 @@ class BotRuntime(object):
             })
             gun_state = self._gun_states[bot_id]
             state = self.states[bot_id]
+            state.setdefault('_overturn_check', 0.0)
+            state.setdefault('_overturn_time', 0.0)
+            state.setdefault('_overturn_level', 0)
+            state.setdefault('_overturned', False)
             ammo_state = self._ammo_states.get(bot_id)
             if ammo_state is None:
                 ammo_state = _BotAmmoState(descriptor, profile, raw)
@@ -2518,7 +2606,7 @@ class BotRuntime(object):
         return changed
 
     def _advance_bot_drowning(self, state, step):
-        """Apply the copied 0.8.2 continuous-deep-water bot death law."""
+        """Apply #1513 WaterSensor danger and its ten-second death clock."""
         if (not state.get('alive', False) or
                 _number(state.get('health')) <= 0.0 or step <= 0.0):
             return False
@@ -2533,7 +2621,9 @@ class BotRuntime(object):
         state['_drown_check'] = 0.0
         depth = _number(self._water_depth_probe(_position(state)), -1.0)
         state['_water_depth'] = depth
-        if depth <= BOT_DROWNING_DEPTH:
+        descriptor = self._descriptors.get(state['id'], {})
+        level = _water_sensor_level(state, descriptor, depth)
+        if level != 2:
             state['_drown_time'] = 0.0
             state['_drowning'] = False
             return False
@@ -2544,23 +2634,69 @@ class BotRuntime(object):
             return False
 
         display_health = max(0, int(_number(state.get('health'))))
-        descriptor = self._descriptors.get(state['id'], {})
-        shadow = _BotCriticalVehicle(
-            state, descriptor, None,
-            _number(state.get('combat_fire_timer')))
-        critical = critical_damage.apply_drowning(shadow)
-        if isinstance(critical, dict):
-            state['critical'] = _canonical_critical(critical)
+        critical = _terminal_critical(state, descriptor, 'drowning')
+        if critical is not None:
+            state['critical'] = critical
         state['health'] = 0
         state['alive'] = False
         state['display_health'] = display_health
         state['death_reason'] = BOT_DROWNING_DEATH_REASON
         state['_drowned'] = True
+        state['_drown_time'] = BOT_DROWNING_SECONDS
         state['_drowning'] = False
         self._friendly_repositions.pop(state['id'], None)
         state['speed'] = 0.0
         state['movement_dir'] = 0
         state['rotation_dir'] = 0
+        state['target_kind'] = None
+        state['target_id'] = None
+        return True
+
+    def _advance_bot_overturn(self, state, step):
+        """Apply #1513 overturn warning, input lock and terminal countdown."""
+        if (not state.get('alive', False) or
+                _number(state.get('health')) <= 0.0 or step <= 0.0):
+            return False
+        level = vehicle_physics.overturn_level(
+            _number(state.get('pitch')), _number(state.get('roll')),
+            BOT_OVERTURN_WARNING_COSINE, BOT_OVERTURN_DANGER_COSINE)
+        if level == 0:
+            state['_overturn_check'] = 0.0
+            state['_overturn_time'] = 0.0
+            state['_overturn_level'] = 0
+            state['_overturned'] = False
+            return False
+        state['_overturn_check'] = (
+            _number(state.get('_overturn_check')) + float(step))
+        if (state['_overturn_check'] + 0.000001 <
+                BOT_OVERTURN_IGNORE_SECONDS):
+            return False
+        if level != int(_number(state.get('_overturn_level'))):
+            state['_overturn_level'] = level
+            state['_overturn_time'] = 0.0
+        state['_overturned'] = level == 2
+        if level != 2:
+            state['_overturn_time'] = 0.0
+            return False
+        state['speed'] = 0.0
+        state['movement_dir'] = 0
+        state['rotation_dir'] = 0
+        self._turn_speeds[int(state['id'])] = 0.0
+        state['_overturn_time'] = (
+            _number(state.get('_overturn_time')) + float(step))
+        if (state['_overturn_time'] + 0.000001 <
+                BOT_OVERTURN_DEATH_SECONDS):
+            return False
+        descriptor = self._descriptors.get(state['id'], {})
+        terminal = _terminal_critical(state, descriptor, 'overturn')
+        if terminal is not None:
+            state['critical'] = terminal
+        state['health'] = 0
+        state['alive'] = False
+        state['display_health'] = 0
+        state['death_reason'] = BOT_OVERTURN_DEATH_REASON
+        state['_overturn_time'] = BOT_OVERTURN_DEATH_SECONDS
+        self._friendly_repositions.pop(state['id'], None)
         state['target_kind'] = None
         state['target_id'] = None
         return True
@@ -3614,6 +3750,53 @@ class BotRuntime(object):
         if callable(remember):
             remember(bot_id, attempted_yaw, 5.0)
 
+    def _apply_bot_fall_damage(self, state, impact_speed):
+        """Apply the shared landing law to one hidden-worker Bot."""
+        maximum = max(1, int(_number(
+            state.get('max_health'), state.get('health', 1))))
+        damage = vehicle_physics.fall_damage(maximum, impact_speed)
+        if damage <= 0:
+            return 0
+        health = max(0, int(_number(state.get('health'), maximum)) - damage)
+        state['health'] = health
+        state['display_health'] = health
+        state['alive'] = health > 0
+        if state['alive']:
+            return damage
+        descriptor = self._descriptors.get(state['id'], {})
+        terminal = _terminal_critical(state, descriptor, 'world_collision')
+        if terminal is not None:
+            state['critical'] = terminal
+        state['combat_fire_elapsed'] = 0.0
+        state['combat_fire_timer'] = 0.0
+        self._friendly_repositions.pop(state['id'], None)
+        state['death_reason'] = 3
+        state['speed'] = 0.0
+        state['movement_dir'] = 0
+        state['rotation_dir'] = 0
+        state['push_x'] = 0.0
+        state['push_z'] = 0.0
+        state['target_kind'] = None
+        state['target_id'] = None
+        self._turn_speeds[state['id']] = 0.0
+        return damage
+
+    def _apply_bot_landing_impact(self, state, vertical_speed):
+        """Combine retained lateral velocity with the vertical impact."""
+        lateral_x = _number(state.get('air_lateral_x'))
+        lateral_z = _number(state.get('air_lateral_z'))
+        lateral_speed = math.sqrt(
+            lateral_x * lateral_x + lateral_z * lateral_z)
+        if lateral_speed > 0.01:
+            state['slide_speed'] = max(
+                _number(state.get('slide_speed')), lateral_speed)
+        state['air_lateral_x'] = 0.0
+        state['air_lateral_z'] = 0.0
+        impact_speed = math.sqrt(
+            _number(vertical_speed) * _number(vertical_speed) +
+            lateral_speed * lateral_speed)
+        return self._apply_bot_fall_damage(state, impact_speed)
+
     def _update_vertical_motion(self, state, step, tick_pose=None,
                                 attempted_yaw=None):
         """Run grounded/ballistic phases and reject false raised support."""
@@ -3659,6 +3842,8 @@ class BotRuntime(object):
                 return True
             elif (state['y'] <= ground or
                   (com_gap <= snap_gap and not state.get('airborne', False))):
+                impact_speed = (_number(state.get('vertical_speed'))
+                                if state.get('airborne', False) else 0.0)
                 if state['y'] < ground:
                     rise = ground - state['y']
                     state['y'] += min(rise, max_climb)
@@ -3668,6 +3853,8 @@ class BotRuntime(object):
                     state['y'] = min(state['y'], ground + 0.12)
                 state['vertical_speed'] = 0.0
                 state['airborne'] = False
+                if impact_speed < 0.0:
+                    self._apply_bot_landing_impact(state, impact_speed)
             else:
                 if not state.get('airborne', False):
                     pitch = _number(state.get('last_drive_pitch'))
@@ -3684,9 +3871,12 @@ class BotRuntime(object):
                         vehicle_physics.GRAVITY * sub_step)
                     state['y'] += state['vertical_speed'] * sub_step
                     if state['y'] <= land_y:
+                        impact_speed = state['vertical_speed']
                         state['y'] = land_y
                         state['vertical_speed'] = 0.0
                         state['airborne'] = False
+                        self._apply_bot_landing_impact(
+                            state, impact_speed)
                         break
         elif state.get('grounded_once', False):
             if not state.get('airborne', False):
@@ -5605,6 +5795,9 @@ class BotRuntime(object):
             self._advance_bot_drowning(state, step)
             if not state['alive']:
                 continue
+            self._advance_bot_overturn(state, step)
+            if not state['alive']:
+                continue
             position = _position(state)
             tick_poses[state['id']] = position
             tick_safe[state['id']] = prebaked_navigation.pose_is_safe(
@@ -5864,9 +6057,10 @@ class BotRuntime(object):
             state['hull_aiming'] = bool(hull_aiming)
             unused_devices, destroyed_devices, unused_crew, unused_yellow = (
                 _critical_parts(state))
-            if destroyed_devices.intersection((
+            if (state.get('_overturned', False) or
+                    destroyed_devices.intersection((
                     'engineHealth', 'leftTrackHealth',
-                    'rightTrackHealth')):
+                    'rightTrackHealth'))):
                 throttle = 0.0
                 turn = 0.0
             elif abs(throttle) > 0.01:
@@ -6132,6 +6326,8 @@ class BotRuntime(object):
                         (fire_range <= 0.0 or target_distance < fire_range))
             if (publish and command['fire_allowed'] and target is not None and
                     in_range and
+                    not state.get('_drowning', False) and
+                    not state.get('_overturned', False) and
                     'gunHealth' not in destroyed_devices and
                     state.get('gun_aligned') and
                     gun_state.ready(reload_factor) and
