@@ -274,6 +274,9 @@ class BattleProjectileTests(unittest.TestCase):
 
     def test_artillery_final_probe_uses_exact_native_muzzle(self):
         battle, unused_bigworld = _battle()
+        battle._bot_barrel_point = mock.Mock(
+            return_value=(3.0, 4.0, 5.0))
+        battle._barrel_under_water = mock.Mock(return_value=False)
         muzzle = _Vector((3.0, 4.0, 5.0))
         source = types.SimpleNamespace(
             isStarted=True, typeDescriptor=object(),
@@ -332,6 +335,9 @@ class BattleProjectileTests(unittest.TestCase):
 
     def test_direct_launch_reuses_muzzle_frozen_before_pose_update(self):
         battle, unused_bigworld = _battle()
+        battle._bot_barrel_point = mock.Mock(
+            return_value=(4.0, 5.0, 6.0))
+        battle._barrel_under_water = mock.Mock(return_value=False)
         speed = 100.0
         muzzle = [_Vector((4.0, 5.0, 6.0))]
         moved_origin = _Vector((40.0, 50.0, 60.0))
