@@ -16530,9 +16530,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }
 
-        self.assertEqual(
-            1, battle._resolve_player_destructible_contacts(
-                [player], 12.5))
+        authority_name = (
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused_key: False)
+        with mock.patch.dict(sys.modules, {authority_name: authority}):
+            self.assertEqual(
+                1, battle._resolve_player_destructible_contacts(
+                    [player], 12.5))
 
         battle._destructibles._catalog_motion_blocked.assert_called_once()
         battle.client.send_player_destructible_contact_result.\
@@ -16566,9 +16571,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }
 
-        from gui.mods.offline_lan_0922 import destructibles_authority
-        with mock.patch.object(
-                destructibles_authority, 'is_destroyed', return_value=True):
+        authority_name = (
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused_key: True)
+        with mock.patch.dict(sys.modules, {authority_name: authority}):
             self.assertEqual(
                 1, battle._resolve_player_destructible_contacts(
                     [player], 12.5))
@@ -16606,10 +16613,15 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }
 
-        with mock.patch(
-                'gui.mods.offline_lan_0922.battle_runtime.'
-                'world_collision.check_horizontal_collision',
-                return_value='hard'):
+        authority_name = (
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused_key: False)
+        with mock.patch.dict(sys.modules, {authority_name: authority}), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    return_value='hard'):
             self.assertEqual(
                 1, battle._resolve_player_destructible_contacts(
                     [player], 12.5))
