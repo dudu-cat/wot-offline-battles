@@ -1638,6 +1638,7 @@ class BattleState:
         self.human_ram_episode_seq = {}
         self.human_ram_probe_seq = 0
         self.human_ram_probe_requests = {}
+        self.human_ram_retired_probe_pairs = OrderedDict()
         self.human_ram_probe_fingerprints = OrderedDict()
         self.vehicle_statistics = {}
         self.vehicle_interactions = {}
@@ -2600,6 +2601,7 @@ class BattleState:
         self.human_ram_episode_seq = {}
         self.human_ram_probe_seq = 0
         self.human_ram_probe_requests = {}
+        self.human_ram_retired_probe_pairs = OrderedDict()
         self.human_ram_probe_fingerprints = OrderedDict()
         self.vehicle_statistics = {}
         self.vehicle_interactions = {}
@@ -3668,9 +3670,16 @@ class BattleState:
                 return False
             if message["accepted"]:
                 for chunk_id, item_index, mat_kind in token:
-                    kind = "fragile" if mat_kind is None else "module"
-                    if (kind, chunk_id, item_index, mat_kind) not in \
-                            self.destructibles:
+                    if mat_kind is None:
+                        known = any(
+                            (kind, chunk_id, item_index, None) in
+                            self.destructibles
+                            for kind in ("fragile", "column"))
+                    else:
+                        known = (
+                            "module", chunk_id, item_index, mat_kind) in \
+                            self.destructibles
+                    if not known:
                         return False
             target.destructible_contacts.pop(seq, None)
             if message["accepted"]:
@@ -3904,12 +3913,19 @@ class BattleState:
         """Bind worker-donated collision bodies to this exact player roster."""
         if not isinstance(raw_profiles, (list, tuple)):
             return None
-        expected = {
+        active = {
             player.player_id: player for player in self.players.values()
             if player.connected and player.participating}
-        if len(raw_profiles) != len(expected):
-            return None
+        frozen = {}
+        for participant in self.round_participants.values():
+            if not isinstance(participant, dict):
+                continue
+            try:
+                frozen[int(participant["player_id"])] = participant
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
         profiles = {}
+        seen = set()
         for raw in raw_profiles:
             if not isinstance(raw, dict):
                 return None
@@ -3920,13 +3936,20 @@ class BattleState:
                 ram_profile = raw.get("ram_profile")
             except (TypeError, ValueError, OverflowError):
                 return None
-            player = expected.get(player_id)
+            player = active.get(player_id)
+            participant = player if player is not None else frozen.get(
+                player_id)
             vehicle = _safe_vehicle(raw.get("vehicle"), "")
-            if (player is None or player_id in profiles or
-                    vehicle != player.vehicle or
+            expected_vehicle = (
+                participant.vehicle if player is not None else
+                participant.get("vehicle") if participant is not None else
+                None)
+            if (participant is None or player_id in seen or
+                    vehicle != expected_vehicle or
                     not math.isfinite(mass) or not 100.0 <= mass <= 500000.0 or
                     not isinstance(shape, (list, tuple)) or len(shape) != 4):
                 return None
+            seen.add(player_id)
             try:
                 shape = tuple(float(value) for value in shape)
             except (TypeError, ValueError, OverflowError):
@@ -3946,17 +3969,21 @@ class BattleState:
             if (not math.isfinite(spall) or not 1.0 <= spall <= 1.5 or
                     not math.isfinite(bonus) or not 0.0 <= bonus <= 0.15):
                 return None
-            profiles[player_id] = {
-                "id": player_id,
-                "vehicle": vehicle,
-                "mass": round(mass, 3),
-                "shape": tuple(round(value, 4) for value in shape),
-                "ram_profile": {
-                    "spall_coefficient": round(spall, 4),
-                    "ramming_bonus": round(bonus, 6),
-                },
-            }
-        return profiles if set(profiles) == set(expected) else None
+            # A worker starts from the frozen battle_start roster.  If one of
+            # those players leaves during loading, its old native profile is a
+            # legal extra, but only connected participants remain canonical.
+            if player is not None:
+                profiles[player_id] = {
+                    "id": player_id,
+                    "vehicle": vehicle,
+                    "mass": round(mass, 3),
+                    "shape": tuple(round(value, 4) for value in shape),
+                    "ram_profile": {
+                        "spall_coefficient": round(spall, 4),
+                        "ramming_bonus": round(bonus, 6),
+                    },
+                }
+        return profiles if set(profiles) == set(active) else None
 
     def update_bot_manifest(self, player_id, message):
         """Accept the canonical bot lineup from the elected simulation client."""
@@ -4530,7 +4557,12 @@ class BattleState:
             if previous_pending and (
                     previous_clip == 0 or clip_size == 1):
                 expected_loaded = previous_next
-                expected_clip = clip_size - 1
+                # A full reload is capped by the planned shell's remaining
+                # inventory.  If that reload completes and fires in this same
+                # worker publication, consume one round from the partial
+                # refill rather than inventing a full magazine first.
+                expected_clip = min(
+                    clip_size, before[previous_next]) - 1
             else:
                 expected_loaded = previous_loaded
                 expected_clip = previous_clip - 1
@@ -5896,13 +5928,12 @@ class BattleState:
                        else int(target.get("team", 0)))
         target_alive = (target.alive if target_kind == "player"
                         else bool(target.get("alive")))
-        target_position = (
-            (target.x, target.y, target.z) if target_kind == "player" else
-            (float(target.get("x", 0.0)), float(target.get("y", 0.0)),
-             float(target.get("z", 0.0))))
         if splash:
+            # The bundled hidden worker sampled this pose when it resolved
+            # the native impact.  Rechecking against the target's mutable
+            # receipt-time pose makes a legal high-latency terminal fail.
             distance = math.sqrt(sum(
-                (target_position[index] - impact[index]) ** 2
+                (pose[index] - impact[index]) ** 2
                 for index in range(3)))
             if distance > record["splash_radius"] + PROJECTILE_TOLERANCE:
                 raise ValueError("splash target outside blast radius")
@@ -6330,6 +6361,13 @@ class BattleState:
             # The bounded server manager owns these terminals. A wall-clock
             # expiry here could retire a shot while its final collision chord
             # is still queued behind other projectiles.
+            return 0
+        if (self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
+                self.simulation_worker is not None and
+                self.simulation_worker.connected):
+            # The hidden native worker owns these terminals.  Server wall
+            # time must not overtake a collision result queued on its render
+            # thread; worker loss already terminates the active round.
             return 0
         now_ms = self._server_time_ms()
         expired = []
@@ -9376,23 +9414,47 @@ class BattleState:
                 continue
             pair = (first_id, second_id)
             request = self.human_ram_probe_requests.get(pair)
-            if (request is None or int(request["seq"]) != sequence or
+            if request is None:
+                if self.human_ram_retired_probe_pairs.get(sequence) != pair:
+                    return None
+                normalized.append((pair, result, fingerprint, True))
+                continue
+            if (int(request["seq"]) != sequence or
                     int(request["first"]["id"]) != first_id or
                     int(request["second"]["id"]) != second_id):
                 return None
-            normalized.append((pair, result, fingerprint))
+            normalized.append((pair, result, fingerprint, False))
         return tuple(normalized)
 
     def _commit_human_ram_armors(self, results):
-        for pair, result, fingerprint in results:
-            request = self.human_ram_probe_requests.get(pair)
-            if request is None or int(request["seq"]) != int(result["seq"]):
-                raise RuntimeError("human ram armor request changed at commit")
-            request["result"] = dict(result)
+        for pair, result, fingerprint, retired in results:
+            if retired:
+                sequence = int(result["seq"])
+                if self.human_ram_retired_probe_pairs.get(sequence) != pair:
+                    raise RuntimeError(
+                        "retired human ram armor request changed at commit")
+                self.human_ram_retired_probe_pairs.pop(sequence, None)
+            else:
+                request = self.human_ram_probe_requests.get(pair)
+                if (request is None or
+                        int(request["seq"]) != int(result["seq"])):
+                    raise RuntimeError(
+                        "human ram armor request changed at commit")
+                request["result"] = dict(result)
             self.human_ram_probe_fingerprints[int(result["seq"])] = fingerprint
             while (len(self.human_ram_probe_fingerprints) >
                    MAX_HUMAN_RAM_PROBE_HISTORY):
                 self.human_ram_probe_fingerprints.popitem(last=False)
+
+    def _retire_human_ram_probe(self, pair):
+        request = self.human_ram_probe_requests.pop(pair, None)
+        if request is None:
+            return
+        sequence = int(request["seq"])
+        self.human_ram_retired_probe_pairs[sequence] = pair
+        while (len(self.human_ram_retired_probe_pairs) >
+               MAX_HUMAN_RAM_PROBE_HISTORY):
+            self.human_ram_retired_probe_pairs.popitem(last=False)
 
     def _human_ram_contact_armors(
             self, pair, first, second, frontier_time_us):
@@ -9579,7 +9641,7 @@ class BattleState:
         live_player_ids = set(player.player_id for player in players)
         for pair in list(self.human_ram_probe_requests):
             if not set(pair).issubset(live_player_ids):
-                self.human_ram_probe_requests.pop(pair, None)
+                self._retire_human_ram_probe(pair)
         active_contacts = set(self.human_ram_contacts)
         applied = 0
         for first_index, first in enumerate(players):
@@ -10522,15 +10584,17 @@ class ClientHandler(socketserver.BaseRequestHandler):
             accepted = server.state.update_bot_manifest(
                 authority_id, message)
             if (not accepted and
-                    server.state.last_bot_manifest_reject_code in (
-                        "human_collision_profiles",
-                        "human_collision_manifest_conflict")):
+                    server.state.phase in ("loading", "battle") and
+                    server.state.battle_result is None):
+                reject_code = (
+                    server.state.last_bot_manifest_reject_code or
+                    "bot_manifest_rejected")
                 _server_log(
                     "WORKER MANIFEST fatal code=%s reason=%s" % (
-                        server.state.last_bot_manifest_reject_code,
+                        reject_code,
                         server.state.last_bot_manifest_reject))
                 server.state.remove_simulation_worker(
-                    worker, server.state.last_bot_manifest_reject_code)
+                    worker, reject_code)
                 return "close"
             if accepted:
                 _server_log("BOT MANIFEST authority=%d bots=%d" % (
@@ -10550,12 +10614,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
                         authority_id,
                         server.state.last_bot_state_reject_code,
                         server.state.last_bot_state_reject))
-            if not accepted:
+            if (not accepted and
+                    server.state.phase in ("loading", "battle") and
+                    server.state.battle_result is None):
                 # A bot publication is one atomic canonical batch.  Keeping
                 # the previous snapshot after rejecting it leaves every Bot
                 # frozen while the worker advances beyond the server's
                 # lineage.  Fence the producer and use the existing explicit
-                # infrastructure-failure result instead.
+                # infrastructure-failure result instead.  A late publication
+                # after a terminal result is harmless cleanup traffic and
+                # must not turn the completed round into a worker failure.
                 server.state.remove_simulation_worker(
                     worker, "bot_state_rejected")
                 return "close"

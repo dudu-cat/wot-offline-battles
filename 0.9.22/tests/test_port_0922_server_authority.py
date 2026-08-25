@@ -1107,6 +1107,56 @@ class HumanRamTimelineTest(unittest.TestCase):
             state.last_bot_manifest_reject_code)
         self.assertIsNone(state.human_collision_profile_authority_id)
 
+    def test_loading_leave_allows_frozen_worker_profile(self):
+        state, unused_clock = self._state()
+        state.phase = 'loading'
+        state.human_collision_profiles = {}
+        state.human_collision_profile_authority_id = None
+        state.human_collision_manifest_fingerprint = None
+        state._freeze_round_participants(list(state.players.values()))
+        players = [state.players[1], state.players[2]]
+        departed = state.players.pop(2)
+        departed._mark_disconnected()
+        profiles = [{
+            'id': player.player_id, 'vehicle': player.vehicle,
+            'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+            'ram_profile': {
+                'spall_coefficient': 1.0,
+                'ramming_bonus': 0.0,
+            },
+        } for player in players]
+
+        self.assertTrue(state.update_bot_manifest(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': state.round_id, 'bots': [],
+                'player_collision_profiles': profiles,
+            }))
+        self.assertEqual({1}, set(state.human_collision_profiles))
+
+    def test_frozen_worker_profile_never_admits_unknown_or_changed_identity(self):
+        state, unused_clock = self._state()
+        state._freeze_round_participants(list(state.players.values()))
+        active = state.players[1]
+        departed = state.players.pop(2)
+        departed._mark_disconnected()
+        base = [{
+            'id': player.player_id, 'vehicle': player.vehicle,
+            'mass': 8000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+            'ram_profile': {
+                'spall_coefficient': 1.0,
+                'ramming_bonus': 0.0,
+            },
+        } for player in (active, departed)]
+
+        self.assertIsNone(state._sanitize_human_collision_profiles(
+            base[1:]))
+        changed = copy.deepcopy(base)
+        changed[1]['vehicle'] = 'ussr:R11_MS-1-invalid'
+        self.assertIsNone(state._sanitize_human_collision_profiles(changed))
+        unknown = copy.deepcopy(base)
+        unknown[1]['id'] = 3
+        self.assertIsNone(state._sanitize_human_collision_profiles(unknown))
+
     def test_profile_manifest_exact_retry_folds_and_conflict_fails(self):
         state, unused_clock = self._state()
         manifest = {
@@ -1248,6 +1298,54 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual((1000, 1000), (
             state.players[1].health, state.players[2].health))
         self.assertEqual([], state._human_ram_probe_snapshot())
+
+    def test_late_native_armor_for_a_retired_pair_is_a_noop_success(self):
+        state, clock = self._state()
+        for player_id, z, speed, yaw in (
+                (1, -1.6, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 1, 100000, z, speed, yaw)
+        for player_id, z, speed, yaw in (
+                (1, 0.0, 16.0, 0.0),
+                (2, 6.5, 0.0, math.pi)):
+            self._input(state, clock, player_id, 2, 200000, z, speed, yaw)
+        self.assertEqual(0, state._resolve_human_rams())
+        request = state._human_ram_probe_snapshot()[0]
+        response = {
+            'seq': request['seq'], 'first_id': 1, 'second_id': 2,
+            'available': True, 'armor_first': 45.0,
+            'armor_second': 80.0,
+        }
+
+        state.players[2].health = 0
+        state.players[2].alive = False
+        self.assertEqual(0, state._resolve_human_rams())
+        self.assertEqual([], state._human_ram_probe_snapshot())
+        self.assertEqual(
+            (1, 2),
+            state.human_ram_retired_probe_pairs[request['seq']])
+        state.players[3] = _player(3, team=2)
+
+        message = {
+            'round_id': state.round_id, 'bots': [],
+            'human_ram_armors': [response],
+        }
+        before = (state.players[1].health, state.players[2].health)
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, copy.deepcopy(message)))
+        self.assertEqual(before, (
+            state.players[1].health, state.players[2].health))
+        self.assertNotIn(
+            request['seq'], state.human_ram_retired_probe_pairs)
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, copy.deepcopy(message)))
+
+        forged = copy.deepcopy(message)
+        forged['human_ram_armors'][0]['seq'] += 1
+        self.assertFalse(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, forged))
+        self.assertEqual('human_ram_armors',
+                         state.last_bot_state_reject_code)
 
     def test_input_retry_is_idempotent_and_identity_conflict_is_rejected(self):
         state, clock = self._state()
@@ -1434,6 +1532,37 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertTrue(state.report_player_destructible_contact_result(
             SIMULATION_WORKER_AUTHORITY_ID, message))
 
+    def test_falling_column_is_a_valid_untyped_contact_result(self):
+        state, clock = self._state()
+        clock[0] = 0.2
+        token = [[22, 3, None]]
+        self.assertTrue(state.update_input(1, {
+            'round_id': state.round_id, 'input_seq': 1,
+            'pose_time_us': 100000,
+            'x': 0.0, 'y': 0.0, 'z': -1.6, 'yaw': 0.0,
+            'forward': 1.0, 'speed': 16.0,
+            'destructible_contacts': [{
+                'seq': 1, 'x': 0.0, 'y': 0.0, 'z': -1.6,
+                'yaw': 0.0, 'speed': 16.0, 'dt': 0.04,
+                'token': token,
+            }],
+        }))
+        state.destructibles[('column', 22, 3, None)] = {
+            'kind': 'destructible', 'destructible_kind': 'column',
+            'chunk_id': 22, 'item_index': 3,
+        }
+
+        self.assertTrue(state.report_player_destructible_contact_result(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'player_destructible_contact_result',
+                'round_id': state.round_id, 'player_id': 1,
+                'contact_seq': 1, 'accepted': True, 'token': token,
+            }))
+        self.assertEqual([], list(
+            state.players[1].destructible_contacts))
+        self.assertEqual(
+            1, state.players[1].destructible_contact_resolved_seq)
+
     def test_visible_input_cannot_submit_health_or_critical_verdicts(self):
         state, unused_clock = self._state()
         player = state.players[1]
@@ -1506,6 +1635,29 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual(
             'human_collision_manifest', state.battle_result['reason'])
 
+    def test_any_loading_manifest_rejection_terminates_round(self):
+        state, unused_clock = self._state()
+        state.phase = 'loading'
+        state.battle_result = None
+        state.bot_roster = [{
+            'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot',
+            'vehicle': 'ussr:R11_MS-1', 'max_health': 1000,
+        }]
+        state._human_ram_profiles_required = lambda: False
+        worker = state.simulation_worker
+        handler = object.__new__(ClientHandler)
+
+        result = handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, {
+                'type': 'bot_manifest', 'round_id': state.round_id,
+                'bots': [],
+            })
+
+        self.assertEqual('close', result)
+        self.assertFalse(worker.connected)
+        self.assertEqual(
+            'bot_manifest_rejected', state.worker_failure_reason)
+
     def test_rejected_bot_batch_fences_worker_and_terminates_round(self):
         state, unused_clock = self._state()
         worker = state.simulation_worker
@@ -1523,6 +1675,25 @@ class HumanRamTimelineTest(unittest.TestCase):
         self.assertEqual('bot_state_rejected', state.worker_failure_reason)
         self.assertEqual('bot_state_rejected', state.battle_result['reason'])
         self.assertFalse(state.result_receipts)
+
+    def test_late_rejected_bot_batch_does_not_replace_terminal_result(self):
+        state, unused_clock = self._state()
+        worker = state.simulation_worker
+        handler = object.__new__(ClientHandler)
+        terminal = {
+            'winner_team': 1, 'reason': 'all_enemies_destroyed'}
+        state.battle_result = dict(terminal)
+
+        result = handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, {
+                'type': 'bot_state', 'round_id': state.round_id,
+                'bots': [{'id': 99}],
+            })
+
+        self.assertFalse(result)
+        self.assertTrue(worker.connected)
+        self.assertIs(worker, state.simulation_worker)
+        self.assertEqual(terminal, state.battle_result)
 
     def test_sustained_overlap_without_contact_armor_never_damages(self):
         state, clock = self._state()

@@ -451,6 +451,22 @@ class BotAmmunitionTests(unittest.TestCase):
                 ValueError, 'inventory is not conserved'):
             BattleState._validate_bot_ammo_transition(previous, wrong_slot)
 
+    def test_server_accepts_partial_clip_reload_and_fire_in_one_update(self):
+        previous = {
+            'fire_seq': 1, 'shell_index': 0, 'next_shell_index': 1,
+            'ammo_remaining': [0, 2, 10],
+            'ammo_reload_pending': True,
+            'clip': 0, 'clip_size': 3,
+            'reload_time': 1.0, 'reload_duration': 1.0,
+        }
+        current = dict(
+            previous, fire_seq=2, shell_index=1, next_shell_index=2,
+            ammo_remaining=[0, 1, 10], ammo_reload_pending=True,
+            clip=1)
+
+        self.assertTrue(BattleState._validate_bot_ammo_transition(
+            previous, current))
+
     def test_server_keeps_planned_round_stable_during_reload(self):
         identity = {
             'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot',

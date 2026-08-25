@@ -9654,6 +9654,10 @@ class BattleRuntime(object):
             actual_token = (
                 self._destructible_contact_token(proposal.get('token'))
                 if isinstance(proposal, dict) else None)
+            from gui.mods.offline_lan_0922 import destructibles_authority
+            requested = set(token)
+            unresolved = set(row for row in requested
+                if not destructibles_authority.is_destroyed(*row))
             world_status = world_collision.check_horizontal_collision(
                 self._runtime.bigworld, self._runtime.math,
                 self._avatar.spaceID, self._vector(position), yaw, speed,
@@ -9668,12 +9672,16 @@ class BattleRuntime(object):
             # superset.  The worker remains authoritative: every identity the
             # visible endpoint requested must be present in its exact contact,
             # and any hard member makes the whole proposal non-crushable.
+            proposal_status = (
+                proposal.get('status')
+                if isinstance(proposal, dict) else None)
             accepted = bool(
-                isinstance(proposal, dict) and
-                proposal.get('status') == 'crushed' and
-                world_status in ('clear', 'kinetic') and
-                actual_token is not None and
-                set(token).issubset(set(actual_token)))
+                world_status in ('clear', 'kinetic') and (
+                    (not unresolved and
+                     proposal_status in ('clear', 'crushed')) or
+                    (proposal_status == 'crushed' and
+                     actual_token is not None and
+                     unresolved.issubset(set(actual_token)))))
             commit_status = None
             if accepted and bool(proposal.get('requires_commit', False)):
                 committed = self._destructibles._catalog_motion_blocked(
@@ -9692,7 +9700,7 @@ class BattleRuntime(object):
                     isinstance(committed, dict) and
                     committed.get('status') == 'crushed' and
                     committed_token is not None and
-                    set(token).issubset(set(committed_token)))
+                    unresolved.issubset(set(committed_token)))
             self._report_destructible_verdict(
                 'worker', seq, accepted, token, actual_token,
                 world_status, commit_status)
@@ -11163,11 +11171,18 @@ class BattleRuntime(object):
                 self._local_motion_status = 'kinetic'
                 token = self._destructible_contact_token(
                     proposal.get('token'))
+                committer = getattr(
+                    self._destructibles, 'commit_local_prediction', None)
                 predictor = getattr(
                     self._destructibles, 'begin_local_prediction', None)
-                predicted = bool(
-                    token is not None and callable(predictor) and
-                    predictor(token))
+                if token is not None and callable(committer):
+                    predicted = bool(committer(
+                        self._avatar.spaceID, token,
+                        self._vector(position), yaw, speed))
+                else:
+                    predicted = bool(
+                        token is not None and callable(predictor) and
+                        predictor(token))
                 world_status = world_collision.check_horizontal_collision(
                     self._runtime.bigworld, self._runtime.math,
                     self._avatar.spaceID, self._vector(position), yaw, speed,
@@ -12270,38 +12285,25 @@ class BattleRuntime(object):
 
     def _apply_local_destructible_rejection(
             self, sequence, server_pose=None):
-        """Roll back one still-pending speculative hull traversal once."""
+        """Retire a late worker disagreement without rewinding movement.
+
+        The visible endpoint already committed an exact native crush and
+        recast the same ray for a backing wall before it advanced.  The worker
+        receives that proof later and may no longer find the now-broken skin at
+        its replay pose.  Such a disagreement must not resurrect collision or
+        pull the player's vehicle backwards.
+        """
         if (sequence not in self._local_destructible_contacts or
                 sequence not in self._local_destructible_safe_poses):
             return False
-        # Later proposals were sampled beyond this rejected object. Their
-        # temporary collision bypasses are invalid as well.
         for seq, pending in self._local_destructible_contacts.items():
             if seq >= sequence:
                 self._clear_local_destructible_prediction(
                     self._destructible_contact_token(pending.get('token')))
         self._report_destructible_verdict(
-            'visible_rollback', sequence, False,
+            'visible_kept', sequence, False,
             self._destructible_contact_token(
                 self._local_destructible_contacts[sequence].get('token')))
-        position, yaw = self._local_destructible_safe_poses[sequence]
-        if server_pose is not None:
-            position, yaw = server_pose
-        self._local_position = tuple(float(value) for value in position)
-        self._local_yaw = float(yaw)
-        self._local_speed = 0.0
-        self._local_vertical_speed = 0.0
-        self._local_turn_speed = 0.0
-        self._local_drive_turn = 0.0
-        self._local_push_x = 0.0
-        self._local_push_z = 0.0
-        self._local_grind = 0
-        if self._local_camera_velocity is not None:
-            self._local_camera_velocity = self._vector((0.0, 0.0, 0.0))
-        # Every later proposal was sampled from the now-rejected speculative
-        # path. Keep its ordered wire row until the server terminates it, but
-        # discard its unsafe rollback target so a delayed rejection cannot
-        # move this vehicle forward through the intact object again.
         for seq in list(self._local_destructible_safe_poses):
             if seq >= sequence:
                 self._local_destructible_safe_poses.pop(seq, None)

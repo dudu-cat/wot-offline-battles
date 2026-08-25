@@ -1366,6 +1366,57 @@ def begin_local_prediction(token):
 	return changed
 
 
+def commit_local_prediction(spaceID, token, position, yaw, speed):
+	"""Apply an exact visible hull crush through the stock #1513 seam.
+
+	The visible client owns the native contact that its copied vehicle physics
+	just observed.  Commit that presentation before movement is advanced; the
+	hidden worker still publishes the canonical LAN event for other clients.
+	Only checksum-pinned fragile items and exact structure modules reach here.
+	"""
+	import Math
+	authority = _get_destr_authority()
+	instances = globals().get('g_offh_destr_instances', {})
+	committed = []
+	for raw in token or ():
+		try:
+			chunk_id = int(raw[0])
+			item_index = int(raw[1])
+			mat_kind = None if raw[2] is None else int(raw[2])
+		except (IndexError, TypeError, ValueError, OverflowError):
+			continue
+		instance = instances.get((chunk_id, item_index))
+		if not isinstance(instance, dict):
+			continue
+		kind = instance.get('kind')
+		if not ((kind == 'fragile' and mat_kind is None) or
+				(kind == 'structure' and mat_kind is not None)):
+			continue
+		boxes = tuple(box for box in instance.get('boxes', ())
+			if kind != 'structure' or box[2] == mat_kind)
+		if not boxes:
+			continue
+		center = boxes[0][0]
+		point = Math.Vector3(center[0], center[1], center[2])
+		if authority.is_destroyed(chunk_id, item_index, mat_kind):
+			accepted = True
+		elif kind == 'fragile':
+			accepted = authority.destroy_fragile(
+				spaceID, chunk_id, item_index, point, False)
+		else:
+			accepted = authority.destroy_module(
+				spaceID, chunk_id, item_index, mat_kind, point, False)
+		if not accepted:
+			raise RuntimeError(
+				'local native destructible prediction was not accepted: '
+				'chunk=%s item=%s' % (chunk_id, item_index))
+		note_destroyed(
+			'fragile' if kind == 'fragile' else 'module',
+			chunk_id, item_index, mat_kind)
+		committed.append((chunk_id, item_index, mat_kind))
+	return begin_local_prediction(committed) or bool(committed)
+
+
 def clear_local_prediction(token):
 	"""Stop hiding exact speculative collision after a terminal outcome."""
 	predicted = globals().get('g_offh_destr_speculative')

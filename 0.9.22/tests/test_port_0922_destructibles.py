@@ -4585,6 +4585,42 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             self.assertIsNone(destructibles_sensor._broken_collision_filter(
                 {(22, 37), (22, 38)}))
 
+    def test_local_prediction_commits_exact_native_fragile_and_module(self):
+        destructibles_sensor.g_offh_destr_instances = {
+            (22, 37): {
+                'kind': 'fragile',
+                'boxes': [((1.0, 2.0, 3.0), None, None)],
+            },
+            (22, 38): {
+                'kind': 'structure',
+                'boxes': [((4.0, 5.0, 6.0), None, 73)],
+            },
+        }
+        authority = types.SimpleNamespace(
+            is_destroyed=mock.Mock(return_value=False),
+            destroy_fragile=mock.Mock(return_value=True),
+            destroy_module=mock.Mock(return_value=True))
+        math_module = types.SimpleNamespace(Vector3=_Vector)
+
+        with mock.patch.object(
+                destructibles_sensor, '_get_destr_authority',
+                return_value=authority), mock.patch.dict(
+                    sys.modules, {
+                        'Math': math_module,
+                        'BigWorld': types.SimpleNamespace(time=lambda: 10.0),
+                        'AreaDestructibles': types.SimpleNamespace(
+                            DESTRUCTIBLE_HIDING_DELAY=0.2),
+                    }):
+            self.assertTrue(destructibles_sensor.commit_local_prediction(
+                1, ((22, 37, None), (22, 38, 73)),
+                _Vector(), 0.25, 8.0))
+
+        authority.destroy_fragile.assert_called_once()
+        authority.destroy_module.assert_called_once()
+        self.assertEqual(
+            {(22, 37, None), (22, 38, 73)},
+            destructibles_sensor.g_offh_destr_speculative)
+
     def test_isolation_clears_matching_local_prediction(self):
         destructibles_sensor.g_offh_destr_instances = {
             (22, 37): {'kind': 'fragile', 'bin_keys': []},

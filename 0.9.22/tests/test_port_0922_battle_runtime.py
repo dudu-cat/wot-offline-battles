@@ -11746,7 +11746,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'accepted_now': False, 'used_kinetic_speed': True,
                 'kinds': 'fragile', 'requires_commit': True,
             }),
-            begin_local_prediction=lambda token: predicted.append(token) or True,
+            commit_local_prediction=lambda unused_space, token,
+                unused_position, unused_yaw, unused_speed: (
+                    predicted.append(token) or True),
             clear_local_prediction=mock.Mock(return_value=True))
 
         def static_recast(*unused_args, **unused_kwargs):
@@ -11784,7 +11786,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'kinds': 'structure',
                 'requires_commit': True,
             }),
-            begin_local_prediction=mock.Mock(return_value=True),
+            commit_local_prediction=mock.Mock(return_value=True),
             clear_local_prediction=clear_prediction)
 
         with mock.patch(
@@ -11899,7 +11901,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual([], list(battle._local_destructible_safe_poses))
         battle._sender.send_current.assert_called_once_with()
 
-    def test_destructible_snapshot_rejection_rolls_back_earliest_safe_pose(self):
+    def test_destructible_snapshot_rejection_keeps_visible_native_crush(self):
         battle = BattleRuntime(_runtime())
         battle.client = _Client()
         clear_prediction = mock.Mock(return_value=True)
@@ -11929,10 +11931,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }))
 
-        self.assertEqual((1.12567, 2.0, 3.0), battle._local_position)
-        self.assertEqual(0.25, battle._local_yaw)
+        self.assertEqual((9.0, 2.0, 3.0), battle._local_position)
+        self.assertEqual(1.0, battle._local_yaw)
         self.assertEqual(
-            (0.0, 0.0, 0.0, 0.0, 0.0),
+            (8.0, -3.0, 0.4, 2.0, -2.0),
             (battle._local_speed, battle._local_vertical_speed,
              battle._local_turn_speed, battle._local_push_x,
              battle._local_push_z))
@@ -11943,7 +11945,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             mock.call(((22, 38, None),)),
         ], clear_prediction.call_args_list)
 
-    def test_direct_destructible_rejection_uses_admitted_pose_once(self):
+    def test_direct_destructible_rejection_never_rewinds_visible_pose(self):
         battle = BattleRuntime(_runtime())
         battle.client = _Client()
         battle._start_message = {'round_id': 7}
@@ -11964,25 +11966,23 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'round_id': 7, 'contact_seq': 1, 'accepted': False,
             'x': 1.125, 'y': 2.25, 'z': 3.5, 'yaw': 0.3,
         }))
-        self.assertEqual((1.125, 2.25, 3.5), battle._local_position)
-        self.assertEqual(0.3, battle._local_yaw)
-        self.assertEqual(0.0, battle._local_speed)
+        self.assertEqual((9.0, 2.0, 3.0), battle._local_position)
+        self.assertEqual(8.0, battle._local_speed)
         self.assertEqual([2], list(battle._local_destructible_contacts))
         self.assertEqual([], list(battle._local_destructible_safe_poses))
 
-        # A later rejection from the invalidated speculative path terminates
-        # its ordered row without moving the vehicle forward again.
+        # A later disagreement only terminates its ordered row as well.
         self.assertTrue(battle.on_player_destructible_contact_result({
             'type': 'player_destructible_contact_result',
             'round_id': 7, 'contact_seq': 2, 'accepted': False,
         }))
-        self.assertEqual((1.125, 2.25, 3.5), battle._local_position)
+        self.assertEqual((9.0, 2.0, 3.0), battle._local_position)
         self.assertFalse(battle.on_player_destructible_contact_result({
             'type': 'player_destructible_contact_result',
             'round_id': 7, 'contact_seq': 1, 'accepted': False,
             'x': 20.0, 'y': 20.0, 'z': 20.0, 'yaw': 1.0,
         }))
-        self.assertEqual((1.125, 2.25, 3.5), battle._local_position)
+        self.assertEqual((9.0, 2.0, 3.0), battle._local_position)
 
     def test_neutral_coast_does_not_request_kinetic_crush_drive(self):
         runtime = _runtime()
@@ -15444,6 +15444,45 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.client.send_player_destructible_contact_result.\
             assert_called_once_with(2, 3, True, requested)
 
+    def test_worker_accepts_idempotent_destructible_contact(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._worker_mode = True
+        battle._avatar = runtime.bigworld.avatar
+        battle.client = _Client()
+        battle.client.send_player_destructible_contact_result = mock.Mock(
+            return_value=True)
+        requested = [[22, 37, None]]
+        battle._destructibles = types.SimpleNamespace(
+            _catalog_motion_proposal=mock.Mock(return_value={
+                'status': 'clear', 'token': None,
+                'requires_commit': False,
+            }),
+            _catalog_motion_blocked=mock.Mock())
+        battle._resolve_player_descriptor = mock.Mock(
+            return_value=_Descriptor())
+        player = {
+            'id': 2, 'vehicle': 'ussr:R11_MS-1',
+            'vehicle_compact_descr': 'dGVzdA==',
+            'effective_params': _effective_params_snapshot(),
+            'destructible_contacts': [{
+                'seq': 3, 'x': 1.0, 'y': 2.0, 'z': 3.0,
+                'yaw': 0.25, 'speed': 8.0, 'dt': 0.04,
+                'forward': 1.0, 'token': requested,
+            }],
+        }
+
+        from gui.mods.offline_lan_0922 import destructibles_authority
+        with mock.patch.object(
+                destructibles_authority, 'is_destroyed', return_value=True):
+            self.assertEqual(
+                1, battle._resolve_player_destructible_contacts(
+                    [player], 12.5))
+
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+        battle.client.send_player_destructible_contact_result.\
+            assert_called_once_with(2, 3, True, requested)
+
     def test_worker_rejects_crush_proposal_with_a_backing_wall(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -15485,7 +15524,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.client.send_player_destructible_contact_result.\
             assert_called_once_with(2, 3, False, requested)
 
-    def test_worker_hard_destructible_block_still_rolls_visible_pose_back(self):
+    def test_worker_hard_destructible_block_never_rewinds_visible_pose(self):
         runtime = _runtime()
         worker = BattleRuntime(runtime)
         worker._worker_mode = True
@@ -15514,9 +15553,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             }],
         }
 
-        self.assertEqual(
-            1, worker._resolve_player_destructible_contacts(
-                [player], 12.5))
+        authority_name = (
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused_key: False)
+        with mock.patch.dict(sys.modules, {authority_name: authority}):
+            self.assertEqual(
+                1, worker._resolve_player_destructible_contacts(
+                    [player], 12.5))
 
         worker._destructibles._catalog_motion_blocked.assert_not_called()
         worker.client.send_player_destructible_contact_result.\
@@ -15535,8 +15579,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'round_id': 7, 'contact_seq': 1, 'accepted': False,
             'x': 1.0, 'y': 2.0, 'z': 3.0, 'yaw': 0.25,
         }))
-        self.assertEqual((1.0, 2.0, 3.0), visible._local_position)
-        self.assertEqual(0.0, visible._local_speed)
+        self.assertEqual((1.0, 2.0, 3.5), visible._local_position)
+        self.assertEqual(8.0, visible._local_speed)
 
     def test_worker_launch_uses_visible_trigger_ray_not_model_node(self):
         runtime = _runtime()

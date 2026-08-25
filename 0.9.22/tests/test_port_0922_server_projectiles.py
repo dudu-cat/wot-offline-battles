@@ -1110,16 +1110,39 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(1000, state.players[3].health)
         self.assertIn('1:p:1:1', state.projectiles)
 
+    def test_splash_uses_the_workers_collision_time_target_pose(self):
+        state = _state(players=3)
+        self.assertTrue(_launch_authority(state, _launch(
+            is_he=True, splash_radius=15.0, penetration_factor=0.0)))
+        state.players[3].x = 100.0
+        message = _resolve(
+            '1:p:1:1', penetration_factor=0.0,
+            direct=_effect(target_id=2, damage=50),
+            splash=[_effect(target_id=3, damage=40, x=20.0)])
+
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertEqual([950, 960],
+                         [state.players[index].health for index in (2, 3)])
+
     def test_expiration_result_and_reset_lifecycle(self):
         state = _state()
         self.assertTrue(_launch_authority(
             state, _launch(max_time_ms=100)))
         state.tick += 3
+
+        self.assertEqual(0, state._expire_projectiles())
+        self.assertIn('1:p:1:1', state.projectiles)
+
+        state.simulation_worker.connected = False
+        state.simulation_worker = None
+        state.bot_authority_id = None
         self.assertEqual(1, state._expire_projectiles())
         self.assertNotIn('1:p:1:1', state.projectiles)
         self.assertEqual('expired',
                          state.projectile_tombstones['1:p:1:1']['outcome'])
 
+        _attach_worker_authority(state)
         self.assertTrue(_launch_authority(state, _launch(
             shooter_id=2, shot_seq=1, max_time_ms=10000)))
         self.assertTrue(state._finish_battle(1, 'test'))
@@ -1367,8 +1390,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         state.players[1].offer_reliable = offer_reliable
         state.players[1].offer_snapshot = (
             lambda message: snapshots.append(message) or True)
-        samples = iter((40000, 40017))
-        state._server_time_ms = lambda: next(samples)
+        state._server_time_ms = lambda: 40017
 
         state.tick_once(1.0 / TICK_HZ)
 
