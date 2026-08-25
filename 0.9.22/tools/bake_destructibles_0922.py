@@ -229,8 +229,8 @@ def _item_scale(transform):
     return scale
 
 
-def _native_wires(compiled, bsmi_count):
-    """Map each referenced BSMI row to its native (chunk_id, item_index).
+def native_wires(compiled, bsmi_count):
+    """Map referenced scene rows to native ``(chunk_id, item_index)`` wires.
 
     WGDE table "1" rows are (chunk_id, global_item_begin, item_count) and
     must partition table "2" from zero.  Each non-empty table "2" row is one
@@ -269,7 +269,7 @@ def _native_wires(compiled, bsmi_count):
                 native_index += 1
     row_wires = {}
     wire_rows = {}
-    sptr_seen = set()
+    speedtree_wires = {}
     ref_cursor = 0
     for position, (ref_begin, ref_end) in enumerate(table2):
         ref_begin = int(ref_begin)
@@ -286,9 +286,9 @@ def _native_wires(compiled, bsmi_count):
             ref = int(table3[ref_index])
             if ref & SPTR_INDEX_BIT:
                 index = ref & ~SPTR_INDEX_BIT
-                if not 0 <= index < sptr_count or index in sptr_seen:
+                if not 0 <= index < sptr_count or index in speedtree_wires:
                     raise ValueError('WGDE SpTr reference is invalid')
-                sptr_seen.add(index)
+                speedtree_wires[index] = wire
             else:
                 if not 0 <= ref < bsmi_count or ref in row_wires:
                     raise ValueError('WGDE BSMI reference is invalid')
@@ -299,6 +299,13 @@ def _native_wires(compiled, bsmi_count):
         ref_cursor = ref_end + 1
     if ref_cursor != len(table3):
         raise ValueError('WGDE item spans do not cover the reference table')
+    return row_wires, wire_rows, speedtree_wires
+
+
+def _native_wires(compiled, bsmi_count):
+    """Backward-compatible BSMI-only view used by this catalog baker."""
+    row_wires, wire_rows, unused_speedtree_wires = native_wires(
+        compiled, bsmi_count)
     return row_wires, wire_rows
 
 

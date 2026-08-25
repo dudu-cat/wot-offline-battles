@@ -70,6 +70,8 @@ RPM_PRESENTATION_SECONDS = 0.10
 SPOTTING_UPDATE_SECONDS = 0.10
 SPOTTING_PROBE_SECONDS = 0.50
 SPOTTING_PHASE_BUCKETS = 5
+FALLEN_TREE_FOLIAGE_REFRESH_SECONDS = 0.10
+FALLEN_TREE_FOLIAGE_STABLE_READS = 3
 # Stock client code can republish the server half of a space visibility mask
 # after the local map has entered the battle.  Read it infrequently and only
 # write when it no longer selects this arena's gameplay.
@@ -1304,6 +1306,9 @@ class BattleRuntime(object):
         self._next_outline_report = 0.0
         self._next_spotting_time = 0.0
         self._foliage = None
+        self._next_fallen_tree_foliage_refresh = 0.0
+        self._fallen_tree_foliage_seen_bodies = set()
+        self._fallen_tree_foliage_stable = {}
         self._projectiles = None
         self._projectile_meta = {}
         self._projectile_visual_meta = {}
@@ -1522,6 +1527,9 @@ class BattleRuntime(object):
         self._overturn_started = None
         self._next_spotting_time = 0.0
         self._foliage = None
+        self._next_fallen_tree_foliage_refresh = 0.0
+        self._fallen_tree_foliage_seen_bodies = set()
+        self._fallen_tree_foliage_stable = {}
         projectile_now = self._clock()
         self._projectiles = InFlightProjectiles(
             maximum_active=PROJECTILE_MAX_ACTIVE,
@@ -1642,6 +1650,9 @@ class BattleRuntime(object):
                 self._destructibles.reset(self._avatar.spaceID)
                 self._destructibles.set_event_sink(
                     self._report_destructible)
+                if 'destructibles' in self._start_message:
+                    self._apply_destructible_state(
+                        self._start_message.get('destructibles'))
             # From this point onward every stock Avatar branch must see a real
             # battle, not the viewer mode used by OfflineMapCreator.  destroy()
             # does not require Active(), so it still owns the exact space ids.
@@ -6941,27 +6952,37 @@ class BattleRuntime(object):
             return False
         self._clear_local_destructible_prediction(
             ((chunk_id, item_index, mat_kind),))
-        if destructibles_authority.is_destroyed(
-                chunk_id, item_index, mat_kind):
-            return False
+        already_destroyed = destructibles_authority.is_destroyed(
+            chunk_id, item_index, mat_kind)
         position = self._vector((x, y, z))
         space_id = self._avatar.spaceID
+        applied = False
+        if not already_destroyed:
+            if kind == 'tree':
+                applied = destructibles_authority.destroy_tree(
+                    space_id, chunk_id, item_index,
+                    fall_yaw, speed, position)
+            elif kind == 'column':
+                applied = destructibles_authority.destroy_column(
+                    space_id, chunk_id, item_index,
+                    fall_yaw, speed, position)
+            elif kind == 'fragile':
+                applied = destructibles_authority.destroy_fragile(
+                    space_id, chunk_id, item_index, position, is_shot)
+            else:
+                applied = destructibles_authority.destroy_module(
+                    space_id, chunk_id, item_index,
+                    mat_kind, position, is_shot)
+            if (not applied and not destructibles_authority.is_destroyed(
+                    chunk_id, item_index, mat_kind)):
+                raise RuntimeError(
+                    '#1513 failed to apply canonical destructible event')
+        foliage_changed = False
         if kind == 'tree':
-            applied = destructibles_authority.destroy_tree(
-                space_id, chunk_id, item_index, fall_yaw, speed, position)
-        elif kind == 'column':
-            applied = destructibles_authority.destroy_column(
-                space_id, chunk_id, item_index, fall_yaw, speed, position)
-        elif kind == 'fragile':
-            applied = destructibles_authority.destroy_fragile(
-                space_id, chunk_id, item_index, position, is_shot)
-        else:
-            applied = destructibles_authority.destroy_module(
-                space_id, chunk_id, item_index, mat_kind, position, is_shot)
-        if (not applied and not destructibles_authority.is_destroyed(
-                chunk_id, item_index, mat_kind)):
-            raise RuntimeError(
-                '#1513 failed to apply canonical destructible event')
+            foliage_changed = self._activate_fallen_tree_foliage(
+                chunk_id, item_index)
+        if already_destroyed:
+            return foliage_changed
         note_destroyed = getattr(
             self._destructibles, 'note_destroyed', None)
         if callable(note_destroyed):
@@ -9958,6 +9979,9 @@ class BattleRuntime(object):
             self._flush_pending_bot_create(now)
             self._flush_pending_entities(now)
             self._drain_event_journal()
+            self._run_optional_feature(
+                'foliage camouflage',
+                self._refresh_fallen_tree_foliage, (now,))
             self._maybe_send_battle_ready()
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
@@ -14823,6 +14847,160 @@ class BattleRuntime(object):
             self._warn_optional_failure('foliage camouflage', error)
             return 0.0
 
+    def _activate_fallen_tree_foliage(self, chunk_id, item_index):
+        if (self._foliage is None or not self._optional_feature_enabled(
+                'foliage camouflage')):
+            return False
+        activate = getattr(self._foliage, 'activate_fallen_tree', None)
+        if not callable(activate):
+            return False
+        try:
+            changed = bool(activate(chunk_id, item_index))
+            if changed:
+                self._next_fallen_tree_foliage_refresh = 0.0
+                identity = (int(chunk_id), int(item_index))
+                self._fallen_tree_foliage_seen_bodies.discard(identity)
+                self._fallen_tree_foliage_stable.pop(identity, None)
+            return changed
+        except Exception as error:
+            self._foliage = None
+            self._warn_optional_failure('foliage camouflage', error)
+            return False
+
+    def _fallen_tree_body_identities(self):
+        area_destructibles = getattr(
+            self._runtime, 'area_destructibles', None)
+        animator = getattr(
+            area_destructibles, 'g_destructiblesAnimator', None)
+        bodies = getattr(
+            animator, '_DestructiblesAnimator__bodies', None)
+        if not isinstance(bodies, (list, tuple)):
+            return None
+        identities = set()
+        for body in bodies:
+            if not isinstance(body, dict):
+                continue
+            try:
+                if int(body.get('spaceID')) != int(self._avatar.spaceID):
+                    continue
+                identities.add((
+                    int(body['chunkID']), int(body['destrIndex'])))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        return identities
+
+    def _native_fallen_tree_pose(self, chunk_id, item_index):
+        profile_reader = getattr(
+            self._foliage, 'fallen_tree_profile', None)
+        if not callable(profile_reader):
+            return None
+        profile = profile_reader(chunk_id, item_index)
+        if profile is None:
+            return None
+        center, half_sizes = profile
+        bigworld = self._runtime.bigworld
+        math_module = self._runtime.math
+        chunk_matrix = bigworld.wg_getChunkMatrix(
+            self._avatar.spaceID, int(chunk_id))
+        chunk_translation = getattr(chunk_matrix, 'translation', None)
+        if chunk_translation is None:
+            return None
+        matrix = math_module.Matrix(bigworld.wg_getDestructibleMatrix(
+            self._avatar.spaceID, int(chunk_id), int(item_index)))
+        local_center = self._vector(center)
+        transformed_center = matrix.applyPoint(local_center)
+        world_center = (
+            float(chunk_translation.x + transformed_center.x),
+            float(chunk_translation.y + transformed_center.y),
+            float(chunk_translation.z + transformed_center.z),
+        )
+        half_axes = []
+        for axis in (
+                (half_sizes[0], 0.0, 0.0),
+                (0.0, half_sizes[1], 0.0),
+                (0.0, 0.0, half_sizes[2])):
+            vector = matrix.applyVector(self._vector(axis))
+            half_axes.append((
+                float(vector.x), float(vector.y), float(vector.z)))
+        return world_center, tuple(half_axes)
+
+    def _refresh_fallen_tree_foliage(self, now, force=False):
+        if self._foliage is None:
+            return False
+        pending_reader = getattr(
+            self._foliage, 'refreshing_fallen_tree_wires', None)
+        update = getattr(self._foliage, 'update_fallen_tree_pose', None)
+        settle = getattr(self._foliage, 'settle_fallen_tree', None)
+        if not (callable(pending_reader) and callable(update) and
+                callable(settle)):
+            return False
+        pending = tuple(pending_reader())
+        if not pending:
+            return False
+        now = float(now)
+        if (not force and
+                now + 1.0e-9 < self._next_fallen_tree_foliage_refresh):
+            return False
+        self._next_fallen_tree_foliage_refresh = (
+            now + FALLEN_TREE_FOLIAGE_REFRESH_SECONDS)
+        body_identities = self._fallen_tree_body_identities()
+        manager = getattr(
+            getattr(self._runtime, 'area_destructibles', None),
+            'g_destructiblesManager', None)
+        force_no_animation = bool(getattr(
+            manager, 'forceNoAnimation', False))
+        waiting = getattr(
+            manager, '_DestructiblesManager__destructiblesWaitDestroy', {})
+        loaded = getattr(
+            manager, '_DestructiblesManager__loadedChunkIDs', None)
+        changed = False
+        for identity in pending:
+            chunk_id, item_index = identity
+            if (isinstance(waiting, dict) and
+                    int(chunk_id) in waiting):
+                self._fallen_tree_foliage_stable.pop(identity, None)
+                continue
+            if (isinstance(loaded, dict) and
+                    int(chunk_id) not in loaded):
+                self._fallen_tree_foliage_stable.pop(identity, None)
+                continue
+            try:
+                pose = self._native_fallen_tree_pose(
+                    chunk_id, item_index)
+            except Exception:
+                # A canonical snapshot can precede this chunk's native stream.
+                # Keep the dormant profile pending and retry after it loads.
+                continue
+            if pose is None:
+                continue
+            changed = bool(update(
+                chunk_id, item_index, pose[0], pose[1])) or changed
+            signature = tuple(round(value, 5) for value in (
+                tuple(pose[0]) +
+                tuple(component for axis in pose[1]
+                      for component in axis)))
+            if (body_identities is not None and
+                    identity in body_identities):
+                self._fallen_tree_foliage_seen_bodies.add(identity)
+                self._fallen_tree_foliage_stable.pop(identity, None)
+                continue
+            if (identity in self._fallen_tree_foliage_seen_bodies or
+                    force_no_animation):
+                settle(chunk_id, item_index)
+                self._fallen_tree_foliage_seen_bodies.discard(identity)
+                self._fallen_tree_foliage_stable.pop(identity, None)
+                continue
+            previous = self._fallen_tree_foliage_stable.get(identity)
+            stable_reads = (
+                previous[1] + 1
+                if previous is not None and previous[0] == signature else 1)
+            self._fallen_tree_foliage_stable[identity] = (
+                signature, stable_reads)
+            if stable_reads >= FALLEN_TREE_FOLIAGE_STABLE_READS:
+                settle(chunk_id, item_index)
+                self._fallen_tree_foliage_stable.pop(identity, None)
+        return changed
+
     def _spot_line_of_sight(self, observer, target, target_descriptor,
                             target_moving=False, fired_recently=False,
                             target_still_seconds=0.0,
@@ -16255,6 +16433,9 @@ class BattleRuntime(object):
         self._prebattle_deadline = None
         self._next_spotting_time = 0.0
         self._foliage = None
+        self._next_fallen_tree_foliage_refresh = 0.0
+        self._fallen_tree_foliage_seen_bodies = set()
+        self._fallen_tree_foliage_stable = {}
         if cleanup_error is not None:
             raise cleanup_error
 

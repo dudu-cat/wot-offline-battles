@@ -6219,6 +6219,51 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual(('catalog', None), calls[-1])
 
+    def test_battle_start_replays_canonical_destructible_ledger_after_reset(self):
+        runtime = _runtime()
+        runtime.area_destructibles = object()
+        runtime.destructibles_cache = object()
+        runtime.destructible_catalog_loader = mock.Mock(return_value={
+            'map': '01_karelia', 'resources': {}})
+        battle = BattleRuntime(runtime)
+        module = sys.modules[BattleRuntime.__module__]
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+        calls = []
+        ledger = [{
+            'destructible_kind': 'tree',
+            'chunk_id': 3, 'item_index': 9,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.75, 'speed': 2.0,
+            'is_shot': False,
+        }]
+        message = _minimal_start()
+        message['destructibles'] = ledger
+
+        def apply_state(events):
+            calls.append(('ledger', events))
+            return True
+
+        battle._apply_destructible_state = mock.Mock(side_effect=apply_state)
+        with mock.patch.object(
+                module.destructibles_compat, 'install', return_value=True), \
+                mock.patch.object(destructibles_sensor, 'set_catalog'), \
+                mock.patch.object(
+                    destructibles_sensor, 'reset',
+                    side_effect=lambda space_id=None: calls.append(
+                        ('reset', space_id))), \
+                mock.patch.object(
+                    destructibles_sensor, 'set_event_sink',
+                    side_effect=lambda sink: calls.append(('sink', sink))):
+            self.assertTrue(battle.start({
+                'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+                'name': 'Player'}, message, _Client()))
+            battle.stop(show_login=False)
+
+        self.assertEqual('reset', calls[0][0])
+        self.assertEqual('sink', calls[1][0])
+        self.assertEqual(('ledger', ledger), calls[2])
+        battle._apply_destructible_state.assert_called_once_with(ledger)
+
     def test_destructible_catalog_failure_disables_only_that_feature(self):
         module = sys.modules[BattleRuntime.__module__]
         from gui.mods.offline_lan_0922 import destructibles_sensor
@@ -14035,6 +14080,151 @@ class BattleRuntimeContractTests(unittest.TestCase):
                     create=True), self.assertRaisesRegex(
                     RuntimeError, 'shot flag is invalid'):
             battle._apply_destructible_event(invalid)
+
+    def test_canonical_tree_activates_foliage_on_first_event_and_echo(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = mock.Mock()
+        battle._destructibles.is_isolated_1513.return_value = False
+        battle._foliage = mock.Mock()
+        battle._foliage.activate_fallen_tree.side_effect = [True, False]
+        event = {
+            'destructible_kind': 'tree',
+            'chunk_id': 3, 'item_index': 9,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.75, 'speed': 2.0,
+            'is_shot': False}
+        authority = types.ModuleType(
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority.is_destroyed = mock.Mock(side_effect=[False, True])
+        authority.destroy_tree = mock.Mock(return_value=True)
+        package = sys.modules['gui.mods.offline_lan_0922']
+
+        with mock.patch.dict(sys.modules, {
+                'gui.mods.offline_lan_0922.destructibles_authority':
+                authority}), mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
+            self.assertTrue(battle._apply_destructible_event(event))
+            self.assertFalse(battle._apply_destructible_event(event))
+
+        authority.destroy_tree.assert_called_once()
+        args = authority.destroy_tree.call_args[0]
+        self.assertEqual((7, 3, 9), args[:3])
+        self.assertEqual(0.75, args[3])
+        self.assertEqual(2.0, args[4])
+        self.assertEqual((1.0, 2.0, 3.0), tuple(args[5]))
+        self.assertEqual(
+            [mock.call(3, 9), mock.call(3, 9)],
+            battle._foliage.activate_fallen_tree.call_args_list)
+        battle._destructibles.note_destroyed.assert_called_once_with(
+            'tree', 3, 9, None, runtime.bigworld.now)
+
+    def test_fallen_tree_foliage_follows_native_direction_and_angle(self):
+        class NativeTreeMatrix(object):
+            def __init__(self, translation):
+                self.translation = _Vector(translation)
+
+            @staticmethod
+            def applyVector(value):
+                value = _Vector(value)
+                return _Vector(
+                    3.0 * value.y,
+                    4.0 * value.y + 0.5 * value.z,
+                    2.0 * value.x + 0.5 * value.z)
+
+            def applyPoint(self, value):
+                return self.translation + self.applyVector(value)
+
+        runtime = _runtime()
+        current_matrix = [NativeTreeMatrix((1.0, 2.0, 3.0))]
+        runtime.math.Matrix = lambda value=None: value
+        runtime.bigworld.wg_getChunkMatrix = lambda space, chunk: \
+            types.SimpleNamespace(translation=_Vector(100.0, 2.0, 200.0))
+        runtime.bigworld.wg_getDestructibleMatrix = \
+            lambda space, chunk, item: current_matrix[0]
+        bodies = [{
+            'spaceID': 7, 'chunkID': 3, 'destrIndex': 9,
+        }]
+        runtime.area_destructibles = types.SimpleNamespace(
+            g_destructiblesAnimator=types.SimpleNamespace(
+                _DestructiblesAnimator__bodies=bodies),
+            g_destructiblesManager=types.SimpleNamespace(
+                forceNoAnimation=False,
+                _DestructiblesManager__loadedChunkIDs={3: 10},
+                _DestructiblesManager__destructiblesWaitDestroy={}))
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._foliage = mock.Mock()
+        battle._foliage.refreshing_fallen_tree_wires.return_value = ((3, 9),)
+        battle._foliage.fallen_tree_profile.return_value = (
+            (0.0, 5.0, 0.0), (2.0, 5.0, 1.0))
+        battle._foliage.update_fallen_tree_pose.return_value = True
+
+        self.assertTrue(battle._refresh_fallen_tree_foliage(1.0))
+        first = battle._foliage.update_fallen_tree_pose.call_args[0]
+        self.assertEqual((3, 9), first[:2])
+        self.assertEqual((116.0, 24.0, 203.0), first[2])
+        self.assertEqual((
+            (0.0, 0.0, 4.0),
+            (15.0, 20.0, 0.0),
+            (0.0, 0.5, 0.5),
+        ), first[3])
+        self.assertIn((3, 9), battle._fallen_tree_foliage_seen_bodies)
+
+        current_matrix[0] = NativeTreeMatrix((2.0, 1.0, 4.0))
+        bodies[:] = []
+        self.assertTrue(battle._refresh_fallen_tree_foliage(1.1))
+        battle._foliage.settle_fallen_tree.assert_called_once_with(3, 9)
+        self.assertNotIn((3, 9), battle._fallen_tree_foliage_seen_bodies)
+
+    def test_fallen_tree_foliage_waits_for_queued_chunk_before_settling(self):
+        class NativeTreeMatrix(object):
+            def __init__(self, translation):
+                self.translation = _Vector(translation)
+
+            @staticmethod
+            def applyVector(value):
+                return _Vector(value)
+
+            def applyPoint(self, value):
+                return self.translation + _Vector(value)
+
+        runtime = _runtime()
+        current_matrix = [NativeTreeMatrix((0.0, 0.0, 0.0))]
+        runtime.math.Matrix = lambda value=None: value
+        runtime.bigworld.wg_getChunkMatrix = lambda space, chunk: \
+            types.SimpleNamespace(translation=_Vector())
+        runtime.bigworld.wg_getDestructibleMatrix = \
+            lambda space, chunk, item: current_matrix[0]
+        manager = types.SimpleNamespace(
+            forceNoAnimation=True,
+            _DestructiblesManager__loadedChunkIDs={},
+            _DestructiblesManager__destructiblesWaitDestroy={3: [object()]})
+        runtime.area_destructibles = types.SimpleNamespace(
+            g_destructiblesAnimator=types.SimpleNamespace(
+                _DestructiblesAnimator__bodies=[]),
+            g_destructiblesManager=manager)
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._foliage = mock.Mock()
+        battle._foliage.refreshing_fallen_tree_wires.return_value = ((3, 9),)
+        battle._foliage.fallen_tree_profile.return_value = (
+            (0.0, 5.0, 0.0), (2.0, 5.0, 1.0))
+        battle._foliage.update_fallen_tree_pose.return_value = True
+
+        self.assertFalse(battle._refresh_fallen_tree_foliage(1.0))
+        battle._foliage.update_fallen_tree_pose.assert_not_called()
+        battle._foliage.settle_fallen_tree.assert_not_called()
+
+        manager._DestructiblesManager__destructiblesWaitDestroy.clear()
+        manager._DestructiblesManager__loadedChunkIDs[3] = 10
+        current_matrix[0] = NativeTreeMatrix((8.0, 1.0, -2.0))
+        self.assertTrue(battle._refresh_fallen_tree_foliage(1.1))
+        update = battle._foliage.update_fallen_tree_pose.call_args[0]
+        self.assertEqual((8.0, 6.0, -2.0), update[2])
+        battle._foliage.settle_fallen_tree.assert_called_once_with(3, 9)
 
     def test_canonical_event_never_reenters_an_isolated_native_wire(self):
         runtime = _runtime()

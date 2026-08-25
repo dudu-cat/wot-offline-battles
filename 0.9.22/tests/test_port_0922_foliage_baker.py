@@ -36,7 +36,7 @@ class FoliageBaker0922Tests(unittest.TestCase):
     def test_contract_is_pinned_to_client_1513(self):
         self.assertEqual('offline-lan-0922-foliage',
                          self.baker.FORMAT_NAME)
-        self.assertEqual(1, self.baker.FORMAT_VERSION)
+        self.assertEqual(2, self.baker.FORMAT_VERSION)
         self.assertEqual('offline-lan-0922-foliage-manifest',
                          self.baker.MANIFEST_FORMAT)
         self.assertEqual('0.9.22.0.1-cn-1513', self.baker.GAME_VERSION)
@@ -124,6 +124,43 @@ class FoliageBaker0922Tests(unittest.TestCase):
         self.assertEqual(10, len(data['instances'][0]))
         self.assertEqual({'0,0': [0], '0,1': [0],
                           '1,0': [0], '1,1': [0]}, data['cells'])
+        self.assertEqual([], data['fallen_trees'])
+
+    def test_pure_bake_maps_fallable_trees_to_exact_native_wires(self):
+        payload = struct.pack('<I6f', 106, -2.0, 0.0, -1.0,
+                              2.0, 10.0, 1.0)
+
+        class Resources(object):
+            @staticmethod
+            def read(name):
+                if name.lower() not in (
+                        'speedtree/test/oak.ctree',
+                        'speedtree/test/shrubsouth.ctree'):
+                    raise KeyError(name)
+                return payload
+
+        transform = (
+            2.0, 0.0, 0.0, 0.0,
+            0.0, 2.0, 0.0, 0.0,
+            0.0, 0.0, 2.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        data = self.baker.bake_speedtrees(
+            Resources(), 'test_map', ('shrubsouth',), [
+                ('speedtree/test/Oak.spt', transform),
+                ('speedtree/test/ShrubSouth.spt', transform),
+            ], 32.0, {
+                'speedtree/test/oak.spt': {
+                    'health': 20.0, 'density': 0.3},
+                'speedtree/test/shrubsouth.spt': {
+                    'health': 20.0, 'density': 0.3},
+            }, {0: (12, 7), 1: (12, 8)})
+
+        self.assertEqual(1, len(data['instances']))
+        self.assertEqual([
+            [12, 7, -2.0, 0.0, -1.0, 2.0, 10.0, 1.0, None],
+            [12, 8, -2.0, 0.0, -1.0, 2.0, 10.0, 1.0, 0],
+        ], data['fallen_trees'])
 
     def test_complete_real_batch_matches_manifest_checksums(self):
         manifest_path = DATA_ROOT / 'manifest.json'
@@ -146,6 +183,9 @@ class FoliageBaker0922Tests(unittest.TestCase):
             self.assertEqual(self.baker.GAME_VERSION, data['game_version'])
             self.assertGreater(len(data['instances']), 0)
             self.assertTrue(all(len(row) == 10 for row in data['instances']))
+            self.assertGreater(len(data['fallen_trees']), 0)
+            self.assertTrue(all(
+                len(row) == 9 for row in data['fallen_trees']))
 
     def test_runtime_loader_only_validates_selected_foliage_record(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,6 +210,25 @@ class FoliageBaker0922Tests(unittest.TestCase):
                     ValueError, 'manifest record is invalid'):
                 prebaked_foliage.load_foliage(
                     '06_ensk', base_dir=directory)
+
+    def test_runtime_loader_rejects_shared_standing_foliage_reference(self):
+        data = {
+            'format': self.baker.FORMAT_NAME,
+            'version': self.baker.FORMAT_VERSION,
+            'game_version': self.baker.GAME_VERSION,
+            'map': '06_ensk', 'cell_size': 32.0,
+            'instances': [[
+                0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0,
+                0.15, 1.0]],
+            'cells': {},
+            'fallen_trees': [
+                [1, 1, -1.0, 0.0, -1.0, 1.0, 2.0, 1.0, 0],
+                [1, 2, -1.0, 0.0, -1.0, 1.0, 2.0, 1.0, 0],
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, 'standing foliage'):
+            prebaked_foliage._validate(data, '06_ensk')
 
 
 if __name__ == '__main__':
