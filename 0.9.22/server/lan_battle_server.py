@@ -4423,6 +4423,13 @@ class BattleState:
         if terminal is None:
             return None
         durable = json.loads(json.dumps(terminal))
+        current = bot.get("critical")
+        if (isinstance(current, dict) and
+                current.get("ammo_rack_death", False)):
+            # The manifest's generic wreck is built before this shot. Keep
+            # the admitted ammo-rack terminal cause when completing the rest
+            # of the destroyed module/crew projection.
+            durable["ammo_rack_death"] = True
         bot["critical"] = durable
         bot["combat_fire_elapsed"] = 0.0
         bot["combat_fire_timer"] = 0.0
@@ -6192,7 +6199,12 @@ class BattleState:
             critical_before = combat_before[2]
             applied = min(damage, int(target.get("health", 0)))
             target["health"] = int(target.get("health", 0)) - applied
-            target["alive"] = target["health"] > 0 and not crew_knockout
+            if ammo_rack_death and target["health"] > 0:
+                applied += target["health"]
+                target["health"] = 0
+            target["alive"] = (
+                target["health"] > 0 and not crew_knockout and
+                not ammo_rack_death)
             target["display_health"] = target["health"]
             if crew_knockout:
                 target["death_reason"] = 0
