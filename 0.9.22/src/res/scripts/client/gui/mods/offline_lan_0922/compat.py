@@ -1139,6 +1139,10 @@ class OfflineCompatibility(object):
                     id(vehicle)) if vehicle is not None else None
                 if overlay is not None and overlay.get('_pose_active'):
                     matrix = overlay['matrix']
+                    steady_rotation = overlay.get(
+                        'steady_rotation_matrix', matrix)
+                    stabilised_matrix = overlay.get(
+                        'stabilised_matrix', matrix)
                     output = getattr(
                         calculator,
                         '_SteadyVehicleMatrixCalculator__outputMProv', None)
@@ -1149,12 +1153,12 @@ class OfflineCompatibility(object):
                     if output is None or stabilised is None:
                         raise RuntimeError(
                             '#1513 steady vehicle providers are unavailable')
-                    output.rotationSrc = matrix
-                    output.translationSrc = matrix
-                    stabilised.target = matrix
-                    if (output.rotationSrc is not matrix or
-                            output.translationSrc is not matrix or
-                            stabilised.target is not matrix):
+                    output.rotationSrc = steady_rotation
+                    output.translationSrc = stabilised_matrix
+                    stabilised.target = stabilised_matrix
+                    if (output.rotationSrc is not steady_rotation or
+                            output.translationSrc is not stabilised_matrix or
+                            stabilised.target is not stabilised_matrix):
                         raise RuntimeError(
                             '#1513 steady vehicle providers rejected live '
                             'pose')
@@ -1671,9 +1675,10 @@ class OfflineCompatibility(object):
                 vehicle_filter = (
                     compatibility._original_vehicle_getattribute(
                         vehicle, name))
-                pose_matrix = (overlay['matrix']
-                               if (direct_fixed_turret_pose or
-                                   direct_crashed_track_pose) else None)
+                pose_matrix = (
+                    overlay.get('stabilised_matrix', overlay['matrix'])
+                    if direct_fixed_turret_pose else
+                    (overlay['matrix'] if direct_crashed_track_pose else None))
                 velocity = (overlay.get('velocity')
                             if direct_camera_motion else None)
                 acceleration = (overlay.get('acceleration')
@@ -3043,7 +3048,9 @@ class OfflineCompatibility(object):
 
     def set_vehicle_pose_overlay(self, vehicle, position, yaw, matrix,
                                  speed=0.0, turn_speed=0.0, velocity=None,
-                                 acceleration=None):
+                                 acceleration=None,
+                                 steady_rotation_matrix=None,
+                                 stabilised_matrix=None):
         """Publish one copied-physics pose through the stock Vehicle API.
 
         #1513's client-only ``Vehicle`` has no retail cell stream, so its
@@ -3059,6 +3066,11 @@ class OfflineCompatibility(object):
         overlay['position'] = position
         overlay['yaw'] = float(yaw)
         overlay['matrix'] = matrix
+        overlay['steady_rotation_matrix'] = (
+            matrix if steady_rotation_matrix is None
+            else steady_rotation_matrix)
+        overlay['stabilised_matrix'] = (
+            matrix if stabilised_matrix is None else stabilised_matrix)
         overlay['speed'] = float(speed)
         overlay['turn_speed'] = float(turn_speed)
         if velocity is not None:
@@ -3103,6 +3115,7 @@ class OfflineCompatibility(object):
                 not overlay.get('_pose_active')):
             raise RuntimeError('player pose source requires a live overlay')
         matrix = overlay['matrix']
+        stabilised_matrix = overlay.get('stabilised_matrix', matrix)
         matrices = getattr(avatar, 'consistentMatrices', None)
         if matrices is None:
             raise RuntimeError('#1513 ConsistentMatrices is unavailable')
@@ -3120,8 +3133,8 @@ class OfflineCompatibility(object):
         if stabilised is None:
             raise RuntimeError(
                 '#1513 player stabilised matrix provider is unavailable')
-        stabilised.target = matrix
-        if stabilised.target is not matrix:
+        stabilised.target = stabilised_matrix
+        if stabilised.target is not stabilised_matrix:
             raise RuntimeError(
                 '#1513 player stabilised matrix rejected live pose')
 
@@ -3173,6 +3186,7 @@ class OfflineCompatibility(object):
         if overlay is None:
             return False
         for name in ('_pose_active', 'position', 'yaw', 'matrix',
+                     'steady_rotation_matrix', 'stabilised_matrix',
                      'speed', 'turn_speed', 'velocity', 'acceleration',
                      '_collision_filter'):
             overlay.pop(name, None)

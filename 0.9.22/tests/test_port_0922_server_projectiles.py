@@ -247,7 +247,6 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         state = _state()
         player = state.players[1]
         player.vehicle = 'sweden:S21_UDES_03'
-
         _update_player_input(
             state, 1, siege_enabled=True, forward=1.0, turn=1.0,
             speed=99.0, x=10.0, y=4.0, z=11.0, yaw=0.5)

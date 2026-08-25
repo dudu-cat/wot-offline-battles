@@ -96,6 +96,17 @@ class _MatrixAnimation(object):
         self.translation = _Vector()
 
 
+class _MatrixInverse(object):
+    def __init__(self, source):
+        self.source = source
+
+
+class _MatrixProduct(object):
+    def __init__(self):
+        self.a = None
+        self.b = None
+
+
 class _Matrix(object):
     def __init__(self, other=None):
         self.yaw = getattr(other, 'yaw', 0.0)
@@ -116,6 +127,15 @@ class _Matrix(object):
     def setIdentity(self):
         self.yaw = self.pitch = self.roll = 0.0
         self.translation = _Vector()
+
+    def set(self, other):
+        self.yaw = getattr(other, 'yaw', 0.0)
+        self.pitch = getattr(other, 'pitch', 0.0)
+        self.roll = getattr(other, 'roll', 0.0)
+        self.translation = _Vector(getattr(
+            other, 'translation', _Vector()))
+        self.axis = _Vector(getattr(
+            other, 'axis', _Vector(0.0, 0.0, 1.0)))
 
     def setRotateYPR(self, value):
         self.yaw, self.pitch, self.roll = map(float, value)
@@ -999,11 +1019,19 @@ class _Compatibility(object):
 
     def set_vehicle_pose_overlay(self, vehicle, position, yaw, matrix,
                                  speed=0.0, turn_speed=0.0, velocity=None,
-                                 acceleration=None):
+                                 acceleration=None,
+                                 steady_rotation_matrix=None,
+                                 stabilised_matrix=None):
+        if steady_rotation_matrix is None:
+            steady_rotation_matrix = matrix
+        if stabilised_matrix is None:
+            stabilised_matrix = matrix
         self.pose_overlays[id(vehicle)] = {
             'position': position, 'yaw': yaw, 'matrix': matrix,
             'speed': speed, 'turn_speed': turn_speed,
-            'velocity': velocity, 'acceleration': acceleration}
+            'velocity': velocity, 'acceleration': acceleration,
+            'steady_rotation_matrix': steady_rotation_matrix,
+            'stabilised_matrix': stabilised_matrix}
         vehicle.position = position
         vehicle.yaw = yaw
         vehicle.matrix = matrix
@@ -1013,17 +1041,20 @@ class _Compatibility(object):
         return self.pose_overlays.pop(id(vehicle), None) is not None
 
     def bind_vehicle_pose_sources(self, avatar, vehicle):
-        matrix = self.pose_overlays[id(vehicle)]['matrix']
+        overlay = self.pose_overlays[id(vehicle)]
+        matrix = overlay['matrix']
+        steady_rotation = overlay['steady_rotation_matrix']
+        stabilised_matrix = overlay['stabilised_matrix']
         avatar.consistentMatrices._ConsistentMatrices__setTarget(
             matrix, False)
-        avatar._PlayerAvatar__ownVehicleStabMProv.target = matrix
+        avatar._PlayerAvatar__ownVehicleStabMProv.target = stabilised_matrix
         calculator = avatar.inputHandler.steadyVehicleMatrixCalculator
         calculator._SteadyVehicleMatrixCalculator__outputMProv.rotationSrc = \
-            matrix
+            steady_rotation
         calculator._SteadyVehicleMatrixCalculator__outputMProv.\
-            translationSrc = matrix
+            translationSrc = stabilised_matrix
         calculator._SteadyVehicleMatrixCalculator__stabilisedMProv.target = \
-            matrix
+            stabilised_matrix
         return True
 
     def restore_vehicle_pose_sources(self, avatar, vehicle, native_matrix,
@@ -1833,7 +1864,8 @@ def _runtime():
             g_hangarSpace=hangar_space),
         math=types.SimpleNamespace(
             Vector3=_Vector, Matrix=_Matrix,
-            MatrixAnimation=_MatrixAnimation),
+            MatrixAnimation=_MatrixAnimation,
+            MatrixInverse=_MatrixInverse, MatrixProduct=_MatrixProduct),
         model_assembler=types.SimpleNamespace(
             prepareCompoundAssembler=lambda descriptor, state, space, flag:
             descriptor,
@@ -1994,6 +2026,68 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertTrue(state.detach())
         self.assertIsNone(state.entity)
         self.assertIsNone(state.model_changed)
+
+    def test_native_siege_authority_uses_hydraulic_body_and_ground_chassis(self):
+        runtime = _runtime()
+        native_body = _Matrix()
+        native_ground = _Matrix()
+        set_delta = mock.Mock()
+        descriptor = _Descriptor('sweden:S11_Strv_103B')
+        descriptor.hasSiegeMode = True
+        descriptor.gun.pitchLimits = {'absolute': (-0.2, 0.4)}
+        entity = types.SimpleNamespace(
+            typeDescriptor=descriptor, siegeState=2,
+            filter=types.SimpleNamespace(
+                bodyMatrix=native_body,
+                groundPlacingMatrix=native_ground,
+                getVehiclePhysics=lambda: types.SimpleNamespace(
+                    setHullAimingAnglesDelta=set_delta)))
+        state = _NativeRemoteState(
+            types.SimpleNamespace(), runtime.math, mock.Mock(), None,
+            _Vector(), (0.0, 0.05, 0.0), interpolate_motion=False,
+            authority_geometry=True)
+        state.entity = entity
+
+        self.assertTrue(state.set_aim(0.0, 0.0, -0.45))
+        body_matrix, chassis_matrix = state.collision_matrices()
+
+        self.assertIs(state.matrix, chassis_matrix)
+        self.assertIs(state._siege_relative_body_matrix, body_matrix.a)
+        self.assertIs(state.matrix, body_matrix.b)
+        self.assertIs(native_body, body_matrix.a.a)
+        self.assertIs(native_ground, body_matrix.a.b.source)
+        yaw_delta, pitch_delta = set_delta.call_args[0]
+        self.assertEqual(0.0, yaw_delta)
+        self.assertAlmostEqual(-0.3, pitch_delta)
+        self.assertAlmostEqual(-0.2, state.aim.gunMatrix.pitch)
+
+        # SWITCHING_OFF retains the enabled hydraulic pose until the
+        # authoritative DISABLED edge completes the transition.
+        entity.siegeState = 3
+        switching_body, switching_chassis = state.collision_matrices()
+        self.assertIs(body_matrix, switching_body)
+        self.assertIs(state.matrix, switching_chassis)
+        entity.siegeState = 0
+        disabled_body, disabled_chassis = state.collision_matrices()
+        self.assertIs(state.matrix, disabled_body)
+        self.assertIs(state.matrix, disabled_chassis)
+
+    def test_visible_native_siege_vehicle_keeps_existing_presentation_path(self):
+        runtime = _runtime()
+        descriptor = _Descriptor('sweden:S11_Strv_103B')
+        descriptor.hasSiegeMode = True
+        state = _NativeRemoteState(
+            types.SimpleNamespace(), runtime.math, mock.Mock(), None,
+            _Vector(), (0.0, 0.0, 0.0), interpolate_motion=False)
+        state.entity = types.SimpleNamespace(
+            typeDescriptor=descriptor, siegeState=2)
+
+        self.assertTrue(state.set_aim(0.0, 0.0, -0.45))
+        body_matrix, chassis_matrix = state.collision_matrices()
+
+        self.assertAlmostEqual(-0.45, state.aim.gunMatrix.pitch)
+        self.assertIs(state.matrix, body_matrix)
+        self.assertIs(state.matrix, chassis_matrix)
 
     def test_native_vehicle_owns_stock_appearance_and_lan_pose_overlay(self):
         runtime = _runtime()
@@ -2559,6 +2653,33 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         local_start, local_end = hit_tester.localHitTest.call_args[0]
         self.assertEqual(-20.0, local_start.z)
         self.assertEqual(80.0, local_end.z)
+
+    def test_pose_collider_keeps_hydraulic_chassis_on_ground_matrix(self):
+        descriptor = _Descriptor()
+        chassis_tester = types.SimpleNamespace(
+            localHitTest=mock.Mock(return_value=[]))
+        hull_tester = types.SimpleNamespace(
+            localHitTest=mock.Mock(return_value=[]))
+        descriptor.chassis.hitTester = chassis_tester
+        descriptor.hull.hitTester = hull_tester
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        body_matrix = _Matrix()
+        body_matrix.translation = _Vector(0.0, 0.0, 20.0)
+        chassis_matrix = _Matrix()
+        chassis_matrix.translation = _Vector(0.0, 0.0, 10.0)
+
+        collide_vehicle_at_matrix(
+            vehicle, body_matrix, _Vector(0.0, 1.0, 0.0),
+            _Vector(0.0, 1.0, 100.0),
+            types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix),
+            chassis_matrix=chassis_matrix)
+
+        chassis_start = chassis_tester.localHitTest.call_args[0][0]
+        hull_start = hull_tester.localHitTest.call_args[0][0]
+        self.assertEqual(-10.0, chassis_start.z)
+        self.assertEqual(-20.0, hull_start.z)
 
     def test_remote_collision_preserves_ext_shape_across_ticks_and_skip_gun(self):
         descriptor = _Descriptor()
@@ -6189,6 +6310,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_siege_setting_is_sent_as_an_authoritative_input_request(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle.client = types.SimpleNamespace(_input_seq=17)
         battle._server = types.SimpleNamespace(vehicle_id=10)
         battle._sender = types.SimpleNamespace(
             send_current=mock.Mock(return_value=True))
@@ -6202,6 +6324,80 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._sender.send_current.assert_called_once_with(
             siege_enabled=True)
+        self.assertEqual((True, 17), battle._local_siege_pending)
+
+    def test_siege_request_locks_drive_until_its_authoritative_echo(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle.client._input_seq = 0
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor('sweden:S11_Strv_103B')
+        descriptor.hasSiegeMode = True
+        entity = _Vehicle(
+            10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        entity.siegeState = 0
+        entity.filter.bodyMatrix = _Matrix()
+        entity.filter.groundPlacingMatrix = _Matrix()
+        entity.filter.groundPlacingMatrixFiltered = _Matrix()
+        entity.filter.stabilisedMatrix = _Matrix()
+        entity.filter.getVehiclePhysics = lambda: types.SimpleNamespace(
+            setHullAimingAnglesDelta=mock.Mock())
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+
+        def send_current(**unused_kwargs):
+            battle.client._input_seq += 1
+            return True
+
+        battle._sender = types.SimpleNamespace(
+            forward=1.0, turn=1.0, aim_yaw=0.0, gun_pitch=0.0,
+            handbrake=False, send_current=mock.Mock(
+                side_effect=send_current))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = descriptor
+        battle._attach_local_presentation()
+
+        setting = runtime.constants.VEHICLE_SETTING.SIEGE_MODE_ENABLED
+        self.assertTrue(battle.change_vehicle_setting(setting, True))
+        self.assertEqual((True, 1), battle._local_siege_pending)
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step') as drive, \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step') as traverse:
+            battle._drive_local(0.1)
+        drive.assert_not_called()
+        traverse.assert_not_called()
+
+        record = {
+            'engine_id': 10, 'local': True,
+            'presented_siege_state': 0}
+        self.assertFalse(battle._apply_siege_state(record, {
+            'input_seq': 0, 'siege_state': 0,
+            'siege_time_left_ms': 0}))
+        self.assertEqual((True, 1), battle._local_siege_pending)
+        self.assertFalse(battle._apply_siege_state(record, {
+            'input_seq': 1, 'siege_state': 0,
+            'siege_time_left_ms': 0}))
+        self.assertIsNone(battle._local_siege_pending)
+
+    def test_rejected_siege_enqueue_preserves_the_older_pending_lock(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = types.SimpleNamespace(_input_seq=9)
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            send_current=mock.Mock(return_value=False))
+        battle._server_entity = lambda unused_id: types.SimpleNamespace(
+            typeDescriptor=types.SimpleNamespace(hasSiegeMode=True))
+        battle._local_siege_pending = (True, 8)
+
+        setting = runtime.constants.VEHICLE_SETTING.SIEGE_MODE_ENABLED
+        self.assertFalse(battle.change_vehicle_setting(setting, False))
+        self.assertEqual((True, 8), battle._local_siege_pending)
 
     def test_snapshot_siege_edge_drives_binding_and_active_gun_law(self):
         runtime = _runtime()
@@ -6213,6 +6409,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             update_vehicle_siege_state=mock.Mock(return_value=True))
         battle._gun_state = types.SimpleNamespace(
             adopt_descriptor=mock.Mock(return_value=True))
+        battle._local_matrix = object()
+        battle._select_local_siege_pose = mock.Mock(return_value=True)
+        battle._update_local_hull_aiming = mock.Mock(return_value=True)
         battle._local_physics = {'speedFwd': 19.0}
         battle._local_factors = mock.Mock(return_value={'engine/power': 1.0})
         battle._targeting_signature = ('old',)
@@ -6228,11 +6427,34 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._binding.update_vehicle_siege_state.assert_called_once_with(
             10, 1, 2.0)
+        battle._select_local_siege_pose.assert_called_once_with(vehicle, False)
+        battle._update_local_hull_aiming.assert_called_once_with(vehicle)
         battle._gun_state.adopt_descriptor.assert_called_once_with(descriptor)
         derive.assert_called_once_with(
             descriptor, {'engine/power': 1.0})
         self.assertEqual({'speedFwd': 5.0 / 3.6}, battle._local_physics)
         self.assertIsNone(battle._targeting_signature)
+
+    def test_switching_off_keeps_the_enabled_local_hydraulic_pose(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = types.SimpleNamespace(hasSiegeMode=True)
+        vehicle = types.SimpleNamespace(typeDescriptor=descriptor)
+        battle._server_entity = lambda unused_id: vehicle
+        battle._binding = types.SimpleNamespace(
+            update_vehicle_siege_state=mock.Mock(return_value=True))
+        battle._local_matrix = object()
+        battle._select_local_siege_pose = mock.Mock(return_value=True)
+        battle._update_local_hull_aiming = mock.Mock(return_value=True)
+        record = {
+            'engine_id': 10, 'local': True,
+            'presented_siege_state': 2}
+
+        self.assertTrue(battle._apply_siege_state(record, {
+            'siege_state': 3, 'siege_time_left_ms': 1200}))
+
+        battle._select_local_siege_pose.assert_called_once_with(vehicle, True)
+        battle._update_local_hull_aiming.assert_called_once_with(vehicle)
 
     def test_player_cannot_fire_during_a_siege_transition(self):
         runtime = _runtime()
@@ -10704,6 +10926,133 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(runtime.bigworld.avatar.positions)
         self.assertTrue(client.sent)
 
+    def test_siege_transition_locks_copied_drive_without_erasing_keys(self):
+        for siege_state in (1, 3):
+            runtime = _runtime()
+            battle = BattleRuntime(runtime)
+            battle.client = _Client()
+            battle._avatar = runtime.bigworld.avatar
+            descriptor = _Descriptor('sweden:S11_Strv_103B')
+            descriptor.hasSiegeMode = True
+            entity = _Vehicle(
+                10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
+                {'health': 500})
+            entity.siegeState = siege_state
+            entity.filter.bodyMatrix = _Matrix()
+            entity.filter.groundPlacingMatrix = _Matrix()
+            entity.filter.groundPlacingMatrixFiltered = _Matrix()
+            entity.filter.stabilisedMatrix = _Matrix()
+            physics = types.SimpleNamespace(
+                setHullAimingAnglesDelta=mock.Mock())
+            entity.filter.getVehiclePhysics = lambda: physics
+            runtime.bigworld.entities[10] = entity
+            battle._server = types.SimpleNamespace(vehicle_id=10)
+            battle._sender = types.SimpleNamespace(
+                forward=1.0, turn=1.0, aim_yaw=0.0, gun_pitch=0.0,
+                handbrake=False, send_current=mock.Mock(return_value=True))
+            battle._local_position = (2.0, 3.0, 4.0)
+            battle._local_yaw = 0.35
+            battle._local_speed = 8.0
+            battle._local_turn_speed = 0.4
+            battle._local_descriptor = descriptor
+            battle._attach_local_presentation()
+
+            with mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.longitudinal_step') as drive, \
+                    mock.patch(
+                        'gui.mods.offline_lan_0922.battle_runtime.'
+                        'vehicle_physics.traverse_step') as traverse:
+                battle._drive_local(0.1)
+
+            drive.assert_not_called()
+            traverse.assert_not_called()
+            self.assertEqual((2.0, 4.0), (
+                battle._local_position[0], battle._local_position[2]))
+            self.assertAlmostEqual(0.35, battle._local_yaw)
+            self.assertEqual((0.0, 0.0, 0.0), (
+                battle._local_speed, battle._local_turn_speed,
+                battle._local_drive_turn))
+            self.assertEqual((1.0, 1.0), (
+                battle._sender.forward, battle._sender.turn))
+            entity.filter.notifyInputKeysDown.assert_called_with(0, 0)
+            physics.setHullAimingAnglesDelta.assert_called_with(0.0, 0.0)
+
+    def test_enabled_siege_transplants_native_hydraulic_pose_and_aim(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor('sweden:S11_Strv_103B')
+        descriptor.hasSiegeMode = True
+        entity = _Vehicle(
+            10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        entity.siegeState = 0
+        native_body = _Matrix()
+        native_ground = _Matrix()
+        native_ground_filtered = _Matrix()
+        native_stabilised = _Matrix()
+        entity.filter.bodyMatrix = native_body
+        entity.filter.groundPlacingMatrix = native_ground
+        entity.filter.groundPlacingMatrixFiltered = native_ground_filtered
+        entity.filter.stabilisedMatrix = native_stabilised
+        physics = types.SimpleNamespace(
+            setHullAimingAnglesDelta=mock.Mock())
+        entity.filter.getVehiclePhysics = lambda: physics
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=0.0, aim_yaw=0.0, gun_pitch=-0.25,
+            handbrake=False, send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_pitch = -0.03
+        battle._local_descriptor = descriptor
+        battle._avatar.gunRotator.gunPitch = -0.07
+        battle._attach_local_presentation()
+
+        self.assertIs(entity.model.matrix, battle._local_pose_matrix)
+        self.assertIs(
+            battle._local_matrix, battle._local_pose_matrix.a)
+        body_relative = battle._local_siege_body_matrix.a
+        self.assertIs(native_body, body_relative.a)
+        self.assertIs(native_ground, body_relative.b.source)
+        self.assertIs(
+            battle._local_matrix, battle._local_siege_body_matrix.b)
+
+        entity.siegeState = 2
+        self.assertTrue(battle._select_local_siege_pose(entity, True))
+        self.assertIs(
+            battle._local_siege_body_matrix,
+            battle._local_pose_matrix.a)
+        self.assertIs(
+            battle._local_siege_stabilised_matrix,
+            battle._local_stabilised_matrix.a)
+        self.assertIs(
+            battle._local_siege_ground_matrix,
+            battle._local_steady_rotation_matrix.a)
+        self.assertTrue(battle._update_local_hull_aiming(entity))
+        physics.setHullAimingAnglesDelta.assert_called_once()
+        yaw_delta, pitch_delta = \
+            physics.setHullAimingAnglesDelta.call_args[0]
+        self.assertEqual(0.0, yaw_delta)
+        self.assertAlmostEqual(-0.15, pitch_delta)
+
+        physics.setHullAimingAnglesDelta.reset_mock()
+        entity.siegeState = 3
+        self.assertTrue(battle._select_local_siege_pose(entity, True))
+        self.assertTrue(battle._update_local_hull_aiming(entity))
+        self.assertIs(
+            battle._local_siege_body_matrix,
+            battle._local_pose_matrix.a)
+        self.assertAlmostEqual(
+            -0.15,
+            physics.setHullAimingAnglesDelta.call_args[0][1])
+
+        self.assertTrue(battle._select_local_siege_pose(entity, False))
+        self.assertIs(
+            battle._local_matrix, battle._local_pose_matrix.a)
+
     def test_limited_traverse_autorotation_follows_unclamped_mouse_target(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -12485,6 +12834,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         entity = _Vehicle(10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
                           {'health': 500})
         entity.siegeState = runtime.constants.VEHICLE_SIEGE_STATE.DISABLED
+        entity.filter.bodyMatrix = _Matrix()
+        entity.filter.groundPlacingMatrix = _Matrix()
+        entity.filter.groundPlacingMatrixFiltered = _Matrix()
+        entity.filter.stabilisedMatrix = _Matrix()
+        entity.filter.getVehiclePhysics = lambda: types.SimpleNamespace(
+            setHullAimingAnglesDelta=mock.Mock())
         runtime.bigworld.entities[10] = entity
         battle._server = types.SimpleNamespace(vehicle_id=10)
         battle._sender = _LANInputSender(battle)

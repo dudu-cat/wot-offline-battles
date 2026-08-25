@@ -2402,8 +2402,12 @@ class OfflineCompatibilityTests(unittest.TestCase):
         runtime.bigworld._player = avatar
 
         live_matrix = object()
+        steady_rotation_matrix = object()
+        stabilised_matrix = object()
         compatibility.set_vehicle_pose_overlay(
-            vehicle, 'live-position', 0.75, live_matrix, 8.0, 0.2)
+            vehicle, 'live-position', 0.75, live_matrix, 8.0, 0.2,
+            steady_rotation_matrix=steady_rotation_matrix,
+            stabilised_matrix=stabilised_matrix)
         compatibility.bind_vehicle_pose_sources(avatar, vehicle)
 
         own = avatar.consistentMatrices.\
@@ -2417,14 +2421,17 @@ class OfflineCompatibilityTests(unittest.TestCase):
             _SteadyVehicleMatrixCalculator__stabilisedMProv
         self.assertIs(live_matrix, own.target)
         self.assertIs(live_matrix, attached.target)
-        self.assertIs(live_matrix, output.rotationSrc)
-        self.assertIs(live_matrix, output.translationSrc)
-        self.assertIs(live_matrix, steady.target)
+        self.assertIs(steady_rotation_matrix, output.rotationSrc)
+        self.assertIs(stabilised_matrix, output.translationSrc)
+        self.assertIs(stabilised_matrix, steady.target)
+        self.assertIs(
+            stabilised_matrix,
+            avatar._PlayerAvatar__ownVehicleStabMProv.target)
 
         avatar.inputHandler.onControlModeChanged('sniper', source='wheel')
-        self.assertIs(live_matrix, output.rotationSrc)
-        self.assertIs(live_matrix, output.translationSrc)
-        self.assertIs(live_matrix, steady.target)
+        self.assertIs(steady_rotation_matrix, output.rotationSrc)
+        self.assertIs(stabilised_matrix, output.translationSrc)
+        self.assertIs(stabilised_matrix, steady.target)
         self.assertIn(
             ('control_mode', 'sniper', {'source': 'wheel'}), operations)
 

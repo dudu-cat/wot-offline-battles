@@ -730,28 +730,29 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertTrue(queried)
         self.assertFalse(set(target_ids).intersection(queried))
 
-    def test_worker_projectile_uses_canonical_pose_not_render_blend(self):
+    def test_worker_player_projectile_uses_hydraulic_body_and_chassis(self):
         battle, unused_bigworld = _battle()
         battle._worker_mode = True
         self.assertTrue(battle._accept_projectile_event(_event()))
         source = battle._server_entity(41)
         rendered_matrix = object()
         canonical_matrix = object()
+        chassis_matrix = object()
         target = types.SimpleNamespace(
             id=42, isStarted=True, matrix=rendered_matrix,
             position=_Vector((5.0, 1.0, 0.0)), isAlive=lambda: True)
-        battle._records['bot:8'] = {
-            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+        battle._records['player:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'player',
             'native_remote': True, 'local': False, 'ready': True,
             'state': {'health': 100, 'alive': True}}
         battle._server_entity = lambda entity_id: (
             source if entity_id == 41 else target if entity_id == 42 else None)
         battle._remote_factory = types.SimpleNamespace(
-            projectile_collision_matrix=mock.Mock(
-                return_value=canonical_matrix))
+            projectile_collision_matrices=mock.Mock(
+                return_value=(canonical_matrix, chassis_matrix)))
         battle._projectile_current_positions = {
             'player:7': (0.0, 0.0, 0.0),
-            'bot:8': (5.0, 1.0, 0.0),
+            'player:8': (5.0, 1.0, 0.0),
         }
         battle._projectile_position_history = []
         battle._resolve_shot_scene = mock.Mock(return_value={
@@ -771,9 +772,12 @@ class BattleProjectileTests(unittest.TestCase):
                 0.0, 0.1)
 
         self.assertEqual({'reason': 'impact', 'fraction': 0.5}, terminal)
-        battle._remote_factory.projectile_collision_matrix.\
-            assert_called_once_with(42)
+        battle._remote_factory.projectile_collision_matrices.\
+            assert_called_once_with(42, None)
         self.assertIs(canonical_matrix, collide.call_args.args[1])
+        self.assertIs(
+            chassis_matrix,
+            collide.call_args.kwargs['chassis_matrix'])
         self.assertIsNot(rendered_matrix, collide.call_args.args[1])
 
     def test_destroyed_vehicle_still_owns_projectile_collision(self):

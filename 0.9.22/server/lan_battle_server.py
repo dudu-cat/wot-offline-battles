@@ -7878,6 +7878,9 @@ class BattleState:
                 if "gun_pitch" in message:
                     player.gun_pitch = _clamp(_finite_float(message.get("gun_pitch")), -1.2, 1.2)
                 if "x" in message and "z" in message:
+                    # Switching owns the drivetrain, not world contact. Keep
+                    # accepting the client's gravity, slope and collision pose
+                    # while forward/turn/speed remain authoritatively zero.
                     player.x = _clamp(_finite_float(message.get("x"), player.x), -2000.0, 2000.0)
                     player.y = _clamp(_finite_float(message.get("y"), player.y), -1000.0, 1000.0)
                     player.z = _clamp(_finite_float(message.get("z"), player.z), -2000.0, 2000.0)

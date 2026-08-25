@@ -742,7 +742,7 @@ def _component_aim_angles(descriptor, turret_yaw, gun_pitch):
 
 
 def _pose_components(vehicle, math_module):
-    """Build descriptor hit-test transforms from one visible vehicle pose."""
+    """Build descriptor-local hit-test transforms below the body pose."""
     descriptor = vehicle.typeDescriptor
     result = []
     identity = math_module.Matrix()
@@ -783,26 +783,38 @@ def _pose_components(vehicle, math_module):
 
 
 def collide_vehicle_at_matrix(vehicle, vehicle_matrix, start_point,
-                              end_point, math_module):
-    """Run precise descriptor collision at the supplied visible matrix.
+                              end_point, math_module, chassis_matrix=None):
+    """Run precise descriptor collision at supplied body/chassis matrices.
 
     #1513's native ``Vehicle.collideSegmentExt`` first rejects rays through
     the retail ``WGVehicleFilter``. Copied 0.8.2 physics deliberately leaves
     that filter at the spawn pose, so local incoming shots must use the live
     presentation matrix instead. Remote vehicles use the same routine to
-    keep outgoing and incoming collision geometry identical.
+    keep outgoing and incoming collision geometry identical. Hydraulic
+    vehicles use ``bodyMatrix`` for hull/turret/gun and the separate
+    ``groundPlacingMatrix`` for chassis, matching stock ``getComponents``.
     """
     world_to_vehicle = math_module.Matrix(vehicle_matrix)
     world_to_vehicle.invert()
-    start = world_to_vehicle.applyPoint(start_point)
-    end = world_to_vehicle.applyPoint(end_point)
+    body_start = world_to_vehicle.applyPoint(start_point)
+    body_end = world_to_vehicle.applyPoint(end_point)
+    chassis_start = body_start
+    chassis_end = body_end
+    if chassis_matrix is not None and chassis_matrix is not vehicle_matrix:
+        world_to_chassis = math_module.Matrix(chassis_matrix)
+        world_to_chassis.invert()
+        chassis_start = world_to_chassis.applyPoint(start_point)
+        chassis_end = world_to_chassis.applyPoint(end_point)
     hits = []
-    for component, component_matrix in _pose_components(
-            vehicle, math_module):
+    for component_index, pair in enumerate(_pose_components(
+            vehicle, math_module)):
+        component, component_matrix = pair
         tester = _component_value(component, 'hitTester')
         local_hit_test = getattr(tester, 'localHitTest', None)
         if not callable(local_hit_test):
             continue
+        start = chassis_start if component_index == 0 else body_start
+        end = chassis_end if component_index == 0 else body_end
         collisions = local_hit_test(
             component_matrix.applyPoint(start),
             component_matrix.applyPoint(end))

@@ -17,6 +17,8 @@ from gui.mods.offline_lan_0922.entities.remote_vehicle import \
 
 
 _MINIMUM_KEYFRAME_SECONDS = 0.001
+_SIEGE_ENABLED = 2
+_SIEGE_SWITCHING_OFF = 3
 
 
 def set_draw_visibility(entity, visible):
@@ -49,11 +51,13 @@ class _AimTarget(object):
 class _NativeRemoteState(object):
 
     def __init__(self, bigworld, math_module, compatibility, data_links,
-                 position, rotation, interpolate_motion=True):
+                 position, rotation, interpolate_motion=True,
+                 authority_geometry=False):
         self._bigworld = bigworld
         self._math = math_module
         self._compatibility = compatibility
         self._data_links = data_links
+        self._authority_geometry = bool(authority_geometry)
         self.position = math_module.Vector3(position)
         self.roll = float(rotation[0])
         self.pitch = float(rotation[1])
@@ -91,6 +95,9 @@ class _NativeRemoteState(object):
         self.aim = _AimTarget(math_module)
         self._aim_relative_yaw = None
         self._aim_gun_pitch = None
+        self._aim_desired_gun_pitch = None
+        self._siege_relative_body_matrix = None
+        self._siege_body_matrix = None
         self.entity = None
         self.model_changed = None
         self.track_scroll = None
@@ -102,6 +109,125 @@ class _NativeRemoteState(object):
     def _write_matrix(self, matrix):
         matrix.setRotateYPR((self.yaw, self.pitch, self.roll))
         matrix.translation = self.position
+
+    def _matrix_product(self, first, second=None):
+        product_type = getattr(self._math, 'MatrixProduct', None)
+        if not callable(product_type):
+            raise RuntimeError('#1513 Math.MatrixProduct is unavailable')
+        product = product_type()
+        product.a = first
+        if second is not None:
+            product.b = second
+        return product
+
+    def _prepare_siege_pose(self):
+        """Relate native hydraulic body pitch to the canonical LAN ground."""
+        entity = self.entity
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        if self._siege_relative_body_matrix is not None:
+            return True
+        inverse_type = getattr(self._math, 'MatrixInverse', None)
+        if not callable(inverse_type):
+            raise RuntimeError('#1513 Math.MatrixInverse is unavailable')
+        vehicle_filter = getattr(entity, 'filter', None)
+        native_body = getattr(vehicle_filter, 'bodyMatrix', None)
+        native_ground = getattr(vehicle_filter, 'groundPlacingMatrix', None)
+        if native_body is None or native_ground is None:
+            raise RuntimeError(
+                '#1513 hydraulic vehicle matrices are unavailable')
+        # Exact #1513 Vehicle.getComponents() uses body * inverse(ground) for
+        # the hull/turret/gun while the chassis keeps groundPlacingMatrix.
+        self._siege_relative_body_matrix = self._matrix_product(
+            native_body, inverse_type(native_ground))
+        self._siege_body_matrix = self._matrix_product(
+            self._siege_relative_body_matrix, self.matrix)
+        return True
+
+    @staticmethod
+    def _absolute_gun_pitch_limits(descriptor):
+        gun = getattr(descriptor, 'gun', None)
+        limits = getattr(gun, 'pitchLimits', None)
+        if isinstance(limits, dict):
+            limits = limits.get('absolute')
+        else:
+            limits = getattr(limits, 'absolute', None)
+        try:
+            minimum = float(limits[0])
+            maximum = float(limits[1])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            raise RuntimeError(
+                '#1513 hydraulic gun pitch limits are unavailable')
+        if minimum > maximum:
+            raise RuntimeError('#1513 hydraulic gun pitch limits are invalid')
+        return minimum, maximum
+
+    def _write_aim_pitch(self, gun_pitch):
+        gun_pitch = float(gun_pitch)
+        if gun_pitch == self._aim_gun_pitch:
+            return False
+        self.aim.gunMatrix.setRotateYPR((0.0, gun_pitch, 0.0))
+        self._aim_gun_pitch = gun_pitch
+        return True
+
+    def update_siege_pose(self):
+        """Feed #1513 hydraulics and preserve its body/ground split."""
+        if not self._authority_geometry:
+            return False
+        entity = self.entity
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        self._prepare_siege_pose()
+        active = getattr(entity, 'siegeState', 0) in (
+            _SIEGE_ENABLED, _SIEGE_SWITCHING_OFF)
+        desired_pitch = self._aim_desired_gun_pitch
+        visible_pitch = desired_pitch
+        pitch_delta = 0.0
+        if active and desired_pitch is not None:
+            local_desired = float(desired_pitch) - float(self.pitch)
+            minimum, maximum = self._absolute_gun_pitch_limits(descriptor)
+            visible_pitch = max(minimum, min(maximum, local_desired))
+            pitch_delta = ((local_desired - visible_pitch + math.pi) %
+                           (2.0 * math.pi) - math.pi)
+        if visible_pitch is not None:
+            self._write_aim_pitch(visible_pitch)
+        vehicle_filter = getattr(entity, 'filter', None)
+        get_physics = getattr(vehicle_filter, 'getVehiclePhysics', None)
+        if not callable(get_physics):
+            raise RuntimeError(
+                '#1513 Siege vehicle physics boundary is unavailable')
+        physics = get_physics()
+        if physics is None:
+            return False
+        set_delta = getattr(physics, 'setHullAimingAnglesDelta', None)
+        if not callable(set_delta):
+            raise RuntimeError(
+                '#1513 hydraulic aiming input boundary is unavailable')
+        # The exact x86 wrapper takes yaw first and pitch second.
+        set_delta(0.0, pitch_delta)
+        return True
+
+    def collision_matrices(self, ground_matrix=None):
+        """Return authority body and chassis matrices at one ground pose."""
+        canonical_ground = self.matrix if ground_matrix is None else \
+            ground_matrix
+        if not self._authority_geometry:
+            return canonical_ground, canonical_ground
+        entity = self.entity
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        active = bool(
+            getattr(descriptor, 'hasSiegeMode', False) and
+            getattr(entity, 'siegeState', 0) in (
+                _SIEGE_ENABLED, _SIEGE_SWITCHING_OFF))
+        if not active:
+            return canonical_ground, canonical_ground
+        self._prepare_siege_pose()
+        body = (self._siege_body_matrix if ground_matrix is None else
+                self._matrix_product(
+                    self._siege_relative_body_matrix, canonical_ground))
+        return body, canonical_ground
 
     def _rekey(self, relax_time):
         if self.animation is None:
@@ -415,6 +541,10 @@ class _NativeRemoteState(object):
                 '#1513 CompoundAppearance aim-target boundary is unavailable')
         setup(self.aim)
         self._bind_stock_motion()
+        if (self._authority_geometry and
+                bool(getattr(entity.typeDescriptor, 'hasSiegeMode', False))):
+            self._prepare_siege_pose()
+            self.update_siege_pose()
 
         def on_model_changed(*unused_args, **unused_kwargs):
             if self.entity is not None and self.entity.appearance is not None:
@@ -457,6 +587,9 @@ class _NativeRemoteState(object):
         entity = self.entity
         if entity is not None:
             entity._aim_yaw = getattr(entity, '_aim_yaw', self.yaw)
+            if (self._authority_geometry and bool(getattr(
+                    entity.typeDescriptor, 'hasSiegeMode', False))):
+                self.update_siege_pose()
             self._publish_pose()
         return True
 
@@ -471,12 +604,17 @@ class _NativeRemoteState(object):
             self.aim.turretMatrix.setRotateYPR((
                 component_yaw, 0.0, 0.0))
             self._aim_relative_yaw = component_yaw
-        if component_pitch != self._aim_gun_pitch:
-            self.aim.gunMatrix.setRotateYPR((0.0, component_pitch, 0.0))
-            self._aim_gun_pitch = component_pitch
-        if self.entity is not None:
-            self.entity._aim_yaw = float(aim_yaw)
-            self.entity._gun_pitch = raw_gun_pitch
+        self._aim_desired_gun_pitch = component_pitch
+        entity = self.entity
+        if (self._authority_geometry and bool(getattr(
+                getattr(entity, 'typeDescriptor', None),
+                'hasSiegeMode', False))):
+            self.update_siege_pose()
+        else:
+            self._write_aim_pitch(component_pitch)
+        if entity is not None:
+            entity._aim_yaw = float(aim_yaw)
+            entity._gun_pitch = raw_gun_pitch
         return True
 
     def update_tracks(self, left, right, mode):
@@ -583,7 +721,8 @@ class NativeRemoteVehicleFactory(object):
 
     def __init__(self, bigworld, math_module, model_assembler, space_id,
                  binding, compatibility, data_links=None,
-                 interpolate_motion=True, **unused_kwargs):
+                 interpolate_motion=True, authority_geometry=False,
+                 **unused_kwargs):
         self._space_id = int(space_id)
         self._bigworld = bigworld
         self._math = math_module
@@ -591,6 +730,7 @@ class NativeRemoteVehicleFactory(object):
         self._compatibility = compatibility
         self._data_links = data_links
         self._interpolate_motion = bool(interpolate_motion)
+        self._authority_geometry = bool(authority_geometry)
         self._states = {}
         self._vehicles = {}
         self._failed_creates = set()
@@ -622,7 +762,8 @@ class NativeRemoteVehicleFactory(object):
         self._states[int(entity_id)] = _NativeRemoteState(
             self._bigworld, self._math, self._compatibility,
             self._data_links, position, rotation,
-            interpolate_motion=self._interpolate_motion)
+            interpolate_motion=self._interpolate_motion,
+            authority_geometry=self._authority_geometry)
         self._vehicles[int(entity_id)] = None
         try:
             self._binding.arena_vehicle_added(entity_id, {
@@ -689,10 +830,25 @@ class NativeRemoteVehicleFactory(object):
         the state's unblended matrix.  Visible clients do not call this seam;
         their reticle and tracer continue to follow the rendered provider.
         """
+        matrices = self.projectile_collision_matrices(entity_id)
+        return None if matrices is None else matrices[0]
+
+    def projectile_collision_matrices(self, entity_id, ground_matrix=None):
+        """Return unblended hydraulic body and ground authority poses."""
         state = self._states.get(int(entity_id))
         if state is None or state.entity is None:
             return None
-        return state.matrix
+        getter = getattr(state, 'collision_matrices', None)
+        if callable(getter):
+            return getter(ground_matrix)
+        canonical = state.matrix if ground_matrix is None else ground_matrix
+        return canonical, canonical
+
+    def update_entity_siege_pose(self, entity_id):
+        state = self._states.get(int(entity_id))
+        if state is None or state.entity is None:
+            return False
+        return state.update_siege_pose()
 
     def request_wreck(self, unused_entity_id):
         # Vehicle.onHealthChanged owns stock damaged-model replacement.

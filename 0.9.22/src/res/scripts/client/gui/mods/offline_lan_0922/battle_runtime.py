@@ -1192,6 +1192,13 @@ class BattleRuntime(object):
         self._local_pitch = 0.0
         self._local_roll = 0.0
         self._local_matrix = None
+        self._local_pose_matrix = None
+        self._local_stabilised_matrix = None
+        self._local_stabilised_snapshot = None
+        self._local_steady_rotation_matrix = None
+        self._local_siege_body_matrix = None
+        self._local_siege_stabilised_matrix = None
+        self._local_siege_ground_matrix = None
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
@@ -1432,6 +1439,13 @@ class BattleRuntime(object):
         self._local_pitch = 0.0
         self._local_roll = 0.0
         self._local_matrix = None
+        self._local_pose_matrix = None
+        self._local_stabilised_matrix = None
+        self._local_stabilised_snapshot = None
+        self._local_steady_rotation_matrix = None
+        self._local_siege_body_matrix = None
+        self._local_siege_stabilised_matrix = None
+        self._local_siege_ground_matrix = None
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
@@ -2351,7 +2365,11 @@ class BattleRuntime(object):
                     # render frame. Authority Bots opt into interpolation per
                     # entity after creation, so remote humans and live
                     # authority handoffs never retain the wrong provider.
-                    'interpolate_motion': False})
+                    'interpolate_motion': False,
+                    # Visible remote tanks retain their established model/gun
+                    # presentation. Only the hidden worker needs native
+                    # hydraulic matrices as authoritative collision geometry.
+                    'authority_geometry': self._worker_mode})
                 sys.stdout.write(
                     '[Offline LAN 0.9.22] native remote Vehicle presentation '
                     'enabled; copied LAN physics remains authoritative\n')
@@ -3042,7 +3060,7 @@ class BattleRuntime(object):
         except AttributeError:
             return False
 
-        target_matrix = (self._local_matrix if record.get('local')
+        target_matrix = (self._local_body_pose() if record.get('local')
                          else entity.matrix)
         if target_matrix is None:
             return False
@@ -3150,7 +3168,7 @@ class BattleRuntime(object):
         except AttributeError:
             raise RuntimeError(
                 '#1513 attached vehicle matrix target is unavailable')
-        expected_target = self._local_matrix
+        expected_target = self._local_body_pose()
         if (self._spectated_engine_id is not None and self._server is not None
                 and int(self._spectated_engine_id) !=
                 int(self._server.vehicle_id)):
@@ -3176,7 +3194,7 @@ class BattleRuntime(object):
             vehicle = entity_lookup(self._avatar.playerVehicleID)
             if vehicle is not None:
                 expected_camera = getattr(vehicle, 'matrix', None)
-                if expected_camera is not self._local_matrix:
+                if expected_camera is not self._local_body_pose():
                     raise RuntimeError(
                         '#1513 postmortem vehicle captured a stale vehicle '
                         'pose')
@@ -3188,9 +3206,9 @@ class BattleRuntime(object):
                     raise RuntimeError(
                         '#1513 postmortem delay matrix provider is unavailable')
                 if (getattr(expected_camera, 'rotationSrc', None) is not
-                        self._local_matrix or
+                        self._local_steady_rotation() or
                         getattr(expected_camera, 'translationSrc', None) is not
-                        self._local_matrix):
+                        self._local_stabilised_pose()):
                     raise RuntimeError(
                         '#1513 postmortem delay captured a stale vehicle pose')
             if expected_camera is None:
@@ -3222,9 +3240,9 @@ class BattleRuntime(object):
         if output is None or stabilised is None:
             raise RuntimeError(
                 '#1513 steady vehicle matrix providers are unavailable')
-        if (output.rotationSrc is not self._local_matrix or
-                output.translationSrc is not self._local_matrix or
-                stabilised.target is not self._local_matrix):
+        if (output.rotationSrc is not self._local_steady_rotation() or
+                output.translationSrc is not self._local_stabilised_pose() or
+                stabilised.target is not self._local_stabilised_pose()):
             raise RuntimeError(
                 '#1513 control mode captured a stale vehicle pose')
         modes = getattr(self._runtime.avatar_input_handler, '_CTRL_MODE', None)
@@ -3241,7 +3259,7 @@ class BattleRuntime(object):
         except AttributeError:
             raise RuntimeError(
                 'initial #1513 camera has no vehicle matrix provider')
-        if camera_matrix is not self._local_matrix:
+        if camera_matrix is not self._local_body_pose():
             raise RuntimeError(
                 '#1513 arcade camera captured a stale vehicle pose')
         return True
@@ -3275,12 +3293,14 @@ class BattleRuntime(object):
         if output is None or stabilised is None:
             raise RuntimeError(
                 '#1513 steady vehicle matrix providers are unavailable')
-        output.rotationSrc = self._local_matrix
-        output.translationSrc = self._local_matrix
-        stabilised.target = self._local_matrix
-        if (output.rotationSrc is not self._local_matrix or
-                output.translationSrc is not self._local_matrix or
-                stabilised.target is not self._local_matrix):
+        steady_rotation = self._local_steady_rotation()
+        stabilised_pose = self._local_stabilised_pose()
+        output.rotationSrc = steady_rotation
+        output.translationSrc = stabilised_pose
+        stabilised.target = stabilised_pose
+        if (output.rotationSrc is not steady_rotation or
+                output.translationSrc is not stabilised_pose or
+                stabilised.target is not stabilised_pose):
             raise RuntimeError(
                 '#1513 steady vehicle matrix providers rejected live pose')
 
@@ -3303,8 +3323,9 @@ class BattleRuntime(object):
         except AttributeError:
             raise RuntimeError(
                 'initial #1513 camera has no vehicle matrix provider')
-        camera.vehicleMProv = self._local_matrix
-        if camera.vehicleMProv is not self._local_matrix:
+        body_pose = self._local_body_pose()
+        camera.vehicleMProv = body_pose
+        if camera.vehicleMProv is not body_pose:
             # The exact #1513 getter unwraps the translation-only provider and
             # returns its source.  An identity mismatch therefore means the
             # native setter did not accept the copied live matrix.
@@ -4547,6 +4568,136 @@ class BattleRuntime(object):
             hull_yaw + float(turret_yaw), float(gun_pitch))
         return True
 
+    def _local_body_pose(self):
+        return self._local_pose_matrix or self._local_matrix
+
+    def _local_stabilised_pose(self):
+        return self._local_stabilised_snapshot or self._local_body_pose()
+
+    def _local_steady_rotation(self):
+        return self._local_steady_rotation_matrix or self._local_body_pose()
+
+    def _matrix_product(self, first, second=None):
+        product_type = getattr(self._runtime.math, 'MatrixProduct', None)
+        if not callable(product_type):
+            raise RuntimeError('#1513 Math.MatrixProduct is unavailable')
+        product = product_type()
+        product.a = first
+        if second is not None:
+            product.b = second
+        return product
+
+    def _prepare_local_siege_pose(self, entity, native_filter,
+                                  native_stabilised):
+        """Transplant native hydraulic matrices onto the copied world pose."""
+        self._local_pose_matrix = self._local_matrix
+        self._local_stabilised_matrix = self._local_matrix
+        self._local_steady_rotation_matrix = self._local_matrix
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        inverse_type = getattr(self._runtime.math, 'MatrixInverse', None)
+        if not callable(inverse_type):
+            raise RuntimeError('#1513 Math.MatrixInverse is unavailable')
+        native_body = getattr(native_filter, 'bodyMatrix', None)
+        native_ground = getattr(native_filter, 'groundPlacingMatrix', None)
+        native_ground_filtered = getattr(
+            native_filter, 'groundPlacingMatrixFiltered', None)
+        if (native_body is None or native_ground is None or
+                native_ground_filtered is None or
+                native_stabilised is None):
+            raise RuntimeError(
+                '#1513 hydraulic vehicle matrices are unavailable')
+
+        # BigWorld uses row vectors. Exact #1513 Vehicle.getComponents()
+        # relates body and chassis as body * inverse(ground). Strip the stale
+        # client-only entity world pose with that same native relation, then
+        # apply it to the copied terrain pose. The filtered ground and
+        # stabilised providers retain their distinct stock camera roles.
+        inverse_ground = inverse_type(native_ground)
+
+        def transplant(source):
+            relative = self._matrix_product(source, inverse_ground)
+            return self._matrix_product(relative, self._local_matrix)
+
+        self._local_siege_body_matrix = transplant(native_body)
+        self._local_siege_stabilised_matrix = transplant(native_stabilised)
+        self._local_siege_ground_matrix = transplant(
+            native_ground_filtered)
+        self._local_pose_matrix = self._matrix_product(self._local_matrix)
+        self._local_stabilised_matrix = self._matrix_product(
+            self._local_matrix)
+        self._local_stabilised_snapshot = self._runtime.math.Matrix(
+            self._local_stabilised_matrix)
+        self._local_steady_rotation_matrix = self._matrix_product(
+            self._local_matrix)
+        return True
+
+    def _refresh_local_stabilised_snapshot(self):
+        if self._local_stabilised_snapshot is None:
+            return False
+        self._local_stabilised_snapshot.set(
+            self._local_stabilised_matrix)
+        return True
+
+    def _select_local_siege_pose(self, entity, enabled):
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        if (self._local_siege_body_matrix is None or
+                self._local_siege_stabilised_matrix is None or
+                self._local_siege_ground_matrix is None):
+            raise RuntimeError('player hydraulic pose was not prepared')
+        body = (self._local_siege_body_matrix
+                if enabled else self._local_matrix)
+        stabilised = (self._local_siege_stabilised_matrix
+                      if enabled else self._local_matrix)
+        ground = (self._local_siege_ground_matrix
+                  if enabled else self._local_matrix)
+        self._local_pose_matrix.a = body
+        self._local_stabilised_matrix.a = stabilised
+        self._local_steady_rotation_matrix.a = ground
+        if (self._local_pose_matrix.a is not body or
+                self._local_stabilised_matrix.a is not stabilised or
+                self._local_steady_rotation_matrix.a is not ground):
+            raise RuntimeError('#1513 hydraulic pose selector was rejected')
+        self._refresh_local_stabilised_snapshot()
+        return True
+
+    def _update_local_hull_aiming(self, entity):
+        """Feed the native #1513 hydraulic solver its unclamped aim delta."""
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        vehicle_filter = getattr(entity, 'filter', None)
+        get_physics = getattr(vehicle_filter, 'getVehiclePhysics', None)
+        if not callable(get_physics):
+            raise RuntimeError(
+                '#1513 Siege vehicle physics boundary is unavailable')
+        physics = get_physics()
+        if physics is None:
+            return False
+        set_delta = getattr(physics, 'setHullAimingAnglesDelta', None)
+        if not callable(set_delta):
+            raise RuntimeError(
+                '#1513 hydraulic aiming input boundary is unavailable')
+        states = self._runtime.constants.VEHICLE_SIEGE_STATE
+        pitch_delta = 0.0
+        if getattr(entity, 'siegeState', states.DISABLED) in (
+                states.ENABLED, states.SWITCHING_OFF):
+            rotator = getattr(self._avatar, 'gunRotator', None)
+            if self._sender is None or rotator is None:
+                raise RuntimeError('player hydraulic aim source is unavailable')
+            desired_pitch = float(self._sender.gun_pitch)
+            gun_pitch = float(rotator.gunPitch)
+            pitch_delta = ((desired_pitch - float(self._local_pitch) -
+                            gun_pitch + math.pi) %
+                           (2.0 * math.pi) - math.pi)
+        # The exact x86 wrapper takes yaw delta first and pitch delta second;
+        # the four Swedish #1513 vehicles expose pitch hull aiming only.
+        set_delta(0.0, pitch_delta)
+        return True
+
     def _prepare_local_presentation(self, entity):
         """Publish one canonical pose before stock local-vehicle startup."""
         if self._local_matrix is not None:
@@ -4556,21 +4707,26 @@ class BattleRuntime(object):
         if not callable(native_attribute):
             raise RuntimeError('native Vehicle matrix boundary is unavailable')
         native_matrix = native_attribute(entity, 'matrix')
+        native_filter = native_attribute(entity, 'filter')
         matrix = self._runtime.math.Matrix()
         matrix.setRotateYPR((self._local_yaw, 0.0, 0.0))
         position = self._vector(self._local_position)
         matrix.translation = position
         zero_motion = self._vector((0.0, 0.0, 0.0))
-        self._runtime.compatibility.set_vehicle_pose_overlay(
-            entity, position, self._local_yaw, matrix,
-            self._local_speed, self._local_turn_speed,
-            zero_motion, zero_motion)
         native_stabilised = getattr(
-            getattr(entity, 'filter', None), 'stabilisedMatrix',
+            native_filter, 'stabilisedMatrix',
             native_matrix)
         self._local_matrix = matrix
         self._local_native_matrix = native_matrix
         self._local_native_stabilised_matrix = native_stabilised
+        self._prepare_local_siege_pose(
+            entity, native_filter, native_stabilised)
+        self._runtime.compatibility.set_vehicle_pose_overlay(
+            entity, position, self._local_yaw, self._local_body_pose(),
+            self._local_speed, self._local_turn_speed,
+            zero_motion, zero_motion,
+            steady_rotation_matrix=self._local_steady_rotation(),
+            stabilised_matrix=self._local_stabilised_pose())
         self._local_camera_velocity = zero_motion
         self._local_physics = vehicle_physics.derive_params(
             entity.typeDescriptor,
@@ -4590,7 +4746,7 @@ class BattleRuntime(object):
         model = getattr(entity, 'model', None)
         if model is None:
             raise RuntimeError('player compound model is unavailable')
-        model.matrix = self._local_matrix
+        model.matrix = self._local_body_pose()
         self._runtime.compatibility.bind_vehicle_pose_sources(
             self._avatar, entity)
         self._local_model = model
@@ -4621,15 +4777,19 @@ class BattleRuntime(object):
         self._local_matrix.setRotateYPR((
             self._local_yaw, self._local_pitch, self._local_roll))
         self._local_matrix.translation = position
+        self._update_local_hull_aiming(entity)
+        self._refresh_local_stabilised_snapshot()
         # Exact #1513's CompoundAppearance.__linkCompound rebinds
         # ``compoundModel.matrix`` from Vehicle.matrix after every model
         # refresh.  Mutate the persistent provider only; even reading and
         # comparing a native PyCompoundModel provider every render frame can
         # create a fresh Python wrapper and spuriously relink the hierarchy.
         self._runtime.compatibility.set_vehicle_pose_overlay(
-            entity, position, self._local_yaw, self._local_matrix,
+            entity, position, self._local_yaw, self._local_body_pose(),
             self._local_speed, self._local_turn_speed,
-            velocity, acceleration)
+            velocity, acceleration,
+            steady_rotation_matrix=self._local_steady_rotation(),
+            stabilised_matrix=self._local_stabilised_pose())
         self._reset_full_turret_sniper_aim(previous_yaw)
         self._local_camera_velocity = velocity
         self._run_optional_feature(
@@ -4745,6 +4905,13 @@ class BattleRuntime(object):
             self._avatar, entity, self._local_native_matrix,
             self._local_native_stabilised_matrix)
         self._local_matrix = None
+        self._local_pose_matrix = None
+        self._local_stabilised_matrix = None
+        self._local_stabilised_snapshot = None
+        self._local_steady_rotation_matrix = None
+        self._local_siege_body_matrix = None
+        self._local_siege_stabilised_matrix = None
+        self._local_siege_ground_matrix = None
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
@@ -8967,25 +9134,38 @@ class BattleRuntime(object):
                     entity, 'position', record.get('state', {})))
         return result
 
-    def _projectile_vehicle_matrix(self, record, vehicle):
-        """Return the pose matching the projectile position timeline.
+    def _projectile_vehicle_matrices(self, record, vehicle,
+                                     ground_matrix=None):
+        """Return body/chassis poses matching the projectile timeline.
 
         A hidden worker interpolates native Bot compounds for presentation,
         but ``_projectile_record_positions`` intentionally records the
         canonical copied-physics position.  Mixing that position with the
         render-blended matrix makes broad phase and exact hit testing disagree
-        for a moving target.  Use the factory's unblended matrix on the worker
-        and retain the visible provider everywhere else.
+        for a moving target. Use the factory's unblended hydraulic body and
+        ground matrices on the worker and retain the visible provider
+        everywhere else.
         """
+        canonical = vehicle.matrix if ground_matrix is None else ground_matrix
         if (self._worker_mode and record.get('native_remote') and
                 self._remote_factory is not None):
             getter = getattr(
+                self._remote_factory, 'projectile_collision_matrices', None)
+            if callable(getter):
+                matrices = getter(record.get('engine_id'), ground_matrix)
+                if matrices is not None:
+                    return matrices
+            getter = getattr(
                 self._remote_factory, 'projectile_collision_matrix', None)
             if callable(getter):
-                matrix = getter(record.get('engine_id'))
-                if matrix is not None:
-                    return matrix
-        return vehicle.matrix
+                body = getter(record.get('engine_id'))
+                if body is not None:
+                    return body, canonical
+        return canonical, canonical
+
+    def _projectile_vehicle_matrix(self, record, vehicle):
+        """Compatibility seam returning only the authority body pose."""
+        return self._projectile_vehicle_matrices(record, vehicle)[0]
 
     def _sample_projectile_positions(self, now, positions):
         """Keep enough pose history for budgeted projectile catch-up."""
@@ -9148,13 +9328,15 @@ class BattleRuntime(object):
             query_end = self._vector(adjusted_end)
             if record.get('local') and self._local_matrix is not None:
                 collisions = collide_vehicle_at_matrix(
-                    target, self._local_matrix, query_start, query_end,
-                    self._runtime.math)
+                    target, self._local_body_pose(), query_start, query_end,
+                    self._runtime.math,
+                    chassis_matrix=self._local_matrix)
             elif record.get('native_remote'):
+                body_matrix, chassis_matrix = \
+                    self._projectile_vehicle_matrices(record, target)
                 collisions = collide_vehicle_at_matrix(
-                    target, self._projectile_vehicle_matrix(record, target),
-                    query_start, query_end,
-                    self._runtime.math)
+                    target, body_matrix, query_start, query_end,
+                    self._runtime.math, chassis_matrix=chassis_matrix)
             else:
                 collisions = target.collideSegmentExt(
                     query_start, query_end)
@@ -9346,14 +9528,15 @@ class BattleRuntime(object):
             if trace_length > original_length + 0.000001:
                 if record.get('local') and self._local_matrix is not None:
                     extended = collide_vehicle_at_matrix(
-                        target, self._local_matrix, query[0], trace_end,
-                        self._runtime.math)
+                        target, self._local_body_pose(), query[0], trace_end,
+                        self._runtime.math,
+                        chassis_matrix=self._local_matrix)
                 elif record.get('native_remote'):
+                    body_matrix, chassis_matrix = \
+                        self._projectile_vehicle_matrices(record, target)
                     extended = collide_vehicle_at_matrix(
-                        target,
-                        self._projectile_vehicle_matrix(record, target),
-                        query[0], trace_end,
-                        self._runtime.math)
+                        target, body_matrix, query[0], trace_end,
+                        self._runtime.math, chassis_matrix=chassis_matrix)
                 else:
                     extended = target.collideSegmentExt(
                         query[0], trace_end)
@@ -9423,11 +9606,12 @@ class BattleRuntime(object):
                 position[0], position[1] + 1.0, position[2]))
             try:
                 if record.get('native_remote'):
+                    body_matrix, chassis_matrix = \
+                        self._projectile_vehicle_matrices(record, target)
                     collisions = tuple(collide_vehicle_at_matrix(
-                        target,
-                        self._projectile_vehicle_matrix(record, target),
-                        burst, aim,
-                        self._runtime.math) or ())
+                        target, body_matrix, burst, aim,
+                        self._runtime.math,
+                        chassis_matrix=chassis_matrix) or ())
                 else:
                     collisions = tuple(
                         target.collideSegmentExt(burst, aim) or ())
@@ -10755,7 +10939,7 @@ class BattleRuntime(object):
         The ambient-occlusion decals and the ground splodge hang off that
         compound and project onto the terrain through this provider.
         """
-        matrix = self._local_matrix
+        matrix = self._local_body_pose()
         if matrix is None:
             return False
         target = getattr(self._runtime.bigworld, 'target', None)
@@ -11531,7 +11715,8 @@ class BattleRuntime(object):
                 return record
         return None
 
-    def _native_ram_vehicle_armor(self, vehicle, matrix, hit_point):
+    def _native_ram_vehicle_armor(self, vehicle, matrix, hit_point,
+                                  chassis_matrix=None):
         """Return the first real structural plate reached from the contact."""
         descriptor = getattr(vehicle, 'typeDescriptor', None)
         if descriptor is None or matrix is None:
@@ -11547,7 +11732,8 @@ class BattleRuntime(object):
         reach = math.sqrt(shape[0] * shape[0] + shape[1] * shape[1])
         start = hit + outward.scale(reach)
         collisions = collide_vehicle_at_matrix(
-            vehicle, matrix, start, center, self._runtime.math)
+            vehicle, matrix, start, center, self._runtime.math,
+            chassis_matrix=chassis_matrix)
         if not collisions:
             return None
         for collision in sorted(
@@ -11577,6 +11763,7 @@ class BattleRuntime(object):
         if not self._worker_mode:
             return 'pending', None
         vehicles = []
+        records = []
         for body in (first, second):
             try:
                 body_kind = str(body.get('kind', 'bot'))
@@ -11594,6 +11781,7 @@ class BattleRuntime(object):
                     getattr(vehicle, 'typeDescriptor', None) is None):
                 return 'pending', None
             vehicles.append(vehicle)
+            records.append(record)
         if int(first['id']) == int(second['id']):
             return 'invalid', None
         if not tank_collision.vertical_overlap(
@@ -11614,12 +11802,16 @@ class BattleRuntime(object):
         hit_point = self._vector((
             overlap_point[0], (low + high) * 0.5, overlap_point[1]))
         plates = []
-        for body, vehicle in zip((first, second), vehicles):
-            matrix = self._ram_pose_matrix(
+        for body, vehicle, record in zip(
+                (first, second), vehicles, records):
+            ground_matrix = self._ram_pose_matrix(
                 (body['x'], body['y'], body['z']), body['yaw'],
                 _number(body.get('pitch')), _number(body.get('roll')))
+            matrix, chassis_matrix = self._projectile_vehicle_matrices(
+                record, vehicle, ground_matrix=ground_matrix)
             plate = self._native_ram_vehicle_armor(
-                vehicle, matrix, hit_point)
+                vehicle, matrix, hit_point,
+                chassis_matrix=chassis_matrix)
             if plate is None:
                 # At this point both exact entities and their contact geometry
                 # are ready. None now means the native ray found no structural
@@ -12890,7 +13082,8 @@ class BattleRuntime(object):
         # A thrown track is physically locked and must brake through the same
         # grip-limited path as the handbrake.  A dead engine only removes drive
         # torque, so existing momentum continues to coast.
-        handbrake = bool(self._sender.handbrake) or is_tracked
+        handbrake = (bool(self._sender.handbrake) or is_tracked or
+                     siege_drive_locked)
         previous_speed = self._local_speed
         if siege_drive_locked:
             # Freeze only powered longitudinal/traverse motion. Gravity,
@@ -12898,6 +13091,11 @@ class BattleRuntime(object):
             # running through the remainder of this physics frame.
             self._local_speed = 0.0
             self._local_turn_speed = 0.0
+            stop_input = getattr(
+                getattr(entity, 'filter', None),
+                'notifyInputKeysDown', None)
+            if callable(stop_input):
+                stop_input(0, 0)
         else:
             drive_physics = self._local_physics
             power_factor = self._active_engine_power_factor()
@@ -13403,12 +13601,17 @@ class BattleRuntime(object):
                         if (record.get('local') and
                                 self._local_matrix is not None):
                             collisions = collide_vehicle_at_matrix(
-                                vehicle, self._local_matrix, start, end,
-                                self._runtime.math)
+                                vehicle, self._local_body_pose(), start, end,
+                                self._runtime.math,
+                                chassis_matrix=self._local_matrix)
                         elif record.get('native_remote'):
+                            body_matrix, chassis_matrix = \
+                                self._projectile_vehicle_matrices(
+                                    record, vehicle)
                             collisions = collide_vehicle_at_matrix(
-                                vehicle, vehicle.matrix, start, end,
-                                self._runtime.math)
+                                vehicle, body_matrix, start, end,
+                                self._runtime.math,
+                                chassis_matrix=chassis_matrix)
                         else:
                             collide = getattr(
                                 vehicle, 'collideSegmentExt', None)
@@ -14025,12 +14228,15 @@ class BattleRuntime(object):
                 continue
             if (record.get('local') and self._local_matrix is not None):
                 candidate_collisions = collide_vehicle_at_matrix(
-                    candidate, self._local_matrix, start, end,
-                    self._runtime.math)
+                    candidate, self._local_body_pose(), start, end,
+                    self._runtime.math,
+                    chassis_matrix=self._local_matrix)
             elif record.get('native_remote'):
+                body_matrix, chassis_matrix = \
+                    self._projectile_vehicle_matrices(record, candidate)
                 candidate_collisions = collide_vehicle_at_matrix(
-                    candidate, candidate.matrix, start, end,
-                    self._runtime.math)
+                    candidate, body_matrix, start, end,
+                    self._runtime.math, chassis_matrix=chassis_matrix)
             else:
                 candidate_collisions = candidate.collideSegmentExt(start, end)
             if not candidate_collisions:
@@ -14536,6 +14742,17 @@ class BattleRuntime(object):
             record['engine_id'], siege_state,
             float(time_left_ms) / 1000.0)
         record['presented_siege_state'] = siege_state
+        if (self._worker_mode and record.get('native_remote') and
+                self._remote_factory is not None):
+            updater = getattr(
+                self._remote_factory, 'update_entity_siege_pose', None)
+            if callable(updater):
+                updater(record['engine_id'])
+        if record.get('local') and self._local_matrix is not None:
+            self._select_local_siege_pose(
+                entity, siege_state in (
+                    siege_states.ENABLED, siege_states.SWITCHING_OFF))
+            self._update_local_hull_aiming(entity)
         if record.get('local') and self._gun_state is not None:
             self._gun_state.adopt_descriptor(entity.typeDescriptor)
             self._targeting_signature = None
@@ -15966,9 +16183,12 @@ class BattleRuntime(object):
             collisions = ()
             try:
                 if record.get('native_remote'):
+                    body_matrix, chassis_matrix = \
+                        self._projectile_vehicle_matrices(record, target)
                     collisions = tuple(collide_vehicle_at_matrix(
-                        target, target.matrix, burst_position, aim,
-                        self._runtime.math) or ())
+                        target, body_matrix, burst_position, aim,
+                        self._runtime.math,
+                        chassis_matrix=chassis_matrix) or ())
                 else:
                     collisions = tuple(
                         target.collideSegmentExt(burst_position, aim) or ())
@@ -16523,6 +16743,13 @@ class BattleRuntime(object):
         self._local_push_z = 0.0
         self._local_physics = None
         self._local_matrix = None
+        self._local_pose_matrix = None
+        self._local_stabilised_matrix = None
+        self._local_stabilised_snapshot = None
+        self._local_steady_rotation_matrix = None
+        self._local_siege_body_matrix = None
+        self._local_siege_stabilised_matrix = None
+        self._local_siege_ground_matrix = None
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
