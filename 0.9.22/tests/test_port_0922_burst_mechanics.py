@@ -43,6 +43,8 @@ class BurstMechanicsTests(unittest.TestCase):
         self.assertEqual([41], [edge['shot_seq'] for edge in first])
         self.assertEqual([42, 43], [edge['shot_seq'] for edge in crossed])
         self.assertEqual([1, 2], [edge['burst_index'] for edge in crossed])
+        self.assertEqual([0.1, 0.2], [
+            round(edge['due_offset'], 6) for edge in crossed])
         self.assertAlmostEqual(0.095, clock.time_left)
         self.assertTrue(clock.active)
 

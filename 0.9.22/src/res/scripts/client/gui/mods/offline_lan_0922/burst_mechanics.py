@@ -125,6 +125,7 @@ class BurstClock(object):
             return ()
         if math.isnan(dt) or math.isinf(dt):
             return ()
+        due_offset = max(0.0, self.time_left)
         self.time_left -= dt
         due = []
         while self.active and self.time_left <= _EPSILON:
@@ -136,6 +137,9 @@ class BurstClock(object):
                 'burst_count': self.count,
                 'shell_index': self.shell_index,
                 'final': index + 1 >= self.count,
+                # This is the physical edge inside the caller's elapsed
+                # interval, not the render callback receipt time.
+                'due_offset': min(dt, due_offset),
             })
             self.next_index += 1
             if self.next_index >= self.count:
@@ -143,6 +147,7 @@ class BurstClock(object):
                 self.time_left = 0.0
             else:
                 self.time_left += self.interval
+                due_offset += self.interval
         return tuple(due)
 
     def cancel(self, launched_count=None):

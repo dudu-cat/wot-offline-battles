@@ -637,6 +637,18 @@ def _bounded_vector(value, lows, highs):
             for index, component in enumerate(value)]
 
 
+def _bounded_bot_launch_pose(value):
+    if not isinstance(value, list) or len(value) != 6:
+        raise ValueError("expected bot launch pose")
+    position = _bounded_vector(
+        value[:3], (-5000.0, -1000.0, -5000.0),
+        (5000.0, 3000.0, 5000.0))
+    angles = [round(_bounded_float(
+        value[index], -math.pi * 2.0, math.pi * 2.0), 6)
+        for index in range(3, 6)]
+    return position + angles
+
+
 def _projectile_source_shot(value):
     """Return one exact mounted-gun projectile law or reject the wire."""
     if not isinstance(value, dict) or set(value) != {
@@ -1741,6 +1753,8 @@ class BattleState:
         self.projectile_revision = 0
         self.bot_pending_projectile_launches = set()
         self.bot_pending_projectile_metadata = {}
+        self.bot_launch_clock_offset_us = None
+        self.bot_last_projectile_launch_time_us = {}
         self.last_bot_state_reject = ""
         self.last_bot_state_reject_code = ""
         self.last_bot_hit_reject = ""
@@ -2047,6 +2061,8 @@ class BattleState:
             self.authority_epoch += 1
             self.bot_pending_projectile_launches.clear()
             self.bot_pending_projectile_metadata.clear()
+            self.bot_launch_clock_offset_us = None
+            self.bot_last_projectile_launch_time_us.clear()
         if (old != self.bot_authority_id and
                 self.phase in ("loading", "battle")):
             self.bot_manifest_authority_id = None
@@ -2713,6 +2729,8 @@ class BattleState:
         self.bot_state_time_us = 0
         self.bot_source_time_us = None
         self.bot_source_receipt_time_us = None
+        self.bot_launch_clock_offset_us = None
+        self.bot_last_projectile_launch_time_us = {}
         self.motion_time_offset_us = 0
         self.bot_planner.reset()
         self.bot_orders = {"revision": 0, "orders": []}
@@ -4777,6 +4795,7 @@ class BattleState:
             if not self.bot_manifest and self.bot_roster:
                 return self._set_protocol_reject(
                     "bot_state", "manifest_missing", "manifest=empty")
+            previous_source_time_us = self.bot_source_time_us
             source_time_us = None
             if "sample_time_us" in message:
                 try:
@@ -4834,6 +4853,11 @@ class BattleState:
             next_motion_time_offset_us = max(
                 self.motion_time_offset_us,
                 next_bot_state_time_us - received_raw_motion_time_us)
+            next_launch_clock_offset_us = self.bot_launch_clock_offset_us
+            if (source_time_us is not None and
+                    next_launch_clock_offset_us is None):
+                next_launch_clock_offset_us = (
+                    self._server_time_ms() * 1000 - source_time_us)
             identities = {entry["id"]: entry for entry in self.bot_manifest}
             incoming = message.get("bots") or []
             if (not isinstance(incoming, (list, tuple)) or
@@ -4984,6 +5008,20 @@ class BattleState:
                         for edge in burst_edges:
                             shot_seq = (int(edge["burst_group_seq"]) +
                                         int(edge["burst_index"]))
+                            if (source_time_us is None or
+                                    next_launch_clock_offset_us is None):
+                                return self._set_protocol_reject(
+                                    "bot_state", "launch_sample_time",
+                                    "bot=%s shot_seq=%s" % (
+                                        bot_id, shot_seq))
+                            edge = dict(edge)
+                            edge.update({
+                                "sample_start_us": max(
+                                    0, int(previous_source_time_us or 0)),
+                                "sample_end_us": int(source_time_us),
+                                "launch_clock_offset_us": int(
+                                    next_launch_clock_offset_us),
+                            })
                             pending_projectile_launches[(
                                 bot_id, shot_seq)] = edge
                     else:
@@ -5036,6 +5074,8 @@ class BattleState:
                 self.bot_source_time_us = source_time_us
                 self.bot_source_receipt_time_us = (
                     received_raw_motion_time_us)
+                self.bot_launch_clock_offset_us = (
+                    next_launch_clock_offset_us)
             self.bot_state_revision += 1
             return True
 
@@ -5778,6 +5818,7 @@ class BattleState:
                 "splash_radius", "penetration_factor", "source_shot",
                 "authority_epoch", "fire_intent_seq", "fire_input_seq",
                 "burst_group_seq", "burst_index", "burst_count",
+                "launch_time_us", "launch_pose",
             }
             if set(message) - allowed:
                 return False
@@ -5833,6 +5874,17 @@ class BattleState:
                         ("fire_intent_seq" in message or
                          "fire_input_seq" in message)):
                     raise ValueError("bot launch has a player intent")
+                launch_time_us = (
+                    _exact_int(message.get("launch_time_us"), 0,
+                               MAX_MOTION_TIME_US)
+                    if shooter_kind == "bot" else None)
+                launch_pose = (
+                    _bounded_bot_launch_pose(message.get("launch_pose"))
+                    if shooter_kind == "bot" else None)
+                if (shooter_kind == "player" and
+                        ("launch_time_us" in message or
+                         "launch_pose" in message)):
+                    raise ValueError("player launch has a bot logical pose")
                 if not is_he and splash_radius != 0.0:
                     raise ValueError("AP projectile cannot have splash")
                 if not _projectile_source_shot_matches_launch(
@@ -5855,6 +5907,9 @@ class BattleState:
                 "source_shot": source_shot,
             }
             normalized.update(burst)
+            if launch_time_us is not None:
+                normalized["launch_time_us"] = launch_time_us
+                normalized["launch_pose"] = launch_pose
             if fire_intent_seq is not None:
                 normalized["fire_intent_seq"] = fire_intent_seq
                 normalized["fire_input_seq"] = fire_input_seq
@@ -5933,6 +5988,19 @@ class BattleState:
                         "burst_count": 1,
                         "shell_index": shell_index,
                     }
+                try:
+                    sample_start_us = int(expected_edge[
+                        "sample_start_us"])
+                    sample_end_us = int(expected_edge["sample_end_us"])
+                    launch_clock_offset_us = int(expected_edge[
+                        "launch_clock_offset_us"])
+                    mapped_launch_time_us = (
+                        launch_time_us + launch_clock_offset_us)
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return False
+                previous_launch_time_us = \
+                    self.bot_last_projectile_launch_time_us.get(
+                        shooter_id, -1)
                 if (shooter is None or not shooter.get("alive") or
                         expected_edge is None or
                         any(pending_bot == shooter_id and
@@ -5942,14 +6010,17 @@ class BattleState:
                         shell_index != int(expected_edge["shell_index"]) or
                         any(int(burst[name]) != int(expected_edge[name])
                             for name in ("burst_group_seq", "burst_index",
-                                         "burst_count"))):
+                                         "burst_count")) or
+                        not sample_start_us <= launch_time_us <= sample_end_us or
+                        launch_time_us <= previous_launch_time_us or
+                        mapped_launch_time_us < 0 or
+                        mapped_launch_time_us > self._server_time_ms() * 1000):
                     return False
                 team = int(shooter.get("team", 0))
                 if team not in (1, 2):
                     return False
                 source_vehicle = str(shooter.get("vehicle", ""))
-                shooter_position = [
-                    shooter.get("x"), shooter.get("y"), shooter.get("z")]
+                shooter_position = list(launch_pose[:3])
             if not source_vehicle or len(source_vehicle) > 128:
                 return False
             try:
@@ -5960,7 +6031,9 @@ class BattleState:
             except (TypeError, ValueError, OverflowError):
                 return False
 
-            launch_server_time_ms = self._server_time_ms()
+            launch_server_time_ms = (
+                int(round(float(mapped_launch_time_us) / 1000.0))
+                if shooter_kind == "bot" else self._server_time_ms())
             record = dict(normalized)
             record.update({
                 "projectile_id": projectile_id,
@@ -6000,6 +6073,8 @@ class BattleState:
                     (shooter_id, shot_seq))
                 self.bot_pending_projectile_metadata.pop(
                     (shooter_id, shot_seq), None)
+                self.bot_last_projectile_launch_time_us[shooter_id] = (
+                    launch_time_us)
             self._statistics_row(shooter_kind, shooter_id)["shots_fired"] += 1
             self.projectile_revision += 1
 

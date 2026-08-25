@@ -14573,7 +14573,7 @@ class BattleRuntime(object):
             self, source, unused_descriptor, unused_shell_index,
             unused_fire_seq, unused_shot_yaw, unused_shot_pitch,
             unused_flight_time):
-        """Freeze one direct shell's real native muzzle before its lane proof."""
+        """Freeze one direct shell at its exact logical/native muzzle pose."""
         try:
             source_id = int(source.get('id'))
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -14590,9 +14590,25 @@ class BattleRuntime(object):
             return None
         try:
             gun_node = source_entity.model.node('HP_gunFire')
-            return _xyz(self._runtime.math.Matrix(gun_node).translation)
+            native = _xyz(self._runtime.math.Matrix(gun_node).translation)
         except Exception:
             return None
+        presented = source_record.get('projectile_collision_pose')
+        if isinstance(presented, dict):
+            logical_pose = self._projectile_plain_pose((
+                _number(source.get('x')), _number(source.get('y')),
+                _number(source.get('z'))), source)
+            names = ('x', 'y', 'z', 'yaw', 'pitch', 'roll',
+                     'turret_yaw', 'gun_pitch')
+            if any(abs(_number(logical_pose.get(name)) -
+                       _number(presented.get(name))) > 1.0e-7
+                   for name in names):
+                # A stalled callback can simulate several physical edges before
+                # the hidden native compound is presented.  The pure #1513
+                # barrel transform binds each edge to its own logical pose;
+                # the native node remains the exact path for an aligned pose.
+                return tuple(barrel)
+        return native
 
     def _bot_artillery_planning_origin(self, source, descriptor):
         """Read the same native muzzle used by the final SPG proof."""
@@ -14988,7 +15004,14 @@ class BattleRuntime(object):
             bot_id = int(state.get('id'))
             shot_yaw = float(state.get('shot_yaw'))
             shot_pitch = float(state.get('shot_pitch'))
-        except (TypeError, ValueError):
+            launch_time_us = int(state['launch_time_us'])
+            launch_pose = tuple(float(value)
+                                for value in state['launch_pose'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (launch_time_us < 0 or len(launch_pose) != 6 or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in launch_pose)):
             return False
         source_record = self._records.get('bot:%s' % bot_id)
         if source_record is None:
@@ -15098,7 +15121,9 @@ class BattleRuntime(object):
             source_shot=descriptor_donation.project_shot(shot),
             burst_group_seq=state.get('burst_group_seq'),
             burst_index=state.get('burst_index'),
-            burst_count=state.get('burst_count'))
+            burst_count=state.get('burst_count'),
+            launch_time_us=launch_time_us,
+            launch_pose=launch_pose)
         return accepted == int(shot_seq)
 
     def _resolve_bot_shot(self, state, shot_seq):

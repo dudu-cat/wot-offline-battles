@@ -8487,6 +8487,66 @@ class BattleRuntimeContractTests(unittest.TestCase):
         args = battle._artillery.request_launch.call_args.args
         self.assertEqual((4.0, 3.5, 6.0), args[5])
 
+    def test_stalled_bot_launch_uses_its_logical_barrel_pose(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(4.0, 2.0, 6.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        presented = {
+            'x': 4.0, 'y': 2.0, 'z': 6.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0, 'turret_yaw': 0.0,
+            'gun_pitch': 0.0,
+        }
+        battle._records = {'bot:7': {
+            'engine_id': 10, 'kind': 'bot', 'network_id': 7,
+            'ready': True, 'local': False,
+            'projectile_collision_pose': dict(presented),
+            'state': {'team': 1, 'health': 500, 'alive': True},
+        }}
+
+        aligned = battle._bot_direct_launch_origin(
+            dict(presented, id=7), descriptor, 0, 1, 0.0, 0.0, 1.0)
+        moved = battle._bot_direct_launch_origin(
+            dict(presented, id=7, x=9.0),
+            descriptor, 0, 2, 0.0, 0.0, 1.0)
+
+        self.assertEqual((4.0, 3.5, 6.0), aligned)
+        self.assertEqual((9.0, 3.5, 8.0), moved)
+
+    def test_bot_projectile_sends_frozen_logical_time_and_pose(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        entity = _Vehicle(
+            10, descriptor, _Vector(4.0, 2.0, 6.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._records = {'bot:7': {
+            'engine_id': 10, 'kind': 'bot', 'network_id': 7,
+            'ready': True, 'local': False,
+            'state': {'team': 1, 'health': 500, 'alive': True},
+        }}
+        battle.client = types.SimpleNamespace(
+            authority_epoch=4,
+            send_projectile_launch=mock.Mock(return_value=3))
+        launch_pose = (4.0, 2.0, 6.0, 0.0, 0.0, 0.0)
+
+        self.assertTrue(battle._launch_bot_projectile({
+            'id': 7, 'fire_seq': 3, 'shell_index': 0,
+            'shot_yaw': 0.0, 'shot_pitch': 0.0,
+            'shot_origin': (4.0, 3.5, 6.0),
+            'burst_group_seq': 2, 'burst_index': 1, 'burst_count': 3,
+            'launch_time_us': 240000, 'launch_pose': launch_pose,
+            'profile': {'class_tag': 'mediumTank'},
+        }, 3))
+
+        kwargs = battle.client.send_projectile_launch.call_args.kwargs
+        self.assertEqual(240000, kwargs['launch_time_us'])
+        self.assertEqual(launch_pose, kwargs['launch_pose'])
+
     def test_spg_friendly_lane_uses_exact_arc_and_real_he_radius(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

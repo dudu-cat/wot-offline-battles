@@ -148,6 +148,11 @@ def _launch(shooter_id=1, shot_seq=1, shooter_kind='player', **changes):
         'penetration_factor': 1.0,
     }
     message.update(changes)
+    if shooter_kind == 'bot':
+        message.setdefault('launch_time_us', int(shot_seq) * 100000)
+        message.setdefault('launch_pose', [
+            float(message['origin'][0]), float(message['origin'][1]) - 1.0,
+            float(message['origin'][2]), 0.0, 0.0, 0.0])
     if 'source_shot' not in message:
         message['source_shot'] = _source_shot(
             math.sqrt(sum(component * component
@@ -1140,7 +1145,8 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         }
         self.assertTrue(state.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, {
-            'round_id': 1, 'bots': [publication]}),
+            'round_id': 1, 'sample_time_us': 100000,
+            'bots': [publication]}),
             state.last_bot_state_reject)
         self.assertFalse(any(event.get('kind') == 'bot_shot'
                              for event in state.pending_events))
@@ -1205,6 +1211,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             edge = {
                 'burst_group_seq': 1, 'burst_index': index,
                 'burst_count': 3, 'shell_index': 0,
+                'sample_start_us': 0, 'sample_end_us': 300000,
+                'launch_clock_offset_us':
+                    state._server_time_ms() * 1000 - 300000,
             }
             state.bot_pending_projectile_launches.add(key)
             state.bot_pending_projectile_metadata[key] = edge
@@ -1212,7 +1221,16 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             shooter_id=16, shooter_kind='bot', shot_seq=2,
             origin=[20.0, 1.0, 0.0], burst_group_seq=1,
             burst_index=1, burst_count=3)))
+        self.assertFalse(_launch_authority(state, _launch(
+            shooter_id=16, shooter_kind='bot', shot_seq=1,
+            launch_time_us=300001, origin=[20.0, 1.0, 0.0],
+            burst_group_seq=1, burst_index=0, burst_count=3)))
         for index in range(3):
+            if index == 1:
+                self.assertFalse(_launch_authority(state, _launch(
+                    shooter_id=16, shooter_kind='bot', shot_seq=2,
+                    launch_time_us=100000, origin=[20.0, 1.0, 0.0],
+                    burst_group_seq=1, burst_index=1, burst_count=3)))
             self.assertTrue(_launch_authority(state, _launch(
                 shooter_id=16, shooter_kind='bot', shot_seq=index + 1,
                 origin=[20.0, 1.0, 0.0], burst_group_seq=1,
@@ -1220,6 +1238,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual([0, 1, 2], [
             event['burst_index'] for event in state.pending_events
             if event.get('kind') == 'bot_shot'])
+        self.assertEqual(
+            [state._server_time_ms() - 200,
+             state._server_time_ms() - 100,
+             state._server_time_ms()],
+            [state.projectiles['1:b:16:%s' % shot_seq][
+                'launch_server_time_ms'] for shot_seq in (1, 2, 3)])
+
     def test_progress_uses_batch_cas_epoch_and_exact_retry(self):
         state = _state()
         self.assertTrue(_launch_authority(state, _launch()))
@@ -1517,6 +1542,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'x': 20.0, 'y': 0.0, 'z': 0.0,
         }
         state.bot_pending_projectile_launches.add((16, 1))
+        state.bot_pending_projectile_metadata[(16, 1)] = {
+            'burst_group_seq': 1, 'burst_index': 0,
+            'burst_count': 1, 'shell_index': 0,
+            'sample_start_us': 0, 'sample_end_us': 100000,
+            'launch_clock_offset_us':
+                state._server_time_ms() * 1000 - 100000,
+        }
         self.assertTrue(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID,
             _launch(shooter_id=16, shooter_kind='bot', shot_seq=1)))

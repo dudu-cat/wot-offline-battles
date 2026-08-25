@@ -844,6 +844,21 @@ def _strict_world_position(value):
         (5000.0, 3000.0, 5000.0))
 
 
+def _strict_bot_launch_pose(value):
+    """Freeze one Bot hull pose on the worker's source-time clock."""
+    if not isinstance(value, (list, tuple)) or len(value) != 6:
+        return None
+    position = _strict_world_position(list(value[:3]))
+    if position is None:
+        return None
+    angles = [_projectile_float_range(
+        value[index], -math.pi * 2.0, math.pi * 2.0)
+        for index in range(3, 6)]
+    if any(angle is None for angle in angles):
+        return None
+    return position + angles
+
+
 def _strict_launch_velocity(value):
     result = _strict_vector3(value, MAX_PROJECTILE_VELOCITY)
     if result is None:
@@ -2308,7 +2323,8 @@ class LANClient(object):
             velocity, gravity, max_distance, max_time_ms, is_he,
             splash_radius, authority_epoch=None, penetration_factor=1.0,
             source_shot=None, fire_intent_seq=None, fire_input_seq=None,
-            burst_group_seq=None, burst_index=None, burst_count=None):
+            burst_group_seq=None, burst_index=None, burst_count=None,
+            launch_time_us=None, launch_pose=None):
         """Enqueue one immutable projectile launch and return its shot seq."""
         if not self.ready or self.phase != 'battle':
             return None
@@ -2361,8 +2377,13 @@ class LANClient(object):
         else:
             parsed_epoch = _projectile_int_range(
                 authority_epoch, 0, MAX_PROJECTILE_ID)
+            parsed_launch_time = _projectile_int_range(
+                launch_time_us, 0, MAX_MOTION_TIME_US)
+            parsed_launch_pose = _strict_bot_launch_pose(launch_pose)
             if (not self.is_bot_authority() or parsed_epoch is None or
-                    parsed_epoch != _exact_int(self.authority_epoch)):
+                    parsed_epoch != _exact_int(self.authority_epoch) or
+                    parsed_launch_time is None or
+                    parsed_launch_pose is None):
                 return None
 
         with self._projectile_lock:
@@ -2403,6 +2424,9 @@ class LANClient(object):
             }
             if parsed_epoch is not None:
                 message['authority_epoch'] = parsed_epoch
+            if shooter_kind == 'bot':
+                message['launch_time_us'] = parsed_launch_time
+                message['launch_pose'] = parsed_launch_pose
             if parsed_intent_seq is not None:
                 message['fire_intent_seq'] = parsed_intent_seq
                 message['fire_input_seq'] = parsed_input_seq

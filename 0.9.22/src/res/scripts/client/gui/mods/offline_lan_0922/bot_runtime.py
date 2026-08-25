@@ -618,9 +618,23 @@ def _combat_record(state):
     }
 
 
-def _local_launch_record(state):
+def _local_launch_record(state, launch_time_us=None):
     """Return only fields consumed by BattleRuntime's projectile launch."""
     if 'shot_yaw' not in state or 'shot_pitch' not in state:
+        return None
+    try:
+        raw_launch_time_us = launch_time_us
+        launch_time_us = int(raw_launch_time_us)
+        exact_launch_time = float(raw_launch_time_us) == launch_time_us
+    except (TypeError, ValueError, OverflowError):
+        return None
+    launch_pose = tuple(_number(state.get(name)) for name in (
+        'x', 'y', 'z', 'yaw', 'pitch', 'roll'))
+    if (isinstance(raw_launch_time_us, bool) or
+            not exact_launch_time or
+            launch_time_us < 0 or
+            any(math.isnan(value) or math.isinf(value)
+                for value in launch_pose)):
         return None
     profile = state.get('profile')
     profile = profile if isinstance(profile, dict) else {}
@@ -636,6 +650,8 @@ def _local_launch_record(state):
             'burst_group_seq', state.get('fire_seq', 0))),
         'burst_index': int(state.get('burst_index', 0)),
         'burst_count': int(state.get('burst_count', 1)),
+        'launch_time_us': launch_time_us,
+        'launch_pose': launch_pose,
     }
     if 'shot_origin' in state:
         result['shot_origin'] = state['shot_origin']
@@ -6502,7 +6518,8 @@ class BotRuntime(object):
 
     def _commit_burst_edge(
             self, state, gun_state, reload_factor, descriptor, edge,
-            ammo_state, launch_receipt=None, launch_preview=None):
+            ammo_state, launch_receipt=None, launch_preview=None,
+            launch_time_us=None):
         """Atomically commit one real projectile in an armed group."""
         if (state.get('_drowning', False) or
                 state.get('_overturned', False)):
@@ -6585,14 +6602,17 @@ class BotRuntime(object):
         state['reload_time'] = gun_state.remaining(reload_factor)
         state['reload_duration'] = gun_state.duration(reload_factor)
         ammo_state.publish(state)
-        launch = _local_launch_record(state)
+        if launch_time_us is None:
+            launch_time_us = self._sample_time_us
+        launch = _local_launch_record(state, launch_time_us)
         if launch is None:
             raise RuntimeError('physical bot burst launch is incomplete')
         self._queue_pending_launch(launch)
         return True
 
     def _fire(self, state, gun_state, reload_factor, descriptor,
-              launch_receipt=None, ammo_state=None, launch_preview=None):
+              launch_receipt=None, ammo_state=None, launch_preview=None,
+              launch_time_us=None):
         if (state.get('_drowning', False) or
                 state.get('_overturned', False)):
             return False
@@ -6627,7 +6647,8 @@ class BotRuntime(object):
         edge = burst_state.advance(0.0)[0]
         if not self._commit_burst_edge(
                 state, gun_state, reload_factor, descriptor, edge,
-                ammo_state, launch_receipt, launch_preview):
+                ammo_state, launch_receipt, launch_preview,
+                launch_time_us):
             gun_state.cancel_burst()
             burst_state.cancel(0)
             return False
@@ -6666,13 +6687,22 @@ class BotRuntime(object):
 
     def _advance_active_burst(
             self, state, gun_state, ammo_state, reload_factor, descriptor,
-            target, ballistic_solution, step, destroyed_devices):
+            target, ballistic_solution, step, destroyed_devices,
+            step_start_time_us=None, step_end_time_us=None):
         """Launch every descriptor-cadence edge crossed by this tick."""
         burst_state = self._burst_states.get(int(state['id']))
         if burst_state is None or not burst_state.active:
             return 0
+        if step_start_time_us is None:
+            step_start_time_us = self._sample_time_us
+        if step_end_time_us is None:
+            step_end_time_us = step_start_time_us + max(
+                0, int(round(float(step) * 1000000.0)))
         committed = 0
         for edge in burst_state.advance(step):
+            launch_time_us = min(
+                int(step_end_time_us), int(step_start_time_us) + max(
+                    0, int(round(float(edge['due_offset']) * 1000000.0))))
             if (not state.get('alive', False) or
                     state.get('_drowning', False) or
                     state.get('_overturned', False) or
@@ -6709,13 +6739,26 @@ class BotRuntime(object):
             if (not lane_clear or
                     not self._commit_burst_edge(
                         state, gun_state, reload_factor, descriptor, edge,
-                        ammo_state, launch_preview=preview)):
+                        ammo_state, launch_preview=preview,
+                        launch_time_us=launch_time_us)):
                 self._cancel_active_burst(
                     state, gun_state, ammo_state, burst_state)
                 break
             committed += 1
         burst_state.publish(state)
         return committed
+
+    def _bounded_burst_step(self, maximum):
+        """End a simulation slice at the next armed physical round."""
+        result = max(0.0, float(maximum))
+        for burst_state in self._burst_states.values():
+            if not burst_state.active:
+                continue
+            due = max(0.0, float(burst_state.time_left))
+            if due <= 1.0e-9:
+                return min(result, 1.0e-9)
+            result = min(result, due)
+        return result
 
     def update(self, dt, now, players=None, neighbours=None):
         """Advance the complete elapsed interval in stable bounded substeps."""
@@ -6736,7 +6779,7 @@ class BotRuntime(object):
         self._accumulator = 0.0
         outgoing = []
         while elapsed > 1e-12:
-            frame_step = min(elapsed, 0.2)
+            frame_step = self._bounded_burst_step(min(elapsed, 0.2))
             elapsed = max(0.0, elapsed - frame_step)
             step_now = now - elapsed
             outgoing.extend(self._update_once(
@@ -6746,6 +6789,10 @@ class BotRuntime(object):
     def _update_once(self, frame_step, now, players=None, neighbours=None):
         """Advance one stable authority substep and preserve its events."""
         publish = True
+        step_duration_us = max(
+            1, int(round(float(frame_step) * 1000000.0)))
+        step_start_time_us = self._sample_time_us
+        step_end_time_us = step_start_time_us + step_duration_us
         if self._next_publication <= 0.0:
             self._next_publication = now
         # Carry the nominal deadline to preserve an average 30 Hz at render
@@ -7404,7 +7451,8 @@ class BotRuntime(object):
             state['reload_duration'] = gun_state.duration(reload_factor)
             self._advance_active_burst(
                 state, gun_state, ammo_state, reload_factor, descriptor,
-                target, ballistic_solution, step, destroyed_devices)
+                target, ballistic_solution, step, destroyed_devices,
+                step_start_time_us, step_end_time_us)
             fire_range = max(0.0, _number(command.get('fire_range'), 0.0))
             target_distance = (_distance(_position(state), target['position'])
                                if target is not None else 0.0)
@@ -7475,7 +7523,8 @@ class BotRuntime(object):
                         state, gun_state, reload_factor, descriptor,
                         launch_receipt=launch_receipt,
                         ammo_state=ammo_state,
-                        launch_preview=launch_preview)
+                        launch_preview=launch_preview,
+                        launch_time_us=step_end_time_us)
                     if fired and is_spg:
                         self._cancel_artillery_intent(state['id'])
                 elif launch is not None:
@@ -7642,8 +7691,7 @@ class BotRuntime(object):
             if projected is None:
                 raise RuntimeError('bot publication projection failed')
             wire_states.append(projected)
-        self._sample_time_us += max(
-            1, int(round(frame_step * 1000000.0)))
+        self._sample_time_us = step_end_time_us
         publication = {
             'type': 'bot_state', 'bots': wire_states,
             'sample_time_us': self._sample_time_us,

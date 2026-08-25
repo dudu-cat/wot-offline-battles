@@ -3654,6 +3654,7 @@ class BotRuntimeTests(unittest.TestCase):
                 published += 1
                 self.assertTrue(server.update_bot_states(1, {
                     'round_id': server.round_id,
+                    'sample_time_us': bot_state['sample_time_us'],
                     'bots': bot_state['bots'],
                 }))
                 accepted += 1
@@ -3754,6 +3755,7 @@ class BotRuntimeTests(unittest.TestCase):
                     previous_fire[bot['id']] = current_fire
                 self.assertTrue(server.update_bot_states(1, {
                     'round_id': server.round_id,
+                    'sample_time_us': message['sample_time_us'],
                     'bots': message['bots'],
                 }), server.last_bot_state_reject)
                 runtime.apply_snapshot({
@@ -5889,6 +5891,85 @@ class BotRuntimeTests(unittest.TestCase):
                          ammo_state.remaining[ammo_state.loaded])
         self.assertEqual(2, gun_state.clip)
         self.assertFalse(runtime._burst_states[11].active)
+
+    def test_stalled_burst_freezes_each_logical_time_pose_and_muzzle(self):
+        for stall, count in ((0.2, 3), (1.0, 11)):
+            with self.subTest(stall=stall):
+                descriptor = _combat_descriptor(
+                    reload_time=4.0, clip=(count + 1, 2.0),
+                    dispersion=0.01, max_ammo=count + 2)
+                descriptor.gun.burst = (count, 0.1)
+                descriptor.gun.shotDispersionFactors = {
+                    'afterShot': 4.0, 'afterShotInBurst': 1.0,
+                    'turretRotation': 0.0,
+                }
+                runtime = self.module.BotRuntime(
+                    1, friendly_lane_probe=lambda *unused: True,
+                    direct_launch_origin_probe=lambda source, *unused: (
+                        source['x'], source['y'] + 1.0, source['z']))
+                runtime.round_id = 5
+                runtime.authority_id = 1
+                runtime.adapter = object()
+                runtime._descriptors[11] = descriptor
+                state = {
+                    'id': 11, 'alive': True, 'health': 1000,
+                    'fire_seq': 0, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                    'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+                    'aim_yaw': 0.0, 'turret_yaw': 0.0,
+                    'gun_pitch': -0.01, 'critical': {}, 'profile': {},
+                }
+                target = {
+                    'id': 2, 'network_id': 2, 'kind': 'human',
+                    'alive': True, 'position': (0.0, 1.0, 100.0),
+                }
+                solution = {'flight_time': 0.5}
+                gun_state = self.module._BotGunState(descriptor)
+                gun_state.elapsed = 10.0
+                ammo_state = self.module._BotAmmoState(
+                    descriptor, {}, state)
+                runtime._gun_states[11] = gun_state
+                runtime._ammo_states[11] = ammo_state
+                preview = runtime._direct_launch_preview(
+                    state, descriptor, ammo_state.loaded, gun_state,
+                    solution)
+                self.assertTrue(runtime._fire(
+                    state, gun_state, 1.0, descriptor,
+                    ammo_state=ammo_state, launch_preview=preview,
+                    launch_time_us=0))
+
+                substeps = []
+
+                def simulate(step, unused_now, unused_players,
+                             unused_neighbours):
+                    start_us = runtime._sample_time_us
+                    duration_us = max(1, int(round(step * 1000000.0)))
+                    end_us = start_us + duration_us
+                    state['z'] += 10.0 * step
+                    substeps.append(step)
+                    runtime._advance_active_burst(
+                        state, gun_state, ammo_state, 1.0, descriptor,
+                        target, solution, step, set(), start_us, end_us)
+                    runtime._sample_time_us = end_us
+                    return []
+
+                runtime._update_once = simulate
+                runtime.update(stall, stall)
+
+                launches = runtime._pending_launches
+                self.assertEqual(count, len(launches))
+                self.assertEqual(
+                    [index * 100000 for index in range(count)],
+                    [launch['launch_time_us'] for launch in launches])
+                self.assertEqual(
+                    [round(float(index), 6) for index in range(count)],
+                    [round(launch['shot_origin'][2], 6)
+                     for launch in launches])
+                self.assertEqual(
+                    [round(float(index), 6) for index in range(count)],
+                    [round(launch['launch_pose'][2], 6)
+                     for launch in launches])
+                self.assertTrue(all(
+                    step <= 0.100000001 for step in substeps))
 
     def test_siege_transition_edge_locks_pose_in_its_starting_tick(self):
         self.runtime.battle_start(self.start)

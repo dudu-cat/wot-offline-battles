@@ -211,7 +211,12 @@ class ProjectileWireTests(unittest.TestCase):
             fire_input_seq=fire_input_seq,
             burst_group_seq=values.get('burst_group_seq'),
             burst_index=values.get('burst_index'),
-            burst_count=values.get('burst_count'))
+            burst_count=values.get('burst_count'),
+            launch_time_us=(values.get('launch_time_us', 100000)
+                            if shooter_kind == 'bot' else None),
+            launch_pose=(values.get(
+                'launch_pose', [1.0, 0.0, 3.0, 0.0, 0.0, 0.0])
+                if shooter_kind == 'bot' else None))
 
     @staticmethod
     def send_player_input(client, shell_index=2):
@@ -447,6 +452,9 @@ class ProjectileWireTests(unittest.TestCase):
         message = wire_copy(client._outbound_queue[-1][1])
         self.assertEqual(4, message['authority_epoch'])
         self.assertEqual('bot', message['shooter_kind'])
+        self.assertEqual(100000, message['launch_time_us'])
+        self.assertEqual(
+            [1.0, 0.0, 3.0, 0.0, 0.0, 0.0], message['launch_pose'])
 
     def test_launch_rejects_non_plain_nonfinite_and_out_of_bounds_physics(self):
         client = self.active_worker_client()
