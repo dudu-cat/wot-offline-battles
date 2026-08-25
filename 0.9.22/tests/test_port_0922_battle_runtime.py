@@ -4924,10 +4924,26 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, battle.local_ram_contact()['seq'])
         self.assertEqual(2, battle._native_ram_vehicle_armor.call_count)
 
+        # One clear interpolated frame while the hulls are still approaching
+        # is not physical separation and must not re-arm the same impact.
         record['presented_pose']['z'] = 20.0
         battle._resolve_local_tank_contacts(
             local, (0.0, 0.0, 0.0), 0.0, 0.1)
         record['presented_pose']['z'] = 6.5
+        battle._local_speed = 10.0
+        battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+
+        self.assertEqual(1, battle.local_ram_contact()['seq'])
+
+        # A clear frame whose relative motion is separating ends the episode.
+        record['presented_pose']['z'] = 20.0
+        local.filter.velocity = _Vector(0.0, 0.0, -10.0)
+        battle._local_speed = -10.0
+        battle._resolve_local_tank_contacts(
+            local, (0.0, 0.0, 0.0), 0.0, 0.1)
+        record['presented_pose']['z'] = 6.5
+        local.filter.velocity = _Vector(0.0, 0.0, 10.0)
         battle._local_speed = 10.0
         battle._resolve_local_tank_contacts(
             local, (0.0, 0.0, 0.0), 0.0, 0.1)
@@ -5310,6 +5326,18 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._observe_native_ram_contact(
             local, remote, _Vector(0.0, 0.0, 3.25), 10.0)
+        battle._poll_local_ram_contact_episodes(object(), {
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
+            'shape': (1.5, 3.5, 0.0, 1.0),
+            'ram_profile': {
+                'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        }, ({
+            'network_id': 11, 'kind': 'bot', 'alive': True,
+            'x': 0.0, 'y': 0.0, 'z': 20.0, 'yaw': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
+            'shape': (1.5, 3.5, 0.0, 1.0),
+        },))
         battle._observe_native_ram_contact(
             local, remote, _Vector(0.0, 0.0, 3.25), 10.1)
 

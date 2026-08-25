@@ -4335,21 +4335,21 @@ class BotRuntime(object):
                                     self._terminal_human_ram_report(
                                         bot_id, player_id, seq)]
                             else:
-                                normal_x = bot['x'] - player['x']
-                                normal_z = bot['z'] - player['z']
-                                normal_length = math.sqrt(
-                                    normal_x * normal_x +
-                                    normal_z * normal_z)
-                                if normal_length > 0.000001:
-                                    normal_x /= normal_length
-                                    normal_z /= normal_length
+                                contact = tank_collision.obb_contact(
+                                    bot['x'], bot['z'], bot['yaw'],
+                                    bot['shape'],
+                                    player['x'], player['z'], player['yaw'],
+                                    player['shape'])
+                                if contact is None:
+                                    normal_x = normal_z = penetration = 0.0
+                                    closing_speed = 0.0
                                 else:
-                                    normal_x, normal_z = 0.0, 0.0
-                                closing_speed = (
-                                    tank_collision.planar_closing_speed(
-                                        (bot_vx, bot_vz),
-                                        (player_vx, player_vz),
-                                        (normal_x, normal_z)))
+                                    normal_x, normal_z, penetration = contact
+                                    closing_speed = (
+                                        tank_collision.planar_closing_speed(
+                                            (bot_vx, bot_vz),
+                                            (player_vx, player_vz),
+                                            (normal_x, normal_z)))
                                 damage_player, damage_bot = (
                                     tank_collision.ram_damage(
                                         closing_speed,
@@ -4382,7 +4382,7 @@ class BotRuntime(object):
                                     'shape_other': player['shape'],
                                     'contact_normal': (
                                         normal_x, normal_z),
-                                    'contact_penetration': 0.0,
+                                    'contact_penetration': penetration,
                                     'closing_speed': closing_speed,
                                     'damage_to_self': damage_bot,
                                     'damage_to_other': damage_player,

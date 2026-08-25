@@ -11943,31 +11943,13 @@ class BattleRuntime(object):
         """
         previous = set(self._local_ram_episode_contacts)
         overlapping = set()
+        closing_gaps = set()
         newly_armed = set()
         for other in others:
             if (not other.get('alive', True) or
                     other.get('kind') != 'bot'):
                 continue
-            if not tank_collision.vertical_overlap(
-                    own.get('y'), own['shape'],
-                    other.get('y'), other['shape']):
-                continue
-            contact = tank_collision.obb_contact(
-                own['x'], own['z'], own['yaw'], own['shape'],
-                other['x'], other['z'], other['yaw'], other['shape'])
-            if contact is None:
-                continue
             bot_id = int(other['network_id'])
-            overlapping.add(bot_id)
-            overlap_point = self._ram_obb_overlap_point(own, other)
-            if overlap_point is None:
-                continue
-            low = max(
-                float(own['y']) + float(own['shape'][2]),
-                float(other['y']) + float(other['shape'][2]))
-            high = min(
-                float(own['y']) + float(own['shape'][3]),
-                float(other['y']) + float(other['shape'][3]))
             own_center_y = float(own['y']) + (
                 float(own['shape'][2]) +
                 float(own['shape'][3])) * 0.5
@@ -11982,7 +11964,10 @@ class BattleRuntime(object):
                 value * value for value in center_delta)
             if center_distance_squared <= 0.0:
                 # A coincident synthetic spawn has no geometrically provable
-                # approach side. Keep separation but do not invent HP.
+                # approach side. Keep an existing episode armed and do not
+                # invent another HP event from the ambiguous pose.
+                if bot_id in previous:
+                    closing_gaps.add(bot_id)
                 continue
             relative_velocity = (
                 own['vx'] - other['vx'],
@@ -11997,6 +11982,32 @@ class BattleRuntime(object):
                 relative_velocity[index] * center_delta[index]
                 for index in range(3)) / math.sqrt(
                     center_distance_squared)
+            vertical = tank_collision.vertical_overlap(
+                own.get('y'), own['shape'],
+                other.get('y'), other['shape'])
+            contact = (tank_collision.obb_contact(
+                own['x'], own['z'], own['yaw'], own['shape'],
+                other['x'], other['z'], other['yaw'], other['shape'])
+                       if vertical else None)
+            if contact is None:
+                # Interpolated remote poses can flicker just outside the OBB
+                # for one frame while the same pair is still moving together.
+                # That is not physical separation and must not turn sustained
+                # pressure into another HP event.  A contact episode is only
+                # released after the clear hulls are no longer approaching.
+                if bot_id in previous and relative_normal < 0.0:
+                    closing_gaps.add(bot_id)
+                continue
+            overlapping.add(bot_id)
+            overlap_point = self._ram_obb_overlap_point(own, other)
+            if overlap_point is None:
+                continue
+            low = max(
+                float(own['y']) + float(own['shape'][2]),
+                float(other['y']) + float(other['shape'][2]))
+            high = min(
+                float(own['y']) + float(own['shape'][3]),
+                float(other['y']) + float(other['shape'][3]))
             if relative_normal >= 0.0 or bot_id in previous:
                 continue
             hit_point = self._vector((
@@ -12027,7 +12038,7 @@ class BattleRuntime(object):
                     self._native_ram_contact_proofs.values()):
                 newly_armed.add(bot_id)
         self._local_ram_episode_contacts = frozenset(
-            (previous & overlapping) | newly_armed)
+            (previous & (overlapping | closing_gaps)) | newly_armed)
         return bool(newly_armed)
 
     def _contact_tanks(self):

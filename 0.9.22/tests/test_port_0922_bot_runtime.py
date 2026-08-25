@@ -7547,6 +7547,68 @@ class BotRuntimeTests(unittest.TestCase):
         expected_push = 8.0 * (0.90 ** (0.04 * 60.0))
         self.assertAlmostEqual(expected_push, current['push_z'], places=5)
 
+    def test_human_ram_receipt_uses_obb_face_normal_for_side_scrape(self):
+        descriptor = _combat_descriptor()
+        descriptor.physics['weight'] = 25000.0
+        descriptor.hull.hitTester = _HitTester1513(
+            (-1.5, -1.0, -3.5), (1.5, 1.0, 3.5))
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: descriptor,
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        current = runtime.states[11]
+        current.update(x=0.0, y=0.0, z=0.0, yaw=0.0,
+                       speed=10.0, push_x=0.0, push_z=0.0)
+        historical = dict(current)
+        historical.update(ram_vx=0.2, ram_vz=10.0)
+        player = _admit_player({
+            'id': 2, 'team': 1, 'vehicle': 'ussr:R11_MS-1',
+            'x': 2.8, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'speed': 0.0, 'alive': True,
+            'ram_contact': {
+                'seq': 9, 'bot_id': 11, 'bot_state_revision': 39,
+                'presentation_time_us': 170000,
+                'native_contact_time_us': 170000,
+                'contact_x': 1.4, 'contact_y': 0.0,
+                'contact_z': 0.0,
+                'contact_armor_player': 20.0,
+                'contact_armor_bot': 20.0,
+                'contact_spall_player': 1.0,
+                'contact_bonus_player': 0.0,
+                'contact_screened_player': False,
+                'contact_screened_bot': False,
+                'x': 2.8, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+                'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
+                'bot_vx': 0.2, 'bot_vy': 0.0, 'bot_vz': 10.0,
+            },
+            '_ram_contact_bot_state': historical,
+        })
+
+        original = self.module.tank_collision.ram_damage
+        calls = []
+
+        def capture_ram_damage(*args, **kwargs):
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        self.module.tank_collision.ram_damage = capture_ram_damage
+        try:
+            reports = runtime._resolve_human_ram_receipts(
+                [player], 10.0)
+        finally:
+            self.module.tank_collision.ram_damage = original
+
+        self.assertEqual(1, len(reports))
+        self.assertEqual((0, 0), (
+            reports[0]['damage_to_bot'], reports[0]['damage_to_target']))
+        self.assertEqual(1, len(calls))
+        self.assertAlmostEqual(0.2, calls[0][0])
+
     def test_human_ram_ledger_resolves_every_contact_and_terminal_noop(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0
