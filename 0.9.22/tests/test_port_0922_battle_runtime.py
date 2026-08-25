@@ -16508,6 +16508,34 @@ class BattleRuntimeContractTests(unittest.TestCase):
                           selected='engineHealth',
                           requested_active=None), call)
 
+    def test_manual_extinguisher_does_not_send_extra_zero_as_a_target(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        send_intent = mock.Mock(return_value=1)
+        battle.client = types.SimpleNamespace(
+            player_id=1, send_equipment_intent=send_intent)
+        descriptor = _Descriptor()
+        descriptor.extras = {0: types.SimpleNamespace(name='fire')}
+        entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._records = {'player:1': {
+            'engine_id': 10, 'state': {'health': 500, 'alive': True},
+            'kind': 'player', 'network_id': 1, 'local': True}}
+        extinguisher = types.SimpleNamespace(
+            id=(11, 42), compactDescr=402, name='handExtinguishers',
+            tags=(), reuseCount=0, cooldownSeconds=0.0,
+            autoactivate=False)
+        battle._equipment_state = [equipment_mechanics.EquipmentState(
+            equipment_mechanics.project_equipment(extinguisher))]
+
+        self.assertTrue(battle._activate_equipment(42))
+        send_intent.assert_called_once_with(
+            42, activation_code=42, selected=None,
+            requested_active=None)
+
     def test_hit_resolution_uses_public_1513_gun_rotator_api(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

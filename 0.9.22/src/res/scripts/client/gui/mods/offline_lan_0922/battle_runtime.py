@@ -5346,13 +5346,14 @@ class BattleRuntime(object):
         entity = self._server_entity(self._server.vehicle_id)
         if entity is None or entity.typeDescriptor is None:
             return False
-        selected = self._critical_name_from_extra_index(
-            entity.typeDescriptor, extra_index)
         equipment_kind = equipment.contract['kind']
         repair_all = bool(equipment.contract.get('repairAll', False))
-        if repair_all:
-            selected = None
-        elif (equipment_kind == 'medkit' and selected is not None and
+        selected = None
+        if (not repair_all and
+                equipment_kind in ('repairkit', 'medkit')):
+            selected = self._critical_name_from_extra_index(
+                entity.typeDescriptor, extra_index)
+        if (equipment_kind == 'medkit' and selected is not None and
                 selected.endswith('Health')):
             selected = selected[:-6]
         sender = getattr(self.client, 'send_equipment_intent', None)
