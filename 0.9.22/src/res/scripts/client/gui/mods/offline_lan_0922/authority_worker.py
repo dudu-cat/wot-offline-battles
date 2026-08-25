@@ -149,6 +149,7 @@ class AuthorityWorkerLANClient(LANClient):
         }
 
     def send_projected_bot_state(self, bots, sample_time_us=None,
+                                 source_batch_horizon_us=None,
                                  human_ram_armors=None):
         """Queue BotRuntime's canonical publication as one frozen wire blob."""
         if (not self.is_bot_authority() or
@@ -162,6 +163,15 @@ class AuthorityWorkerLANClient(LANClient):
                     not 0 <= sample_time_us <= MAX_MOTION_TIME_US):
                 return False
             message['sample_time_us'] = sample_time_us
+            source_batch_horizon_us = _exact_int(
+                source_batch_horizon_us)
+            if (source_batch_horizon_us is None or
+                    not sample_time_us <= source_batch_horizon_us <=
+                    MAX_MOTION_TIME_US):
+                return False
+            message['source_batch_horizon_us'] = source_batch_horizon_us
+        elif source_batch_horizon_us is not None:
+            return False
         if human_ram_armors is not None:
             human_ram_armors = _project_human_ram_armors(human_ram_armors)
             if human_ram_armors is None:

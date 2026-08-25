@@ -1143,17 +1143,28 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'critical': {}, 'combat_base_revision': 0, 'combat_seq': 0,
             'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
         }
+        first = dict(publication, fire_seq=0)
         self.assertTrue(state.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, {
             'round_id': 1, 'sample_time_us': 100000,
+            'source_batch_horizon_us': 200000,
+            'bots': [first]}),
+            state.last_bot_state_reject)
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+            'round_id': 1, 'sample_time_us': 200000,
+            'source_batch_horizon_us': 200000,
             'bots': [publication]}),
             state.last_bot_state_reject)
+        self.assertEqual(
+            state._server_time_ms() * 1000 - 200000,
+            state.bot_launch_clock_offset_us)
         self.assertFalse(any(event.get('kind') == 'bot_shot'
                              for event in state.pending_events))
 
         launch = _launch(
             shooter_id=16, shooter_kind='bot', shot_seq=1,
-            origin=[20.0, 1.0, 0.0])
+            origin=[20.0, 1.0, 0.0], launch_time_us=200000)
         self.assertFalse(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID,
             dict(launch, authority_epoch=0)))
@@ -1171,6 +1182,22 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertFalse(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID,
             dict(launch, gravity=9.9)))
+
+        next_publication = dict(publication, fire_seq=2)
+        self.assertTrue(state.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+            'round_id': 1, 'sample_time_us': 300000,
+            'source_batch_horizon_us': 300000,
+            'bots': [next_publication]}),
+            state.last_bot_state_reject)
+        future = _launch(
+            shooter_id=16, shooter_kind='bot', shot_seq=2,
+            origin=[20.0, 1.0, 0.0], launch_time_us=300000)
+        self.assertFalse(_launch_authority(state, future))
+        self.assertIn((16, 2), state.bot_pending_projectile_launches)
+        state.tick += 3
+        self.assertTrue(_launch_authority(state, future))
+        self.assertNotIn((16, 2), state.bot_pending_projectile_launches)
 
     def test_bot_burst_transition_yields_each_physical_projectile_edge(self):
         previous = {

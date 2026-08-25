@@ -6801,7 +6801,7 @@ class BotRuntime(object):
         return True
 
     def ack_projectile_launch(self, bot_id, fire_seq):
-        """Remove only this Bot's head accepted by the reliable LAN queue."""
+        """Remove only this Bot's head confirmed by the canonical ledger."""
         try:
             key = (int(bot_id), int(fire_seq))
         except (TypeError, ValueError, OverflowError):
@@ -7092,6 +7092,14 @@ class BotRuntime(object):
             step_now = now - elapsed
             outgoing.extend(self._update_once(
                 frame_step, step_now, players, neighbours))
+        source_batch_horizon_us = self._sample_time_us
+        for message in outgoing:
+            if message.get('type') != 'bot_state':
+                continue
+            sample_time_us = int(message['sample_time_us'])
+            if sample_time_us > source_batch_horizon_us:
+                raise RuntimeError('bot source sample exceeds its batch horizon')
+            message['source_batch_horizon_us'] = source_batch_horizon_us
         return outgoing
 
     def _update_once(self, frame_step, now, players=None, neighbours=None):

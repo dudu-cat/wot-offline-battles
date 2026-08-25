@@ -1210,6 +1210,8 @@ class BattleRuntime(object):
         self._client_ready_received = False
         self._local_descriptor = None
         self._bot_fire_seen = {}
+        self._bot_fire_confirmations = {}
+        self._bot_launch_payloads = {}
         self._bot_destructible_samples = {}
         self._player_tree_destructible_samples = {}
         self._bot_pose_times = {}
@@ -1465,6 +1467,8 @@ class BattleRuntime(object):
         self._client_ready_received = False
         self._local_descriptor = None
         self._bot_fire_seen = {}
+        self._bot_fire_confirmations = {}
+        self._bot_launch_payloads = {}
         self._bot_destructible_samples = {}
         self._player_tree_destructible_samples = {}
         self._bot_pose_times = {}
@@ -6335,6 +6339,9 @@ class BattleRuntime(object):
         # regardless of whether this client gains or loses simulation duty.
         if self._artillery is not None:
             self._artillery.reset()
+        self._bot_fire_seen = {}
+        self._bot_fire_confirmations = {}
+        self._bot_launch_payloads = {}
         start = dict(self._start_message or {})
         start['bot_authority_id'] = player_id
         if (self._worker_mode and
@@ -9025,6 +9032,7 @@ class BattleRuntime(object):
                     meta['checked_distance'] = normalized[
                         'checked_distance']
                     meta['piercing_loss'] = normalized['piercing_loss']
+        self._confirm_bot_projectile_launch(normalized)
         return meta
 
     def _accept_projectile_event(self, event):
@@ -14753,6 +14761,8 @@ class BattleRuntime(object):
             state_kwargs = {}
             if 'sample_time_us' in message:
                 state_kwargs['sample_time_us'] = message.get('sample_time_us')
+                state_kwargs['source_batch_horizon_us'] = message.get(
+                    'source_batch_horizon_us')
             if human_ram_armors is not None:
                 state_kwargs['human_ram_armors'] = human_ram_armors
             projected_sender = getattr(
@@ -14796,13 +14806,9 @@ class BattleRuntime(object):
     def _resolve_bot_fire(self, message):
         if message.get('type') != 'bot_state':
             return False
-        acknowledge = getattr(
-            self._bots, 'ack_projectile_launch', None)
         launches = message.get('launches') or ()
-        if launches and not callable(acknowledge):
-            raise RuntimeError(
-                'bot projectile outbox acknowledgement is unavailable')
         blocked_bots = set()
+        next_sequence = {}
         complete = True
         for state in launches:
             try:
@@ -14814,25 +14820,55 @@ class BattleRuntime(object):
                     'bot projectile outbox identity is invalid')
             if bot_id in blocked_bots:
                 continue
-            previous = self._bot_fire_seen.get(bot_id, 0)
-            if fire_seq <= previous:
-                # Replaying an already consumed publication is idempotent. Its
-                # outbox entry was removed with the original reliable enqueue.
+            confirmed = self._bot_fire_seen.get(bot_id, 0)
+            if fire_seq <= confirmed:
                 continue
-            if (fire_seq != previous + 1 or
+            expected = next_sequence.get(bot_id, confirmed + 1)
+            if (fire_seq != expected or
                     not self._launch_bot_projectile(state, fire_seq)):
-                # A later physical round may never overtake a temporarily
-                # unavailable muzzle or a full reliable queue. Preserve that
-                # shooter's ordered tail, while independent Bot queues remain
-                # free to make progress.
+                # Retry the same frozen payload on the next Bot publication.
+                # A later round never overtakes its unconfirmed predecessor.
                 blocked_bots.add(bot_id)
                 complete = False
                 continue
-            if not acknowledge(bot_id, fire_seq):
-                raise RuntimeError(
-                    'bot projectile outbox acknowledgement is out of order')
-            self._bot_fire_seen[bot_id] = fire_seq
+            next_sequence[bot_id] = fire_seq + 1
         return complete
+
+    def _confirm_bot_projectile_launch(self, normalized):
+        """Ack only a server-admitted Bot launch, preserving Bot order."""
+        if (not isinstance(normalized, dict) or
+                normalized.get('shooter_kind') != 'bot' or
+                self._bots is None or not self._bots.is_authority()):
+            return False
+        try:
+            bot_id = int(normalized['shooter_id'])
+            shot_seq = int(normalized['shot_seq'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RuntimeError('canonical bot projectile identity is invalid')
+        confirmed = self._bot_fire_seen.get(bot_id, 0)
+        previous_confirmed = confirmed
+        if shot_seq <= confirmed:
+            return True
+        pending = self._bot_fire_confirmations.setdefault(bot_id, set())
+        pending.add(shot_seq)
+        acknowledge = getattr(
+            self._bots, 'ack_projectile_launch', None)
+        if not callable(acknowledge):
+            raise RuntimeError(
+                'bot projectile outbox acknowledgement is unavailable')
+        while confirmed + 1 in pending:
+            next_seq = confirmed + 1
+            if not acknowledge(bot_id, next_seq):
+                raise RuntimeError(
+                    'canonical bot projectile acknowledgement is out of order')
+            pending.remove(next_seq)
+            self._bot_launch_payloads.pop((bot_id, next_seq), None)
+            confirmed = next_seq
+        if confirmed > previous_confirmed:
+            self._bot_fire_seen[bot_id] = confirmed
+        if not pending:
+            self._bot_fire_confirmations.pop(bot_id, None)
+        return True
 
     def _remember_player_fire_intent(self, key, intent):
         frozen = dict(intent)
@@ -15030,6 +15066,7 @@ class BattleRuntime(object):
         """Publish one Bot launch; damage waits for the canonical projectile."""
         try:
             bot_id = int(state.get('id'))
+            shot_seq = int(shot_seq)
             shot_yaw = float(state.get('shot_yaw'))
             shot_pitch = float(state.get('shot_pitch'))
             launch_time_us = int(state['launch_time_us'])
@@ -15041,6 +15078,13 @@ class BattleRuntime(object):
                 any(math.isnan(value) or math.isinf(value)
                     for value in launch_pose)):
             return False
+        sender = getattr(self.client, 'send_projectile_launch', None)
+        if not callable(sender):
+            return False
+        frozen = self._bot_launch_payloads.get((bot_id, shot_seq))
+        if frozen is not None:
+            accepted = sender(*frozen[0], **frozen[1])
+            return accepted == shot_seq
         source_record = self._records.get('bot:%s' % bot_id)
         if source_record is None:
             return False
@@ -15135,24 +15179,27 @@ class BattleRuntime(object):
             velocity = tuple(
                 component * speed / length for component in direction)
         is_he = combat_rules.is_he(shot)
-        sender = getattr(self.client, 'send_projectile_launch', None)
-        if not callable(sender):
-            return False
-        accepted = sender(
-            'bot', bot_id, int(shot_seq),
+        args = (
+            'bot', bot_id, shot_seq,
             max(0, int(state.get('shell_index', 0) or 0)),
             list(origin), list(velocity), gravity, maximum,
             max_time_ms, is_he,
-            combat_rules.he_radius(shot) if is_he else 0.0,
-            authority_epoch=getattr(self.client, 'authority_epoch', None),
-            penetration_factor=combat_rules.sample_penetration_factor(),
-            source_shot=descriptor_donation.project_shot(shot),
-            burst_group_seq=state.get('burst_group_seq'),
-            burst_index=state.get('burst_index'),
-            burst_count=state.get('burst_count'),
-            launch_time_us=launch_time_us,
-            launch_pose=launch_pose)
-        return accepted == int(shot_seq)
+            combat_rules.he_radius(shot) if is_he else 0.0)
+        kwargs = {
+            'authority_epoch': getattr(
+                self.client, 'authority_epoch', None),
+            'penetration_factor':
+                combat_rules.sample_penetration_factor(),
+            'source_shot': descriptor_donation.project_shot(shot),
+            'burst_group_seq': state.get('burst_group_seq'),
+            'burst_index': state.get('burst_index'),
+            'burst_count': state.get('burst_count'),
+            'launch_time_us': launch_time_us,
+            'launch_pose': launch_pose,
+        }
+        self._bot_launch_payloads[(bot_id, shot_seq)] = (args, kwargs)
+        accepted = sender(*args, **kwargs)
+        return accepted == shot_seq
 
     def _resolve_bot_shot(self, state, shot_seq):
         try:
@@ -17900,6 +17947,8 @@ class BattleRuntime(object):
         self._local_descriptor = None
         self._vehicle_ready_deadline = 0.0
         self._bot_fire_seen = {}
+        self._bot_fire_confirmations = {}
+        self._bot_launch_payloads = {}
         self._bot_destructible_samples = {}
         self._player_tree_destructible_samples = {}
         self._bot_pose_times = {}

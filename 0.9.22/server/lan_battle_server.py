@@ -1695,6 +1695,7 @@ class BattleState:
         self.bot_state_time_us = 0
         self.bot_source_time_us = None
         self.bot_source_receipt_time_us = None
+        self.bot_source_batch_horizon_us = None
         # Once a source-integrated pose runs ahead of its receipt clock, keep
         # the whole round's motion timeline ahead by the same amount. Letting
         # raw time catch up under max(raw, sample) would flatten successive
@@ -2054,6 +2055,7 @@ class BattleState:
             # public snapshot clock stall until raw time caught up.
             self.bot_source_time_us = None
             self.bot_source_receipt_time_us = None
+            self.bot_source_batch_horizon_us = None
             self.player_environment = {}
             self.player_environment_seq = -1
             self.player_environment_authority_epoch = -1
@@ -2731,6 +2733,7 @@ class BattleState:
         self.bot_state_time_us = 0
         self.bot_source_time_us = None
         self.bot_source_receipt_time_us = None
+        self.bot_source_batch_horizon_us = None
         self.bot_launch_clock_offset_us = None
         self.bot_last_projectile_launch_time_us = {}
         self.motion_time_offset_us = 0
@@ -4897,16 +4900,34 @@ class BattleState:
                     "bot_state", "manifest_missing", "manifest=empty")
             previous_source_time_us = self.bot_source_time_us
             source_time_us = None
+            source_batch_horizon_us = None
             if "sample_time_us" in message:
                 try:
                     source_time_us = _exact_int(
                         message.get("sample_time_us"), 0,
                         MAX_MOTION_TIME_US)
+                    source_batch_horizon_us = _exact_int(
+                        message.get("source_batch_horizon_us"), 0,
+                        MAX_MOTION_TIME_US)
                 except ValueError:
                     return self._set_protocol_reject(
                         "bot_state", "sample_time",
-                        "sample_time_us=%s" % message.get(
-                            "sample_time_us"))
+                        "sample_time_us=%s horizon_us=%s" % (
+                            message.get("sample_time_us"),
+                            message.get("source_batch_horizon_us")))
+                if source_time_us > source_batch_horizon_us:
+                    return self._set_protocol_reject(
+                        "bot_state", "sample_horizon",
+                        "sample_time_us=%s horizon_us=%s" % (
+                            source_time_us, source_batch_horizon_us))
+                if (self.bot_source_batch_horizon_us is not None and
+                        source_batch_horizon_us <
+                        self.bot_source_batch_horizon_us):
+                    return self._set_protocol_reject(
+                        "bot_state", "sample_horizon_order",
+                        "horizon_us=%s previous=%s" % (
+                            source_batch_horizon_us,
+                            self.bot_source_batch_horizon_us))
                 if (self.bot_source_time_us is not None and
                         source_time_us <= self.bot_source_time_us):
                     return self._set_protocol_reject(
@@ -4938,6 +4959,11 @@ class BattleState:
                                 MAX_BOT_SAMPLE_LEAD_US))
                     next_bot_state_time_us = (
                         self.bot_state_time_us + source_delta_us)
+            elif "source_batch_horizon_us" in message:
+                return self._set_protocol_reject(
+                    "bot_state", "sample_horizon_without_time",
+                    "horizon_us=%s" % message.get(
+                        "source_batch_horizon_us"))
             elif self.bot_source_time_us is not None:
                 return self._set_protocol_reject(
                     "bot_state", "sample_time_missing",
@@ -4957,7 +4983,8 @@ class BattleState:
             if (source_time_us is not None and
                     next_launch_clock_offset_us is None):
                 next_launch_clock_offset_us = (
-                    self._server_time_ms() * 1000 - source_time_us)
+                    self._server_time_ms() * 1000 -
+                    source_batch_horizon_us)
             identities = {entry["id"]: entry for entry in self.bot_manifest}
             incoming = message.get("bots") or []
             if (not isinstance(incoming, (list, tuple)) or
@@ -5174,6 +5201,8 @@ class BattleState:
                 self.bot_source_time_us = source_time_us
                 self.bot_source_receipt_time_us = (
                     received_raw_motion_time_us)
+                self.bot_source_batch_horizon_us = (
+                    source_batch_horizon_us)
                 self.bot_launch_clock_offset_us = (
                     next_launch_clock_offset_us)
             self.bot_state_revision += 1

@@ -5372,7 +5372,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             send_projected_bot_state=mock.Mock(return_value=True))
 
         self.assertTrue(battle._send_bot_message({
-            'type': 'bot_state', 'bots': [], 'sample_time_us': 40000}))
+            'type': 'bot_state', 'bots': [], 'sample_time_us': 40000,
+            'source_batch_horizon_us': 40000}))
 
         self.assertEqual([
             mock.call((0.0, 0.0, 0.0), 0.0, 0.1, -0.1),
@@ -5387,7 +5388,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(second_matrix,
                       battle._native_ram_vehicle_armor.call_args_list[1][0][1])
         battle.client.send_projected_bot_state.assert_called_once_with(
-            [], sample_time_us=40000, human_ram_armors=[{
+            [], sample_time_us=40000,
+            source_batch_horizon_us=40000, human_ram_armors=[{
                 'seq': 7, 'first_id': 1, 'second_id': 2,
                 'available': True, 'armor_first': 45.0,
                 'armor_second': 80.0,
@@ -19845,9 +19847,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.client.send_projected_bot_state.reset_mock()
         self.assertTrue(battle._send_bot_message({
             'type': 'bot_state', 'bots': bots,
-            'sample_time_us': 40000}))
+            'sample_time_us': 40000,
+            'source_batch_horizon_us': 40000}))
         battle.client.send_projected_bot_state.assert_called_once_with(
-            bots, sample_time_us=40000)
+            bots, sample_time_us=40000,
+            source_batch_horizon_us=40000)
 
     def test_bot_launch_outbox_survives_bot_state_enqueue_failure(self):
         battle = BattleRuntime(_runtime())
@@ -19856,6 +19860,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(outbox._queue_pending_launch(launch))
         launch['shot_yaw'] = 1.0
         battle._bots = outbox
+        outbox.authority_id = 1
         battle._send_bot_message = mock.Mock(side_effect=[False, True])
         battle._launch_bot_projectile = mock.Mock(return_value=True)
         publication = {
@@ -19871,6 +19876,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._launch_bot_projectile.assert_not_called()
 
         self.assertTrue(battle._enqueue_bot_message(publication))
+        self.assertEqual([1], [
+            value['fire_seq'] for value in outbox._pending_launches])
+        self.assertEqual({}, battle._bot_fire_seen)
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 11, 'shot_seq': 1,
+        }))
         self.assertEqual([], outbox._pending_launches)
         self.assertEqual({11: 1}, battle._bot_fire_seen)
 
@@ -19882,6 +19893,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'id': 11, 'fire_seq': fire_seq,
             }))
         battle._bots = outbox
+        outbox.authority_id = 1
         battle._send_bot_message = mock.Mock(return_value=True)
         attempts = []
 
@@ -19899,9 +19911,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle._enqueue_bot_message(first))
         self.assertEqual([1, 2], attempts)
-        self.assertEqual([2, 3], [
+        self.assertEqual([1, 2, 3], [
             value['fire_seq'] for value in outbox._pending_launches])
-        self.assertEqual({11: 1}, battle._bot_fire_seen)
+        self.assertEqual({}, battle._bot_fire_seen)
 
         retry = {
             'type': 'bot_state', 'bots': [],
@@ -19909,12 +19921,25 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          for value in outbox._pending_launches],
         }
         self.assertTrue(battle._enqueue_bot_message(retry))
-        self.assertEqual([1, 2, 2, 3], attempts)
+        self.assertEqual([1, 2, 1, 2, 3], attempts)
+        self.assertEqual([1, 2, 3], [
+            value['fire_seq'] for value in outbox._pending_launches])
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 11, 'shot_seq': 3,
+        }))
+        self.assertEqual({}, battle._bot_fire_seen)
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 11, 'shot_seq': 1,
+        }))
+        self.assertEqual({11: 1}, battle._bot_fire_seen)
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 11, 'shot_seq': 2,
+        }))
         self.assertEqual([], outbox._pending_launches)
         self.assertEqual({11: 3}, battle._bot_fire_seen)
 
         self.assertTrue(battle._resolve_bot_fire(first))
-        self.assertEqual([1, 2, 2, 3], attempts)
+        self.assertEqual([1, 2, 1, 2, 3], attempts)
 
     def test_bot_launch_failure_blocks_only_that_shooters_tail(self):
         battle = BattleRuntime(_runtime())
@@ -19924,6 +19949,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 'id': bot_id, 'fire_seq': fire_seq,
             }))
         battle._bots = outbox
+        outbox.authority_id = 1
         battle._send_bot_message = mock.Mock(return_value=True)
         attempts = []
 
@@ -19942,10 +19968,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertTrue(battle._enqueue_bot_message(first))
         self.assertEqual([(11, 1), (12, 1)], attempts)
-        self.assertEqual([(11, 1), (11, 2)], [
+        self.assertEqual([(11, 1), (11, 2), (12, 1)], [
             (value['id'], value['fire_seq'])
             for value in outbox._pending_launches])
-        self.assertEqual({12: 1}, battle._bot_fire_seen)
+        self.assertEqual({}, battle._bot_fire_seen)
 
         retry = {
             'type': 'bot_state', 'bots': [],
@@ -19954,7 +19980,20 @@ class BattleRuntimeContractTests(unittest.TestCase):
         }
         self.assertTrue(battle._enqueue_bot_message(retry))
         self.assertEqual(
-            [(11, 1), (12, 1), (11, 1), (11, 2)], attempts)
+            [(11, 1), (12, 1), (11, 1), (11, 2), (12, 1)],
+            attempts)
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 12, 'shot_seq': 1,
+        }))
+        self.assertEqual([(11, 1), (11, 2)], [
+            (value['id'], value['fire_seq'])
+            for value in outbox._pending_launches])
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 11, 'shot_seq': 1,
+        }))
+        self.assertTrue(battle._confirm_bot_projectile_launch({
+            'shooter_kind': 'bot', 'shooter_id': 11, 'shot_seq': 2,
+        }))
         self.assertEqual([], outbox._pending_launches)
         self.assertEqual({11: 2, 12: 1}, battle._bot_fire_seen)
 

@@ -527,6 +527,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.065
         first = self._publication(server, 0.4)
         first['sample_time_us'] = 40000
+        first['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, first))
         first_mapped_time = server.bot_state_time_us
@@ -537,6 +538,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.200
         delayed = self._publication(server, 0.8)
         delayed['sample_time_us'] = 80000
+        delayed['source_batch_horizon_us'] = 80000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, delayed))
         self.assertEqual(first_mapped_time + 40000,
@@ -547,6 +549,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.210
         fast = self._publication(server, 1.2)
         fast['sample_time_us'] = 120000
+        fast['source_batch_horizon_us'] = 120000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, fast))
         self.assertEqual(first_mapped_time + 80000,
@@ -563,6 +566,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
 
         repeated = self._publication(server, 1.2)
         repeated['sample_time_us'] = 120000
+        repeated['source_batch_horizon_us'] = 120000
         self.assertFalse(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, repeated))
         self.assertEqual('sample_time_order',
@@ -590,6 +594,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.200
         slow = self._publication(server, 0.4)
         slow['sample_time_us'] = 40000
+        slow['source_batch_horizon_us'] = 40000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, slow))
         self.assertEqual(200000, server.bot_state_time_us)
@@ -600,6 +605,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.210
         fast = self._publication(server, 1.4)
         fast['sample_time_us'] = 140000
+        fast['source_batch_horizon_us'] = 140000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, fast))
         self.assertEqual(300000, server.bot_state_time_us)
@@ -618,6 +624,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.250
         steady = self._publication(server, 1.8)
         steady['sample_time_us'] = 180000
+        steady['source_batch_horizon_us'] = 180000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, steady))
         self.assertEqual(340000, server.bot_state_time_us)
@@ -645,6 +652,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.490
         skipped = self._publication(server, 2.2)
         skipped['sample_time_us'] = 420000
+        skipped['source_batch_horizon_us'] = 420000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, skipped))
         self.assertEqual(580000, server.bot_state_time_us)
@@ -656,6 +664,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.500
         oversized = self._publication(server, 9.0)
         oversized['sample_time_us'] = 1000000
+        oversized['source_batch_horizon_us'] = 1000000
         self.assertFalse(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, oversized))
         self.assertEqual('sample_time_rate',
@@ -668,6 +677,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         now[0] = 100.530
         recovered = self._publication(server, 2.6)
         recovered['sample_time_us'] = 460000
+        recovered['source_batch_horizon_us'] = 460000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, recovered))
         self.assertEqual(620000, server.bot_state_time_us)
@@ -3663,6 +3673,9 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(
             [280000, 330000],
             [message['sample_time_us'] for message in stalled])
+        self.assertEqual(
+            [330000, 330000],
+            [message['source_batch_horizon_us'] for message in stalled])
         self.assertEqual([], self.runtime.update(0.0, 10.33))
 
         self.runtime.battle_start(dict(self.start, round_id=6))
@@ -3684,6 +3697,9 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(
             [200000, 400000, 600000, 800000, 1000000],
             [message['sample_time_us'] for message in states])
+        self.assertEqual(
+            [1000000] * 5,
+            [message['source_batch_horizon_us'] for message in states])
         self.assertEqual([{'type': 'ram_damage', 'event': 'once'}], events)
         self.assertEqual(0.0, self.runtime._accumulator)
 
