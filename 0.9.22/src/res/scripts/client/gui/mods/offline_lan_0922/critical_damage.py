@@ -45,9 +45,43 @@ def _offh_play_crit_voice(*unused_args, **unused_kwargs):
     return None
 
 
-def _sync_crashed_track(*unused_args, **unused_kwargs):
-    # Stock #1513 Vehicle appearance owns damaged-track presentation.
-    return None
+def _sync_crashed_track(vehicle, before, after):
+    """Mirror authoritative track destruction into stock #1513 visuals.
+
+    The LAN critical payload is our authority record; a remote ``Vehicle``
+    does not receive the retail server's track-break mailbox.  Its stock
+    ``CompoundAppearance`` still exposes the exact presentation seam,
+    ``addCrashedTrack``/``delCrashedTrack``.  Call it only on a confirmed
+    destroyed-set edge, so a snapshot replay cannot restart the effect or
+    invent a broken track from partial module HP.
+    """
+    appearance = getattr(vehicle, 'appearance', None)
+    if appearance is None:
+        return False
+    previous = set((before or {}).get('destroyed') or ())
+    current = set((after or {}).get('destroyed') or ())
+    changed = False
+    for name, is_left in (
+            ('leftTrackHealth', True), ('rightTrackHealth', False)):
+        was_destroyed = name in previous
+        is_destroyed = name in current
+        if was_destroyed == is_destroyed:
+            continue
+        method_name = ('addCrashedTrack' if is_destroyed else
+                       'delCrashedTrack')
+        callback = getattr(appearance, method_name, None)
+        if not callable(callback):
+            continue
+        try:
+            callback(is_left)
+        except Exception as error:
+            # This is optional native presentation; retain the authoritative
+            # device state even if a streamed or retiring appearance declines
+            # the visual update.
+            LOG_DEBUG('crashed-track presentation failed:', str(error))
+            continue
+        changed = True
+    return changed
 
 
 class _SynthDeviceExtra(object):
@@ -1342,6 +1376,7 @@ def apply_payload(vehicle, payload):
         payload.get('ammo_rack_death', False))
     _recompute_crew_impaired(vehicle)
     _refresh_mobility_flags(vehicle)
+    _sync_crashed_track(vehicle, before, _state(vehicle))
     events = tuple(payload.get('events') or ())
     if events:
         return events

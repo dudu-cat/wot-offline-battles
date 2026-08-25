@@ -823,6 +823,43 @@ class CriticalDamageTests(unittest.TestCase):
         self.assertIsNotNone(vehicle._fire_started)
         self.assertEqual(tuple(payload['events']), events)
 
+    def test_payload_syncs_stock_crashed_track_visuals_on_state_edges(self):
+        appearance = types.SimpleNamespace(
+            addCrashedTrack=mock.Mock(), delCrashedTrack=mock.Mock())
+        vehicle = types.SimpleNamespace(
+            typeDescriptor=_descriptor(), health=500,
+            devices_hp={
+                'leftTrackHealth': 100.0,
+                'rightTrackHealth': 100.0,
+            },
+            _destroyed_devices=set(), _critical_devices=set(),
+            appearance=appearance)
+        broken = {
+            'devices': [
+                {'name': 'leftTrackHealth', 'hp': 0.0,
+                 'max_hp': 100.0, 'state': 'destroyed'},
+                {'name': 'rightTrackHealth', 'hp': 100.0,
+                 'max_hp': 100.0, 'state': 'normal'},
+            ],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False, 'events': []}
+        repaired = dict(broken, devices=[
+            {'name': 'leftTrackHealth', 'hp': 50.0,
+             'max_hp': 100.0, 'state': 'critical'},
+            {'name': 'rightTrackHealth', 'hp': 100.0,
+             'max_hp': 100.0, 'state': 'normal'},
+        ], destroyed=[])
+
+        critical_damage.apply_payload(vehicle, broken)
+        critical_damage.apply_payload(vehicle, broken)
+        critical_damage.apply_payload(vehicle, repaired)
+
+        appearance.addCrashedTrack.assert_called_once_with(True)
+        appearance.delCrashedTrack.assert_called_once_with(True)
+        self.assertEqual([], [
+            call for call in appearance.addCrashedTrack.call_args_list
+            if call == mock.call(False)])
+
     def test_eventless_snapshot_derives_missed_damage_transitions(self):
         vehicle = types.SimpleNamespace(
             typeDescriptor=_descriptor(), health=500)

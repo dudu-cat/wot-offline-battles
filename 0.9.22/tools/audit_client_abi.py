@@ -651,6 +651,8 @@ EXPECTED_ABI = {
         'CompoundAppearance.setupGunMatrixTargets': ('self', 'target'),
         'CompoundAppearance.changeVisibility': ('self', 'modelVisible'),
         'CompoundAppearance.deactivate': ('self', 'stopEffects'),
+        'CompoundAppearance.addCrashedTrack': ('self', 'isLeft'),
+        'CompoundAppearance.delCrashedTrack': ('self', 'isLeft'),
     },
     'scripts/client/gui/battle_control/controllers/consumables/'
     'equipment_ctrl.pyc': {
