@@ -12,6 +12,7 @@ from lan_battle_server import (  # noqa: E402
     PREBATTLE_SECONDS, TICK_HZ,
 )
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner  # noqa: E402
+from effective_params_fixture import effective_params  # noqa: E402
 
 
 class _Socket(object):
@@ -20,10 +21,15 @@ class _Socket(object):
 
 
 def _player(player_id, team, x, z, world_pose=True):
+    params = effective_params()
+    params['critical']['devices'] = [{
+        'name': 'leftTrackHealth', 'max_hp': 100.0, 'regen_hp': 70.0,
+    }]
     return Player(
         player_id, _Socket(), ('127.0.0.1', player_id),
         team=team, slot=max(0, player_id - 1), x=x, z=z,
         client_position=world_pose, health=1000, max_health=1000,
+        effective_params=params,
     )
 
 
@@ -44,7 +50,8 @@ class ServerCaptureTests(unittest.TestCase):
         return state._update_capture()
 
     @staticmethod
-    def _apply_canonical_critical(state, player, critical):
+    def _apply_canonical_critical(
+            state, player, critical, critical_delta):
         record = {
             'projectile_id': '%d:b:11:1' % state.round_id,
             'shooter_kind': 'bot', 'shooter_id': 11,
@@ -58,6 +65,7 @@ class ServerCaptureTests(unittest.TestCase):
             'critical_target_base_revision':
                 player.critical_report_base_revision,
             'critical_target_ack_seq': player.critical_ack_seq,
+            'critical_delta': critical_delta,
         }
         proposal = state._normalize_projectile_effect(
             raw, record, (player.x, player.y, player.z), False)
@@ -139,6 +147,7 @@ class ServerCaptureTests(unittest.TestCase):
             'vehicle': 'ussr:R11_MS-1',
             'health': 1000, 'max_health': 1000,
             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'reload_time': 1.0, 'reload_duration': 1.0,
             # BotRuntime._manifest_entry marks its resolved spawn pose.
             'world_pose': True,
             'profile': {}, 'route': {'id': 'test', 'waypoints': []},
@@ -153,6 +162,7 @@ class ServerCaptureTests(unittest.TestCase):
         publication = {
             'id': 16, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
             'health': 1000, 'alive': True, 'fire_seq': 0,
+            'reload_time': 1.0, 'reload_duration': 1.0,
             'critical': {}, 'combat_base_revision': 0, 'combat_seq': 0,
             'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
         }
@@ -322,7 +332,12 @@ class ServerCaptureTests(unittest.TestCase):
                 'old_state': 'normal', 'state': 'critical', 'cause': 'shot',
             }],
         }
-        self._apply_canonical_critical(state, player, critical)
+        self._apply_canonical_critical(state, player, critical, {
+            'devices': [{
+                'name': 'leftTrackHealth', 'hp_loss': 60.0,
+            }],
+            'crew_ko': [], 'ignite': False,
+        })
         self.assertEqual(0, state.rules_state['bases']['1']['points'])
         self.assertEqual({}, state.capture_contributors[1])
         event = state.pending_events[-1]
@@ -335,27 +350,24 @@ class ServerCaptureTests(unittest.TestCase):
         player = _player(2, 2, 0.0, 0.0)
         player.critical = {
             'devices': [{
-                'name': 'leftTrackHealth', 'hp': 40.0, 'max_hp': 100.0,
-                'state': 'critical',
+                'name': 'leftTrackHealth', 'hp': 0.0, 'max_hp': 100.0,
+                'state': 'destroyed',
             }],
-            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [], 'fire': False,
             'ammo_rack_death': False, 'events': [],
         }
         state.players[2] = player
         for offset in range(3):
             self._capture_tick(state, offset)
 
-        repaired = {
-            'devices': [{
-                'name': 'leftTrackHealth', 'hp': 70.0, 'max_hp': 100.0,
-                'state': 'normal',
+        self.assertTrue(state.report_track_repair(2, {
+            'type': 'track_repair', 'round_id': state.round_id,
+            'critical_base_revision': 0, 'repair_seq': 1,
+            'tracks': [{
+                'name': 'leftTrackHealth', 'hp': 70.0,
+                'max_hp': 100.0, 'state': 'critical',
             }],
-            'events': [{
-                'kind': 'device', 'name': 'leftTrackHealth',
-                'old_state': 'critical', 'state': 'normal', 'cause': 'repair',
-            }],
-        }
-        self._apply_canonical_critical(state, player, repaired)
+        }))
         self.assertEqual(3, state.rules_state['bases']['1']['points'])
         self.assertEqual({'human:2': 3}, state.capture_contributors[1])
 

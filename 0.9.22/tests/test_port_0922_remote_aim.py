@@ -52,6 +52,7 @@ class RemoteAimTests(unittest.TestCase):
         native = object.__new__(_NativeRemoteState)
         native.aim = _appearance()
         native.entity = types.SimpleNamespace(typeDescriptor=descriptor)
+        native._authority_geometry = False
         native._aim_relative_yaw = None
         native._aim_gun_pitch = None
         native.set_aim(0.25, 1.25, -0.3)

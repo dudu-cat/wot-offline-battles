@@ -12,6 +12,7 @@ PACKAGE_ROOT = (PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' /
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import BattleState, CLIENT_BUILD_0922, Player  # noqa: E402
+from effective_params_fixture import effective_params  # noqa: E402
 
 
 def _load_bot_runtime():
@@ -101,6 +102,14 @@ def _graph():
 def _spawn(team, slot):
     point = _graph()['spawn_formations'][str(int(team))][int(slot)]
     return ((point[0], point[1], point[2]), point[3])
+
+
+def _human():
+    return {
+        'id': 1, 'team': 1, 'alive': True,
+        'x': 0.0, 'y': 0.0, 'z': 100.0,
+        'effective_params': effective_params(),
+    }
 
 
 class _Director(object):
@@ -209,10 +218,7 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
                 return method(1, message)
             finally:
                 server.client_build = build
-        human = {
-            'id': 1, 'team': 1, 'alive': True,
-            'x': 0.0, 'y': 0.0, 'z': 100.0,
-        }
+        human = _human()
         last_fire = dict((entry['id'], 0) for entry in roster)
         publications = 0
         hit_reports = 0
@@ -277,10 +283,7 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
 
     def test_external_hit_crew_roster_survives_repeated_publication(self):
         runtime, server, unused_roster = self._runtime_and_server()
-        human = {
-            'id': 1, 'team': 1, 'alive': True,
-            'x': 0.0, 'y': 0.0, 'z': 100.0,
-        }
+        human = _human()
         first = runtime.update(
             1.0 / 24.0, 1.0, players=[human])[0]
         self.assertTrue(server.update_bot_states(1, {
@@ -340,10 +343,7 @@ class ServerCombatLineageIntegrationTests(unittest.TestCase):
             finally:
                 server.client_build = build
         publication = runtime.update(
-            1.0 / 24.0, 1.0, players=[{
-                'id': 1, 'team': 1, 'alive': True,
-                'x': 0.0, 'y': 0.0, 'z': 100.0,
-            }])[0]
+            1.0 / 24.0, 1.0, players=[_human()])[0]
         self.assertTrue(server.update_bot_states(1, {
             'round_id': server.round_id, 'bots': publication['bots']}))
 

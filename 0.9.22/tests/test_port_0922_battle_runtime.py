@@ -16534,7 +16534,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.destructibles_authority')
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused_key: False)
-        with mock.patch.dict(sys.modules, {authority_name: authority}):
+        package = sys.modules['gui.mods.offline_lan_0922']
+        with mock.patch.dict(sys.modules, {authority_name: authority}), \
+                mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
             self.assertEqual(
                 1, battle._resolve_player_destructible_contacts(
                     [player], 12.5))
@@ -16575,7 +16579,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.destructibles_authority')
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused_key: True)
-        with mock.patch.dict(sys.modules, {authority_name: authority}):
+        package = sys.modules['gui.mods.offline_lan_0922']
+        with mock.patch.dict(sys.modules, {authority_name: authority}), \
+                mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
             self.assertEqual(
                 1, battle._resolve_player_destructible_contacts(
                     [player], 12.5))
@@ -16617,7 +16625,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.destructibles_authority')
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused_key: False)
+        package = sys.modules['gui.mods.offline_lan_0922']
         with mock.patch.dict(sys.modules, {authority_name: authority}), \
+                mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True), \
                 mock.patch(
                     'gui.mods.offline_lan_0922.battle_runtime.'
                     'world_collision.check_horizontal_collision',
@@ -16663,7 +16675,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.destructibles_authority')
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused_key: False)
-        with mock.patch.dict(sys.modules, {authority_name: authority}):
+        package = sys.modules['gui.mods.offline_lan_0922']
+        with mock.patch.dict(sys.modules, {authority_name: authority}), \
+                mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
             self.assertEqual(
                 1, worker._resolve_player_destructible_contacts(
                     [player], 12.5))

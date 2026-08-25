@@ -1172,7 +1172,7 @@ class OrderedEventVocabularyTests(unittest.TestCase):
         # Critical-damage records have their own nested ``kind`` vocabulary;
         # they are payload rows inside a top-level hit/repair event and never
         # enter the ordered battle-event dispatcher directly.
-        return kinds - {'device'}
+        return kinds - {'device', 'ammo_rack', 'crew', 'fire'}
 
     def _client_kinds(self):
         namespace = {}

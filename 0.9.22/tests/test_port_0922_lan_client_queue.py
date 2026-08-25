@@ -15,6 +15,7 @@ from gui.mods.offline_lan_0922 import lan_client as lan_client_module
 from gui.mods.offline_lan_0922.authority_worker import (
     AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.lan_client import LANClient
+from effective_params_fixture import effective_params
 
 
 class RecordingSocket(object):
@@ -525,7 +526,7 @@ class LanClientQueueTests(unittest.TestCase):
     def test_worker_keeps_hello_first_then_starts_sender(self):
         client = LANClient(
             '127.0.0.1', 28782, 'P', 'ussr:MS-1',
-            bigworld=QueueBigWorld())
+            bigworld=QueueBigWorld(), effective_params=effective_params())
         outer = self
 
         class ConnectedSocket(RecordingSocket):
@@ -611,7 +612,7 @@ class LanClientQueueTests(unittest.TestCase):
     def test_stop_start_generation_barrier_rejects_old_hello_worker(self):
         client = LANClient(
             '127.0.0.1', 28782, 'P', 'ussr:MS-1',
-            bigworld=QueueBigWorld())
+            bigworld=QueueBigWorld(), effective_params=effective_params())
         old_at_publish = threading.Event()
         release_old = threading.Event()
         old_finished = threading.Event()

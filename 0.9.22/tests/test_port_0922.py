@@ -22,6 +22,8 @@ PORT_ROOT = ROOT / '0.9.22'
 CLIENT_SCRIPTS = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
+from effective_params_fixture import effective_params, wire_player
+
 
 def _load_tool(name):
     path = PORT_ROOT / 'tools' / (name + '.py')
@@ -4999,7 +5001,7 @@ class LANClientTests(unittest.TestCase):
         client = module.LANClient(
             '127.0.0.1', 28782, 'Player', 'ussr:MS-1', 100,
             on_event=lambda kind, message: events.append((kind, message)),
-            bigworld=bigworld)
+            bigworld=bigworld, effective_params=effective_params())
         return module, client, events, bigworld
 
     @staticmethod
@@ -5020,7 +5022,8 @@ class LANClientTests(unittest.TestCase):
         connection = None
         client = module.LANClient(
             '127.0.0.1', listener.getsockname()[1], 'Loopback',
-            'china:Ch01_Type59', 1300, bigworld=_LANBigWorld())
+            'china:Ch01_Type59', 1300, bigworld=_LANBigWorld(),
+            effective_params=effective_params())
         try:
             self.assertTrue(client.start())
             connection, unused_address = listener.accept()
@@ -5047,10 +5050,11 @@ class LANClientTests(unittest.TestCase):
     def test_requested_team_is_carried_only_when_explicit(self):
         module = _load_port_source('lan_client')
         automatic = module.LANClient(
-            '127.0.0.1', 28782, 'Auto', 'ussr:R11_MS-1')
+            '127.0.0.1', 28782, 'Auto', 'ussr:R11_MS-1',
+            effective_params=effective_params())
         selected = module.LANClient(
             '127.0.0.1', 28782, 'TeamTwo', 'ussr:R11_MS-1',
-            requested_team=2)
+            requested_team=2, effective_params=effective_params())
 
         self.assertNotIn('requested_team', automatic._hello_payload())
         self.assertEqual(2, selected._hello_payload()['requested_team'])
@@ -5106,6 +5110,7 @@ class LANClientTests(unittest.TestCase):
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
                 module.PLAYER_ENVIRONMENT_CAPABILITY,
+                module.EFFECTIVE_PARAMS_CAPABILITY,
                 module.RANDOM_MAP_CAPABILITY,
                 module.TEAM_SELECTION_CAPABILITY],
             'authority_epoch': 1,
@@ -5123,6 +5128,7 @@ class LANClientTests(unittest.TestCase):
             'round_id': 3,
             'state_revision': 4,
             'spawn': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0},
+            'effective_params': effective_params(),
         })
         client._handle_message({
             'type': 'roster',
@@ -5134,7 +5140,7 @@ class LANClientTests(unittest.TestCase):
             'map_pool': ['01_karelia', '04_himmelsdorf'],
             'host_player_id': 7,
             'authority_epoch': 1,
-            'players': [{'id': 7}, {'id': 8}],
+            'players': [wire_player(7), wire_player(8)],
         })
 
         self.assertTrue(client.ready)
@@ -5200,13 +5206,13 @@ class LANClientTests(unittest.TestCase):
             'type': 'roster', 'protocol': 5, 'round_id': 3,
             'state_revision': 6, 'phase': 'waiting',
             'map': '01_karelia', 'host_player_id': 2,
-            'players': [{'id': 2, 'name': 'NewHost'}]})
+            'players': [wire_player(2, name='NewHost')]})
         client._handle_message({
             'type': 'roster', 'protocol': 5, 'round_id': 3,
             'state_revision': 5, 'phase': 'waiting',
             'map': '01_karelia', 'host_player_id': 1,
-            'players': [{'id': 1, 'name': 'OldHost'},
-                        {'id': 2, 'name': 'NewHost'}]})
+            'players': [wire_player(1, name='OldHost'),
+                        wire_player(2, name='NewHost')]})
 
         self.assertEqual(6, client.state_revision)
         self.assertEqual(2, client.host_player_id)
@@ -5231,15 +5237,15 @@ class LANClientTests(unittest.TestCase):
             'state_revision': 6, 'phase': 'battle',
             'map': '01_karelia', 'host_player_id': 2,
             'bot_authority_id': -1,
-            'players': [{'id': 2, 'name': 'NewHost'}]})
+            'players': [wire_player(2, name='NewHost')]})
         stale_start = {
             'type': 'battle_start', 'protocol': 5, 'round_id': 3,
             'state_revision': 5, 'phase': 'loading',
             'map': '01_karelia',
             'host_player_id': 1,
             'bot_authority_id': 1,
-            'players': [{'id': 1, 'name': 'OldHost'},
-                        {'id': 2, 'name': 'NewHost'}],
+            'players': [wire_player(1, name='OldHost'),
+                        wire_player(2, name='NewHost')],
             'bots': [],
         }
         client._handle_message(stale_start)
@@ -5279,7 +5285,7 @@ class LANClientTests(unittest.TestCase):
             'round_id': 4, 'state_revision': 2, 'phase': 'battle',
             'map': '01_karelia', 'host_player_id': 7,
             'bot_authority_id': -1,
-            'players': [{'id': 7}]})
+            'players': [wire_player(7)]})
         client._queue_message({
             'type': 'snapshot', 'protocol': 5,
             'round_id': 4, 'server_tick': 2,
@@ -5361,7 +5367,7 @@ class LANClientTests(unittest.TestCase):
             'type': 'roster', 'protocol': 5,
             'round_id': 6, 'state_revision': 8, 'phase': 'waiting',
             'map': '01_karelia', 'host_player_id': 7,
-            'players': [{'id': 7}]})
+            'players': [wire_player(7)]})
         self.assertEqual(6, client.round_id)
         self.assertIsNone(client.last_snapshot)
         self.assertEqual(0, client._fire_seq)
@@ -5393,14 +5399,16 @@ class LANClientTests(unittest.TestCase):
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
-                module.PLAYER_ENVIRONMENT_CAPABILITY],
+                module.PLAYER_ENVIRONMENT_CAPABILITY,
+                module.EFFECTIVE_PARAMS_CAPABILITY],
             'authority_epoch': 1,
             'host_player_id': 7, 'name': 'Player',
             'vehicle': 'ussr:MS-1', 'max_health': 100,
             'team': 1, 'slot': 0, 'round_id': 1,
             'state_revision': 1,
             'phase': 'waiting', 'map': '01_karelia',
-            'spawn': {'x': 0, 'y': 0, 'z': 0}})
+            'spawn': {'x': 0, 'y': 0, 'z': 0},
+            'effective_params': effective_params()})
 
         self.assertFalse(client.running)
         self.assertFalse(client.ready)
@@ -5420,13 +5428,15 @@ class LANClientTests(unittest.TestCase):
                 module.RAM_CONTACT_LEDGER_CAPABILITY,
                 module.HUMAN_RAM_TIMELINE_CAPABILITY,
                 module.PLAYER_FIRE_INTENT_CAPABILITY,
-                module.PLAYER_ENVIRONMENT_CAPABILITY],
+                module.PLAYER_ENVIRONMENT_CAPABILITY,
+                module.EFFECTIVE_PARAMS_CAPABILITY],
             'authority_epoch': 1,
             'name': 'Player', 'vehicle': 'ussr:MS-1',
             'max_health': 100, 'team': 1, 'slot': 0, 'round_id': 1,
             'state_revision': 1,
             'phase': 'waiting', 'map': '01_karelia',
-            'spawn': {'x': 0, 'y': 0, 'z': 0}})
+            'spawn': {'x': 0, 'y': 0, 'z': 0},
+            'effective_params': effective_params()})
 
         self.assertFalse(client.running)
         self.assertFalse(client.ready)
@@ -5441,7 +5451,8 @@ class LANClientTests(unittest.TestCase):
             'type': 'roster', 'protocol': 5, 'round_id': 3,
             'state_revision': 4,
             'phase': 'waiting', 'map': '01_karelia',
-            'host_player_id': 'not-an-id', 'players': [{'id': 7}]})
+            'host_player_id': 'not-an-id',
+            'players': [wire_player(7)]})
 
         self.assertFalse(client.running)
         self.assertEqual('invalid roster message', client.last_error)
@@ -5455,9 +5466,10 @@ class LANClientTests(unittest.TestCase):
 
         client._handle_message({
             'type': 'battle_start', 'protocol': 5, 'round_id': 3,
-            'state_revision': 4,
+            'state_revision': 4, 'phase': 'loading',
             'map': '01_karelia', 'host_player_id': 8,
-            'players': [{'id': 7}]})
+            'bot_authority_id': -1,
+            'players': [wire_player(7)]})
 
         self.assertFalse(client.running)
         self.assertFalse(client.ready)

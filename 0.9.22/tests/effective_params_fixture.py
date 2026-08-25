@@ -119,3 +119,32 @@ def effective_params():
             }],
         },
     }
+
+
+def equipment_ledger():
+    """One complete empty canonical equipment ledger fixture."""
+    return {
+        'equipment_states': [],
+        'equipment_revision': 0,
+        'equipment_intent_seq': 0,
+        'equipment_intent_result': {
+            'intent_seq': 0,
+            'accepted': False,
+            'reason': '',
+        },
+    }
+
+
+def wire_player(player_id, **values):
+    """One complete player row accepted by modern roster wires."""
+    result = {
+        'id': player_id,
+        'outfits': {},
+        'effective_params': effective_params(),
+        'critical_revision': 0,
+        'critical_base_revision': 0,
+        'critical_ack_seq': 0,
+    }
+    result.update(equipment_ledger())
+    result.update(values)
+    return result
