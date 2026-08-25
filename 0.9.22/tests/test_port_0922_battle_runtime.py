@@ -5726,6 +5726,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 raise RuntimeError('native operation denied')
             except RuntimeError as error:
                 battle._fail(error)
+            runtime.bigworld.callbacks.pop()()
 
         rendered = output.getvalue()
         self.assertIn('battle failed: native operation denied', rendered)
@@ -6536,6 +6537,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual('failed', battle.state)
         self.assertIn('game.abort', battle.error)
 
+        runtime.bigworld.callbacks.pop()()
         runtime.offline_map_creator.create = normal_create
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
@@ -6878,6 +6880,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, _minimal_start(), _Client()))
 
+        runtime.bigworld.callbacks.pop()()
         self.assertEqual([
             ('account_retire',), ('hangar_destroy',), ('clear_retained',),
             ('clear_retained',), ('clear_all_spaces',),
@@ -6908,6 +6911,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, _minimal_start(), _Client()))
 
+        runtime.bigworld.callbacks.pop()()
         runtime.offline_map_creator.create.assert_not_called()
         self.assertEqual(['destroy', 'restore'], calls)
         self.assertEqual('failed', battle.state)
@@ -6924,6 +6928,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, _minimal_start(), _Client()))
 
+        runtime.bigworld.callbacks.pop()()
         runtime.offline_map_creator.create.assert_not_called()
         self.assertIs(account, runtime.bigworld.avatar)
         self.assertEqual([], runtime.bigworld.operations)
@@ -6954,6 +6959,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, runtime.app_loader.lobby_listener_balance)
         runtime.offline_map_creator.create.assert_not_called()
 
+        runtime.bigworld.callbacks.pop()()
         type(runtime.app_loader).battle_loading_calls.return_value = True
         self.assertTrue(battle.start({
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
@@ -10476,6 +10482,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual('failed', battle.state)
         self.assertIn('did not enter world', battle.error)
+        runtime.bigworld.callbacks.pop(0)()
         self.assertTrue(runtime.compatibility.account_restored)
 
     def test_vehicle_ready_gets_a_fresh_timeout_after_slow_map_load(self):
@@ -10525,6 +10532,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual('failed', battle.state)
         self.assertIsNone(battle._callback_id)
         self.assertIsNone(battle._ammo_callback_id)
+        self.assertEqual(1, len(runtime.bigworld.callbacks))
+        runtime.bigworld.callbacks.pop(0)()
         self.assertEqual([], runtime.bigworld.callbacks)
 
     def test_gui_guard_orders_fast_page_and_ignores_late_loading(self):
@@ -18066,6 +18075,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, _minimal_start(), _Client()))
 
+        self.assertEqual(['clear', 'destroy'], calls)
+        runtime.bigworld.callbacks.pop()()
         self.assertEqual(['clear', 'destroy', 'restore'], calls)
         self.assertEqual('failed', battle.state)
         self.assertFalse(battle._map_create_attempted)
@@ -18099,6 +18110,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
             'name': 'Player'}, _minimal_start(), _Client()))
 
+        self.assertEqual(['clear', 'destroy'], calls)
+        runtime.bigworld.callbacks.pop()()
         self.assertEqual(['clear', 'destroy', 'restore'], calls)
         self.assertEqual('failed', battle.state)
 
@@ -18231,14 +18244,64 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._fail(RuntimeError('entity loading failed'))
 
-        self.assertEqual(['destroy', 'restore'], calls)
+        self.assertEqual(['destroy'], calls)
         self.assertEqual('failed', battle.state)
+        callback.assert_not_called()
+        runtime.bigworld.callbacks.pop()()
+        self.assertEqual(['destroy', 'restore'], calls)
         callback.assert_called_once_with(
             'battle_failed', {
                 'message': 'entity loading failed',
                 'round_id': None,
                 'lobby_restored': True,
             })
+
+    def test_failure_retains_native_owner_until_deferred_lobby_restore(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        owner = object()
+        battle._avatar = owner
+        battle._cleanup = lambda: setattr(battle, '_avatar', None)
+        restore = mock.Mock()
+        runtime.compatibility.restore_lobby_account = restore
+        callback = mock.Mock()
+        battle.client = types.SimpleNamespace(on_event=callback)
+
+        battle._fail(RuntimeError('entity loading failed'))
+
+        restore.assert_not_called()
+        callback.assert_not_called()
+        self.assertIn(owner, battle._retired_native_owners)
+        runtime.bigworld.callbacks.pop()()
+        restore.assert_called_once_with()
+        callback.assert_called_once_with('battle_failed', {
+            'message': 'entity loading failed',
+            'round_id': None,
+            'lobby_restored': True,
+        })
+        self.assertEqual([], battle._retired_native_owners)
+
+    def test_global_stop_cancels_pending_failure_lobby_restore(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        cleanup = mock.Mock()
+        battle._cleanup = cleanup
+        restore = mock.Mock()
+        runtime.compatibility.restore_lobby_account = restore
+        callback = mock.Mock()
+        battle.client = types.SimpleNamespace(on_event=callback)
+
+        battle._fail(RuntimeError('entity loading failed'))
+        self.assertTrue(battle.lobby_restore_pending())
+
+        battle.stop(restore_account=False)
+
+        self.assertEqual('stopped', battle.state)
+        self.assertFalse(battle.lobby_restore_pending())
+        cleanup.assert_called_once_with()
+        runtime.bigworld.callbacks.pop()()
+        restore.assert_not_called()
+        callback.assert_not_called()
 
     def test_failed_lobby_restore_is_reported_without_transport_error(self):
         runtime = _runtime()
@@ -18257,6 +18320,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertEqual('failed', battle.state)
         self.assertIn('entity loading failed', battle.error)
+        callback.assert_not_called()
+        runtime.bigworld.callbacks.pop()()
         self.assertIn('replacement Account failed', battle.error)
         self.assertEqual(1, runtime.compatibility.disconnect_calls)
         self.assertIsNone(runtime.bigworld.player())
@@ -18322,6 +18387,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         battle._fail(RuntimeError('first native failure'))
 
+        runtime.bigworld.callbacks.pop()()
         self.assertEqual('failed', battle.state)
         self.assertEqual('first native failure', battle.error)
 

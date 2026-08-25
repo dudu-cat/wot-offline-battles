@@ -1744,6 +1744,8 @@ class LANSession(object):
     def _start_battle(self, message):
         round_id = _message_value(message, 'round_id',
                                   getattr(self.client, 'round_id', None))
+        if self._starting_round_id is not None:
+            return False
         if round_id == self._departed_round_id:
             return False
         if (self._departed_round_id is not None and
@@ -1799,8 +1801,17 @@ class LANSession(object):
                 self._starting_round_id = None
             raise
         owns_start = self._starting_round_id == round_id
-        if owns_start:
+        restore_pending = False
+        pending_check = getattr(
+            self._battle_runtime, 'lobby_restore_pending', None)
+        if owns_start and not started and callable(pending_check):
+            restore_pending = bool(pending_check())
+        if owns_start and not restore_pending:
             self._starting_round_id = None
+        elif restore_pending:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] battle start failed; retaining round '
+                '%r until deferred lobby recovery completes\n' % round_id)
         if started and owns_start and not self._stopped:
             self._battle_started = True
             self._active_round_id = round_id

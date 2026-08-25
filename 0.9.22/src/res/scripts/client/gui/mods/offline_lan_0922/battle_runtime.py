@@ -1663,6 +1663,10 @@ class BattleRuntime(object):
             self._fail(error)
             return False
 
+    def lobby_restore_pending(self):
+        """Return whether native teardown is waiting for its GUI boundary."""
+        return self._lobby_restore_token is not None
+
     def _preflight_lobby_retirement(self):
         """Validate destructive lobby boundaries before changing GUI state."""
         clear = getattr(
@@ -16011,6 +16015,14 @@ class BattleRuntime(object):
             if not restore_account and self._lobby_restore_token is not None:
                 self._cancel_deferred_lobby_restore()
             return
+        if self.state == 'failed' and self._lobby_restore_token is not None:
+            # _fail() has already performed cleanup.  Preserve its one queued
+            # restore instead of tearing the same native owners down again;
+            # global shutdown can still cancel that pending reconstruction.
+            if not restore_account:
+                self._cancel_deferred_lobby_restore()
+            self.state = 'stopped'
+            return
         self._generation += 1
         self._cancel_callbacks()
         self._retain_native_teardown_owners()
@@ -16066,7 +16078,7 @@ class BattleRuntime(object):
             self._retired_native_owners.extend(owners)
         return len(owners)
 
-    def _schedule_lobby_restore(self):
+    def _schedule_lobby_restore(self, on_complete=None):
         token = object()
         self._lobby_restore_token = token
         sys.stdout.write(
@@ -16078,13 +16090,18 @@ class BattleRuntime(object):
                 return
             self._lobby_restore_token = None
             self._lobby_restore_callback_id = None
+            lobby_restored = False
             try:
                 # A LAN transport failure is not a WoT account disconnect.
                 # Account.showGUI owns the native showLobby transition; do not
                 # call g_appLoader separately or duplicate it.
                 self._runtime.compatibility.restore_lobby_account()
             except Exception as error:
-                self.error = 'lobby restore failed: %s' % error
+                restore_error = 'lobby restore failed: %s' % error
+                if self.error:
+                    self.error = '%s; %s' % (self.error, restore_error)
+                else:
+                    self.error = restore_error
                 sys.stdout.write(
                     '[Offline LAN 0.9.22] deferred lobby restore failed: '
                     '%s\n' % error)
@@ -16095,9 +16112,19 @@ class BattleRuntime(object):
                         '[Offline LAN 0.9.22] offline disconnect after lobby '
                         'restore failure failed: %s\n' % disconnect_error)
             else:
+                lobby_restored = True
                 sys.stdout.write(
                     '[Offline LAN 0.9.22] deferred lobby Account restored\n')
             self._retired_native_owners = []
+            if callable(on_complete):
+                try:
+                    on_complete(lobby_restored)
+                except Exception as error:
+                    # Failure reporting is downstream of native recovery and
+                    # must never escape into BigWorld's callback dispatcher.
+                    sys.stdout.write(
+                        '[Offline LAN 0.9.22] deferred lobby completion '
+                        'failed: %s\n' % error)
 
         try:
             callback_id = self._runtime.bigworld.callback(
@@ -16538,6 +16565,7 @@ class BattleRuntime(object):
         self.error = str(error)
         self._generation += 1
         self._cancel_callbacks()
+        self._retain_native_teardown_owners()
         cleanup_error = None
         try:
             self._cleanup()
@@ -16547,27 +16575,30 @@ class BattleRuntime(object):
                 self.error, cleanup_failure)
         self.state = 'failed'
         # Asynchronous map/entity failures happen after OfflineMapCreator has
-        # replaced the lobby Account.  Recover the same boundary as a normal
-        # round exit, but report it separately from a LAN transport failure so
-        # the waiting-room socket can survive a local map construction error.
-        lobby_restored = False
+        # replaced the lobby Account.  Recover across the same native callback
+        # boundary as a normal round exit; constructing Hangar in this cleanup
+        # callback can reuse a battle GUI component still queued for update.
         if cleanup_error is None:
             try:
-                self._runtime.compatibility.restore_lobby_account()
-                lobby_restored = True
-            except Exception as restore_failure:
-                self.error = '%s; lobby restore failed: %s' % (
-                    self.error, restore_failure)
-        if not lobby_restored:
-            # A failed cleanup/restore cannot remain LOGGED_ON without a
-            # valid Account or Avatar.  Retire the fake WoT connection here;
-            # LANSession owns only its socket/picker and must not recurse into
-            # this native runtime boundary.
-            try:
-                self._runtime.compatibility.disconnect()
-            except Exception as disconnect_failure:
-                self.error = '%s; offline disconnect failed: %s' % (
-                    self.error, disconnect_failure)
+                self._schedule_lobby_restore(
+                    lambda lobby_restored: self._report_failure(
+                        lobby_restored, active_traceback))
+                return
+            except Exception as schedule_failure:
+                self.error = '%s; lobby restore scheduling failed: %s' % (
+                    self.error, schedule_failure)
+        self._retired_native_owners = []
+        # A failed cleanup/schedule cannot remain LOGGED_ON without a valid
+        # Account or Avatar.  LANSession owns only its socket/picker and must
+        # not recurse into this native runtime boundary.
+        try:
+            self._runtime.compatibility.disconnect()
+        except Exception as disconnect_failure:
+            self.error = '%s; offline disconnect failed: %s' % (
+                self.error, disconnect_failure)
+        self._report_failure(False, active_traceback)
+
+    def _report_failure(self, lobby_restored, active_traceback):
         callback = getattr(self.client, 'on_event', None)
         if callable(callback):
             try:

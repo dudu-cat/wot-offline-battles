@@ -211,6 +211,7 @@ class _BattleRuntime(object):
         self.events = []
         self.rosters = []
         self.observations = []
+        self.restore_pending = False
 
     def start(self, config, message=None, lan_client=None,
               on_local_leave=None):
@@ -219,6 +220,9 @@ class _BattleRuntime(object):
             'lan_client': lan_client,
             'on_local_leave': on_local_leave})
         return True
+
+    def lobby_restore_pending(self):
+        return self.restore_pending
 
     def on_snapshot(self, message):
         self.snapshots.append(message)
@@ -1919,6 +1923,39 @@ class LANSessionTests(unittest.TestCase):
         # A failed round puts the player back in the GARAGE, so the room waits
         # for another Battle click instead of raising itself over the hangar.
         self.assertFalse(self.session._picker_open)
+
+    def test_deferred_runtime_failure_keeps_start_owner_until_recovery(self):
+        start = {
+            'round_id': 7, 'map': '01_karelia', 'players': [{
+                'id': 'p1', 'x': 1, 'y': 2, 'z': 3,
+                'vehicle': 'ussr:T-34'}]}
+
+        def fail_start(config, message=None, lan_client=None,
+                       on_local_leave=None):
+            self.battle_runtime.started.append({
+                'config': dict(config), 'message': message,
+                'lan_client': lan_client,
+                'on_local_leave': on_local_leave})
+            self.battle_runtime.restore_pending = True
+            return False
+
+        self.battle_runtime.start = fail_start
+        self.emit('battle_start', start)
+
+        self.assertEqual(7, self.session._starting_round_id)
+        self.assertFalse(self.session._battle_started)
+        self.emit('battle_start', start)
+        self.assertEqual(1, len(self.battle_runtime.started))
+
+        self.battle_runtime.restore_pending = False
+        self.emit('battle_failed', {
+            'round_id': 7, 'message': 'invalid entity property',
+            'lobby_restored': True})
+
+        self.assertIsNone(self.session._starting_round_id)
+        self.assertEqual('awaiting_round_end', self.session.state)
+        self.assertEqual(7, self.session._departed_round_id)
+        self.assertEqual(1, self.client.leave_calls)
 
     def test_unrestored_runtime_failure_stops_only_lan_owners(self):
         self.emit('battle_start', {
