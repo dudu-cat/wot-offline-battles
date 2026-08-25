@@ -37,6 +37,7 @@ CLOSE_THREAT_FOCUS_LIMIT = 4
 ROUTE_REBALANCE_SECONDS = 4.0
 ROUTE_LEASE_SECONDS = 6.0
 MAX_BASE_DEFENDERS = 3
+MAX_BASE_CAPTURERS = 3
 RECENT_HIT_SECONDS = 6.0
 RECENT_ATTACKER_SCORE_BONUS = 140.0
 LOW_HEALTH_BASE_FRACTION = 0.18
@@ -89,6 +90,7 @@ class BotPlanner(object):
         self._cover_reservations = set()
         self._target_assignments = {}
         self._base_defense = {1: {}, 2: {}}
+        self._base_capture = {1: {}, 2: {}}
         self._artillery_anchors = {}
         self._recent_hits = {}
 
@@ -106,6 +108,7 @@ class BotPlanner(object):
         self._cover_reservations = set()
         self._target_assignments = {}
         self._base_defense = {1: {}, 2: {}}
+        self._base_capture = {1: {}, 2: {}}
         self._artillery_anchors = {}
         self._recent_hits = {}
 
@@ -323,6 +326,8 @@ class BotPlanner(object):
             protected_ids = set(defenders.get(team, {}))
             self._rebalance_routes(
                 team, team_bots, contacts[team], now, protected_ids)
+            capture_ids = self._update_base_capture(
+                team, team_bots, capture_targets[team], protected_ids)
             assignments = self._assign_targets(team_bots, contacts[team], now)
             assignments = self._prioritize_base_invaders(
                 team, team_bots, contacts[team], assignments,
@@ -333,7 +338,7 @@ class BotPlanner(object):
                     contacts[team], now,
                     defenders.get(team, {}).get(bot["id"]), team_axis,
                     team_bots, capture_targets[team],
-                    not bool(contacts[team]))
+                    not bool(contacts[team]) and bot["id"] in capture_ids)
                 base = defenders.get(team, {}).get(bot["id"])
                 orders.append(order)
         orders.sort(key=lambda value: value["id"])
@@ -731,6 +736,59 @@ class BotPlanner(object):
         order["move_position"] = point
         order["throttle_override"] = None
         order["route_join"] = False
+
+    @staticmethod
+    def _capture_candidate_key(bot, target):
+        state = bot.get("state") if isinstance(bot.get("state"), dict) else {}
+        point = target["point"]
+        distance = math.hypot(
+            point["x"] - _number(state.get("x")),
+            point["z"] - _number(state.get("z")))
+        speed = _clamp(
+            _number(bot.get("profile", {}).get("speed"), 12.0), 4.0, 30.0)
+        health = max(0.0, _number(state.get("health"), 1.0))
+        max_health = max(1.0, _number(state.get("max_health"), 1.0))
+        return (distance / speed, -(health / max_health), bot["id"])
+
+    def _update_base_capture(self, team, bots, target, protected_ids):
+        """Keep a small, stable capture squad and replace lost members."""
+        if target is None:
+            self._base_capture[team] = {}
+            return set()
+        base_id = str(target["id"])
+        state = self._base_capture.setdefault(team, {})
+        if state.get("base_id") != base_id:
+            state = {"base_id": base_id, "bot_ids": []}
+            self._base_capture[team] = state
+
+        candidates = [
+            bot for bot in bots
+            if bot["id"] not in protected_ids and
+            self._base_defense_eligible(bot)
+        ]
+        regulars = [
+            bot for bot in candidates
+            if str(bot.get("profile", {}).get("class_tag") or "") != "SPG"
+        ]
+        eligible = regulars if regulars else candidates
+        eligible_by_id = dict((bot["id"], bot) for bot in eligible)
+        selected = [
+            bot_id for bot_id in state.get("bot_ids", ())
+            if bot_id in eligible_by_id
+        ][:MAX_BASE_CAPTURERS]
+        missing = min(MAX_BASE_CAPTURERS, len(eligible)) - len(selected)
+        if missing > 0:
+            available = [
+                bot for bot in eligible if bot["id"] not in selected
+            ]
+            selected.extend(
+                bot["id"] for bot in sorted(
+                    available,
+                    key=lambda bot: self._capture_candidate_key(bot, target)
+                )[:missing]
+            )
+        state["bot_ids"] = selected
+        return set(selected)
 
     def _prioritize_base_invaders(self, team, bots, contacts, assignments,
                                   defenders, defense):

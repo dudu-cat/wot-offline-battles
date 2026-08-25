@@ -79,6 +79,15 @@ def _contact(target_id, x, z, observers, class_tag='mediumTank'):
     }
 
 
+def _capture_defense():
+    return {
+        'capture_bases': {
+            '1': [{'id': '1:0', 'x': 0.0, 'y': 0.0, 'z': -100.0}],
+            '2': [{'id': '2:0', 'x': 123.5, 'y': 0.0, 'z': 456.25}],
+        },
+    }
+
+
 class ServerBotTacticsTests(unittest.TestCase):
     def setUp(self):
         self.route = _route('lane', [
@@ -180,12 +189,7 @@ class ServerBotTacticsTests(unittest.TestCase):
 
     def test_contact_free_bots_capture_the_authoritative_enemy_base(self):
         planner = BotPlanner()
-        defense = {
-            'capture_bases': {
-                '1': [{'id': '1:0', 'x': 0.0, 'y': 0.0, 'z': -100.0}],
-                '2': [{'id': '2:0', 'x': 123.5, 'y': 0.0, 'z': 456.25}],
-            },
-        }
+        defense = _capture_defense()
 
         order = planner.build_orders(
             self.manifest, self.states, [], 1.0, defense)['orders'][0]
@@ -197,16 +201,128 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual(order['move_position'], order['aim_position'])
         self.assertEqual(order['move_position'], order['face_position'])
 
+    def test_capture_squad_is_capped_while_other_bots_keep_routes(self):
+        planner = BotPlanner()
+        manifest = [
+            _bot(100 + index, 1, index, self.route, 'mediumTank')
+            for index in range(15)
+        ]
+        states = [
+            _state(bot['id'], 1, 0, index * 2)
+            for index, bot in enumerate(manifest)
+        ]
+
+        orders = planner.build_orders(
+            manifest, states, [], 1.0, _capture_defense())['orders']
+        capture = [order for order in orders
+                   if order['combat_mode'] == 'base_capture']
+        routed = [order for order in orders
+                  if order['combat_mode'] == 'route']
+
+        self.assertEqual(3, len(capture))
+        self.assertEqual(12, len(routed))
+        self.assertTrue(all(order['route_id'] == 'lane' for order in routed))
+        self.assertTrue(all('capture_base_id' not in order
+                            for order in routed))
+
+    def test_spgs_yield_capture_slots_to_regular_vehicles(self):
+        planner = BotPlanner()
+        manifest = [
+            _bot(201, 1, 0, self.route, 'mediumTank'),
+            _bot(202, 1, 1, self.route, 'heavyTank'),
+            _bot(203, 1, 2, self.route, 'SPG'),
+            _bot(204, 1, 3, self.route, 'SPG'),
+            _bot(205, 1, 4, self.route, 'SPG'),
+        ]
+        states = [_state(bot['id'], 1, 0, 0) for bot in manifest]
+
+        orders = planner.build_orders(
+            manifest, states, [], 1.0, _capture_defense())['orders']
+        capture_ids = {
+            order['id'] for order in orders
+            if order['combat_mode'] == 'base_capture'
+        }
+
+        self.assertEqual({201, 202}, capture_ids)
+
+    def test_capture_squad_is_stable_across_a_contact_cycle(self):
+        planner = BotPlanner()
+        manifest = [
+            _bot(300 + index, 1, index, self.route, 'mediumTank')
+            for index in range(5)
+        ]
+        states = [
+            _state(bot['id'], 1, index * 25, 0)
+            for index, bot in enumerate(manifest)
+        ]
+        defense = _capture_defense()
+        initial = planner.build_orders(
+            manifest, states, [], 1.0, defense)['orders']
+        initial_ids = {
+            order['id'] for order in initial
+            if order['combat_mode'] == 'base_capture'
+        }
+        self.assertEqual(3, len(initial_ids))
+
+        contact = _contact(900, 0, 400, [])
+        players = [{'id': 900, 'team': 2, 'alive': True}]
+        self.assertEqual(1, planner.report_contacts(
+            [contact], planner.known_targets(states, players), 2.0))
+        engaged = planner.build_orders(
+            manifest, states, players, 2.0, defense)['orders']
+        self.assertFalse(any(order['combat_mode'] == 'base_capture'
+                             for order in engaged))
+
+        for state in states:
+            state['z'] = (-900.0 if state['id'] in initial_ids else 450.0)
+        resumed = planner.build_orders(
+            manifest, states, players, 10.1, defense)['orders']
+        resumed_ids = {
+            order['id'] for order in resumed
+            if order['combat_mode'] == 'base_capture'
+        }
+        self.assertEqual(initial_ids, resumed_ids)
+
+    def test_capture_squad_replaces_only_a_dead_member(self):
+        planner = BotPlanner()
+        manifest = [
+            _bot(400 + index, 1, index, self.route, 'mediumTank')
+            for index in range(5)
+        ]
+        states = [
+            _state(bot['id'], 1, index * 20, 0)
+            for index, bot in enumerate(manifest)
+        ]
+        defense = _capture_defense()
+        initial = planner.build_orders(
+            manifest, states, [], 1.0, defense)['orders']
+        initial_ids = {
+            order['id'] for order in initial
+            if order['combat_mode'] == 'base_capture'
+        }
+        lost_id = min(initial_ids)
+        for state in states:
+            if state['id'] == lost_id:
+                state['alive'] = False
+                break
+
+        updated = planner.build_orders(
+            manifest, states, [], 2.0, defense)['orders']
+        updated_ids = {
+            order['id'] for order in updated
+            if order['combat_mode'] == 'base_capture'
+        }
+
+        self.assertEqual(3, len(updated_ids))
+        self.assertEqual(initial_ids - {lost_id},
+                         updated_ids.intersection(initial_ids))
+        self.assertNotIn(lost_id, updated_ids)
+
     def test_known_enemy_keeps_the_route_instead_of_starting_base_capture(self):
         planner = BotPlanner()
         contact = _contact(2, 0, 400, [])
         players = self._report(planner, [contact])
-        defense = {
-            'capture_bases': {
-                '1': [{'id': '1:0', 'x': 0.0, 'y': 0.0, 'z': -100.0}],
-                '2': [{'id': '2:0', 'x': 123.5, 'y': 0.0, 'z': 456.25}],
-            },
-        }
+        defense = _capture_defense()
 
         order = planner.build_orders(
             self.manifest, self.states, players, 1.0, defense)['orders'][0]
