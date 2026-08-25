@@ -198,6 +198,11 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
         self.assertEqual(1.0, by_file[SYNTH_FRAGILE][16])
         self.assertEqual(1.0, by_file[SYNTH_SHED][16])
 
+        compiled = types.SimpleNamespace(sections=sections)
+        unused_rows, unused_wire_rows, speedtree_wires = \
+            self.baker.native_wires(compiled, 4)
+        self.assertEqual({0: (100, 0)}, speedtree_wires)
+
     def test_synthetic_wgde_rejects_broken_chunk_ranges_and_spans(self):
         sections, descriptors = _synthetic_scene()
         sections['WGDE']._data['1'] = [(100, 1, 3), (200, 4, 1)]

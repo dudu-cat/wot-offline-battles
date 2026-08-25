@@ -30,7 +30,7 @@ PREFERENCES_CONFIGS = (
 )
 PYTHON_MAGIC = '\x03\xf3\r\n'
 FOLIAGE_FORMAT = 'offline-lan-0922-foliage'
-FOLIAGE_VERSION = 1
+FOLIAGE_VERSION = 2
 FOLIAGE_MANIFEST_FORMAT = FOLIAGE_FORMAT + '-manifest'
 DESTRUCTIBLE_FORMAT = 'offline-lan-0922-destructible-catalog'
 DESTRUCTIBLE_VERSION = 5
@@ -354,6 +354,7 @@ def _validate_foliage(foliage_root):
             data = json.loads(payload.decode('utf-8'))
             instances = data.get('instances')
             cells = data.get('cells')
+            fallen_trees = data.get('fallen_trees')
             if (data.get('format') != FOLIAGE_FORMAT or
                     int(data.get('version', -1)) != FOLIAGE_VERSION or
                     data.get('game_version') != _navigation_schema.GAME_VERSION or
@@ -361,8 +362,11 @@ def _validate_foliage(foliage_root):
                     float(data.get('cell_size', 0.0)) <= 0.0 or
                     not isinstance(instances, list) or not instances or
                     not isinstance(cells, dict) or
+                    not isinstance(fallen_trees, list) or
                     any(not isinstance(row, list) or len(row) != 10
-                        for row in instances)):
+                        for row in instances) or
+                    any(not isinstance(row, list) or len(row) != 9
+                        for row in fallen_trees)):
                 raise ValueError('invalid foliage data')
         except (AttributeError, TypeError, ValueError) as error:
             raise SystemExit(

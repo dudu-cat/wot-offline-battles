@@ -30,13 +30,14 @@ for path in (TOOL_ROOT, SCHEMA_ROOT, VENDOR_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from packed_xml import read_packed_xml
+from packed_xml import TYPE_ELEMENT, read_packed_xml
 from wot_space_bin_utils import CompiledSpace
+from bake_destructibles_0922 import native_wires
 import navigation_graph_schema
 
 
 FORMAT_NAME = 'offline-lan-0922-foliage'
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
 GAME_VERSION = '0.9.22.0.1-cn-1513'
 DECODER_VERSION = '0.9.22.0.1'
@@ -100,6 +101,51 @@ def bush_tokens(data):
     if not result:
         raise ValueError('speedtree/bushes.xml contains no bush taxonomy')
     return tuple(sorted(set(result), key=lambda value: (-len(value), value)))
+
+
+def _single_child(element, name):
+    encoded = name.encode('ascii')
+    values = [value for child_name, value in element.children
+              if child_name == encoded]
+    if len(values) != 1:
+        raise ValueError(
+            'destructibles.xml tree requires one field %s' % name)
+    return values[0]
+
+
+def tree_descriptors(data):
+    """Return exact fallable-tree health and density by SPT resource."""
+    root = read_packed_xml(data)
+    trees = _single_child(root, 'trees')
+    if trees.value_type != TYPE_ELEMENT:
+        raise ValueError('destructibles.xml trees section is invalid')
+    result = {}
+    for child_name, value in trees.value.children:
+        if child_name != b'entry' or value.value_type != TYPE_ELEMENT:
+            raise ValueError('destructibles.xml tree entry is invalid')
+        entry = value.value
+        filename = _single_child(entry, 'filename').value
+        if isinstance(filename, bytes):
+            filename = filename.decode('utf-8')
+        filename = str(filename).replace('\\', '/').strip().lower()
+        if not filename or not filename.endswith('.spt') or filename in result:
+            raise ValueError('destructibles.xml tree filename is invalid')
+        try:
+            health = float(_single_child(entry, 'health').value)
+            density = float(_single_child(entry, 'density').value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                'destructibles.xml tree values are invalid for %s' %
+                filename)
+        if (not math.isfinite(health) or not math.isfinite(density) or
+                density < 0.0):
+            raise ValueError(
+                'destructibles.xml tree values are invalid for %s' %
+                filename)
+        result[filename] = {'health': health, 'density': density}
+    if not result:
+        raise ValueError('destructibles.xml contains no tree descriptors')
+    return result
 
 
 def ctree_bounds(data):
@@ -214,11 +260,12 @@ def foliage_instance(bounds, transform):
     return row, (minimum_x, minimum_z, maximum_x, maximum_z)
 
 
-def decode_speedtrees(space_data):
-    """Decode ordered SpTr rows and their BWST resource names."""
+def decode_speedtrees_and_wires(space_data):
+    """Decode SpTr rows and their exact streamed destructible wires."""
     compiled = CompiledSpace(io.BytesIO(space_data), DECODER_VERSION,
-                             DECODER_REGION, ['BWST', 'SpTr'])
-    missing = [name for name in ('BWST', 'SpTr')
+                             DECODER_REGION,
+                             ['BWST', 'BSMI', 'WGDE', 'SpTr'])
+    missing = [name for name in ('BWST', 'BSMI', 'WGDE', 'SpTr')
                if name not in compiled.sections]
     if missing:
         raise ValueError('compiled space omitted %s' % ', '.join(missing))
@@ -233,11 +280,31 @@ def decode_speedtrees(space_data):
         if len(transform) != 16:
             raise ValueError('SpTr row %d has an invalid transform' % index)
         result.append((resource, transform))
-    return result
+    unused_rows, unused_wire_rows, speedtree_wires = native_wires(
+        compiled, len(list(compiled.sections['BSMI'].model_ids())))
+    return result, speedtree_wires
+
+
+def decode_speedtrees(space_data):
+    """Decode ordered SpTr rows and their BWST resource names."""
+    speedtrees, unused_wires = decode_speedtrees_and_wires(space_data)
+    return speedtrees
+
+
+def fallen_tree_profile(bounds):
+    """Return exact local bounds for one future native-matrix follower."""
+    minimum, maximum = bounds
+    values = tuple(float(value) for value in minimum + maximum)
+    if (not all(math.isfinite(value) for value in values) or
+            not all(values[index] < values[index + 3]
+                    for index in range(3))):
+        raise ValueError('fallen tree profile is degenerate')
+    return tuple(_round(value) for value in values)
 
 
 def bake_speedtrees(resources, map_name, tokens, speedtrees,
-                    cell_size=CELL_SIZE):
+                    cell_size=CELL_SIZE, tree_records=None,
+                    speedtree_wires=None):
     """Bake already-decoded SpeedTree rows; kept pure for deterministic tests."""
     if float(cell_size) <= 0.0:
         raise ValueError('cell size must be positive')
@@ -245,32 +312,69 @@ def bake_speedtrees(resources, map_name, tokens, speedtrees,
     cells = {}
     asset_counts = {}
     bush_source_count = 0
+    fallen_trees = []
+    fallen_tree_wires = set()
+    nonconcealing_fallable_trees = 0
+    tree_records = tree_records or {}
+    speedtree_wires = speedtree_wires or {}
     for source_index, (resource, transform) in enumerate(speedtrees):
-        if not is_bush_resource(resource, tokens):
-            continue
-        bush_source_count += 1
-        ctree = os.path.splitext(resource)[0] + '.ctree'
-        try:
-            bounds = ctree_bounds(resources.read(ctree))
-            row, world_bounds = foliage_instance(bounds, transform)
-        except (KeyError, ValueError, struct.error) as error:
-            raise ValueError('bush resource failed %s at SpTr row %d: %s' %
-                             (resource, source_index, error))
-        instance_id = len(instances)
-        instances.append(row)
         normalized = str(resource).replace('\\', '/')
-        asset = os.path.splitext(os.path.basename(normalized))[0].lower()
-        asset_counts[asset] = asset_counts.get(asset, 0) + 1
-        min_cell_x = int(math.floor(world_bounds[0] / float(cell_size)))
-        min_cell_z = int(math.floor(world_bounds[1] / float(cell_size)))
-        max_cell_x = int(math.floor(world_bounds[2] / float(cell_size)))
-        max_cell_z = int(math.floor(world_bounds[3] / float(cell_size)))
-        for cell_x in range(min_cell_x, max_cell_x + 1):
-            for cell_z in range(min_cell_z, max_cell_z + 1):
-                key = '%d,%d' % (cell_x, cell_z)
-                cells.setdefault(key, []).append(instance_id)
+        folded = normalized.lower()
+        ctree = os.path.splitext(resource)[0] + '.ctree'
+        bounds = None
+        standing_instance_id = None
+        if is_bush_resource(resource, tokens):
+            bush_source_count += 1
+            try:
+                bounds = ctree_bounds(resources.read(ctree))
+                row, world_bounds = foliage_instance(bounds, transform)
+            except (KeyError, ValueError, struct.error) as error:
+                raise ValueError('bush resource failed %s at SpTr row %d: %s' %
+                                 (resource, source_index, error))
+            instance_id = len(instances)
+            instances.append(row)
+            standing_instance_id = instance_id
+            asset = os.path.splitext(os.path.basename(normalized))[0].lower()
+            asset_counts[asset] = asset_counts.get(asset, 0) + 1
+            min_cell_x = int(math.floor(world_bounds[0] / float(cell_size)))
+            min_cell_z = int(math.floor(world_bounds[1] / float(cell_size)))
+            max_cell_x = int(math.floor(world_bounds[2] / float(cell_size)))
+            max_cell_z = int(math.floor(world_bounds[3] / float(cell_size)))
+            for cell_x in range(min_cell_x, max_cell_x + 1):
+                for cell_z in range(min_cell_z, max_cell_z + 1):
+                    key = '%d,%d' % (cell_x, cell_z)
+                    cells.setdefault(key, []).append(instance_id)
+        wire = speedtree_wires.get(source_index)
+        if wire is None:
+            continue
+        record = tree_records.get(folded)
+        if record is None:
+            raise ValueError(
+                'WGDE SpeedTree has no descriptor %s at SpTr row %d' %
+                (resource, source_index))
+        health = float(record['health'])
+        if health < 10.0 or health > 1000.0:
+            continue
+        if float(record['density']) <= 0.0:
+            nonconcealing_fallable_trees += 1
+            continue
+        if wire in fallen_tree_wires:
+            raise ValueError('fallen tree wire is duplicated: %r' % (wire,))
+        if bounds is None:
+            try:
+                bounds = ctree_bounds(resources.read(ctree))
+            except (KeyError, ValueError, struct.error) as error:
+                raise ValueError(
+                    'fallen tree resource failed %s at SpTr row %d: %s' %
+                    (resource, source_index, error))
+        profile = fallen_tree_profile(bounds)
+        fallen_trees.append([
+            int(wire[0]), int(wire[1])] + list(profile) +
+            [standing_instance_id])
+        fallen_tree_wires.add(wire)
     if not instances:
         raise ValueError('no concealment vegetation found for %s' % map_name)
+    fallen_trees.sort(key=lambda row: (row[0], row[1]))
     return {
         'format': FORMAT_NAME,
         'version': FORMAT_VERSION,
@@ -279,12 +383,15 @@ def bake_speedtrees(resources, map_name, tokens, speedtrees,
         'cell_size': float(cell_size),
         'instances': instances,
         'cells': cells,
+        'fallen_trees': fallen_trees,
         'bake': {
             'taxonomy': list(tokens),
             'matching': 'case-insensitive asset-name substring',
             'source_speedtrees': len(speedtrees),
             'source_bushes': bush_source_count,
             'foliage_instances': len(instances),
+            'fallen_tree_profiles': len(fallen_trees),
+            'nonconcealing_fallable_trees': nonconcealing_fallable_trees,
             'spatial_cells': len(cells),
             'camouflage_per_volume': CAMOUFLAGE_PER_VOLUME,
             'ctree_version': CTREE_VERSION,
@@ -316,7 +423,21 @@ def read_taxonomy(client_root):
         return bush_tokens(resources.read('speedtree/bushes.xml'))
 
 
-def bake_map(client_root, map_name, tokens=None, cell_size=CELL_SIZE):
+def read_tree_descriptors(client_root):
+    scripts = os.path.join(
+        os.path.abspath(client_root), 'res', 'packages', 'scripts.pkg')
+    if not os.path.isfile(scripts):
+        raise ValueError('required client package not found: %s' % scripts)
+    with zipfile.ZipFile(scripts, 'r') as package:
+        try:
+            data = package.read('scripts/destructibles.xml')
+        except KeyError:
+            raise ValueError('destructibles.xml missing from scripts.pkg')
+    return tree_descriptors(data)
+
+
+def bake_map(client_root, map_name, tokens=None, cell_size=CELL_SIZE,
+             tree_records=None):
     if map_name not in SUPPORTED_MAPS:
         raise ValueError('unsupported standard map: %s' % map_name)
     map_path, shared_path, sandbox_path, misc_path = _package_paths(
@@ -324,20 +445,23 @@ def bake_map(client_root, map_name, tokens=None, cell_size=CELL_SIZE):
     if tokens is None:
         with CaseFoldZipResources((misc_path,)) as misc:
             tokens = bush_tokens(misc.read('speedtree/bushes.xml'))
+    if tree_records is None:
+        tree_records = read_tree_descriptors(client_root)
     space_member = 'spaces/%s/space.bin' % map_name
     with zipfile.ZipFile(map_path, 'r') as package:
         try:
             space_data = package.read(space_member)
         except KeyError:
             raise ValueError('compiled space missing: %s' % space_member)
-    speedtrees = decode_speedtrees(space_data)
+    speedtrees, speedtree_wires = decode_speedtrees_and_wires(space_data)
     # A small set of stock winter foliage (for example CaneReeds1) is stored
     # in shared_content_sandbox.pkg rather than either the map package or
     # shared_content.pkg in the pinned Chinese HD client.
     with CaseFoldZipResources(
             (map_path, shared_path, sandbox_path)) as resources:
-        return bake_speedtrees(resources, map_name, tokens, speedtrees,
-                               cell_size)
+        return bake_speedtrees(
+            resources, map_name, tokens, speedtrees, cell_size,
+            tree_records, speedtree_wires)
 
 
 def write_json(path, data):
@@ -390,11 +514,13 @@ def bake_all(client_root, output_root=DEFAULT_OUTPUT_ROOT,
     if actual and actual != expected:
         raise ValueError('existing foliage output set is incomplete or extra')
     tokens = read_taxonomy(client_root)
+    tree_records = read_tree_descriptors(client_root)
     with tempfile.TemporaryDirectory(
             prefix='offline-lan-0922-foliage-', dir=parent) as staging:
         digests = {}
         for map_name in SUPPORTED_MAPS:
-            data = bake_map(client_root, map_name, tokens, cell_size)
+            data = bake_map(
+                client_root, map_name, tokens, cell_size, tree_records)
             path = os.path.join(staging, map_name + '.json')
             write_json(path, data)
             digests[map_name] = _sha256(path)

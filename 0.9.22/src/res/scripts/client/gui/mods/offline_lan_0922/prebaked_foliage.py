@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import math
 import os
 
 from gui.mods.offline_lan_0922.foliage import FoliageMap
@@ -13,8 +14,12 @@ from gui.mods.offline_lan_0922.prebaked_navigation import mod_dir
 
 
 FORMAT_NAME = 'offline-lan-0922-foliage'
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_FORMAT = FORMAT_NAME + '-manifest'
+try:
+	_INTEGER_TYPES = (int, long)
+except NameError:
+	_INTEGER_TYPES = (int,)
 
 
 def _sha256(path):
@@ -91,6 +96,40 @@ def _validate(data, map_name):
 			if int(instance_id) < 0 or int(instance_id) >= len(instances):
 				raise ValueError(
 					'foliage cell references an invalid instance')
+	fallen_trees = data.get('fallen_trees')
+	if not isinstance(fallen_trees, list):
+		raise ValueError('fallen tree foliage profiles are invalid')
+	seen_wires = set()
+	seen_standing_instances = set()
+	for row in fallen_trees:
+		if (not isinstance(row, list) or len(row) != 9 or
+				type(row[0]) not in _INTEGER_TYPES or
+				type(row[1]) not in _INTEGER_TYPES or
+				row[0] < 0 or row[1] < 0):
+			raise ValueError('fallen tree foliage profile is invalid')
+		wire = (int(row[0]), int(row[1]))
+		if wire in seen_wires:
+			raise ValueError('fallen tree foliage wire is duplicated')
+		seen_wires.add(wire)
+		try:
+			bounds = tuple(float(value) for value in row[2:8])
+		except (TypeError, ValueError, OverflowError):
+			raise ValueError('fallen tree foliage profile is invalid')
+		if (not all(not math.isnan(value) and not math.isinf(value)
+				for value in bounds) or
+				not all(bounds[index] < bounds[index + 3]
+					for index in range(3))):
+			raise ValueError('fallen tree foliage profile is invalid')
+		standing_instance_id = row[8]
+		if (standing_instance_id is not None and
+				(type(standing_instance_id) not in _INTEGER_TYPES or
+				 standing_instance_id < 0 or
+				 standing_instance_id >= len(instances) or
+				 standing_instance_id in seen_standing_instances)):
+			raise ValueError(
+				'fallen tree standing foliage reference is invalid')
+		if standing_instance_id is not None:
+			seen_standing_instances.add(standing_instance_id)
 	return data
 
 
