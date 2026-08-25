@@ -3214,6 +3214,48 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(11, first[0]['bots'][0]['id'])
         self.assertEqual([], self.runtime.battle_start(self.start))
 
+    def test_manifest_descriptor_preflight_failure_is_atomic(self):
+        for failure_kind in ('resolver', 'siege_pair'):
+            good = _combat_descriptor()
+            broken = _combat_descriptor()
+            broken.hasSiegeMode = True
+            resolved = []
+
+            def resolver(vehicle_name):
+                resolved.append(vehicle_name)
+                if vehicle_name == 'broken:Vehicle':
+                    if failure_kind == 'resolver':
+                        raise ValueError('descriptor parse failed')
+                    return broken
+                return good
+
+            runtime = self.module.BotRuntime(
+                1, descriptor_resolver=resolver,
+                adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+                baked_graph=_graph())
+            start = dict(self.start, bots=[
+                {'id': 11, 'team': 2, 'slot': 0, 'name': 'Good',
+                 'vehicle': 'good:Vehicle'},
+                {'id': 12, 'team': 2, 'slot': 1, 'name': 'Broken',
+                 'vehicle': 'broken:Vehicle'},
+            ])
+
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    'bot 12 vehicle broken:Vehicle descriptor is '
+                    'unavailable'):
+                runtime.battle_start(start)
+
+            self.assertEqual(['good:Vehicle', 'broken:Vehicle'], resolved)
+            self.assertEqual({}, runtime.states)
+            self.assertEqual({}, runtime._descriptor_pairs)
+            self.assertEqual({}, runtime._descriptors)
+            self.assertEqual({}, runtime._gun_states)
+            self.assertEqual({}, runtime._ammo_states)
+            self.assertEqual({}, runtime._physics_params)
+            self.assertFalse(runtime._manifest_sent)
+            self.assertIsNone(runtime.adapter)
+
     def test_worker_donates_sorted_client_effective_collision_profiles(self):
         descriptor = _combat_descriptor()
         descriptor.physics['weight'] = 25000.0

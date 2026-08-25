@@ -2365,15 +2365,10 @@ class BotRuntime(object):
             return []
         if self.finished:
             return []
-        if self.adapter is None:
-            self._ensure_navigation_graph(message.get('map', ''))
-            self.adapter = self._new_adapter(message.get('map', ''),
-                                             round_id or 0)
-            if self.navigator is not None:
-                self.adapter.navigation_target = self._navigation_target
         server_manifest = message.get('bot_manifest')
         restoring_authority = bool(server_manifest)
         manifest = server_manifest or message.get('bots') or []
+        resolved_manifest = []
         for raw in manifest:
             if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
@@ -2384,12 +2379,18 @@ class BotRuntime(object):
                 descriptor_pair = siege_mechanics.descriptor_pair(
                     resolved_descriptor)
             except Exception as error:
-                # A vehicle this client cannot build is a roster problem, not
-                # an authority one.  Leave the slot empty and keep the round.
-                sys.stdout.write(
-                    '[Offline LAN 0.9.22] bot %d dropped, vehicle %s is '
-                    'unusable: %s\n' % (bot_id, vehicle_name, error))
-                continue
+                raise RuntimeError(
+                    'bot %d vehicle %s descriptor is unavailable: %s' % (
+                        bot_id, vehicle_name, error))
+            resolved_manifest.append((
+                raw, bot_id, vehicle_name, descriptor_pair))
+        if self.adapter is None:
+            self._ensure_navigation_graph(message.get('map', ''))
+            self.adapter = self._new_adapter(message.get('map', ''),
+                                             round_id or 0)
+            if self.navigator is not None:
+                self.adapter.navigation_target = self._navigation_target
+        for raw, bot_id, vehicle_name, descriptor_pair in resolved_manifest:
             raw_siege_state = raw.get(
                 'siege_state', siege_mechanics.DISABLED)
             raw_wire_time = raw.get('siege_time_left_ms', 0)
