@@ -8445,10 +8445,14 @@ class BattleState:
                     player, intent_seq, False, "automatic_only")
             critical = (player.critical
                         if isinstance(player.critical, dict) else {})
+            stun_state = self._vehicle_stun_state(("player", player_id))
+            stunned = bool(
+                stun_state is not None and
+                int(stun_state.get("end", 0)) > self._server_time_ms())
             effect = equipment_mechanics.effect_policy(
                 equipment, critical, selected=selected,
                 requested_active=requested_active,
-                active=equipment.active)
+                active=equipment.active, stunned=stunned)
             now = float(self.tick) / TICK_HZ
             player.equipment_clock = now
             if effect is None or not equipment.ready(now):
@@ -8458,18 +8462,21 @@ class BattleState:
             if effect.get("action") != "set_rpm_limiter":
                 payload = player_critical_mechanics.apply_equipment(
                     player, effect, now)
-                if payload is None:
+                if payload is None and not effect.get("clearStun", False):
                     return self._finish_equipment_intent(
                         player, intent_seq, False, "equipment_no_effect")
             committed = equipment.activate(
                 now, critical, selected=selected,
-                requested_active=requested_active)
+                requested_active=requested_active, stunned=stunned)
             if committed != effect:
                 raise RuntimeError(
                     "canonical player equipment commit diverged")
             if payload is not None:
                 self._commit_player_critical_progress(
                     player, _critical_payload(payload))
+            if effect.get("clearStun", False):
+                if not self._clear_vehicle_stun(("player", player_id)):
+                    raise RuntimeError("canonical medkit stun clear diverged")
             player.equipment_revision += 1
             return self._finish_equipment_intent(
                 player, intent_seq, True, "")

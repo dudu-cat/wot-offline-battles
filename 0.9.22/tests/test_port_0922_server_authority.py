@@ -821,6 +821,24 @@ class CanonicalPlayerEquipmentTest(unittest.TestCase):
         self.assertGreater(engine['hp'], 0.0)
         self.assertEqual(0.0, track['hp'])
 
+    def test_medkit_clears_stun_without_a_knocked_out_crew_member(self):
+        medkit = self._contract(
+            'smallMedkit', 42, tags=('medkit',), repairAll=False)
+        state, player = self._state([medkit])
+        player.stun_end_server_time_ms = state._server_time_ms() + 5000
+        player.stun_attacker_kind = 'bot'
+        player.stun_attacker_id = 7
+
+        self.assertTrue(self._intent(
+            state, 1, 42, selected='commander'))
+        self.assertTrue(player.equipment_intent_result['accepted'])
+        self.assertEqual(0, player.stun_end_server_time_ms)
+        self.assertEqual('', player.stun_attacker_kind)
+        self.assertEqual(0, player.stun_attacker_id)
+        self.assertEqual(0, player.equipment_states[0].uses_left)
+        self.assertEqual('stun', state.pending_events[-1]['kind'])
+        self.assertFalse(state.pending_events[-1]['active'])
+
     def test_continuous_progress_does_not_starve_track_owner_cas(self):
         limiter = self._contract(
             'removedRpmLimiter', 12, reuseCount=-1,
