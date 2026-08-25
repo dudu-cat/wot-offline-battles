@@ -25,7 +25,7 @@ else:
         core, error_reports, i18n, vehicle_editor_ui, vehicle_overlays)
 
 
-LAUNCHER_VERSION = "0.6.0 alpha.4"
+LAUNCHER_VERSION = "0.6.0 alpha.5"
 WINDOW_TITLE = "World of Tanks Offline Battles %s" % LAUNCHER_VERSION
 
 _CHINESE = {
