@@ -31,8 +31,8 @@ from gui.mods.offline_lan_0922.entities.native_remote_vehicle import \
     NativeRemoteVehicleFactory, set_draw_visibility
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
     RemoteVehicleFactory, _collide_vehicle_evidence_at_matrix,
-    _pose_components, collide_vehicle_at_matrix, pose_animation_writes,
-    reset_pose_animation_writes)
+    _component_aim_angles, _pose_components, collide_vehicle_at_matrix,
+    pose_animation_writes, reset_pose_animation_writes)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
@@ -732,7 +732,9 @@ def _angle_delta(current, target):
 class _ProjectileCollisionAppearance(object):
     """Aim matrices frozen with one historical collision pose."""
 
-    def __init__(self, math_module, turret_yaw, gun_pitch):
+    def __init__(self, math_module, descriptor, turret_yaw, gun_pitch):
+        turret_yaw, gun_pitch = _component_aim_angles(
+            descriptor, turret_yaw, gun_pitch)
         self.turretMatrix = math_module.Matrix()
         self.turretMatrix.setRotateYPR((float(turret_yaw), 0.0, 0.0))
         self.gunMatrix = math_module.Matrix()
@@ -9750,7 +9752,7 @@ class BattleRuntime(object):
         position = self._vector(_xyz(pose))
         matrix.translation = position
         appearance = _ProjectileCollisionAppearance(
-            self._runtime.math, pose.get('turret_yaw', 0.0),
+            self._runtime.math, descriptor, pose.get('turret_yaw', 0.0),
             pose.get('gun_pitch', 0.0))
         return _ProjectileCollisionTarget(
             target, descriptor, matrix, position, appearance,

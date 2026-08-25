@@ -1396,6 +1396,47 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(4, len(collisions[0]))
         self.assertEqual((evidence,), returned_evidence)
 
+    def test_frozen_collision_uses_active_descriptor_static_gun_angles(self):
+        battle, unused_bigworld = _battle()
+
+        class _PoseMatrix(object):
+            def __init__(self):
+                self.ypr = None
+                self.translation = None
+
+            def setRotateYPR(self, value):
+                self.ypr = tuple(value)
+
+        battle._runtime.math.Matrix = _PoseMatrix
+        default = types.SimpleNamespace(
+            gun=types.SimpleNamespace(
+                staticTurretYaw=None, staticPitch=None))
+        siege = types.SimpleNamespace(
+            gun=types.SimpleNamespace(
+                staticTurretYaw=0.0,
+                staticPitch=math.radians(-1.0)))
+        descriptor = types.SimpleNamespace(
+            hasSiegeMode=True, defaultVehicleDescr=default,
+            siegeVehicleDescr=siege)
+        target = types.SimpleNamespace(typeDescriptor=descriptor)
+        pose = {
+            'x': 4.0, 'y': 5.0, 'z': 6.0,
+            'yaw': 0.1, 'pitch': 0.2, 'roll': 0.3,
+            'turret_yaw': 0.4, 'gun_pitch': -0.5,
+            'siege_state': 2,
+        }
+
+        frozen = battle._projectile_frozen_target(target, pose)
+
+        self.assertIs(siege, frozen.typeDescriptor)
+        self.assertEqual((0.0, 0.0, 0.0),
+                         frozen.appearance.turretMatrix.ypr)
+        self.assertEqual(
+            (0.0, math.radians(-1.0), 0.0),
+            frozen.appearance.gunMatrix.ypr)
+        self.assertEqual(0.4, pose['turret_yaw'])
+        self.assertEqual(-0.5, pose['gun_pitch'])
+
     def test_unsupported_historic_pose_contracts_keep_live_collision_fallback(
             self):
         cases = (
