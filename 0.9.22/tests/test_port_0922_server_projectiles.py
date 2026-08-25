@@ -1119,6 +1119,60 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID,
             dict(launch, gravity=9.9)))
 
+    def test_bot_burst_transition_yields_each_physical_projectile_edge(self):
+        previous = {
+            'fire_seq': 0, 'shell_index': 0,
+            'burst_active': False, 'burst_group_seq': 0,
+            'burst_count': 0, 'burst_next_index': 0,
+            'burst_interval': 0.0, 'burst_time_left': 0.0,
+            'burst_shell_index': 0,
+        }
+        current = dict(previous, fire_seq=3, burst_active=False,
+                       burst_group_seq=1, burst_count=3,
+                       burst_next_index=3)
+
+        edges = BattleState._bot_burst_transition(previous, current)
+
+        self.assertEqual([0, 1, 2], [
+            edge['burst_index'] for edge in edges])
+        self.assertEqual([3, 3, 3], [
+            edge['burst_count'] for edge in edges])
+        with self.assertRaises(ValueError):
+            BattleState._bot_burst_transition(
+                previous, dict(current, burst_group_seq=2))
+
+    def test_server_binds_bot_launches_to_ordered_burst_metadata(self):
+        state = _state()
+        state.bot_states[16] = {
+            'id': 16, 'team': 2, 'alive': True, 'fire_seq': 3,
+            'shell_index': 0, 'health': 1000, 'max_health': 1000,
+            'vehicle': 'ussr:R11_MS-1',
+            'x': 20.0, 'y': 0.0, 'z': 0.0,
+            'burst_active': False, 'burst_group_seq': 1,
+            'burst_count': 3, 'burst_next_index': 3,
+            'burst_interval': 0.1, 'burst_time_left': 0.0,
+            'burst_shell_index': 0,
+        }
+        for index in range(3):
+            key = (16, index + 1)
+            edge = {
+                'burst_group_seq': 1, 'burst_index': index,
+                'burst_count': 3, 'shell_index': 0,
+            }
+            state.bot_pending_projectile_launches.add(key)
+            state.bot_pending_projectile_metadata[key] = edge
+        self.assertFalse(_launch_authority(state, _launch(
+            shooter_id=16, shooter_kind='bot', shot_seq=2,
+            origin=[20.0, 1.0, 0.0], burst_group_seq=1,
+            burst_index=1, burst_count=3)))
+        for index in range(3):
+            self.assertTrue(_launch_authority(state, _launch(
+                shooter_id=16, shooter_kind='bot', shot_seq=index + 1,
+                origin=[20.0, 1.0, 0.0], burst_group_seq=1,
+                burst_index=index, burst_count=3)))
+        self.assertEqual([0, 1, 2], [
+            event['burst_index'] for event in state.pending_events
+            if event.get('kind') == 'bot_shot'])
     def test_progress_uses_batch_cas_epoch_and_exact_retry(self):
         state = _state()
         self.assertTrue(_launch_authority(state, _launch()))

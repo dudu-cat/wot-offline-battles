@@ -13,6 +13,7 @@ import os
 import sys
 import time
 
+from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import siege_mechanics
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922.lan_client import (
@@ -78,6 +79,11 @@ def _trusted_projected_bot_states(bots):
                     state.get('siege_time_left_ms'),
                     transition_total_ms=state.get(
                         'siege_transition_total_ms'))):
+            return False
+        try:
+            burst_mechanics.BurstClock().restore(
+                state, state.get('fire_seq', 0))
+        except ValueError:
             return False
         try:
             reload_time = float(state['reload_time'])

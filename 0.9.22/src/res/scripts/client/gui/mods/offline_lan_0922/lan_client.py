@@ -9,6 +9,7 @@ import time
 import uuid
 
 from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
+from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import siege_mechanics
 
@@ -120,6 +121,9 @@ _BOT_STATE_WIRE_FIELDS = (
     'speed', 'movement_dir', 'rotation_dir', 'fire_seq', 'shell_index',
     'next_shell_index', 'ammo_remaining', 'ammo_reload_pending',
     'reload_time', 'reload_duration', 'clip', 'clip_size',
+    'burst_active', 'burst_group_seq', 'burst_count',
+    'burst_next_index', 'burst_interval', 'burst_time_left',
+    'burst_shell_index',
     'siege_state', 'siege_time_left_ms', 'siege_transition_total_ms',
     'health', 'alive', 'critical', 'combat_base_revision', 'combat_seq',
     'combat_fire_elapsed', 'combat_fire_timer',
@@ -590,6 +594,11 @@ def project_bot_state(state):
                 transition_total_ms=state.get(
                     'siege_transition_total_ms'))):
         return None
+    try:
+        burst_mechanics.BurstClock().restore(
+            projected, projected.get('fire_seq', 0))
+    except ValueError:
+        return None
     return projected
 
 
@@ -644,6 +653,22 @@ def _projectile_int_range(value, minimum, maximum):
     if value < minimum or value > maximum:
         return None
     return value
+
+
+def _strict_burst_group(shot_seq, group_seq, burst_index, burst_count):
+    """Validate the immutable physical-shell identity of one trigger group."""
+    shot_seq = _projectile_int_range(shot_seq, 1, MAX_PROJECTILE_ID)
+    group_seq = _projectile_int_range(group_seq, 1, MAX_PROJECTILE_ID)
+    burst_count = _projectile_int_range(
+        burst_count, 1, burst_mechanics.MAX_BURST_COUNT)
+    if burst_count is None:
+        return None
+    burst_index = _projectile_int_range(
+        burst_index, 0, burst_count - 1)
+    if (shot_seq is None or group_seq is None or burst_index is None or
+            shot_seq != group_seq + burst_index):
+        return None
+    return group_seq, burst_index, burst_count
 
 
 def _projectile_float_range(value, minimum, maximum):
@@ -1039,6 +1064,7 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
         return False
     expected = frozenset((
         'projectile_id', 'shooter_kind', 'shooter_id', 'shot_seq',
+        'burst_group_seq', 'burst_index', 'burst_count',
         'source_vehicle', 'source_shot', 'shell_index', 'team', 'origin',
         'velocity', 'gravity', 'max_distance', 'max_time_ms', 'is_he',
         'splash_radius',
@@ -1067,6 +1093,9 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
             projectile.get('shooter_id'), 1, MAX_PROJECTILE_ID)
         shot_seq = _projectile_int_range(
             projectile.get('shot_seq'), 1, MAX_PROJECTILE_ID)
+        burst_group = _strict_burst_group(
+            shot_seq, projectile.get('burst_group_seq'),
+            projectile.get('burst_index'), projectile.get('burst_count'))
         shell_index = _projectile_int_range(
             projectile.get('shell_index'), 0, 9)
         team = _projectile_int_range(projectile.get('team'), 1, 2)
@@ -1123,6 +1152,7 @@ def _valid_active_projectiles(value, authority_epoch, server_time_ms):
                 not isinstance(source_vehicle, string_types) or
                 not source_vehicle or len(source_vehicle) > 128 or
                 shooter_id is None or shot_seq is None or
+                burst_group is None or
                 shell_index is None or team is None or origin is None or
                 velocity is None or range_origin is None or
                 segment_origin is None or segment_velocity is None or
@@ -2277,7 +2307,8 @@ class LANClient(object):
             self, shooter_kind, shooter_id, shot_seq, shell_index, origin,
             velocity, gravity, max_distance, max_time_ms, is_he,
             splash_radius, authority_epoch=None, penetration_factor=1.0,
-            source_shot=None, fire_intent_seq=None, fire_input_seq=None):
+            source_shot=None, fire_intent_seq=None, fire_input_seq=None,
+            burst_group_seq=None, burst_index=None, burst_count=None):
         """Enqueue one immutable projectile launch and return its shot seq."""
         if not self.ready or self.phase != 'battle':
             return None
@@ -2335,16 +2366,20 @@ class LANClient(object):
                 return None
 
         with self._projectile_lock:
-            if shooter_kind == 'player':
-                parsed_seq = _projectile_int_range(
-                    shot_seq, 1, MAX_PROJECTILE_ID)
-                if parsed_seq is None:
-                    return None
+            parsed_seq = _projectile_int_range(
+                shot_seq, 1, MAX_PROJECTILE_ID)
+            if parsed_seq is None:
+                return None
+            supplied_group = (
+                burst_group_seq is not None or burst_index is not None or
+                burst_count is not None)
+            if supplied_group:
+                parsed_group = _strict_burst_group(
+                    parsed_seq, burst_group_seq, burst_index, burst_count)
             else:
-                parsed_seq = _projectile_int_range(
-                    shot_seq, 1, MAX_PROJECTILE_ID)
-                if parsed_seq is None:
-                    return None
+                parsed_group = (parsed_seq, 0, 1)
+            if parsed_group is None:
+                return None
 
             message = {
                 'type': 'projectile_launch',
@@ -2352,6 +2387,9 @@ class LANClient(object):
                 'shooter_kind': shooter_kind,
                 'shooter_id': parsed_shooter_id,
                 'shot_seq': parsed_seq,
+                'burst_group_seq': parsed_group[0],
+                'burst_index': parsed_group[1],
+                'burst_count': parsed_group[2],
                 'shell_index': parsed_shell,
                 'source_shot': parsed_source_shot,
                 'origin': parsed_origin,

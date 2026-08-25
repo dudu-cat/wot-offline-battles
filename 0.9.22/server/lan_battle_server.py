@@ -41,6 +41,7 @@ if _CLIENT_SCRIPT_ROOT not in sys.path:
 from server_bot_ai import BotPlanner
 from offline_rewards import compute_offline_rewards
 from gui.mods.offline_lan_0922 import tank_collision
+from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
 from gui.mods.offline_lan_0922 import equipment_mechanics
 from gui.mods.offline_lan_0922 import device_damage
@@ -1739,6 +1740,7 @@ class BattleState:
         self.projectile_tombstones = {}
         self.projectile_revision = 0
         self.bot_pending_projectile_launches = set()
+        self.bot_pending_projectile_metadata = {}
         self.last_bot_state_reject = ""
         self.last_bot_state_reject_code = ""
         self.last_bot_hit_reject = ""
@@ -1863,6 +1865,9 @@ class BattleState:
             "source_shot": _projectile_source_shot(
                 record["source_shot"]),
             "shot_seq": record["shot_seq"],
+            "burst_group_seq": record["burst_group_seq"],
+            "burst_index": record["burst_index"],
+            "burst_count": record["burst_count"],
             "shell_index": record["shell_index"],
             "team": record["team"],
             "origin": list(record["origin"]),
@@ -2041,6 +2046,7 @@ class BattleState:
                 self.client_build == CLIENT_BUILD_0922):
             self.authority_epoch += 1
             self.bot_pending_projectile_launches.clear()
+            self.bot_pending_projectile_metadata.clear()
         if (old != self.bot_authority_id and
                 self.phase in ("loading", "battle")):
             self.bot_manifest_authority_id = None
@@ -2754,6 +2760,7 @@ class BattleState:
         self.projectile_tombstones = {}
         self.projectile_revision = 0
         self.bot_pending_projectile_launches = set()
+        self.bot_pending_projectile_metadata = {}
         self.last_bot_state_reject = ""
         self.last_bot_state_reject_code = ""
         self.last_bot_hit_reject = ""
@@ -4178,6 +4185,146 @@ class BattleState:
         return True
 
     @staticmethod
+    def _ordinary_bot_burst(fire_seq, shell_index):
+        fire_seq = max(0, int(fire_seq))
+        return {
+            "burst_active": False,
+            "burst_group_seq": fire_seq if fire_seq else 0,
+            "burst_count": 1 if fire_seq else 0,
+            "burst_next_index": 1 if fire_seq else 0,
+            "burst_interval": 0.0,
+            "burst_time_left": 0.0,
+            "burst_shell_index": max(0, int(shell_index)),
+        }
+
+    @staticmethod
+    def _sanitize_bot_burst(raw, fire_seq, shell_index):
+        """Validate one complete physical-burst clock publication."""
+        fields = burst_mechanics.BurstClock.WIRE_FIELDS
+        present = tuple(name in raw for name in fields)
+        if not any(present):
+            return BattleState._ordinary_bot_burst(fire_seq, shell_index)
+        if not all(present):
+            raise ValueError("bot burst snapshot is incomplete")
+        active = raw.get("burst_active")
+        if not isinstance(active, bool):
+            raise ValueError("bot burst active flag is invalid")
+        try:
+            group_seq = _exact_int(
+                raw.get("burst_group_seq"), 0, PROJECTILE_MAX_ID)
+            count = _exact_int(
+                raw.get("burst_count"), 0,
+                burst_mechanics.MAX_BURST_COUNT)
+            next_index = _exact_int(
+                raw.get("burst_next_index"), 0, count)
+            interval = round(_bounded_float(
+                raw.get("burst_interval"), 0.0,
+                burst_mechanics.MAX_BURST_INTERVAL_SECONDS), 6)
+            time_left = round(_bounded_float(
+                raw.get("burst_time_left"), 0.0,
+                burst_mechanics.MAX_BURST_INTERVAL_SECONDS), 6)
+            burst_shell = _exact_int(
+                raw.get("burst_shell_index"), 0, 9)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("bot burst snapshot is malformed")
+        if ((count > 1 and interval <= 0.0) or
+                (active and (count < 2 or next_index < 1 or
+                             next_index >= count or
+                             time_left > interval + 1.0e-9)) or
+                (not active and time_left != 0.0) or
+                (count == 0 and
+                 (group_seq != 0 or next_index != 0)) or
+                (count > 0 and
+                 int(fire_seq) != group_seq + next_index - 1)):
+            raise ValueError("bot burst snapshot is invalid")
+        return {
+            "burst_active": active,
+            "burst_group_seq": group_seq,
+            "burst_count": count,
+            "burst_next_index": next_index,
+            "burst_interval": interval,
+            "burst_time_left": time_left,
+            "burst_shell_index": burst_shell,
+        }
+
+    @staticmethod
+    def _bot_burst_transition(previous, current):
+        """Return every newly published physical projectile edge."""
+        previous_fire = int((previous or {}).get("fire_seq", 0))
+        current_fire = int(current.get("fire_seq", 0))
+        fire_delta = current_fire - previous_fire
+        if fire_delta < 0:
+            raise ValueError("bot burst fire sequence moved backwards")
+        previous_burst = dict(previous or {})
+        if not all(name in previous_burst for name in
+                   burst_mechanics.BurstClock.WIRE_FIELDS):
+            previous_burst.update(BattleState._ordinary_bot_burst(
+                previous_fire, previous_burst.get("shell_index", 0)))
+        current_group = int(current["burst_group_seq"])
+        current_count = int(current["burst_count"])
+        current_next = int(current["burst_next_index"])
+        current_shell = int(current["burst_shell_index"])
+        previous_group = int(previous_burst["burst_group_seq"])
+        previous_count = int(previous_burst["burst_count"])
+        previous_next = int(previous_burst["burst_next_index"])
+        previous_shell = int(previous_burst["burst_shell_index"])
+        previous_active = bool(previous_burst["burst_active"])
+        current_active = bool(current["burst_active"])
+
+        if fire_delta == 0:
+            if previous_active:
+                same_active = (
+                    current_active and current_group == previous_group and
+                    current_count == previous_count and
+                    current_next == previous_next and
+                    current_shell == previous_shell and
+                    float(current["burst_interval"]) ==
+                    float(previous_burst["burst_interval"]) and
+                    float(current["burst_time_left"]) <=
+                    float(previous_burst["burst_time_left"]) + 1.0e-9)
+                cancelled = (
+                    not current_active and
+                    current_group == previous_group and
+                    current_count == previous_count and
+                    current_next == previous_next and
+                    current_shell == previous_shell and
+                    float(current["burst_interval"]) ==
+                    float(previous_burst["burst_interval"]))
+                if not (same_active or cancelled):
+                    raise ValueError("bot active burst state changed")
+            elif any(current[name] != previous_burst[name] for name in
+                     burst_mechanics.BurstClock.WIRE_FIELDS):
+                raise ValueError("bot idle burst state changed")
+            return ()
+
+        if previous_active:
+            if (current_group != previous_group or
+                    current_count != previous_count or
+                    current_shell != previous_shell or
+                    float(current["burst_interval"]) !=
+                    float(previous_burst["burst_interval"]) or
+                    current_next != previous_next + fire_delta or
+                    current_next > previous_count or
+                    current_active != (current_next < current_count)):
+                raise ValueError("bot burst continuation is invalid")
+            first_index = previous_next
+        else:
+            if (current_group != previous_fire + 1 or
+                    current_next != fire_delta or
+                    current_count < fire_delta or current_count < 1 or
+                    current_active != (current_next < current_count)):
+                raise ValueError("bot burst start is invalid")
+            if current_count == 1 and fire_delta != 1:
+                raise ValueError("ordinary bot shot skipped a sequence")
+            first_index = 0
+        return tuple({
+            "burst_group_seq": current_group,
+            "burst_index": index,
+            "burst_count": current_count,
+            "shell_index": current_shell,
+        } for index in range(first_index, current_next))
+
+    @staticmethod
     def _sanitize_bot_state(raw, identity, previous):
         max_health = int(identity.get("max_health", 1000))
         reported_health = max(0, min(int(_finite_float(raw.get("health"), max_health)), max_health))
@@ -4194,6 +4341,8 @@ class BattleState:
         rotation = _finite_float(raw.get("rotation_dir"), 0.0)
         ammunition = BattleState._sanitize_bot_ammo(
             raw, identity, previous)
+        burst = BattleState._sanitize_bot_burst(
+            raw, fire_seq, ammunition.get("loaded", 0))
         gun_clip = BattleState._sanitize_bot_clip(raw, previous)
         reload_progress = _validated_bot_reload_progress(raw)
         (siege_state, siege_time_left_ms,
@@ -4269,6 +4418,7 @@ class BattleState:
             "stun_attacker_id": int((previous or {}).get(
                 "stun_attacker_id", 0)),
         }
+        result.update(burst)
         if reload_progress is not None:
             result["reload_time"], result["reload_duration"] = \
                 reload_progress
@@ -4323,7 +4473,7 @@ class BattleState:
             raise ValueError("bot ammunition contract appeared mid-round")
         fire_delta = (int(current.get("fire_seq", 0)) -
                       int(previous.get("fire_seq", 0)))
-        if fire_delta not in (0, 1):
+        if fire_delta < 0 or fire_delta > burst_mechanics.MAX_BURST_COUNT:
             raise ValueError("bot ammunition fire delta is invalid")
         loaded = int(current.get("shell_index", 0))
         previous_loaded = int(previous.get("shell_index", 0))
@@ -4348,7 +4498,12 @@ class BattleState:
         if fire_delta:
             if not pending:
                 raise ValueError("bot shot did not enter reload state")
-            if previous_pending and (
+            previous_active = bool((previous or {}).get(
+                "burst_active", False))
+            if previous_active:
+                expected_loaded = previous_loaded
+                expected_clip = previous_clip - fire_delta
+            elif previous_pending and (
                     previous_clip == 0 or clip_size == 1):
                 expected_loaded = previous_next
                 # A full reload is capped by the planned shell's remaining
@@ -4356,18 +4511,20 @@ class BattleState:
                 # worker publication, consume one round from the partial
                 # refill rather than inventing a full magazine first.
                 expected_clip = min(
-                    clip_size, before[previous_next]) - 1
+                    clip_size, before[previous_next]) - fire_delta
             else:
                 expected_loaded = previous_loaded
-                expected_clip = previous_clip - 1
+                expected_clip = previous_clip - fire_delta
             if previous_clip <= 0 and not (
                     previous_pending and previous_clip == 0):
                 raise ValueError("bot fired from an empty clip")
-            if loaded != expected_loaded:
+            burst_shell = int(current.get("burst_shell_index", loaded))
+            if loaded != burst_shell or loaded != expected_loaded:
                 raise ValueError("bot loaded shell changed while firing")
-            if loaded >= len(expected) or expected[loaded] <= 0:
+            if (expected_clip < 0 or loaded >= len(expected) or
+                    expected[loaded] < fire_delta):
                 raise ValueError("bot fired an exhausted shell")
-            expected[loaded] -= 1
+            expected[loaded] -= fire_delta
             exhausted_clip_switch = (
                 clip_size > 1 and expected_clip > 0 and
                 expected[loaded] == 0 and sum(expected) > 0)
@@ -4377,7 +4534,7 @@ class BattleState:
                     "bot clip did not consume one round (%d -> %d, "
                     "expected %d)" % (
                         previous_clip, clip, expected_clip))
-            if not previous_pending and next_shell != previous_next:
+            if next_shell != previous_next:
                 # The worker must keep ``next`` usable in every atomic ammo
                 # snapshot.  Consuming the last round of the planned shell
                 # therefore selects its fallback in the same fire update,
@@ -4390,7 +4547,8 @@ class BattleState:
                     (sum(expected) == 0 and next_shell == 0) or
                     (0 <= next_shell < len(expected) and
                      expected[next_shell] > 0))
-                initial_reload_completed = previous_reload_time > 0.0
+                initial_reload_completed = (
+                    not previous_active and previous_reload_time > 0.0)
                 if (not fallback_is_usable or not (
                         planned_was_consumed or
                         initial_reload_completed)):
@@ -4679,7 +4837,7 @@ class BattleState:
                     "bot_state", "human_ram_armors",
                     "worker human ram armor results are invalid")
             shot_events = []
-            pending_projectile_launches = set()
+            pending_projectile_launches = {}
             fire_deaths = []
             capture_resets = set()
             seen = set()
@@ -4758,18 +4916,15 @@ class BattleState:
                             raw.get("combat_seq"),
                             (previous or {}).get("combat_ack_seq", 0),
                             error))
-                previous_fire = int((previous or {}).get("fire_seq", 0))
-                if current["fire_seq"] > previous_fire + 1:
-                    return self._set_protocol_reject(
-                        "bot_state", "fire_gap",
-                        "bot=%s client_fire=%s server_fire=%s" % (
-                            bot_id, current["fire_seq"], previous_fire))
                 try:
+                    burst_edges = self._bot_burst_transition(
+                        previous, current)
                     self._validate_bot_ammo_transition(previous, current)
                 except ValueError as error:
                     return self._set_protocol_reject(
                         "bot_state", "ammo_contract",
                         "bot=%s reason=%s" % (bot_id, error))
+                previous_fire = int((previous or {}).get("fire_seq", 0))
                 next_states[bot_id] = current
                 previous_fire_active = bool(
                     (previous or {}).get("critical") and
@@ -4810,8 +4965,11 @@ class BattleState:
                         (previous is None or previous.get("alive")) and
                         current["fire_seq"] > previous_fire):
                     if self.client_build == CLIENT_BUILD_0922:
-                        pending_projectile_launches.add(
-                            (bot_id, current["fire_seq"]))
+                        for edge in burst_edges:
+                            shot_seq = (int(edge["burst_group_seq"]) +
+                                        int(edge["burst_index"]))
+                            pending_projectile_launches[(
+                                bot_id, shot_seq)] = edge
                     else:
                         shot_event = {
                             "kind": "bot_shot", "attacker_bot": bot_id,
@@ -4830,6 +4988,8 @@ class BattleState:
             self._commit_human_ram_armors(human_ram_armors)
             self.bot_states = next_states
             self.bot_pending_projectile_launches.update(
+                pending_projectile_launches)
+            self.bot_pending_projectile_metadata.update(
                 pending_projectile_launches)
             for bot_id in capture_resets:
                 self._drop_capture_for_vehicle("bot", bot_id)
@@ -5306,6 +5466,32 @@ class BattleState:
         return "%d:%s:%d:%d" % (
             int(round_id), prefix, int(shooter_id), int(shot_seq))
 
+    @staticmethod
+    def _projectile_burst(message, shot_seq):
+        fields = ("burst_group_seq", "burst_index", "burst_count")
+        present = tuple(name in message for name in fields)
+        if not any(present):
+            return {
+                "burst_group_seq": shot_seq,
+                "burst_index": 0,
+                "burst_count": 1,
+            }
+        if not all(present):
+            raise ValueError("projectile burst metadata is incomplete")
+        group_seq = _exact_int(
+            message.get("burst_group_seq"), 1, PROJECTILE_MAX_ID)
+        count = _exact_int(
+            message.get("burst_count"), 1,
+            burst_mechanics.MAX_BURST_COUNT)
+        index = _exact_int(message.get("burst_index"), 0, count - 1)
+        if shot_seq != group_seq + index:
+            raise ValueError("projectile burst sequence is invalid")
+        return {
+            "burst_group_seq": group_seq,
+            "burst_index": index,
+            "burst_count": count,
+        }
+
     def _projectile_authority_matches(self, player_id, message):
         try:
             epoch = _exact_int(
@@ -5575,6 +5761,7 @@ class BattleState:
                 "gravity", "max_distance", "max_time_ms", "is_he",
                 "splash_radius", "penetration_factor", "source_shot",
                 "authority_epoch", "fire_intent_seq", "fire_input_seq",
+                "burst_group_seq", "burst_index", "burst_count",
             }
             if set(message) - allowed:
                 return False
@@ -5586,6 +5773,7 @@ class BattleState:
                     message.get("shooter_id"), 1, PROJECTILE_MAX_ID)
                 shot_seq = _exact_int(
                     message.get("shot_seq"), 1, PROJECTILE_MAX_ID)
+                burst = self._projectile_burst(message, shot_seq)
                 shell_index = _exact_int(message.get("shell_index"), 0, 9)
                 origin = _bounded_vector(
                     message.get("origin"), (-5000.0, -1000.0, -5000.0),
@@ -5650,6 +5838,7 @@ class BattleState:
                 "penetration_factor": penetration_factor,
                 "source_shot": source_shot,
             }
+            normalized.update(burst)
             if fire_intent_seq is not None:
                 normalized["fire_intent_seq"] = fire_intent_seq
                 normalized["fire_input_seq"] = fire_input_seq
@@ -5718,11 +5907,26 @@ class BattleState:
                     intent["x"], intent["y"], intent["z"]]
             else:
                 launch_edge = (shooter_id, shot_seq)
+                expected_edge = self.bot_pending_projectile_metadata.get(
+                    launch_edge)
+                if (expected_edge is None and launch_edge in
+                        self.bot_pending_projectile_launches):
+                    expected_edge = {
+                        "burst_group_seq": shot_seq,
+                        "burst_index": 0,
+                        "burst_count": 1,
+                        "shell_index": shell_index,
+                    }
                 if (shooter is None or not shooter.get("alive") or
-                        shell_index != int(shooter.get("shell_index", 0)) or
-                        launch_edge not in
-                        self.bot_pending_projectile_launches or
-                        shot_seq != int(shooter.get("fire_seq", 0))):
+                        expected_edge is None or
+                        any(pending_bot == shooter_id and
+                            pending_seq < shot_seq
+                            for pending_bot, pending_seq in
+                            self.bot_pending_projectile_launches) or
+                        shell_index != int(expected_edge["shell_index"]) or
+                        any(int(burst[name]) != int(expected_edge[name])
+                            for name in ("burst_group_seq", "burst_index",
+                                         "burst_count"))):
                     return False
                 team = int(shooter.get("team", 0))
                 if team not in (1, 2):
@@ -5778,6 +5982,8 @@ class BattleState:
             else:
                 self.bot_pending_projectile_launches.discard(
                     (shooter_id, shot_seq))
+                self.bot_pending_projectile_metadata.pop(
+                    (shooter_id, shot_seq), None)
             self._statistics_row(shooter_kind, shooter_id)["shots_fired"] += 1
             self.projectile_revision += 1
 
@@ -6656,10 +6862,26 @@ class BattleState:
         keep = set()
         for bot_id, shot_seq in self.bot_pending_projectile_launches:
             state = self.bot_states.get(bot_id)
-            if (state is not None and state.get("alive") and
-                    int(state.get("fire_seq", 0)) == int(shot_seq)):
+            edge = self.bot_pending_projectile_metadata.get(
+                (bot_id, shot_seq))
+            if (state is not None and state.get("alive") and edge is not None and
+                    int(edge.get("burst_group_seq", -1)) ==
+                    int(state.get("burst_group_seq", -2)) and
+                    int(edge.get("burst_count", -1)) ==
+                    int(state.get("burst_count", -2)) and
+                    int(edge.get("burst_index", -1)) <
+                    int(state.get("burst_next_index", 0)) and
+                    int(edge.get("shell_index", -1)) ==
+                    int(state.get("burst_shell_index", -2))):
+                keep.add((bot_id, shot_seq))
+            elif (edge is None and state is not None and
+                  state.get("alive") and
+                  int(state.get("fire_seq", 0)) == int(shot_seq)):
                 keep.add((bot_id, shot_seq))
         self.bot_pending_projectile_launches = keep
+        self.bot_pending_projectile_metadata = dict(
+            (key, value) for key, value in
+            self.bot_pending_projectile_metadata.items() if key in keep)
 
     def report_bot_hit(self, player_id, message):
         """Apply a human or authority-owned bot shot to a bot HP record."""

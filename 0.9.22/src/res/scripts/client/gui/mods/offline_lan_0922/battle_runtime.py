@@ -8529,6 +8529,11 @@ class BattleRuntime(object):
                 'ordered shot event attacker has no native entity: %s' % key)
         transient_names = []
         try:
+            normalized = None
+            try:
+                burst_index = int(event.get('burst_index', 0))
+            except (TypeError, ValueError, OverflowError):
+                burst_index = 0
             entity._offlineLANShotIndex = max(
                 0, int(event.get('shell_index', 0) or 0))
             if ('shot_yaw' in event and 'shot_pitch' in event and
@@ -8546,6 +8551,7 @@ class BattleRuntime(object):
                 normalized = self._projectile_wire_meta(event)
                 if normalized is not None:
                     self._install_projectile_meta(normalized)
+                    burst_index = normalized['burst_index']
                 projectile_id = event.get('projectile_id')
                 origin = event.get('origin')
                 velocity = event.get('velocity')
@@ -8580,8 +8586,9 @@ class BattleRuntime(object):
                 # stock local Vehicle has no such delegate, so launch its
                 # authoritative tracer explicitly from the event instead of
                 # reconstructing it from a later muzzle pose.
-                if (not bool(getattr(
-                        entity, '_offlineLANPresentation', False)) and
+                if ((not bool(getattr(
+                        entity, '_offlineLANPresentation', False)) or
+                        burst_index > 0) and
                         self._remote_factory is not None):
                     self._remote_factory.play_projectile_tracer(
                         entity.typeDescriptor,
@@ -8589,17 +8596,23 @@ class BattleRuntime(object):
                         origin, velocity, gravity,
                         event.get('maxDistance'), entity.id, projectile_id,
                         reference_origin, reference_velocity)
-            # Exact #1513 uses gun.burst[0] for the predicted-shot fallback.
-            # Zero is not a one-shot sentinel: it reaches the native shoot
-            # extra as an unbounded burst.  A server event is authoritative,
-            # so pass False explicitly; for the local vehicle that also
-            # closes Avatar's isWaitingForShot/cancelWaitingForShot handshake.
-            burst = _field(entity.typeDescriptor.gun, 'burst', (1,))
-            try:
-                burst_count = int(burst[0])
-            except (TypeError, ValueError, IndexError):
-                burst_count = 1
-            entity.showShooting(max(1, burst_count), False)
+            if burst_index == 0:
+                # One native call owns the grouped muzzle effect and local
+                # waiting-for-shot handshake.  Later physical rounds already
+                # received their explicit canonical tracer above.
+                burst = _field(entity.typeDescriptor.gun, 'burst', (1,))
+                try:
+                    descriptor_count = int(burst[0])
+                except (TypeError, ValueError, IndexError):
+                    descriptor_count = 1
+                burst_count = (normalized.get('burst_count')
+                               if normalized is not None else
+                               event.get('burst_count', descriptor_count))
+                try:
+                    burst_count = int(burst_count)
+                except (TypeError, ValueError, OverflowError):
+                    burst_count = 1
+                entity.showShooting(max(1, burst_count), False)
         finally:
             for name in transient_names:
                 try:
@@ -8775,7 +8788,9 @@ class BattleRuntime(object):
                 shooter_kind = 'player'
                 shooter_id = raw.get('attacker')
         required = (
-            'projectile_id', 'source_vehicle', 'shot_seq', 'shell_index', 'origin',
+            'projectile_id', 'source_vehicle', 'shot_seq',
+            'burst_group_seq', 'burst_index', 'burst_count',
+            'shell_index', 'origin',
             'velocity', 'gravity', 'max_time_ms', 'is_he',
             'splash_radius', 'penetration_factor', 'launch_server_time_ms',
             'source_shot', 'range_origin', 'segment_origin',
@@ -8805,6 +8820,9 @@ class BattleRuntime(object):
             shooter_kind = str(shooter_kind)
             shooter_id = int(shooter_id)
             shot_seq = int(raw['shot_seq'])
+            burst_group = lan_protocol._strict_burst_group(
+                shot_seq, raw['burst_group_seq'], raw['burst_index'],
+                raw['burst_count'])
             shell_index = int(raw['shell_index'])
             launch_server_time = int(raw['launch_server_time_ms'])
             segment_start_time = int(raw['segment_start_time_ms'])
@@ -8824,6 +8842,7 @@ class BattleRuntime(object):
                 len(source_vehicle) > 128 or
                 shooter_kind not in ('player', 'bot') or
                 shooter_id <= 0 or shot_seq <= 0 or
+                burst_group is None or
                 shell_index < 0 or shell_index > 9 or
                 gravity <= 0.0 or maximum <= 0.0 or
                 max_time_ms <= 0 or max_time_ms > PROJECTILE_MAX_TIME_MS or
@@ -8862,6 +8881,9 @@ class BattleRuntime(object):
             'source_vehicle': source_vehicle,
             'source_shot': source_shot,
             'shot_seq': shot_seq,
+            'burst_group_seq': burst_group[0],
+            'burst_index': burst_group[1],
+            'burst_count': burst_group[2],
             'shell_index': shell_index,
             'origin': origin,
             'velocity': velocity,
@@ -8918,6 +8940,7 @@ class BattleRuntime(object):
             frozen = (
                 'shooter_kind', 'shooter_id', 'source_vehicle',
                 'source_shot', 'shot_seq', 'shell_index',
+                'burst_group_seq', 'burst_index', 'burst_count',
                 'origin', 'velocity', 'range_origin',
                 'gravity', 'max_distance',
                 'max_time_ms', 'is_he', 'splash_radius',
@@ -15018,7 +15041,10 @@ class BattleRuntime(object):
             combat_rules.he_radius(shot) if is_he else 0.0,
             authority_epoch=getattr(self.client, 'authority_epoch', None),
             penetration_factor=combat_rules.sample_penetration_factor(),
-            source_shot=descriptor_donation.project_shot(shot))
+            source_shot=descriptor_donation.project_shot(shot),
+            burst_group_seq=state.get('burst_group_seq'),
+            burst_index=state.get('burst_index'),
+            burst_count=state.get('burst_count'))
         return accepted == int(shot_seq)
 
     def _resolve_bot_shot(self, state, shot_seq):

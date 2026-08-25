@@ -14,6 +14,7 @@ from gui.mods.offline_lan_0922.ai.navigation import (
     BAKED_FATAL_HAZARDS, TerrainNavigator)
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import ballistics
+from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import device_damage
 from gui.mods.offline_lan_0922 import effective_params
 from gui.mods.offline_lan_0922 import gun_pitch_limits
@@ -608,6 +609,10 @@ def _local_launch_record(state):
         'shot_yaw': state['shot_yaw'],
         'shot_pitch': state['shot_pitch'],
         'class_tag': class_tag,
+        'burst_group_seq': int(state.get(
+            'burst_group_seq', state.get('fire_seq', 0))),
+        'burst_index': int(state.get('burst_index', 0)),
+        'burst_count': int(state.get('burst_count', 1)),
     }
     if 'shot_origin' in state:
         result['shot_origin'] = state['shot_origin']
@@ -745,6 +750,10 @@ class _BotGunState(object):
         factors = _value(gun, 'shotDispersionFactors', {}) or {}
         self.after_shot = max(
             0.0, _number(_value(factors, 'afterShot'), 1.5))
+        self.after_shot_in_burst = burst_mechanics.after_shot_factor(
+            gun, False)
+        self.burst_count, self.burst_interval = \
+            burst_mechanics.descriptor_burst(gun)
         self.turret_dispersion_factor = max(
             0.0, _number(_value(factors, 'turretRotation'), 0.0))
         self.aiming_time = max(
@@ -788,6 +797,7 @@ class _BotGunState(object):
         self.reload_duration = self.reload_full
         self.reload_kind = 'full'
         self.reload_factor = 1.0
+        self._burst_remaining = 0
         self.restore_fire_seq(fire_seq, dispersion_factor)
 
     def adopt_descriptor(self, descriptor):
@@ -802,6 +812,7 @@ class _BotGunState(object):
                 '#1513 Siege descriptor changed the ammunition contract')
         names = (
             'loadout', 'fully_aimed_dispersion', 'after_shot',
+            'after_shot_in_burst', 'burst_count', 'burst_interval',
             'turret_dispersion_factor', 'aiming_time',
             'movement_dispersion_factor', 'rotation_dispersion_factor',
             'reload_full', 'reload_intra')
@@ -906,6 +917,7 @@ class _BotGunState(object):
         else:
             self.elapsed = 0.0
             self.reload_factor = 1.0
+        self._burst_remaining = 0
         if fire_seq > 0:
             # The previous authority's exact aiming clock is not on the wire.
             # Start conservatively at one post-shot ideal and let the full safe
@@ -949,12 +961,14 @@ class _BotGunState(object):
         self.dispersion = (self.fully_aimed_dispersion *
                            self.current_dispersion_factor)
 
-    def commit_shot_bloom(self, dispersion_factor=1.0):
-        """Apply #1513's final-shot ideal factor after physical launch."""
+    def commit_shot_bloom(self, dispersion_factor=1.0, final_round=True):
+        """Apply #1513's intra-burst or final physical-shot bloom."""
         dispersion_factor = max(0.0, float(dispersion_factor))
+        bloom = (self.after_shot if final_round else
+                 self.after_shot_in_burst)
         ideal = dispersion_factor * math.sqrt(
             1.0 + self.motion_dispersion_squared +
-            self.after_shot * self.after_shot)
+            bloom * bloom)
         if self.current_dispersion_factor < ideal:
             self.current_dispersion_factor = ideal
             self.aiming_start_factor = ideal
@@ -1016,14 +1030,38 @@ class _BotGunState(object):
         return max(0, min(int(_number(requested)), self.shell_count - 1))
 
     def fire(self, reload_factor=1.0):
-        if not self.ready(reload_factor):
+        if not self.begin_burst(1, reload_factor):
+            return False
+        return self.fire_burst_round(True, reload_factor)
+
+    def begin_burst(self, count, reload_factor=1.0):
+        """Arm a physical group without consuming its first round."""
+        if self._burst_remaining > 0 or not self.ready(reload_factor):
+            return False
+        try:
+            count = int(count)
+        except (TypeError, ValueError, OverflowError):
             return False
         if self.clip <= 0:
             self.complete_reload(reload_factor)
-        if self.clip <= 0:
+        count = min(count, self.clip)
+        if count <= 0:
             return False
-        self.elapsed = 0.0
+        self._burst_remaining = count
+        return True
+
+    def fire_burst_round(self, final_round, reload_factor=1.0):
+        """Consume one armed round and start reload only on the last."""
+        if self._burst_remaining <= 0 or self.clip <= 0:
+            return False
+        expected_final = self._burst_remaining == 1
+        if bool(final_round) != expected_final:
+            return False
         self.clip -= 1
+        self._burst_remaining -= 1
+        if not expected_final:
+            return True
+        self.elapsed = 0.0
         if self.clip <= 0:
             self.clip = 0
             self.reload_kind = 'full'
@@ -1031,6 +1069,20 @@ class _BotGunState(object):
         else:
             self.reload_kind = 'intra'
             self.reload_duration = self.reload_intra
+        return True
+
+    def cancel_burst(self):
+        """Cancel only the automatic tail and enter ordinary recovery."""
+        if self._burst_remaining <= 0:
+            return False
+        self._burst_remaining = 0
+        self.elapsed = 0.0
+        if self.clip > 0:
+            self.reload_kind = 'intra'
+            self.reload_duration = self.reload_intra
+        else:
+            self.reload_kind = 'full'
+            self.reload_duration = self.reload_full
         return True
 
     def remaining(self, reload_factor=1.0):
@@ -1248,13 +1300,13 @@ class _BotAmmoState(object):
             self.plan_pending = False
         return changed
 
-    def can_fire(self):
+    def can_fire(self, continuing_burst=False):
         return (0 <= self.loaded < self.shell_count and
                 self.remaining[self.loaded] > 0 and
-                not self.reload_pending)
+                (bool(continuing_burst) or not self.reload_pending))
 
-    def consume_loaded(self):
-        if not self.can_fire():
+    def consume_loaded(self, continuing_burst=False):
+        if not self.can_fire(continuing_burst):
             return False
         self.remaining[self.loaded] -= 1
         self.next = self._available(self.next)
@@ -1290,7 +1342,8 @@ def _effective_shot_dispersion(gun_state, state, descriptor):
 
 
 def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
-                             dispersion_angle, base_direction=None):
+                             dispersion_angle, burst_index=0,
+                             burst_group_seq=None, base_direction=None):
     """Return the actual physical shot ray used by the battle resolver.
 
     The 0.8.2 presentation uses negative pitch for a raised barrel.  Protocol
@@ -1313,9 +1366,11 @@ def _dispersed_barrel_angles(bot_id, round_id, fire_seq, yaw, pitch,
         if length <= 1.0e-12:
             raise ValueError('bot shot direction is unavailable')
         direction = [value / length for value in direction]
+    group_seq = fire_seq if burst_group_seq is None else burst_group_seq
     seed = ((int(_number(round_id)) & 0xffff) * 1000003 +
             (int(bot_id) & 0xffff) * 9176 +
-            (int(fire_seq) & 0x7fffffff) * 6113) & 0x7fffffff
+            (int(group_seq) & 0x7fffffff) * 6113 +
+            (int(burst_index) & 0xffff) * 3571) & 0x7fffffff
     generator = random.Random(seed)
     try:
         dispersion_angle = float(dispersion_angle)
@@ -1624,6 +1679,8 @@ class BotRuntime(object):
         self._gun_yaw_limits = {}
         self._gun_states = {}
         self._ammo_states = {}
+        self._burst_states = {}
+        self._pending_launches = []
         self._artillery_intents = {}
         self._artillery_reproofs = {}
         self._friendly_repositions = {}
@@ -2146,6 +2203,12 @@ class BotRuntime(object):
         pair = self._descriptor_pairs.get(int(state['id']))
         if pair is None or pair[1] is None:
             return False
+        burst_state = self._burst_states.get(int(state['id']))
+        if burst_state is not None and burst_state.active:
+            # One native trigger owns the complete physical group.  A mode
+            # descriptor may not change between its automatic rounds.
+            state['_siege_intent_elapsed'] = 0.0
+            return False
         current = int(state.get(
             'siege_state', siege_mechanics.DISABLED))
         switching = current in (siege_mechanics.SWITCHING_ON,
@@ -2206,6 +2269,8 @@ class BotRuntime(object):
             self._gun_yaw_limits = {}
             self._gun_states = {}
             self._ammo_states = {}
+            self._burst_states = {}
+            self._pending_launches = []
             self._clear_artillery_intents()
             self._friendly_repositions = {}
             self._shot_los_cache = {}
@@ -2238,6 +2303,7 @@ class BotRuntime(object):
             self._next_observation = 0.0
             self._next_publication = 0.0
             self._pending_ram_reports = []
+            self._pending_launches = []
             self._cover_cursor = 0
             self._cover_queue = []
             self._cover_results = []
@@ -2278,6 +2344,7 @@ class BotRuntime(object):
             self._world_receipt_frame = None
             self._prewarm_receipt_cursor = 0
             self._pending_ram_reports = []
+            self._pending_launches = []
             self._ram_cooldowns = {}
             self._human_ram_cooldowns = {}
             self._ram_contacts = frozenset()
@@ -2481,6 +2548,19 @@ class BotRuntime(object):
                     raw.get('reload_time'), raw.get('reload_duration'),
                     reload_factor, raw.get('clip'), raw.get('clip_size'))
             ammo_state.publish(state)
+            burst_state = self._burst_states.get(bot_id)
+            if burst_state is None:
+                burst_state = burst_mechanics.BurstClock()
+                self._burst_states[bot_id] = burst_state
+            if restoring_authority:
+                restored = burst_state.restore(
+                    raw, state.get('fire_seq', 0))
+                if restored:
+                    gun_state._burst_remaining = max(
+                        0, burst_state.count - burst_state.next_index)
+                else:
+                    burst_state.cancel(0)
+            burst_state.publish(state)
             if authority_handoff:
                 self._apply_authority_takeover_motion(state, raw)
             sync = self._combat_sync_state(state)
@@ -6110,19 +6190,43 @@ class BotRuntime(object):
 
     def _direct_launch_preview(
             self, state, descriptor, shell_index, gun_state,
-            ballistic_solution):
+            ballistic_solution, burst_edge=None):
         """Freeze the exact next direct-shell angles without committing it."""
-        if not isinstance(ballistic_solution, dict):
-            return None
-        try:
-            flight_time = float(ballistic_solution['flight_time'])
-        except (KeyError, TypeError, ValueError, OverflowError):
+        flight_time = None
+        if isinstance(ballistic_solution, dict):
+            try:
+                flight_time = float(ballistic_solution['flight_time'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+        elif isinstance(burst_edge, dict):
+            # Once armed, a native automatic group keeps firing from the
+            # current barrel even when its original target solution is lost.
+            physical = _shot_ballistics(descriptor, shell_index)
+            if physical is None:
+                return None
+            speed, unused_gravity, maximum = physical
+            if speed > 0.0 and maximum > 0.0:
+                flight_time = min(
+                    ballistics.PROJECTILE_MAX_FLIGHT_SECONDS,
+                    maximum / speed)
+        if flight_time is None:
             return None
         if (math.isnan(flight_time) or math.isinf(flight_time) or
                 flight_time <= 0.0 or
                 flight_time > ballistics.PROJECTILE_MAX_FLIGHT_SECONDS):
             return None
         fire_seq = int(state.get('fire_seq', 0)) + 1
+        burst_index = 0
+        burst_group_seq = fire_seq
+        if isinstance(burst_edge, dict):
+            try:
+                fire_seq = int(burst_edge['shot_seq'])
+                burst_index = int(burst_edge['burst_index'])
+                burst_group_seq = int(burst_edge['burst_group_seq'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return None
+            if fire_seq != int(state.get('fire_seq', 0)) + 1:
+                return None
         base_direction = self._dispersal_base_direction(state, descriptor)
         if (base_direction is None and
                 (abs(_number(state.get('pitch'))) > 1.0e-12 or
@@ -6132,6 +6236,7 @@ class BotRuntime(object):
             state['id'], self.round_id, fire_seq,
             state['aim_yaw'], state['gun_pitch'],
             _effective_shot_dispersion(gun_state, state, descriptor),
+            burst_index, burst_group_seq,
             base_direction=base_direction)
         try:
             if self._probe_clock is None:
@@ -6273,28 +6378,120 @@ class BotRuntime(object):
             'shell_index': marker['shell_index'],
         }, False
 
+    @staticmethod
+    def _direct_preview_values(launch_preview, expected_seq):
+        try:
+            preview_seq = int(launch_preview['fire_seq'])
+            preview_yaw = float(launch_preview['shot_yaw'])
+            preview_pitch = float(launch_preview['shot_pitch'])
+            preview_origin = tuple(
+                float(value) for value in launch_preview['origin'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if (preview_seq != int(expected_seq) or len(preview_origin) != 3 or
+                math.isnan(preview_yaw) or math.isinf(preview_yaw) or
+                math.isnan(preview_pitch) or math.isinf(preview_pitch) or
+                any(math.isnan(value) or math.isinf(value)
+                    for value in preview_origin)):
+            return None
+        return preview_yaw, preview_pitch, preview_origin
+
+    def _commit_burst_edge(
+            self, state, gun_state, reload_factor, descriptor, edge,
+            ammo_state, launch_receipt=None, launch_preview=None):
+        """Atomically commit one real projectile in an armed group."""
+        if (state.get('_drowning', False) or
+                state.get('_overturned', False)):
+            return False
+        try:
+            shot_seq = int(edge['shot_seq'])
+            group_seq = int(edge['burst_group_seq'])
+            burst_index = int(edge['burst_index'])
+            burst_count = int(edge['burst_count'])
+            shell_index = int(edge['shell_index'])
+            final_round = bool(edge['final'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if (shot_seq != int(state.get('fire_seq', 0)) + 1 or
+                shot_seq != group_seq + burst_index or
+                burst_index < 0 or burst_index >= burst_count or
+                shell_index != int(ammo_state.loaded)):
+            return False
+        preview_values = None
+        fallback_direction = None
+        if launch_receipt is not None:
+            if (launch_preview is not None or burst_count != 1 or
+                    int(launch_receipt.get('fire_seq', -1)) != shot_seq):
+                return False
+        elif launch_preview is not None:
+            preview_values = self._direct_preview_values(
+                launch_preview, shot_seq)
+            if preview_values is None:
+                return False
+        else:
+            fallback_direction = self._dispersal_base_direction(
+                state, descriptor)
+            if (fallback_direction is None and
+                    (abs(_number(state.get('pitch'))) > 1.0e-12 or
+                     abs(_number(state.get('roll'))) > 1.0e-12)):
+                return False
+        continuing = burst_index > 0
+        if (not ammo_state.can_fire(continuing) or
+                not gun_state.fire_burst_round(
+                    final_round, reload_factor)):
+            return False
+        if not ammo_state.consume_loaded(continuing):
+            raise RuntimeError(
+                'bot ammunition changed during atomic burst')
+        if final_round and ammo_state.loaded_shell_requires_full_reload():
+            gun_state.require_full_reload()
+        state['fire_seq'] = shot_seq
+        state['burst_group_seq'] = group_seq
+        state['burst_index'] = burst_index
+        state['burst_count'] = burst_count
+        for name in (
+                'shot_origin', 'shot_velocity', 'shot_gravity',
+                'shot_max_distance', 'shot_max_time_ms', 'shot_proof_key'):
+            state.pop(name, None)
+        if launch_receipt is not None:
+            state['shot_yaw'] = launch_receipt['shot_yaw']
+            state['shot_pitch'] = launch_receipt['shot_pitch']
+            state['shot_origin'] = tuple(launch_receipt['origin'])
+            state['shot_velocity'] = tuple(launch_receipt['velocity'])
+            state['shot_gravity'] = launch_receipt['gravity']
+            state['shot_max_distance'] = launch_receipt['max_distance']
+            state['shot_max_time_ms'] = launch_receipt['max_time_ms']
+            state['shot_proof_key'] = launch_receipt['proof_key']
+        elif preview_values is not None:
+            state['shot_yaw'], state['shot_pitch'], state['shot_origin'] = \
+                preview_values
+        else:
+            state['shot_yaw'], state['shot_pitch'] = \
+                _dispersed_barrel_angles(
+                    state['id'], self.round_id, shot_seq,
+                    state['aim_yaw'], state['gun_pitch'],
+                    _effective_shot_dispersion(
+                        gun_state, state, descriptor),
+                    burst_index, group_seq,
+                    base_direction=fallback_direction)
+        gun_state.commit_shot_bloom(
+            _critical_factor(state, descriptor, 'dispersion'),
+            final_round=final_round)
+        state['clip'] = gun_state.clip
+        state['reload_time'] = gun_state.remaining(reload_factor)
+        state['reload_duration'] = gun_state.duration(reload_factor)
+        ammo_state.publish(state)
+        launch = _local_launch_record(state)
+        if launch is None:
+            raise RuntimeError('physical bot burst launch is incomplete')
+        self._pending_launches.append(launch)
+        return True
+
     def _fire(self, state, gun_state, reload_factor, descriptor,
               launch_receipt=None, ammo_state=None, launch_preview=None):
-        next_fire_seq = int(state.get('fire_seq', 0)) + 1
-        if launch_receipt is not None:
-            if int(launch_receipt.get('fire_seq', -1)) != next_fire_seq:
-                return False
-        if launch_preview is not None:
-            try:
-                preview_seq = int(launch_preview['fire_seq'])
-                preview_yaw = float(launch_preview['shot_yaw'])
-                preview_pitch = float(launch_preview['shot_pitch'])
-                preview_origin = tuple(
-                    float(value) for value in launch_preview['origin'])
-            except (KeyError, TypeError, ValueError, OverflowError):
-                return False
-            if (launch_receipt is not None or preview_seq != next_fire_seq or
-                    len(preview_origin) != 3 or
-                    math.isnan(preview_yaw) or math.isinf(preview_yaw) or
-                    math.isnan(preview_pitch) or math.isinf(preview_pitch) or
-                    any(math.isnan(value) or math.isinf(value)
-                        for value in preview_origin)):
-                return False
+        if (state.get('_drowning', False) or
+                state.get('_overturned', False)):
+            return False
         if ammo_state is None:
             ammo_state = self._ammo_states.get(int(state.get('id', 0)))
         if ammo_state is None:
@@ -6304,53 +6501,117 @@ class BotRuntime(object):
             ammo_state.stage(state.get('shell_index', 0), True)
         if not ammo_state.can_fire():
             return False
-        if not gun_state.fire(reload_factor):
+        count, interval = burst_mechanics.planned_count(
+            _value(descriptor, 'gun', {}) or {},
+            ammo_state.remaining[ammo_state.loaded], gun_state.clip)
+        if count <= 0:
             return False
-        if not ammo_state.consume_loaded():
-            raise RuntimeError('bot ammunition changed during atomic fire')
-        if ammo_state.loaded_shell_requires_full_reload():
-            # #1513 discards the unusable remainder of an autoloader clip
-            # when its current shell type is exhausted.  The fallback shell
-            # becomes usable only after a full magazine reload.
-            gun_state.require_full_reload()
-        state['fire_seq'] = next_fire_seq
-        for name in (
-                'shot_origin', 'shot_velocity', 'shot_gravity',
-                'shot_max_distance', 'shot_max_time_ms', 'shot_proof_key'):
-            state.pop(name, None)
-        if launch_receipt is None:
-            if launch_preview is not None:
-                state['shot_yaw'] = preview_yaw
-                state['shot_pitch'] = preview_pitch
-                state['shot_origin'] = preview_origin
-            else:
-                base_direction = self._dispersal_base_direction(
-                    state, descriptor)
-                state['shot_yaw'], state['shot_pitch'] = \
-                    _dispersed_barrel_angles(
-                        state['id'], self.round_id, state['fire_seq'],
-                        state['aim_yaw'], state['gun_pitch'],
-                        _effective_shot_dispersion(
-                            gun_state, state, descriptor),
-                        base_direction=base_direction)
-        else:
-            state['shot_yaw'] = launch_receipt['shot_yaw']
-            state['shot_pitch'] = launch_receipt['shot_pitch']
-            state['shot_origin'] = tuple(launch_receipt['origin'])
-            state['shot_velocity'] = tuple(launch_receipt['velocity'])
-            state['shot_gravity'] = launch_receipt['gravity']
-            state['shot_max_distance'] = launch_receipt['max_distance']
-            state['shot_max_time_ms'] = launch_receipt['max_time_ms']
-            state['shot_proof_key'] = launch_receipt['proof_key']
-        # The committed ray used the pre-shot circle frozen above. Expand only
-        # after launch so this penalty applies to the following round.
-        gun_state.commit_shot_bloom(
-            _critical_factor(state, descriptor, 'dispersion'))
-        state['clip'] = gun_state.clip
-        state['reload_time'] = gun_state.remaining(reload_factor)
-        state['reload_duration'] = gun_state.duration(reload_factor)
-        ammo_state.publish(state)
+        # Every SPG parabola requires its own world proof.  The pinned build
+        # has no burst artillery descriptor, so keep that exact path singular.
+        if launch_receipt is not None:
+            count, interval = 1, 0.0
+        burst_state = self._burst_states.get(int(state['id']))
+        if burst_state is None:
+            burst_state = burst_mechanics.BurstClock()
+            self._burst_states[int(state['id'])] = burst_state
+        first_seq = int(state.get('fire_seq', 0)) + 1
+        if (not burst_state.start(
+                first_seq, count, interval, ammo_state.loaded) or
+                not gun_state.begin_burst(count, reload_factor)):
+            burst_state.cancel(0)
+            return False
+        edge = burst_state.advance(0.0)[0]
+        if not self._commit_burst_edge(
+                state, gun_state, reload_factor, descriptor, edge,
+                ammo_state, launch_receipt, launch_preview):
+            gun_state.cancel_burst()
+            burst_state.cancel(0)
+            return False
+        burst_state.publish(state)
         return True
+
+    def _cancel_active_burst(
+            self, state, gun_state=None, ammo_state=None, burst_state=None):
+        """Cancel the unlaunched tail and begin ordinary recovery."""
+        bot_id = int(state.get('id', 0))
+        burst_state = burst_state or self._burst_states.get(bot_id)
+        gun_state = gun_state or self._gun_states.get(bot_id)
+        gun_pending = bool(
+            gun_state is not None and gun_state._burst_remaining > 0)
+        if burst_state is None or (not burst_state.active and not gun_pending):
+            return False
+        launched = 0
+        if burst_state.group_seq > 0:
+            launched = max(
+                0, int(state.get('fire_seq', 0)) - burst_state.group_seq + 1)
+        launched = min(launched, burst_state.next_index)
+        burst_state.cancel(launched)
+        if gun_pending:
+            gun_state.cancel_burst()
+        ammo_state = ammo_state or self._ammo_states.get(bot_id)
+        if ammo_state is not None:
+            ammo_state.publish(state)
+        if gun_state is not None:
+            reload_factor = _critical_factor(
+                state, self._descriptors.get(bot_id, {}), 'reload')
+            state['clip'] = gun_state.clip
+            state['reload_time'] = gun_state.remaining(reload_factor)
+            state['reload_duration'] = gun_state.duration(reload_factor)
+        burst_state.publish(state)
+        return True
+
+    def _advance_active_burst(
+            self, state, gun_state, ammo_state, reload_factor, descriptor,
+            target, ballistic_solution, step, destroyed_devices):
+        """Launch every descriptor-cadence edge crossed by this tick."""
+        burst_state = self._burst_states.get(int(state['id']))
+        if burst_state is None or not burst_state.active:
+            return 0
+        committed = 0
+        for edge in burst_state.advance(step):
+            if (not state.get('alive', False) or
+                    state.get('_drowning', False) or
+                    state.get('_overturned', False) or
+                    'gunHealth' in destroyed_devices or
+                    int(state.get('siege_state',
+                                  siege_mechanics.DISABLED)) in (
+                        siege_mechanics.SWITCHING_ON,
+                        siege_mechanics.SWITCHING_OFF) or
+                    not ammo_state.can_fire(True)):
+                self._cancel_active_burst(
+                    state, gun_state, ammo_state, burst_state)
+                break
+            preview = self._direct_launch_preview(
+                state, descriptor, burst_state.shell_index, gun_state,
+                ballistic_solution, burst_edge=edge)
+            if preview is None:
+                self._cancel_active_burst(
+                    state, gun_state, ammo_state, burst_state)
+                break
+            if self._probe_clock is None:
+                lane_value = self.friendly_lane_probe(
+                    state, target if isinstance(target, dict) else {},
+                    descriptor, burst_state.shell_index, preview)
+            else:
+                probe_started = self._probe_started()
+                try:
+                    lane_value = self.friendly_lane_probe(
+                        state, target if isinstance(target, dict) else {},
+                        descriptor, burst_state.shell_index, preview)
+                finally:
+                    self._probe_finished(1, probe_started)
+            lane_clear, unused_verdict = self._friendly_lane_verdict(
+                lane_value)
+            if (not lane_clear or
+                    not self._commit_burst_edge(
+                        state, gun_state, reload_factor, descriptor, edge,
+                        ammo_state, launch_preview=preview)):
+                self._cancel_active_burst(
+                    state, gun_state, ammo_state, burst_state)
+                break
+            committed += 1
+        burst_state.publish(state)
+        return committed
 
     def update(self, dt, now, players=None, neighbours=None):
         """Advance the complete elapsed interval in stable bounded substeps."""
@@ -6429,6 +6690,7 @@ class BotRuntime(object):
         integrated = set()
         for state in self.states.values():
             if not state['alive']:
+                self._cancel_active_burst(state)
                 continue
             self._note_source_stillness(state, now)
             # Every live bot consumes the same banked authority step. Planner
@@ -6439,12 +6701,15 @@ class BotRuntime(object):
             integrated.add(state['id'])
             self._advance_bot_critical(state, step, now)
             if not state['alive']:
+                self._cancel_active_burst(state)
                 continue
             self._advance_bot_drowning(state, step)
             if not state['alive']:
+                self._cancel_active_burst(state)
                 continue
             self._advance_bot_overturn(state, step)
             if not state['alive']:
+                self._cancel_active_burst(state)
                 continue
             self._advance_bot_siege(state, step)
             position = _position(state)
@@ -6647,15 +6912,20 @@ class BotRuntime(object):
             if ammo_state is None:
                 ammo_state = _BotAmmoState(descriptor, profile, state)
                 self._ammo_states[state['id']] = ammo_state
+            burst_state = self._burst_states.get(state['id'])
+            if burst_state is None:
+                burst_state = burst_mechanics.BurstClock()
+                self._burst_states[state['id']] = burst_state
             reload_factor = _critical_factor(
                 state, descriptor, 'reload')
-            gun_state.rescale_reload(reload_factor)
-            gun_state.tick(step)
-            reload_kind = gun_state.complete_reload(
-                reload_factor, ammo_state.planned_rounds())
-            ammo_state.stage(
-                gun_state.shell_index(command.get('shell_index', 0)),
-                reload_kind is not None, reload_kind == 'full')
+            if not burst_state.active:
+                gun_state.rescale_reload(reload_factor)
+                gun_state.tick(step)
+                reload_kind = gun_state.complete_reload(
+                    reload_factor, ammo_state.planned_rounds())
+                ammo_state.stage(
+                    gun_state.shell_index(command.get('shell_index', 0)),
+                    reload_kind is not None, reload_kind == 'full')
             ammo_state.publish(state)
             is_spg = str(profile.get('class_tag') or '') == 'SPG'
             pending_intent = None
@@ -6999,6 +7269,9 @@ class BotRuntime(object):
             state['clip'] = gun_state.clip
             state['reload_time'] = gun_state.remaining(reload_factor)
             state['reload_duration'] = gun_state.duration(reload_factor)
+            self._advance_active_burst(
+                state, gun_state, ammo_state, reload_factor, descriptor,
+                target, ballistic_solution, step, destroyed_devices)
             fire_range = max(0.0, _number(command.get('fire_range'), 0.0))
             target_distance = (_distance(_position(state), target['position'])
                                if target is not None else 0.0)
@@ -7011,6 +7284,7 @@ class BotRuntime(object):
                     not state.get('_overturned', False) and
                     'gunHealth' not in destroyed_devices and
                     state.get('gun_aligned') and
+                    not burst_state.active and
                     gun_state.ready(reload_factor) and
                     ammo_state.can_fire() and
                     (pending_intent is not None or
@@ -7215,15 +7489,15 @@ class BotRuntime(object):
         if not publish:
             return []
         wire_states = []
-        launches = []
+        launches = list(self._pending_launches)
         for state in self._ordered_states():
+            burst_state = self._burst_states.get(int(state['id']))
+            if burst_state is not None:
+                burst_state.publish(state)
             projected = lan_client.project_bot_state(state)
             if projected is None:
                 raise RuntimeError('bot publication projection failed')
             wire_states.append(projected)
-            launch = _local_launch_record(state)
-            if launch is not None:
-                launches.append(launch)
         self._sample_time_us += max(
             1, int(round(frame_step * 1000000.0)))
         publication = {
@@ -7234,6 +7508,7 @@ class BotRuntime(object):
             # Never put these local-only SPG proof receipts on the LAN wire.
             # BattleRuntime retries an unaccepted launch from this compact list.
             publication['launches'] = launches
+        self._pending_launches = []
         outgoing = [publication]
         # The server validates ram proximity against its latest authority pose.
         # Publish state first, then the cooldown-gated damage reports.

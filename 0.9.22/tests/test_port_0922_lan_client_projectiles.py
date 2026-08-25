@@ -208,7 +208,10 @@ class ProjectileWireTests(unittest.TestCase):
             penetration_factor=values['penetration_factor'],
             source_shot=frozen_shot,
             fire_intent_seq=fire_intent_seq,
-            fire_input_seq=fire_input_seq)
+            fire_input_seq=fire_input_seq,
+            burst_group_seq=values.get('burst_group_seq'),
+            burst_index=values.get('burst_index'),
+            burst_count=values.get('burst_count'))
 
     @staticmethod
     def send_player_input(client, shell_index=2):
@@ -247,13 +250,17 @@ class ProjectileWireTests(unittest.TestCase):
             'shell_index', 'origin', 'velocity', 'gravity', 'max_distance',
             'max_time_ms', 'is_he', 'splash_radius', 'penetration_factor',
             'source_shot', 'authority_epoch', 'fire_intent_seq',
-            'fire_input_seq',
+            'fire_input_seq', 'burst_group_seq', 'burst_index',
+            'burst_count',
         }, set(message))
         self.assertEqual('player', message['shooter_kind'])
         self.assertEqual(7, message['shooter_id'])
         self.assertEqual(1, message['shot_seq'])
         self.assertEqual(6, message['fire_intent_seq'])
         self.assertEqual(9, message['fire_input_seq'])
+        self.assertEqual((1, 0, 1), (
+            message['burst_group_seq'], message['burst_index'],
+            message['burst_count']))
         self.assertEqual([1.0, 2.0, 3.0], message['origin'])
 
     def test_failed_fire_intent_enqueue_rolls_back_sequence(self):
@@ -840,6 +847,36 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual(2, client.authority_epoch)
         self.assertTrue(client.has_projectile_ledger())
 
+    def test_bot_burst_group_is_exact_for_every_physical_shell(self):
+        client = self.active_worker_client()
+
+        for index in range(3):
+            self.assertEqual(index + 1, self.launch(
+                client, shooter_kind='bot', shooter_id=11,
+                shot_seq=index + 1, authority_epoch=4,
+                burst_group_seq=1, burst_index=index, burst_count=3))
+        self.assertEqual([1, 2, 3], [
+            row[1]['shot_seq'] for row in client._outbound_queue])
+        self.assertEqual([0, 1, 2], [
+            row[1]['burst_index'] for row in client._outbound_queue])
+
+    def test_bot_burst_rejects_partial_or_inconsistent_group(self):
+        client = self.active_worker_client()
+        invalid = (
+            {'burst_group_seq': 1},
+            {'burst_group_seq': 1, 'burst_index': 0},
+            {'burst_group_seq': 1, 'burst_index': 1, 'burst_count': 3},
+            {'burst_group_seq': 2, 'burst_index': 0, 'burst_count': 3},
+            {'burst_group_seq': 1, 'burst_index': 3, 'burst_count': 3},
+            {'burst_group_seq': 1, 'burst_index': True, 'burst_count': 3},
+        )
+        for values in invalid:
+            with self.subTest(values=values):
+                self.assertIsNone(self.launch(
+                    client, shooter_kind='bot', shooter_id=11,
+                    shot_seq=1, authority_epoch=4, **values))
+        self.assertEqual([], client._outbound_queue)
+
     def test_waiting_room_accepts_idle_without_an_authority_id(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
@@ -881,6 +918,9 @@ class ProjectileWireTests(unittest.TestCase):
             'source_shot': source_shot(
                 math.sqrt(10100.0), 9.81, 500.0),
             'shot_seq': 1,
+            'burst_group_seq': 1,
+            'burst_index': 0,
+            'burst_count': 1,
             'fire_intent_seq': 4,
             'fire_input_seq': 8,
             'shell_index': 0,
