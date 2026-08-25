@@ -1057,15 +1057,12 @@ The source audit deliberately keeps the following differences visible:
 - the server publishes terminal winner/reason/base team plus live frags and the
   human team-killer flag, but not the complete 0.8.2
   `personal`/`players`/`vehicles` battle-result record;
-- bot drowning and the complete stun penalty/medical-kit loop remain open.
-  Authority-Bot movement now runs the same server-relayed destructible contact
-  boundary as player movement. When server authority is active, the server
-  advances both human and Bot projectile trajectories and resolves their
-  baked-world collisions and damage. It still trusts each human client for its
-  pose, launch parameters, reload/ammunition legality and native descriptor
-  donation. Human fire, drowning, repair/equipment progression and parts of
-  spotting also remain client-originated. This is a trusted-LAN architecture,
-  not an anti-cheat or a claim that every calculation runs on the server.
+- the complete stun penalty/medical-kit loop remains open. Bot movement and
+  both Bot and human projectile trajectories run in the mandatory hidden
+  native worker, while the LAN server admits their ordered results and shared
+  ledgers. Each human client still originates its own input, pose and gun-state
+  checkpoint. This is a trusted-LAN architecture, not an anti-cheat design or
+  a claim that every calculation runs inside the Python server.
 
 The local player path does include server-relayed critical state, fire,
 drowning, exact fall/landing attribution, small repair/medkit/extinguisher

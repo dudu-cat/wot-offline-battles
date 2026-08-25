@@ -72,12 +72,14 @@ Requirements
   listens on 0.0.0.0:28782 and supports up to 30 players. A single-player round
   also uses it.
 
-Optional simulation worker
---------------------------
+Manual diagnostic entry points
+------------------------------
 
-Start the server, START_SIMULATION_WORKER_0922.bat, then
-START_OFFLINE_0922.bat. Both clients use the same game installation; the
-worker does not occupy a player slot.
+The Launcher normally starts the LAN server, mandatory hidden worker and
+visible client together. For diagnostics only, start the server, then
+START_SIMULATION_WORKER_0922.bat, then START_OFFLINE_0922.bat. The hidden
+worker does not occupy a player slot; without it the room cannot start a
+battle.
 
 Troubleshooting
 ---------------
