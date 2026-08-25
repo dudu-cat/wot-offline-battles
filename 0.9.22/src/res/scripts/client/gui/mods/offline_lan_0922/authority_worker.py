@@ -342,6 +342,17 @@ class AuthorityWorkerLANClient(LANClient):
             'health': 1, 'max_health': 1, 'alive': True,
             'critical': {}, 'critical_revision': 0,
             'critical_base_revision': 0, 'critical_ack_seq': 0,
+            # LANClient validates the equipment ledger for every projected
+            # player, including this worker-local carrier.  Keep an isolated
+            # copy of the real descriptor's canonical ledger; the carrier is
+            # never published and never activates equipment itself.
+            'equipment_states': [
+                dict(value)
+                for value in source.get('equipment_states') or ()],
+            'equipment_revision': source.get('equipment_revision'),
+            'equipment_intent_seq': source.get('equipment_intent_seq'),
+            'equipment_intent_result': dict(
+                source.get('equipment_intent_result') or {}),
             'outfits': {},
             'effective_params': _canonical_effective_params(
                 source['effective_params']),

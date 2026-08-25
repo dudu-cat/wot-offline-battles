@@ -152,6 +152,11 @@ def _human(player_id=1):
         'critical_revision': 0,
         'critical_base_revision': 0,
         'critical_ack_seq': 0,
+        'equipment_states': [],
+        'equipment_revision': 0,
+        'equipment_intent_seq': 0,
+        'equipment_intent_result': {
+            'intent_seq': 0, 'accepted': False, 'reason': ''},
         'outfits': {},
         'vehicle_compact_descr': 'dGVzdA==',
         'effective_params': effective_params(),
@@ -461,6 +466,12 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual('germany:G54_E-50', dummy['vehicle'])
         self.assertEqual(1, dummy['health'])
         self.assertEqual(1, dummy['max_health'])
+        self.assertEqual([], dummy['equipment_states'])
+        self.assertEqual(0, dummy['equipment_revision'])
+        self.assertEqual(0, dummy['equipment_intent_seq'])
+        self.assertEqual(
+            {'intent_seq': 0, 'accepted': False, 'reason': ''},
+            dummy['equipment_intent_result'])
         self.assertEqual(1, client.max_health)
         self.assertEqual(WORKER_AUTHORITY_ID, client.player_id)
 
