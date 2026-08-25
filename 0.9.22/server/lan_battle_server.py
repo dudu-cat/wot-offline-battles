@@ -3596,7 +3596,8 @@ class BattleState:
                             "bot takeover manifest has no canonical state")
                     _validated_bot_reload_progress(state, required=True)
                     for name in (
-                            "fire_seq", "reload_time", "reload_duration"):
+                            "fire_seq", "reload_time", "reload_duration",
+                            "equipment_states"):
                         entry[name] = state[name]
                 takeover_manifest.append(entry)
             message = {
@@ -4492,6 +4493,33 @@ class BattleState:
                 "death_reason", 0))), 255))
         result["display_health"] = max(0, min(int(_finite_float(
             raw.get("display_health"), reported_health)), max_health))
+        snapshots = raw.get("equipment_states")
+        previous_snapshots = (previous or {}).get("equipment_states")
+        if snapshots is None:
+            snapshots = previous_snapshots if previous_snapshots is not None \
+                else []
+        if not isinstance(snapshots, (list, tuple)):
+            raise ValueError("bot equipment snapshot is invalid")
+        contracts = None
+        if previous_snapshots is not None:
+            contracts = equipment_mechanics.bot_consumable_contracts(
+                None, snapshot=previous_snapshots)
+        else:
+            contracts = equipment_mechanics.bot_consumable_contracts(
+                None, snapshot=snapshots)
+        equipments = equipment_mechanics.restore_equipment_states(
+            snapshots, contracts=contracts, now=0.0)
+        canonical_snapshots = [equipment.snapshot(0.0)
+                               for equipment in equipments]
+        if previous_snapshots is not None:
+            previous_equipments = \
+                equipment_mechanics.restore_equipment_states(
+                    previous_snapshots, contracts=contracts, now=0.0)
+            for old, new in zip(previous_equipments, equipments):
+                if (old.uses_left >= 0 and
+                        new.uses_left > old.uses_left):
+                    raise ValueError("bot equipment inventory increased")
+        result["equipment_states"] = canonical_snapshots
         return result
 
     @staticmethod

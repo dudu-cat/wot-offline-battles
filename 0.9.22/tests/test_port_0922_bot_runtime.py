@@ -339,7 +339,7 @@ class _CaptureSocket(object):
 
 class ServerBotStateRevisionTests(unittest.TestCase):
     @staticmethod
-    def _server(clock=None, before_manifest=None):
+    def _server(clock=None, before_manifest=None, equipment_states=None):
         server = BattleState(map_name='04_himmelsdorf', clock=clock)
         server.client_build = CLIENT_BUILD_0922
         server.phase = 'battle'
@@ -379,6 +379,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             'ammo_remaining': [20], 'ammo_reload_pending': False,
             'reload_time': 0.5, 'reload_duration': 0.5,
         }
+        if equipment_states is not None:
+            manifest_bot['equipment_states'] = list(equipment_states)
         if before_manifest is not None:
             before_manifest()
         assert server.update_bot_manifest(SIMULATION_WORKER_AUTHORITY_ID, {
@@ -445,6 +447,52 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(0, server.bot_state_time_us)
         self.assertIsNone(server.bot_source_time_us)
         self.assertIsNone(server.bot_source_receipt_time_us)
+
+    def test_bot_consumables_survive_server_publication_and_takeover(self):
+        module = _load()
+        contracts = _bot_equipment_contracts(module)
+        equipments = [module.equipment_mechanics.EquipmentState(contract)
+                      for contract in contracts]
+        self.assertIsNotNone(equipments[2].activate(
+            0.0, _critical_payload(
+                {'name': 'leftTrackHealth', 'hp': 0.0, 'max_hp': 170.0,
+                 'state': 'destroyed'},
+                destroyed=('leftTrackHealth',))))
+        snapshots = [equipment.snapshot(12.0)
+                     for equipment in equipments]
+        server, unused_manifest, unused_socket = self._server(
+            equipment_states=snapshots)
+        self.assertAlmostEqual(
+            78.0,
+            server.bot_states[11]['equipment_states'][2][
+                'cooldownTimeLeft'])
+
+        restored = module.equipment_mechanics.restore_equipment_states(
+            server.bot_states[11]['equipment_states'],
+            contracts=contracts, now=0.0)
+        self.assertIsNotNone(restored[1].activate(
+            0.0, _critical_payload(crew_ko=('commander',))))
+        publication = self._publication(server, 1.0)
+        publication['bots'][0]['equipment_states'] = [
+            equipment.snapshot(0.0) for equipment in restored]
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, publication),
+            server.last_bot_state_reject)
+
+        takeover = server.current_battle_message()
+        persisted = takeover['bot_manifest'][0]['equipment_states']
+        self.assertEqual(1, persisted[1]['usesLeft'])
+        self.assertAlmostEqual(90.0, persisted[1]['cooldownTimeLeft'])
+        self.assertAlmostEqual(78.0, persisted[2]['cooldownTimeLeft'])
+
+        invalid = self._publication(server, 2.0)
+        invalid['bots'][0]['equipment_states'] = json.loads(json.dumps(
+            invalid['bots'][0]['equipment_states']))
+        invalid['bots'][0]['equipment_states'][1]['usesLeft'] = 2
+        self.assertFalse(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, invalid))
+        self.assertEqual('combat_contract',
+                         server.last_bot_state_reject_code)
 
     def test_snapshot_carries_real_bot_receipt_time_and_queue_age(self):
         now = [100.0]
@@ -6947,6 +6995,12 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(
             0.9, runtime.bot_equipment_passives(11)[
                 'fireStartingChanceFactor'])
+        projected = self.module.lan_client.project_bot_state(state)
+        self.assertEqual(3, len(projected['equipment_states']))
+        malformed = dict(state)
+        malformed['equipment_states'] = [{}]
+        self.assertIsNone(
+            self.module.lan_client.project_bot_state(malformed))
 
     def test_bot_equipment_takeover_restores_once_without_clock_rewind(self):
         contracts = _bot_equipment_contracts(self.module)
