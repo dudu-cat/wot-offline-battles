@@ -380,6 +380,8 @@ class BattleProjectileTests(unittest.TestCase):
             'id': 11, 'profile': {'class_tag': 'MT'},
             'shot_yaw': 0.0, 'shot_pitch': 0.0, 'shell_index': 0,
             'shot_origin': frozen_origin,
+            'launch_time_us': 1000000,
+            'launch_pose': (1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
         }
 
         self.assertTrue(battle._launch_bot_projectile(state, 1))
@@ -427,6 +429,8 @@ class BattleProjectileTests(unittest.TestCase):
             'shot_origin': origin, 'shot_velocity': velocity,
             'shot_gravity': 9.81, 'shot_max_distance': 100.0,
             'shot_max_time_ms': 20000, 'shot_proof_key': proof,
+            'launch_time_us': 1000000,
+            'launch_pose': (1.0, 2.0, 3.0, 0.0, 0.0, 0.0),
         }
 
         self.assertTrue(battle._launch_bot_projectile(state, 4))
