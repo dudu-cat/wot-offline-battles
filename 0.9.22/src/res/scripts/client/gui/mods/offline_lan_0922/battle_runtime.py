@@ -10779,11 +10779,13 @@ class BattleRuntime(object):
         sys.stdout.write('[Offline LAN 0.9.22] TARGET %s\n' % message)
 
     def _clear_target_outline(self):
-        """Remove the one edge this port owns, and say whether it could.
+        """Remove the one edge this port owns.
 
         ``wgDelEdgeDetectEntity`` resolves the drawer key from the entity's
         current compound, so a removal issued after that compound changed
-        deletes nothing and leaves an entry no later call can reach.
+        deletes nothing and leaves an entry no later call can reach.  Treat
+        that state as a lifecycle error; disabling later outlines cannot make
+        the already-stale native entry safe.
         """
         entity = self._outlined_entity
         vehicle = self._outlined_vehicle
@@ -10796,7 +10798,7 @@ class BattleRuntime(object):
         if engine_id is not None:
             self.monitor_vehicle_damaged_devices(0)
         if entity is None and engine_id is None:
-            return not self._outline_blocked
+            return True
         set_candidate = getattr(
             self._runtime.compatibility, 'set_target_lock_candidate', None)
         if not callable(set_candidate):
@@ -10804,7 +10806,9 @@ class BattleRuntime(object):
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(None)
         if entity is None:
-            return not self._outline_blocked
+            raise RuntimeError(
+                'outlined vehicle %s lost its entity before edge removal' %
+                engine_id)
         visual_entity = (vehicle if bool(getattr(
             vehicle, '_offlineNativeRemote', False)) else getattr(
                 vehicle, 'bw_entity', None))
@@ -10812,12 +10816,9 @@ class BattleRuntime(object):
                 visual_entity is not entity or
                 getattr(vehicle, 'model', None) is not model or
                 getattr(entity, 'model', None) is None):
-            self._outline_blocked = True
-            sys.stdout.write(
-                '[Offline LAN 0.9.22] TARGET id=%s changed its compound '
-                'before the edge was removed; this round outlines nothing '
-                'more\n' % engine_id)
-            return False
+            raise RuntimeError(
+                'outlined vehicle %s changed its compound before edge '
+                'removal' % engine_id)
         remove_edge = getattr(
             self._runtime.bigworld, 'wgDelEdgeDetectEntity', None)
         if not callable(remove_edge):
@@ -14491,6 +14492,8 @@ class BattleRuntime(object):
         """Destroy a remote Vehicle that entered after its network removal."""
         if record.get('presentation'):
             if self._remote_factory is not None:
+                if self._outlined_engine_id == record.get('engine_id'):
+                    self._clear_target_outline()
                 if not record.get('native_remote'):
                     self._stop_remote_visual(record)
                 self._remote_factory.destroy(record['engine_id'])
@@ -15280,6 +15283,13 @@ class BattleRuntime(object):
         previous_dead = bool(
             previous_signature is not None and
             (previous_signature[0] <= 0 or not previous_signature[2]))
+        if (dead and not previous_dead and
+                self._outlined_engine_id == engine_id):
+            # Exact #1513's native onHealthChanged/set_isCrewActive death
+            # path may replace the CompoundAppearance model.  EdgeDrawer keys
+            # the outline by that compound, so release it before either stock
+            # callback can retire the key.
+            self._clear_target_outline()
         if dead and not previous_dead and not crew_knockout:
             fire_reason = self._attack_reason('FIRE', 1)
             if reason_id == fire_reason:
@@ -15452,6 +15462,8 @@ class BattleRuntime(object):
             self._materialize_record(record)
             return
         if record.get('presentation'):
+            if self._outlined_engine_id == record.get('engine_id'):
+                self._clear_target_outline()
             self._records.pop(event.get('entity'), None)
             if record.get('arena_added'):
                 self._binding.arena_vehicle_removed(record['engine_id'])

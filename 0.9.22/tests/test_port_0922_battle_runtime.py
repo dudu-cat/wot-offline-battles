@@ -2329,6 +2329,28 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
 
 
 class RemoteVehicleFactoryTests(unittest.TestCase):
+    def _ready_native_factory(self):
+        runtime = _runtime()
+        holder = {}
+        binding = BigWorldVehicleBinding(
+            runtime.bigworld, runtime.bigworld.avatar, runtime.constants,
+            _VehicleDescr, runtime.encode_gun_angles,
+            outfit_provider=lambda unused_descriptor: '',
+            authority_entity_resolver=lambda entity_id:
+            holder['factory'].get(entity_id))
+        factory = NativeRemoteVehicleFactory(
+            runtime.bigworld, runtime.math, runtime.model_assembler, 7,
+            binding=binding, compatibility=runtime.compatibility)
+        holder['factory'] = factory
+        properties = binding.properties_from_compact_descr(
+            'ussr:R11_MS-1', 2, 'Native remote')
+        vehicle_id = factory.create(
+            _Descriptor(), properties, _Vector(0.0, 0.0, 20.0),
+            (0.0, 0.0, 0.0))
+        runtime.bigworld.enter_pending_vehicle(vehicle_id)
+        self.assertTrue(factory.is_ready(vehicle_id))
+        return runtime, factory, binding, vehicle_id, factory.get(vehicle_id)
+
     def test_sticker_owner_survives_failed_native_detach(self):
         runtime = _runtime()
         vehicle = RemoteVehicle(
@@ -3812,10 +3834,10 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertFalse(factory.engine_active())
         factory.destroy_all()
 
-    def test_a_replaced_compound_stops_the_outline_instead_of_leaking(self):
+    def test_a_replaced_compound_is_a_lifecycle_error_not_cleanup(self):
         """wgDelEdgeDetectEntity resolves the drawer key from the entity's
         current compound.  A removal issued after that compound changed
-        deletes nothing, so the port refuses it and outlines nothing more."""
+        deletes nothing.  Disabling later outlines cannot repair that entry."""
         runtime = _runtime()
         factory = RemoteVehicleFactory(
             runtime.bigworld, runtime.math, runtime.model_assembler, 7)
@@ -3839,12 +3861,12 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(1, len(runtime.bigworld.edge_adds))
         vehicle.model = _Model()
 
-        self.assertFalse(battle._clear_target_outline())
+        with self.assertRaisesRegex(
+                RuntimeError, 'changed its compound before edge removal'):
+            battle._clear_target_outline()
 
         self.assertEqual([], runtime.bigworld.edge_removes)
-        self.assertTrue(battle._outline_blocked)
-        battle._update_target_outline(2.0)
-        self.assertEqual(1, len(runtime.bigworld.edge_adds))
+        self.assertFalse(battle._outline_blocked)
         factory.destroy_all()
 
     def test_a_control_mode_change_drops_the_outline(self):
@@ -4039,6 +4061,90 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         battle._binding.arena_vehicle_killed.assert_called_once_with(
             vehicle_id, 0, 0)
         factory.destroy_all()
+
+    def test_native_death_removes_outline_before_stock_model_replacement(self):
+        runtime, factory, unused_binding, vehicle_id, vehicle = \
+            self._ready_native_factory()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._remote_factory = factory
+        record = {
+            'engine_id': vehicle_id, 'local': False, 'ready': True,
+            'presentation': True, 'native_remote': True,
+            'state': {'team': 2, 'health': 500, 'alive': True}}
+        battle._records = {'bot:11': record}
+        original_model = vehicle.model
+        battle._outlined_engine_id = vehicle_id
+        battle._outlined_entity = vehicle
+        battle._outlined_vehicle = vehicle
+        battle._outlined_model = original_model
+        order = []
+
+        def remove_edge(entity):
+            order.append(('edge', entity.model))
+            runtime.bigworld.edge_removes.append(entity)
+
+        def replace_model(health, attacker_id, reason_id):
+            order.append(('health', vehicle.model))
+            vehicle.model = _Model()
+            vehicle.appearance.compoundModel = vehicle.model
+            vehicle.health_change = (health, attacker_id, reason_id)
+
+        runtime.bigworld.wgDelEdgeDetectEntity = remove_edge
+        vehicle.onHealthChanged = replace_model
+
+        battle._apply_health(record, {'health': 0, 'alive': False})
+
+        self.assertEqual(['edge', 'health'], [item[0] for item in order])
+        self.assertIs(original_model, order[0][1])
+        self.assertIs(original_model, order[1][1])
+        self.assertEqual([vehicle], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        self.assertFalse(battle._outline_blocked)
+        factory.destroy_all()
+
+    def test_native_remove_paths_clear_outline_before_entity_destruction(self):
+        for path in ('event', 'tombstone'):
+            with self.subTest(path=path):
+                runtime, factory, unused_binding, vehicle_id, vehicle = \
+                    self._ready_native_factory()
+                battle = BattleRuntime(runtime)
+                battle.client = _Client()
+                battle._avatar = runtime.bigworld.avatar
+                battle._binding = mock.Mock()
+                battle._remote_factory = factory
+                record = {
+                    'engine_id': vehicle_id, 'local': False, 'ready': True,
+                    'presentation': True, 'native_remote': True,
+                    'arena_added': True,
+                    'state': {'team': 2, 'health': 500, 'alive': True}}
+                battle._records = {'bot:11': record}
+                battle._outlined_engine_id = vehicle_id
+                battle._outlined_entity = vehicle
+                battle._outlined_vehicle = vehicle
+                battle._outlined_model = vehicle.model
+                order = []
+                runtime.bigworld.wgDelEdgeDetectEntity = (
+                    lambda entity: order.append(('edge', entity)))
+                original_destroy = factory.destroy
+
+                def destroy(entity_id):
+                    order.append(('destroy', entity_id))
+                    self.assertIsNone(battle._outlined_engine_id)
+                    return original_destroy(entity_id)
+
+                factory.destroy = destroy
+                if path == 'event':
+                    battle._destroy_entity({'entity': 'bot:11'})
+                else:
+                    battle._flush_tombstone(record)
+
+                self.assertEqual(
+                    [('edge', vehicle), ('destroy', vehicle_id)], order)
+                self.assertIsNone(runtime.bigworld.entity(vehicle_id))
+                factory.destroy_all()
 
     def test_a_burning_bot_plays_and_stops_the_stock_1513_fire_extra(self):
         runtime = _runtime()
