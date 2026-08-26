@@ -12569,18 +12569,21 @@ class BattleRuntime(object):
         rotation_dir = int(_number(bot_state.get('rotation_dir')))
         turn_speed = _number(getattr(
             self._bots, '_turn_speeds', {}).get(int(bot_id), 0.0))
-        # The staggered planner may reuse a typed, read-only proof only when
-        # the current exact hull sweep is still contained by its 3x3 rays.
-        # A generic path-clear answer is not sufficient: its lane geometry is
-        # deliberately wider and can miss a narrow pillar at the real hull edge.
-        receipt_reusable = getattr(
-            self._bots, 'motion_world_receipt_reusable', None)
+        # Reuse a contained exact receipt when available. While its bounded
+        # optimisation queue is pending, the complete dual-height, three-lane
+        # native corridor from this same authority tick is sufficient; queue
+        # pressure is not a physical collision and must not freeze the pose.
+        corridor_reusable = getattr(
+            self._bots, 'motion_world_corridor_reusable', None)
+        if not callable(corridor_reusable):
+            corridor_reusable = getattr(
+                self._bots, 'motion_world_receipt_reusable', None)
         travel_yaw = (float(yaw) if speed >= 0.0 else
                       float(yaw) + math.pi)
         if (self._destructibles is not None and not airborne and
                 movement_dir * float(speed) > 0.0 and rotation_dir == 0 and
-                abs(turn_speed) <= 0.01 and callable(receipt_reusable) and
-                receipt_reusable(
+                abs(turn_speed) <= 0.01 and callable(corridor_reusable) and
+                corridor_reusable(
                     bot_id, position, travel_yaw, speed, now, dt) and
                 not self._destructibles._catalog_hull_contact(
                     pos, yaw, speed, descriptor, dt)):

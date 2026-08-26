@@ -1907,7 +1907,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(math.pi, cached['yaw'])
         self.assertEqual(-1, cached['direction'])
 
-    def test_deferred_final_world_receipt_is_not_cached_and_retries(self):
+    def test_deferred_final_world_receipt_uses_generic_and_retries(self):
         command = {
             'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
             'shell_index': 0, 'fire_allowed': False, 'target_id': None,
@@ -1941,7 +1941,10 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.battle_start(self.start)
 
         runtime.update(.04, 1.0)
-        self.assertNotIn(11, runtime._motion_probe_cache)
+        first = runtime._motion_probe_cache[11]['result']
+        self.assertTrue(first['_world_receipt_pending'])
+        self.assertTrue(runtime._probe_is_clear(first))
+        self.assertEqual(1, runtime.states[11]['movement_dir'])
 
         runtime.update(.04, 1.04)
         self.assertEqual(2, len(receipt_calls))
@@ -2017,23 +2020,24 @@ class BotRuntimeTests(unittest.TestCase):
             baked_graph=_graph())
         runtime.battle_start(dict(self.start, bots=roster))
 
-        expected_cached = (13, 26, 29)
+        expected_exact = (13, 26, 29)
         for frame_index, now in enumerate((1.0, 1.04, 1.08)):
             frame[0] = frame_index
             runtime.update(.04, now)
             self.assertLessEqual(
                 receipt_counts[frame_index],
                 self.module.MAX_WORLD_RECEIPTS_PER_FRAME)
-            self.assertEqual(
-                expected_cached[frame_index],
-                len(runtime._motion_probe_cache))
-            uncached = set(runtime.states).difference(
-                runtime._motion_probe_cache)
+            self.assertEqual(29, len(runtime._motion_probe_cache))
+            exact = sum(
+                1 for cached in runtime._motion_probe_cache.values()
+                if isinstance(cached['result'].get('world_receipt'), dict))
             self.assertTrue(all(
-                runtime.states[bot_id]['movement_dir'] == 0
-                for bot_id in uncached))
+                runtime.states[bot_id]['movement_dir'] == 1
+                for bot_id in runtime.states))
+            self.assertEqual(expected_exact[frame_index], exact)
             self.assertTrue(all(
-                'world_receipt' in cached['result']
+                ('world_receipt' in cached['result'] or
+                 cached['result'].get('_world_receipt_pending', False))
                 for cached in runtime._motion_probe_cache.values()))
 
         self.assertEqual([13, 13, 3], receipt_counts)
@@ -2162,6 +2166,11 @@ class BotRuntimeTests(unittest.TestCase):
              'vehicle': 'deferred-%d' % (11 + index)}
             for index in range(29)
         ]
+
+        def resolve_motion(*args):
+            resolver_calls.append(args)
+            return 'clear'
+
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=descriptor,
             adapter_factory=lambda *unused, **kwargs: adapter,
@@ -2171,48 +2180,50 @@ class BotRuntimeTests(unittest.TestCase):
             ground_probe=lambda *unused: 0.0,
             physics_ground_probe=lambda *unused: 0.0,
             spawn_resolver=_spawn_resolver, baked_graph=_graph(),
-            motion_resolver=lambda *args: resolver_calls.append(args))
+            motion_resolver=resolve_motion)
         runtime.battle_start(dict(self.start, bots=roster))
         poses = {}
         for bot_id, state in runtime.states.items():
             state.update(speed=4.0, grounded_once=True)
             poses[bot_id] = (state['x'], state['y'], state['z'])
 
-        cohorts = []
-        for now in (1.0, 1.04, 1.08):
-            before = len(receipt_attempts)
-            runtime.update(.04, now)
-            cohort = set(receipt_attempts[before:])
-            cohorts.append(cohort)
-            self.assertTrue(cohort)
-            self.assertLessEqual(
-                len(cohort), self.module.MAX_WORLD_RECEIPTS_PER_FRAME)
-            self.assertEqual({}, runtime._motion_probe_cache)
-            self.assertEqual([], resolver_calls)
-            self.assertEqual([], failure_driver.calls)
-            for bot_id, state in runtime.states.items():
-                self.assertEqual(poses[bot_id],
-                                 (state['x'], state['y'], state['z']))
-                self.assertAlmostEqual(4.0, state['speed'])
-                self.assertEqual(0, state['movement_dir'])
+        original_step = self.module.vehicle_physics.longitudinal_step
+        self.module.vehicle_physics.longitudinal_step = \
+            lambda *unused, **unused_kwargs: 4.0
+        try:
+            cohorts = []
+            service_counts = dict((bot_id, 0) for bot_id in range(11, 40))
+            for frame_index in range(60):
+                before = len(receipt_attempts)
+                runtime.update(.04, 1.0 + frame_index * .04)
+                frame_attempts = receipt_attempts[before:]
+                cohort = set(frame_attempts)
+                if frame_index < 3:
+                    cohorts.append(cohort)
+                    self.assertTrue(cohort)
+                self.assertLessEqual(
+                    len(frame_attempts),
+                    self.module.MAX_WORLD_RECEIPTS_PER_FRAME)
+                for bot_id in frame_attempts:
+                    service_counts[bot_id] += 1
+        finally:
+            self.module.vehicle_physics.longitudinal_step = original_step
 
         self.assertNotEqual(cohorts[0], cohorts[1])
         self.assertEqual(set(range(11, 40)), set().union(*cohorts))
-
-        service_counts = dict((bot_id, 0) for bot_id in range(11, 40))
-        for bot_id in receipt_attempts:
-            service_counts[bot_id] += 1
-        for frame_index in range(3, 60):
-            before = len(receipt_attempts)
-            runtime.update(.04, 1.0 + frame_index * .04)
-            frame_attempts = receipt_attempts[before:]
-            self.assertLessEqual(
-                len(frame_attempts),
-                self.module.MAX_WORLD_RECEIPTS_PER_FRAME)
-            for bot_id in frame_attempts:
-                service_counts[bot_id] += 1
         self.assertLessEqual(
             max(service_counts.values()) - min(service_counts.values()), 1)
+        self.assertEqual([], failure_driver.calls)
+        self.assertEqual(60 * 29, len(resolver_calls))
+        self.assertEqual(29, len(runtime._motion_probe_cache))
+        for bot_id, state in runtime.states.items():
+            start_x, start_y, start_z = poses[bot_id]
+            travelled = (
+                (state['x'] - start_x) * math.sin(state['yaw']) +
+                (state['z'] - start_z) * math.cos(state['yaw']))
+            self.assertAlmostEqual(4.0 * .04 * 60, travelled, places=8)
+            self.assertAlmostEqual(start_y, state['y'])
+            self.assertAlmostEqual(4.0, state['speed'])
 
     def test_persistent_deferred_bot_does_not_starve_receipt_refresh(self):
         command = {
@@ -2273,6 +2284,60 @@ class BotRuntimeTests(unittest.TestCase):
             initial_moving_attempts,
             attempts.count('receipt-moving'))
         self.assertEqual(1, runtime.states[12]['movement_dir'])
+
+    def test_deferred_receipt_spike_advances_complete_wall_time(self):
+        command = {
+            'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False, 'target_id': None,
+            'fire_range': 0.0, 'combat_mode': 'route',
+            'aim_position': None, 'face_position': None,
+            'move_position': None,
+            'recovery_mode': 'drive', 'movement_intent': True,
+        }
+        receipt_calls = []
+        resolver_calls = []
+
+        def receipt(*unused):
+            receipt_calls.append(True)
+            return 'deferred'
+
+        def resolve_motion(*args):
+            resolver_calls.append(args)
+            return 'clear'
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **unused_kwargs:
+                _FixedAdapter(command),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False, 'slope': 0.0},
+            world_receipt_probe=receipt,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            motion_resolver=resolve_motion)
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(speed=4.0, grounded_once=True)
+        start_x, start_z, travel_yaw = state['x'], state['z'], state['yaw']
+
+        original_step = self.module.vehicle_physics.longitudinal_step
+        self.module.vehicle_physics.longitudinal_step = \
+            lambda *unused, **unused_kwargs: 4.0
+        try:
+            runtime.update(.04, 1.0)
+            runtime.update(.24, 1.24)
+        finally:
+            self.module.vehicle_physics.longitudinal_step = original_step
+
+        travelled = (
+            (state['x'] - start_x) * math.sin(travel_yaw) +
+            (state['z'] - start_z) * math.cos(travel_yaw))
+        self.assertAlmostEqual(4.0 * .28, travelled, places=9)
+        self.assertEqual(3, len(resolver_calls))
+        # The 0.24-second catch-up uses two bounded simulation slices, but the
+        # exact native optimisation still runs at most once per render call.
+        self.assertEqual(2, len(receipt_calls))
 
     def test_initial_motion_deadlines_fill_one_cycle_without_exceeding_it(self):
         now = 10.0
@@ -3037,6 +3102,90 @@ class BotRuntimeTests(unittest.TestCase):
         before = len(calls)
         runtime.update(0.04, 2.0)
         self.assertEqual(29, len(calls) - before)
+
+    def test_traffic_without_forward_teammate_skips_coast_integral(self):
+        source = {
+            'id': 21, 'team': 2,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'speed': 8.0,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        behind = {
+            'id': 22, 'team': 2,
+            'position': (0.0, 0.0, -8.0), 'yaw': 0.0,
+            'velocity': (0.0, 0.0, 8.0),
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        original = self.module.BotRuntime._traffic_stopping_distance
+        self.module.BotRuntime._traffic_stopping_distance = staticmethod(
+            lambda *unused: (_ for _ in ()).throw(
+                AssertionError('unused coast integral ran')))
+        try:
+            self.assertEqual((1.0, False), self.module.BotRuntime.
+                             _traffic_throttle(source, {
+                                 'throttle': 1.0,
+                                 'target_yaw': 0.0,
+                                 'turn': 0.0,
+                             }, [behind]))
+        finally:
+            self.module.BotRuntime._traffic_stopping_distance = staticmethod(
+                original)
+
+    def test_traffic_stopping_cache_reuses_only_identical_inputs(self):
+        runtime = self.module.BotRuntime(1)
+        source = {
+            'id': 21, 'speed': 8.0, 'last_drive_pitch': 0.1,
+        }
+        command = {'turn': 0.0}
+        params = self.module.vehicle_physics.derive_params({})
+        calls = []
+        original = self.module.BotRuntime._traffic_stopping_distance
+
+        def stopping(*args):
+            calls.append(args)
+            return 3.25
+
+        self.module.BotRuntime._traffic_stopping_distance = staticmethod(
+            stopping)
+        try:
+            self.assertEqual(3.25, runtime.
+                             _cached_traffic_stopping_distance(
+                                 source, command, params))
+            self.assertEqual(3.25, runtime.
+                             _cached_traffic_stopping_distance(
+                                 source, command, params))
+            self.assertEqual(1, len(calls))
+            source['speed'] = 8.000001
+            runtime._cached_traffic_stopping_distance(
+                source, command, params)
+            self.assertEqual(2, len(calls))
+        finally:
+            self.module.BotRuntime._traffic_stopping_distance = staticmethod(
+                original)
+
+    def test_traffic_lateral_bound_never_skips_a_possible_obb_hit(self):
+        cases = (
+            (1.7, 3.5, 1.7, 3.5),
+            (2.5, 5.5, 1.1, 2.4),
+            (0.8, 1.8, 2.8, 6.0),
+        )
+        for own_width, own_length, other_width, other_length in cases:
+            lateral = (
+                math.hypot(own_width, own_length) +
+                math.hypot(other_width, other_length) + .001)
+            self.assertTrue(self.module.BotRuntime.
+                            _traffic_lateral_separated(
+                                lateral, own_width, own_length,
+                                other_width, other_length))
+            for own_yaw in (-2.4, 0.0, 1.7):
+                for other_yaw in (-1.1, .8, 2.9):
+                    for forward in (-20.0, 0.0, 35.0):
+                        self.assertEqual(float('inf'), self.module.BotRuntime.
+                                         _traffic_obb_clearance(
+                                             lateral, forward, 0.0,
+                                             own_yaw, own_width, own_length,
+                                             other_yaw, other_width,
+                                             other_length))
 
     def test_friendly_crossing_traffic_brakes_both_inside_safe_clearance(self):
         lower = {
@@ -4885,6 +5034,37 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, state['rotation_dir'])
         self.assertTrue(runtime.states[11]['hull_aiming'])
         self.assertEqual(0, state['fire_seq'])
+
+    def test_no_target_gun_keeps_safe_bearing_and_rests_horizontally(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(
+            x=0.0, y=0.0, z=0.0, yaw=0.0,
+            aim_yaw=0.65, turret_yaw=0.65,
+            gun_pitch=-0.30, desired_gun_pitch=-0.30)
+        command = {
+            'aim_position': (0.0, -100.0, 1.0),
+            '_ballistic_solution': None,
+        }
+        original_origin = runtime._exact_shot_origin
+        runtime._exact_shot_origin = lambda *unused: (_ for _ in ()).throw(
+            AssertionError('no-target rest requested a shot origin'))
+        try:
+            desired_yaw, horizontal = runtime._update_gun_aim(
+                state, command, None, .20)
+        finally:
+            runtime._exact_shot_origin = original_origin
+
+        self.assertAlmostEqual(.65, desired_yaw, places=9)
+        self.assertEqual(0.0, horizontal)
+        self.assertAlmostEqual(0.0, state['desired_gun_pitch'], places=9)
+        self.assertGreater(state['gun_pitch'], -.30)
+        self.assertFalse(state['gun_aligned'])
 
     def test_bot_fire_uses_turret_pitch_los_reload_clip_and_barrel_scatter(self):
         lane_probes = []
@@ -9516,10 +9696,12 @@ class BotRuntimeTests(unittest.TestCase):
         calls = []
         original = self.runtime._traffic_throttle
 
-        def traffic(source, command, neighbours, physics_params):
+        def traffic(source, command, neighbours, physics_params,
+                    stopping_distance_resolver=None):
             calls.append((source['id'], source['speed']))
             return original(
-                source, command, neighbours, physics_params)
+                source, command, neighbours, physics_params,
+                stopping_distance_resolver)
 
         self.runtime._traffic_throttle = traffic
         self.runtime.update(.04, 1.00)

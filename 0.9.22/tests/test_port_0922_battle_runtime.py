@@ -13344,6 +13344,36 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._bots.motion_world_receipt_reusable.assert_called_once_with(
             11, (0.0, 0.0, 0.0), 0.0, 4.0, 10.0, 0.04)
 
+    def test_bot_pending_exact_receipt_reuses_generic_world_corridor(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        corridor_reusable = mock.Mock(return_value=True)
+        exact_reusable = mock.Mock(return_value=False)
+        battle._bots = types.SimpleNamespace(
+            states={11: {
+                'movement_dir': 1, 'rotation_dir': 0,
+                'airborne': False,
+            }},
+            motion_world_corridor_reusable=corridor_reusable,
+            motion_world_receipt_reusable=exact_reusable)
+        battle._destructibles = mock.Mock()
+        battle._destructibles._catalog_hull_contact.return_value = False
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision') as world_probe:
+            status = battle._resolve_bot_motion(
+                11, (0.0, 0.0, 0.0), 0.0, 4.0,
+                _Descriptor(), 0.04, 10.0)
+
+        self.assertEqual('clear', status)
+        corridor_reusable.assert_called_once_with(
+            11, (0.0, 0.0, 0.0), 0.0, 4.0, 10.0, 0.04)
+        exact_reusable.assert_not_called()
+        world_probe.assert_not_called()
+        battle._destructibles._catalog_motion_blocked.assert_not_called()
+
     def test_bot_reverse_receipt_uses_travel_yaw_and_actual_dt(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

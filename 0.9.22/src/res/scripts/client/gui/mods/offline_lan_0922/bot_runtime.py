@@ -113,12 +113,11 @@ TRAFFIC_DIRECTION_SPEED_EPSILON = 0.02
 # Bound it so an unreachable lateral point cannot suppress the server order
 # forever; every metre still has to pass the ordinary native motion gate.
 FRIENDLY_REPOSITION_SECONDS = 4.0
-# A final exact receipt costs nine native rays.  Thirteen jobs per render frame
+# A final exact receipt costs nine native rays. Thirteen jobs per render frame
 # drains all 29 Bots within three frames even at the supported 24 FPS floor.
-# New, unproved motion fails closed when the budget is exhausted; proactive
-# refresh keeps using the old receipt only while it still contains that exact
-# motion.  Falling back to a nine-ray commit sweep would merely move the same
-# spike elsewhere.
+# The complete dual-height, three-lane generic sweep remains authoritative
+# while an exact receipt waits for that bounded optimisation queue. A completed
+# exact hard receipt still vetoes motion immediately.
 MAX_WORLD_RECEIPTS_PER_FRAME = 13
 FIRE_DURATION_SECONDS = 10.0
 FIRE_TICK_SECONDS = 1.0
@@ -1831,6 +1830,7 @@ class BotRuntime(object):
         self._cover_results = []
         self._decision_cache = {}
         self._motion_probe_cache = {}
+        self._traffic_stopping_cache = {}
         self._slope_pose_cursor = 0
         self._flip_diary = {}
         self.debug_logging = False
@@ -2054,6 +2054,7 @@ class BotRuntime(object):
             'requested_set': set(),
             'request_uncached': {},
             'attempted': set(),
+            'attempt_results': {},
             'attempt_deferred': [],
         }
 
@@ -2109,6 +2110,14 @@ class BotRuntime(object):
             frame['request_uncached'][bot_id] = (
                 waiting_initial[bot_id] if bot_id in waiting_initial else
                 bool(uncached))
+        if bot_id in frame['attempted']:
+            # One render callback may contain several catch-up slices. Never
+            # multiply native receipt work for the same Bot inside that one
+            # callback. Preserve a proved hard result; every other result can
+            # safely use the already-complete generic corridor until the next
+            # render callback refreshes the exact optimisation.
+            return (False if frame['attempt_results'].get(bot_id) is False
+                    else 'deferred')
         priority = frame['priority']
         if (frame['initial_first'] and
                 not frame['request_uncached'][bot_id]):
@@ -2122,6 +2131,7 @@ class BotRuntime(object):
         frame['attempted'].add(bot_id)
         result = self._call_world_receipt_probe(
             position, yaw, speed, descriptor, maximum_distance)
+        frame['attempt_results'][bot_id] = result
         if result == 'deferred':
             frame['attempt_deferred'].append(bot_id)
         return result
@@ -2234,6 +2244,7 @@ class BotRuntime(object):
         self._vision_ranges.pop(bot_id, None)
         self._spotting_profiles.pop(('bot', bot_id), None)
         self._motion_probe_cache.pop(bot_id, None)
+        self._traffic_stopping_cache.pop(bot_id, None)
         self._cancel_artillery_intent(bot_id)
         if state is not None:
             half_length, half_width = _hull_dimensions(descriptor)
@@ -2524,6 +2535,7 @@ class BotRuntime(object):
             self._cover_results = []
             self._decision_cache = {}
             self._motion_probe_cache = {}
+            self._traffic_stopping_cache = {}
             self._slope_pose_cursor = 0
             self._world_receipt_waiting = []
             self._world_receipt_frame = None
@@ -2560,6 +2572,7 @@ class BotRuntime(object):
             self._shot_los_deadlines = {}
             self._decision_cache = {}
             self._motion_probe_cache = {}
+            self._traffic_stopping_cache = {}
             self._world_receipt_waiting = []
             self._world_receipt_frame = None
             self._prewarm_receipt_cursor = 0
@@ -4269,7 +4282,8 @@ class BotRuntime(object):
 
     @staticmethod
     def _motion_probe_reusable(cached, position, travel_yaw, speed, now,
-                               settled=False, dt=None):
+                               settled=False, dt=None,
+                               ignore_deadline=False):
         """Prove that a cached hull corridor still contains this motion ray."""
         if not isinstance(cached, dict):
             return False
@@ -4297,7 +4311,8 @@ class BotRuntime(object):
             return bool(
                 abs(forward) <= 0.05 and lateral <= 0.05 and dy <= 0.05 and
                 angle <= 0.005)
-        if now >= cached.get('deadline', 0.0):
+        if (not ignore_deadline and
+                now >= cached.get('deadline', 0.0)):
             return False
         lookahead = 20.0 if abs(_number(speed)) > 5.0 else 15.0
         heading_drift = lookahead * abs(math.sin(angle))
@@ -4338,6 +4353,36 @@ class BotRuntime(object):
             return False
         return self._motion_probe_reusable(
             cached, position, travel_yaw, speed, now, False, dt)
+
+    def motion_world_corridor_reusable(self, bot_id, position, travel_yaw,
+                                       speed, now, dt):
+        """Reuse exact rays or a generic sweep awaiting its exact receipt.
+
+        The generic dual-height, three-lane sweep is a complete native world
+        query. An exact 3x3 receipt only avoids repeating that work at commit
+        time; exhausting its fair per-frame queue is not a physical collision
+        and must not freeze authoritative motion.
+        """
+        cached = self._motion_probe_cache.get(int(bot_id))
+        if not isinstance(cached, dict):
+            return False
+        result = cached.get('result')
+        if not isinstance(result, dict):
+            return False
+        exact = isinstance(result.get('world_receipt'), dict)
+        pending = bool(result.get('_world_receipt_pending', False))
+        if not (exact or pending):
+            return False
+        if exact:
+            return bool(
+                not result.get('deferred', False) and
+                self._probe_is_clear(result) and
+                self._world_receipt_contains(
+                    result.get('world_receipt'), position, travel_yaw,
+                    speed, dt))
+        return self._motion_probe_reusable(
+            cached, position, travel_yaw, speed, now, False, dt,
+            ignore_deadline=True)
 
     def _neighbours_for(self, source, supplied, spatial_index=None,
                         traffic_bodies=None):
@@ -4923,6 +4968,31 @@ class BotRuntime(object):
             current = following
         return float('inf')
 
+    def _cached_traffic_stopping_distance(
+            self, source, command, physics_params):
+        """Memoize the exact coast integral for unchanged physical inputs."""
+        bot_id = int(_number(source.get('id')))
+        speed = abs(_number(source.get('speed')))
+        slope_pitch = _number(source.get('last_drive_pitch'))
+        steering = abs(_number(command.get('turn'))) > 0.01
+        key = (id(physics_params), speed, slope_pitch, steering)
+        cached = self._traffic_stopping_cache.get(bot_id)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        distance = self._traffic_stopping_distance(
+            speed, physics_params, slope_pitch, steering)
+        self._traffic_stopping_cache[bot_id] = (key, distance)
+        return distance
+
+    @staticmethod
+    def _traffic_lateral_separated(
+            lateral, own_width, own_length, other_width, other_length):
+        """Return a strict OBB circumcircle separation for corridor travel."""
+        return bool(
+            float(lateral) >
+            math.hypot(float(own_width), float(own_length)) +
+            math.hypot(float(other_width), float(other_length)))
+
     @staticmethod
     def _traffic_obb_clearance(
             dx, dz, corridor_yaw, own_yaw, own_width, own_length,
@@ -4973,7 +5043,8 @@ class BotRuntime(object):
         return entry
 
     @staticmethod
-    def _traffic_throttle(source, command, neighbours, physics_params=None):
+    def _traffic_throttle(source, command, neighbours, physics_params=None,
+                          stopping_distance_resolver=None):
         """Return ``(throttle, waiting)`` for nearby friendly traffic.
 
         Same-lane followers always respect the vehicle ahead. At a crossing or
@@ -4999,14 +5070,8 @@ class BotRuntime(object):
             physics_params = vehicle_physics.derive_params({})
         slope_pitch = _number(source.get('last_drive_pitch'))
         steering = abs(_number(command.get('turn'))) > 0.01
-        stopping_clearance = (
-            TRAFFIC_STANDSTILL_CLEARANCE +
-            BotRuntime._traffic_stopping_distance(
-                own_speed, physics_params, slope_pitch, steering))
-        scan_clearance = max(
-            9.0, TRAFFIC_STANDSTILL_CLEARANCE +
-            own_speed * TRAFFIC_HEADWAY_SECONDS,
-            stopping_clearance)
+        stopping_clearance = None
+        scan_clearance = None
         sine, cosine = math.sin(yaw), math.cos(yaw)
         target_yaw = _number(command.get('target_yaw'), yaw)
         target_sine = math.sin(target_yaw)
@@ -5039,10 +5104,19 @@ class BotRuntime(object):
                     forward = target_forward
                     lateral = target_lateral
                     corridor_yaw = target_yaw
+            if forward <= 0.0:
+                continue
             other_length = max(
                 0.5, _number(raw.get('half_length'), 3.5))
             other_width = max(
                 0.3, _number(raw.get('half_width'), 1.7))
+            # The sum of both OBB circumradii is a strict separating bound.
+            # Outside it, no forward translation along this corridor can make
+            # the hulls overlap, so the four-axis continuous SAT is needless.
+            if BotRuntime._traffic_lateral_separated(
+                    lateral, own_width, own_length,
+                    other_width, other_length):
+                continue
             other_velocity = raw.get('velocity') or raw.get('vel')
             try:
                 other_vx = float(other_velocity[0])
@@ -5062,7 +5136,20 @@ class BotRuntime(object):
             clearance = BotRuntime._traffic_obb_clearance(
                 dx, dz, corridor_yaw, yaw, own_width, own_length,
                 other_yaw, other_width, other_length)
-            if forward <= 0.0 or clearance > scan_clearance:
+            if stopping_clearance is None:
+                stopping_distance = (
+                    stopping_distance_resolver(
+                        source, command, physics_params)
+                    if callable(stopping_distance_resolver) else
+                    BotRuntime._traffic_stopping_distance(
+                        own_speed, physics_params, slope_pitch, steering))
+                stopping_clearance = (
+                    TRAFFIC_STANDSTILL_CLEARANCE + stopping_distance)
+                scan_clearance = max(
+                    9.0, TRAFFIC_STANDSTILL_CLEARANCE +
+                    own_speed * TRAFFIC_HEADWAY_SECONDS,
+                    stopping_clearance)
+            if clearance > scan_clearance:
                 continue
             if (not same_direction and raw.get('id') is not None and
                     source.get('id') is not None):
@@ -6306,30 +6393,41 @@ class BotRuntime(object):
         """Slew the rendered turret and barrel through the 0.8.2 limits."""
         descriptor = self._descriptors.get(state['id'], {})
         ballistic_solution = command.get('_ballistic_solution')
-        fallback = (target.get('position') if target is not None
-                    else _position(state))
-        if isinstance(ballistic_solution, dict):
-            aim_position = _point(
-                ballistic_solution.get('aim_position'), fallback)
+        if target is None and not isinstance(ballistic_solution, dict):
+            # Strategic route points lie on the terrain. They steer the hull,
+            # but are not gun targets: aiming a tall tank at a nearby ground
+            # waypoint produces the reported 20-degree nose-down barrel.
+            # Preserve the last safe world bearing and return to a neutral
+            # horizontal rest without paying for an unused shot-origin solve.
+            desired_yaw = _number(
+                state.get('aim_yaw'), state.get('yaw'))
+            world_pitch = 0.0
+            horizontal = 0.0
         else:
-            aim_position = _point(command.get('aim_position'), fallback)
-        origin = self._exact_shot_origin(
-            state, descriptor, state.get('shell_index', 0))
-        if origin is None:
-            state['gun_aligned'] = False
-            return _number(state.get('aim_yaw')), 0.0
-        dx = aim_position[0] - origin[0]
-        dz = aim_position[2] - origin[2]
-        horizontal = math.sqrt(dx * dx + dz * dz)
-        desired_yaw = (_number(ballistic_solution.get('yaw'))
-                       if isinstance(ballistic_solution, dict) else
-                       (math.atan2(dx, dz) if horizontal > 0.1
-                        else _number(state.get('yaw'))))
-        world_pitch = (_number(ballistic_solution.get('pitch'))
-                       if isinstance(ballistic_solution, dict) else
-                       -math.atan2(
-                           (aim_position[1] + 1.0) - origin[1],
-                           max(0.5, horizontal)))
+            fallback = (target.get('position') if target is not None
+                        else _position(state))
+            if isinstance(ballistic_solution, dict):
+                aim_position = _point(
+                    ballistic_solution.get('aim_position'), fallback)
+            else:
+                aim_position = _point(command.get('aim_position'), fallback)
+            origin = self._exact_shot_origin(
+                state, descriptor, state.get('shell_index', 0))
+            if origin is None:
+                state['gun_aligned'] = False
+                return _number(state.get('aim_yaw')), 0.0
+            dx = aim_position[0] - origin[0]
+            dz = aim_position[2] - origin[2]
+            horizontal = math.sqrt(dx * dx + dz * dz)
+            desired_yaw = (_number(ballistic_solution.get('yaw'))
+                           if isinstance(ballistic_solution, dict) else
+                           (math.atan2(dx, dz) if horizontal > 0.1
+                            else _number(state.get('yaw'))))
+            world_pitch = (_number(ballistic_solution.get('pitch'))
+                           if isinstance(ballistic_solution, dict) else
+                           -math.atan2(
+                               (aim_position[1] + 1.0) - origin[1],
+                               max(0.5, horizontal)))
         self._update_hydraulic_suspension(
             state, descriptor, desired_yaw, world_pitch, step)
         local_angles = self._local_gun_angles_for_world(
@@ -7228,12 +7326,19 @@ class BotRuntime(object):
         elapsed = self._accumulator
         self._accumulator = 0.0
         outgoing = []
-        while elapsed > 1e-12:
-            frame_step = self._bounded_burst_step(min(elapsed, 0.2))
-            elapsed = max(0.0, elapsed - frame_step)
-            step_now = now - elapsed
-            outgoing.extend(self._update_once(
-                frame_step, step_now, players, neighbours))
+        # The exact-receipt cap belongs to this render callback, not each
+        # catch-up slice. Resetting it inside _update_once multiplied native
+        # work after a slow frame and made the next callback slow as well.
+        self._begin_world_receipt_frame()
+        try:
+            while elapsed > 1e-12:
+                frame_step = self._bounded_burst_step(min(elapsed, 0.2))
+                elapsed = max(0.0, elapsed - frame_step)
+                step_now = now - elapsed
+                outgoing.extend(self._update_once(
+                    frame_step, step_now, players, neighbours))
+        finally:
+            self._finish_world_receipt_frame()
         source_batch_horizon_us = self._sample_time_us
         for message in outgoing:
             if message.get('type') != 'bot_state':
@@ -7282,7 +7387,6 @@ class BotRuntime(object):
               self._next_observation)))
         shot_lane_budget = [MAX_SHOT_LANE_PAIRS_PER_FRAME]
         shot_lanes_ready = True
-        self._begin_world_receipt_frame()
         neighbours = list(neighbours or []) + self._player_neighbours(players)
         # Native terrain and visibility probes run on BigWorld's render thread.
         # Build the traffic view lazily, only when a staggered decision is due.
@@ -7456,7 +7560,8 @@ class BotRuntime(object):
             command['throttle'], waiting_for_traffic = \
                 self._traffic_throttle(
                     state, command, traffic_neighbours,
-                    self._physics_params.get(state['id']))
+                    self._physics_params.get(state['id']),
+                    self._cached_traffic_stopping_distance)
             if waiting_for_traffic:
                 driver = getattr(self.adapter, 'driver', None)
                 wait = getattr(driver, 'wait_for_traffic', None)
@@ -7741,8 +7846,7 @@ class BotRuntime(object):
                                     'collision': True,
                                 })
                             elif refreshed == 'deferred':
-                                motion_probe['_receipt_refresh_deferred'] = \
-                                    True
+                                motion_probe['_world_receipt_pending'] = True
                             elif self._world_receipt_contains(
                                     refreshed, position, travel_yaw,
                                     receipt_speed, step):
@@ -7759,9 +7863,10 @@ class BotRuntime(object):
                                  {}).get('world_receipt'), dict),
                             maximum_probe_distance)
                         if receipt == 'deferred':
-                            motion_probe['deferred'] = True
-                            motion_probe['clear'] = False
-                            motion_probe['collision'] = False
+                            # The complete generic native corridor already
+                            # passed. Queueing its exact cache receipt is an
+                            # optimisation delay, not a collision result.
+                            motion_probe['_world_receipt_pending'] = True
                         elif receipt is False:
                             motion_probe.update({
                                 'clear': False,
@@ -7779,7 +7884,7 @@ class BotRuntime(object):
                         'deadline': (
                             _number(now)
                             if motion_probe.get(
-                                '_receipt_refresh_deferred', False)
+                                    '_world_receipt_pending', False)
                             else _motion_probe_deadline(
                                 now, state['id'],
                                 cached_motion_probe is None)),
@@ -8099,7 +8204,6 @@ class BotRuntime(object):
                 elif lane_sample[1]:
                     observation_entries[key][1].add(
                         int(lane_source['id']))
-        self._finish_world_receipt_frame()
         if collect_observation and not shot_lanes_ready:
             collect_observation = False
         completed_affordances = ()
