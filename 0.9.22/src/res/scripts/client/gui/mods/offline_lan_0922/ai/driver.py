@@ -478,9 +478,7 @@ class LocalDriver(object):
 			}
 
 		# A low reported speed alone is not enough: waiting at a hold point should
-		# not trigger recovery.  Displacement, velocity and rotation must all
-		# fail; a deliberate pivot or ascent alignment turns in place for
-		# seconds and is progress, not a stall.
+		# not trigger recovery. Displacement, velocity and rotation must all fail.
 		if (displacement < 0.08 and
 				abs(float(speed)) < 0.35 and yaw_rate < 0.25):
 			state['stuck_time'] += step
@@ -569,18 +567,6 @@ class LocalDriver(object):
 		# while braking a recovery or sliding downhill; steering remains forward.
 		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
-		climb_grade = ((float(target[1]) - float(position[1])) /
-		               max(0.1, target_distance))
-		if climb_grade > 0.10 and abs(delta) > 0.30 and not avoiding:
-			# A climbable edge can become impassable when entered diagonally. Align
-			# at the foot of a meaningful ascent before applying forward torque.
-			throttle = 0.0
-		elif abs(delta) > 1.35 and not avoiding:
-			# A target more than about 77 degrees off the bow is a pivot, not a
-			# clearing arc. Driving while applying full steering makes a deployed
-			# formation draw a loop before it can enter its lane. Separation remains
-			# allowed to move an overlapping hull sideways out of a dense spawn.
-			throttle = 0.0
 		return {
 			'throttle': throttle,
 			'turn': turn,

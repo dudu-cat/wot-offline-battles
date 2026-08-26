@@ -4618,10 +4618,11 @@ class BotRuntime(object):
                                 wet_escape=False):
         """Rank one candidate through the validated baked static corridor.
 
-        ``True`` or ``False`` is advisory to LocalDriver only. ``None`` asks
-        the caller to retain the native planner probe because the shipped
-        graph contract is unavailable or failed.  This result is never stored
-        in the native motion cache and can never authorize a realised step.
+        ``True`` admits a planner candidate and ``False`` rejects a known fatal
+        hazard. ``None`` asks the caller to retain the native planner probe
+        because the shipped graph is unavailable, failed, or only produced an
+        ambiguous corridor negative. This result is never stored in the native
+        motion cache and can never authorize a realised step.
         """
         if wet_escape:
             return None
@@ -4656,7 +4657,12 @@ class BotRuntime(object):
             if grid.segment_has_baked_hazard(
                     position, end, BAKED_FATAL_HAZARDS):
                 return False
-            return bool(grid.segment_clear(position, end))
+            if grid.segment_clear(position, end):
+                return True
+            # A coarse baked corridor can reject a valid short turn on uneven
+            # terrain. Let the native candidate probe decide that ambiguous
+            # negative; fatal baked hazards above remain an immediate veto.
+            return None
         except Exception:
             # The graph is a planner optimisation. Unknown graph state keeps
             # the old native candidate probe; it never becomes a clear path.

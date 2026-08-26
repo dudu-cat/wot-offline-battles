@@ -1262,6 +1262,31 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(14.0, ends[0][0])
         self.assertAlmostEqual(20.0, ends[0][2])
 
+    def test_baked_corridor_negative_defers_to_native_candidate_probe(self):
+        class Grid(object):
+            prebaked = True
+            cell_size = 4.0
+
+            def near_baked_navigation(self, unused_position, unused_radius):
+                return True
+
+            def segment_has_baked_hazard(
+                    self, unused_start, unused_end, unused_hazards):
+                return False
+
+            def segment_clear(self, unused_start, unused_end):
+                return False
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(grid=Grid())
+        runtime.baked_graph = {'bake': {
+            'vehicle_half_width': 2.15,
+            'edge_clearance_radii': (3.0,),
+        }}
+
+        self.assertIsNone(runtime._planner_corridor_clear(
+            (10.0, 0.0, 20.0), math.pi / 2.0, 20.0))
+
     def test_bot_drowning_requires_ten_continuous_seconds_and_publishes_death(self):
         depth = [2.0]
         runtime = self.module.BotRuntime(
@@ -1823,7 +1848,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([], receipt_calls)
         self.assertEqual(0, runtime.states[11]['movement_dir'])
 
-    def test_baked_planner_failure_restores_native_candidate_fallback(self):
+    def test_baked_planner_negative_restores_native_candidate_fallback(self):
         command = {
             'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
             'shell_index': 0, 'fire_allowed': False, 'target_id': None,
@@ -1836,11 +1861,18 @@ class BotRuntimeTests(unittest.TestCase):
         adapter = _FixedAdapter(command)
         calls = []
 
-        class BrokenGrid(object):
+        class NegativeGrid(object):
             prebaked = True
 
             def near_baked_navigation(self, unused_position, unused_radius):
-                raise RuntimeError('broken graph')
+                return True
+
+            def segment_has_baked_hazard(
+                    self, unused_start, unused_end, unused_mask):
+                return False
+
+            def segment_clear(self, unused_start, unused_end):
+                return False
 
         graph = _graph()
         graph['bake'].update({
@@ -1856,12 +1888,13 @@ class BotRuntimeTests(unittest.TestCase):
             physics_ground_probe=lambda *unused: 0.0,
             spawn_resolver=_spawn_resolver, baked_graph=graph)
         runtime.battle_start(self.start)
-        runtime.navigator.grid = BrokenGrid()
+        runtime.navigator.grid = NegativeGrid()
 
         runtime.update(.04, 1.0)
 
         # _FixedAdapter asks once, followed by the independent selected gate.
         self.assertEqual(2, len(calls))
+        self.assertEqual(1, runtime.states[11]['movement_dir'])
 
     def test_reverse_final_world_receipt_receives_exact_travel_heading(self):
         command = {
@@ -4224,7 +4257,7 @@ class BotRuntimeTests(unittest.TestCase):
             'name': 'fuelTankHealth', 'hp': 0.0, 'max_hp': 100.0,
             'state': 'destroyed'}, destroyed=['fuelTankHealth'], fire=True)
 
-        for fps in (20, 24, 30, 40, 60, 120):
+        for fps in (5, 20, 24, 30, 40, 60, 120):
             with self.subTest(fps=fps):
                 runtime = self.module.BotRuntime(
                     1,
