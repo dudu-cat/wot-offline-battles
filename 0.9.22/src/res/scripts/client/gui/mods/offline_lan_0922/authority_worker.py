@@ -44,6 +44,54 @@ WORKER_STATUS_SECONDS = 2.0
 WORKER_DUMMY_Y = -500.0
 _PROJECTED_BOT_STATE_FIELDS = frozenset(
     _BOT_STATE_WIRE_FIELDS + ('shot_yaw', 'shot_pitch'))
+_COALESCIBLE_BOT_STATE_FIELDS = frozenset((
+    'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
+    'speed', 'movement_dir', 'rotation_dir', 'reload_time',
+    'siege_time_left_ms'))
+_COALESCIBLE_EQUIPMENT_FIELDS = frozenset((
+    'cooldownTimeLeft', 'autoPendingElapsed', 'aiPendingElapsed'))
+
+
+def _immutable_outbound_key(value):
+    """Freeze one already validated wire fragment for equality only."""
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (key, _immutable_outbound_key(item))
+            for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_immutable_outbound_key(item) for item in value)
+    return value
+
+
+def _equipment_edge_key(snapshots):
+    if not isinstance(snapshots, (list, tuple)):
+        return _immutable_outbound_key(snapshots)
+    return tuple(_immutable_outbound_key(dict(
+        (name, value) for name, value in snapshot.items()
+        if name not in _COALESCIBLE_EQUIPMENT_FIELDS))
+        if isinstance(snapshot, dict) else _immutable_outbound_key(snapshot)
+        for snapshot in snapshots)
+
+
+def _bot_state_coalesce_key(message):
+    """Identify checkpoints that differ only in supersedable continuous data."""
+    bots = message.get('bots') or ()
+    bot_keys = []
+    for state in bots:
+        fields = []
+        for name, value in state.items():
+            if name in _COALESCIBLE_BOT_STATE_FIELDS:
+                continue
+            if name == 'equipment_states':
+                value = _equipment_edge_key(value)
+            else:
+                value = _immutable_outbound_key(value)
+            fields.append((name, value))
+        bot_keys.append(tuple(sorted(fields)))
+    return (
+        int(message.get('round_id') or 0),
+        _immutable_outbound_key(message.get('human_ram_armors')),
+        tuple(bot_keys))
 
 
 def _trusted_projected_bot_states(bots):
@@ -177,7 +225,12 @@ class AuthorityWorkerLANClient(LANClient):
             if human_ram_armors is None:
                 return False
             message['human_ram_armors'] = human_ram_armors
-        return self._send_preencoded_trusted(message)
+        try:
+            coalesce_key = _bot_state_coalesce_key(message)
+        except Exception:
+            return False
+        return self._send_preencoded_trusted(
+            message, coalesce_key=coalesce_key)
 
     def send_simulation_progress(self, frame_seq):
         """Prove that the native BattleRuntime frame callback is advancing."""

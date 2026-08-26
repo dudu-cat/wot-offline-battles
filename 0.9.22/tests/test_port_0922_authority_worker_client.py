@@ -353,6 +353,117 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual([], client._outbound_queue)
         self.assertTrue(client.running)
 
+    def test_worker_replaces_unsent_continuous_bot_checkpoint(self):
+        client = self._active_client()
+        first = _projected_bot_state()
+        second = json.loads(json.dumps(first))
+        second['x'] = 8.0
+        second['yaw'] = 0.7
+        second['reload_time'] = 0.05
+
+        self.assertTrue(client.send_projected_bot_state(
+            [first], sample_time_us=40000,
+            source_batch_horizon_us=40000))
+        first_size = client._outbound_bytes
+        self.assertTrue(client.send_projected_bot_state(
+            [second], sample_time_us=80000,
+            source_batch_horizon_us=80000))
+
+        self.assertTrue(client.running)
+        self.assertEqual(1, len(client._outbound_queue))
+        self.assertNotEqual(first_size, 0)
+        self.assertEqual(
+            client._outbound_queue[0][2], client._outbound_bytes)
+        wire = json.loads(
+            client._outbound_queue[0][1].payload.decode('utf-8'))
+        self.assertEqual(80000, wire['sample_time_us'])
+        self.assertEqual(8.0, wire['bots'][0]['x'])
+        self.assertEqual(0.05, wire['bots'][0]['reload_time'])
+
+    def test_worker_keeps_discrete_bot_edges_and_ordered_messages_fifo(self):
+        client = self._active_client()
+        first = _projected_bot_state()
+        fired = json.loads(json.dumps(first))
+        fired['fire_seq'] += 1
+        fired['ammo_remaining'][0] -= 1
+        fired['ammo_reload_pending'] = True
+
+        self.assertTrue(client.send_projected_bot_state(
+            [first], sample_time_us=40000,
+            source_batch_horizon_us=40000))
+        self.assertTrue(client.send_projected_bot_state(
+            [fired], sample_time_us=80000,
+            source_batch_horizon_us=80000))
+        self.assertTrue(client._send({
+            'type': 'projectile_launch', 'shot_seq': 3}))
+        later = json.loads(json.dumps(fired))
+        later['x'] = 9.0
+        later['reload_time'] = 0.04
+        self.assertTrue(client.send_projected_bot_state(
+            [later], sample_time_us=120000,
+            source_batch_horizon_us=120000))
+
+        self.assertEqual(4, len(client._outbound_queue))
+        self.assertEqual([
+            'bot_state', 'bot_state', 'projectile_launch', 'bot_state',
+        ], [
+            (json.loads(item[1].payload.decode('utf-8'))['type']
+             if isinstance(item[1], lan_client_module._PreencodedOutbound)
+             else item[1]['type'])
+            for item in client._outbound_queue])
+
+    def test_worker_never_coalesces_damage_or_combat_sequence_edges(self):
+        client = self._active_client()
+        first = _projected_bot_state()
+        damaged = json.loads(json.dumps(first))
+        damaged['health'] = 640
+        damaged['display_health'] = 640
+        damaged['critical']['devices'][0]['hp'] = 80.0
+        damaged['combat_seq'] += 1
+
+        self.assertTrue(client.send_projected_bot_state(
+            [first], sample_time_us=40000,
+            source_batch_horizon_us=40000))
+        self.assertTrue(client.send_projected_bot_state(
+            [damaged], sample_time_us=80000,
+            source_batch_horizon_us=80000))
+
+        self.assertEqual(2, len(client._outbound_queue))
+        wires = [json.loads(item[1].payload.decode('utf-8'))
+                 for item in client._outbound_queue]
+        self.assertEqual([700, 640], [
+            wire['bots'][0]['health'] for wire in wires])
+        self.assertEqual([2, 3], [
+            wire['bots'][0]['combat_seq'] for wire in wires])
+
+    def test_worker_normal_30hz_pose_backlog_stays_bounded(self):
+        client = self._active_client()
+        states = [_projected_bot_state(bot_id)
+                  for bot_id in range(1, 30)]
+        original_limit = lan_client_module.MAX_OUTBOUND_MESSAGES
+        lan_client_module.MAX_OUTBOUND_MESSAGES = 2
+        try:
+            for frame in range(600):
+                sample = (frame + 1) * 33333
+                for state in states:
+                    state['x'] = frame * 0.001
+                    state['yaw'] = frame * 0.0001
+                    state['reload_time'] = max(
+                        0.0, 0.1 - (frame % 3) * 0.01)
+                self.assertTrue(client.send_projected_bot_state(
+                    states, sample_time_us=sample,
+                    source_batch_horizon_us=sample))
+        finally:
+            lan_client_module.MAX_OUTBOUND_MESSAGES = original_limit
+
+        self.assertTrue(client.running)
+        self.assertTrue(client.connected)
+        self.assertEqual(1, len(client._outbound_queue))
+        wire = json.loads(
+            client._outbound_queue[0][1].payload.decode('utf-8'))
+        self.assertEqual(600 * 33333, wire['sample_time_us'])
+        self.assertEqual(0.599, wire['bots'][0]['x'])
+
     def test_worker_bot_state_uses_common_fail_closed_queue_limit(self):
         client = self._active_client()
         sock = client.sock

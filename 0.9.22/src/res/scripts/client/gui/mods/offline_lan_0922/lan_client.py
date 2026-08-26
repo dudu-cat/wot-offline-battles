@@ -174,10 +174,11 @@ class _OutboundPayloadError(Exception):
 class _PreencodedOutbound(object):
     """Immutable wire bytes owned by the reliable outbound queue."""
 
-    __slots__ = ('payload',)
+    __slots__ = ('payload', 'coalesce_key')
 
-    def __init__(self, payload):
+    def __init__(self, payload, coalesce_key=None):
         self.payload = payload
+        self.coalesce_key = coalesce_key
 
 
 def _json_text_size(value):
@@ -3368,7 +3369,31 @@ class LANClient(object):
                     not self._outbound_accepting or self._stopping or
                     not self.running or not self.connected):
                 return False
-            if (len(self._outbound_queue) >= MAX_OUTBOUND_MESSAGES or
+            previous = (self._outbound_queue[-1]
+                        if self._outbound_queue else None)
+            previous_message = previous[1] if previous is not None else None
+            replace_tail = bool(
+                isinstance(message, _PreencodedOutbound) and
+                message.coalesce_key is not None and
+                isinstance(previous_message, _PreencodedOutbound) and
+                previous_message.coalesce_key == message.coalesce_key)
+            replacement_bytes = (
+                self._outbound_bytes - previous[2] + encoded_size
+                if replace_tail else self._outbound_bytes + encoded_size)
+            if (replace_tail and
+                    replacement_bytes <= MAX_OUTBOUND_BYTES):
+                # A worker Bot publication is a full canonical checkpoint.
+                # When no discrete combat/ammo/equipment edge changed and no
+                # ordered message was queued between two checkpoints, only
+                # the newest unsent pose/timer sample has observable value.
+                # Replacing it here prevents a slightly slower local server
+                # from accumulating stale 30 Hz poses indefinitely while all
+                # fire, damage, ammunition and protocol barriers remain FIFO.
+                self._outbound_seq += 1
+                self._outbound_queue[-1] = (
+                    self._outbound_seq, message, encoded_size)
+                self._outbound_bytes = replacement_bytes
+            elif (len(self._outbound_queue) >= MAX_OUTBOUND_MESSAGES or
                     self._outbound_bytes + encoded_size >
                     MAX_OUTBOUND_BYTES):
                 overflow = True
@@ -3384,7 +3409,7 @@ class LANClient(object):
         self._outbound_event.set()
         return True
 
-    def _send_preencoded_trusted(self, message):
+    def _send_preencoded_trusted(self, message, coalesce_key=None):
         """Encode one trusted canonical message directly into queue bytes.
 
         This deliberately bypasses the generic recursive freeze/copy pass.
@@ -3409,7 +3434,8 @@ class LANClient(object):
         if encoded_size > MAX_MESSAGE_BYTES:
             return False
         return self._enqueue_outbound(
-            _PreencodedOutbound(payload), encoded_size, generation)
+            _PreencodedOutbound(payload, coalesce_key), encoded_size,
+            generation)
 
     def _send(self, message):
         """Freeze and enqueue one reliable message without wire I/O."""
