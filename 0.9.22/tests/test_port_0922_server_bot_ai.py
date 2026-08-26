@@ -707,7 +707,14 @@ class ServerBotArtilleryTests(unittest.TestCase):
         }]
 
         planner._rebalance_routes(1, bots, contacts, 1.0)
+        donor_id = next(
+            bot_id for bot_id in (41, 42)
+            if planner._route_assignments[bot_id]['route']['id'] == 'target')
+        donor = next(bot for bot in bots if bot['id'] == donor_id)
+        planner._route(donor, 1.1)
+        planner._route_states[donor_id]['index'] = 1
         planner._rebalance_routes(1, bots, contacts, 5.0)
+        planner._rebalance_routes(1, bots, contacts, 9.0)
 
         assigned = dict((bot_id, value['route']['id'])
                         for bot_id, value in
@@ -715,6 +722,9 @@ class ServerBotArtilleryTests(unittest.TestCase):
         self.assertEqual('target', assigned[43])
         self.assertEqual(1, sum(
             assigned[bot_id] == 'target' for bot_id in (41, 42)))
+        self.assertEqual(1, planner._route_states[donor_id]['index'])
+        self.assertGreater(
+            planner._route_assignments[donor_id]['until'], 9.0)
 
 
 if __name__ == '__main__':

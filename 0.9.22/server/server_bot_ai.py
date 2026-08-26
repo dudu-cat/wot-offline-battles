@@ -1334,10 +1334,6 @@ class BotPlanner(object):
         if pressure[target_route] - counts[target_route] * 0.45 <= 0.0:
             return
         target_record = catalog[target_route]
-        if ("capacity" in target_record and
-                counts[target_route] >= max(
-                    1, _integer(target_record.get("capacity"), 1))):
-            return
         # Re-evaluation happens before a temporary assignment expires. Renew
         # the same pressured route in place so its waypoint index survives;
         # only a real route change clears progress below.
@@ -1348,6 +1344,10 @@ class BotPlanner(object):
                     str(route.get("id") or "") == target_route and
                     _number(assignment.get("until")) > 0.0):
                 assignment["until"] = _number(now) + ROUTE_LEASE_SECONDS
+        if ("capacity" in target_record and
+                counts[target_route] >= max(
+                    1, _integer(target_record.get("capacity"), 1))):
+            return
         candidates = []
         for bot in bots:
             if bot["id"] in protected_ids:
