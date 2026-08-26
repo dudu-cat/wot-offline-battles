@@ -38,6 +38,8 @@ _SHOT_AP_KINDS_1513 = frozenset((
 # ``NORMAL_MAX`` is an exclusive sentinel: DestructiblesCache allocates
 # structure modules from 73 through 85 and maps 87 through 99 to damaged BSP
 # materials.  Only a normal material may enter encodeDestructibleModule.
+_DESTRUCTIBLE_MAT_KIND_MIN_1513 = 71
+_DESTRUCTIBLE_MAT_KIND_MAX_1513 = 100
 _STRUCTURE_MAT_KIND_MIN_1513 = 73
 _STRUCTURE_MAT_KIND_MAX_1513 = 86
 
@@ -2484,7 +2486,8 @@ def _try_destroy_destructible(spaceID, matInfo, yaw, vel,
 			'chunk=', chunkID, 'idx=', itemIndex)
 	# #1513's native material namespace ends at 100.  Do not feed arbitrary BSP
 	# material values into destructible encoders.
-	if matKind < 71 or matKind > 100:
+	if (matKind < _DESTRUCTIBLE_MAT_KIND_MIN_1513 or
+			matKind > _DESTRUCTIBLE_MAT_KIND_MAX_1513):
 		return False
 	desc = AreaDestructibles.g_cache.getDescByFilename(fname)
 	if not desc:
@@ -3449,6 +3452,40 @@ def _typed_shot_result_1513(world_distance, stop_distance=None,
 	}
 
 
+def _validated_tree_shot_identity_1513(spaceID, decoded):
+	"""Return one exact SpeedTree identity that cannot obstruct a shell."""
+	if decoded is None:
+		return None
+	unused_hit, unused_normal, chunk_id, item_index, mat_kind, filename = decoded
+	if (_destructible_isolated_1513(chunk_id, item_index) or
+			mat_kind < _DESTRUCTIBLE_MAT_KIND_MIN_1513 or
+			mat_kind > _DESTRUCTIBLE_MAT_KIND_MAX_1513):
+		return None
+	import AreaDestructibles
+	desc = AreaDestructibles.g_cache.getDescByFilename(filename)
+	if desc is None or desc.get('type') != AreaDestructibles.DESTR_TYPE_TREE:
+		return None
+	health = desc.get('health', 0)
+	if health < 10 or health > 1000:
+		return None
+	if not validate_tree_identity_1513(spaceID, chunk_id, item_index):
+		return None
+	return int(chunk_id), int(item_index)
+
+
+def _transparent_tree_shot_filter_1513(ignored_trees):
+	"""Keep every native surface except an exact validated SpeedTree."""
+	def keep_surface(*hit):
+		# #1513 passes (matKind, collFlags, itemIndex, chunkID).  Malformed or
+		# ordinary surfaces stay authoritative; only exact tree wires are skipped.
+		try:
+			identity = int(hit[3]), int(hit[2])
+		except (IndexError, TypeError, ValueError, OverflowError):
+			return True
+		return identity not in ignored_trees
+	return keep_surface
+
+
 def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 		shot=None):
 	"""Resolve the first native or exact-catalog destructible on a shell ray.
@@ -3457,23 +3494,52 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 	legacy float contract for diagnostics and old fixtures.
 	"""
 	import math
+	ignored_trees = set()
+	tree_filter = _transparent_tree_shot_filter_1513(ignored_trees)
+	tree_hits = 0
 	world_dist = 99999.0
 	world_collision = bigworld.wg_collideSegment(
 		spaceID, start_pos, end_pos, 128)
 	shot_yaw = math.atan2(dir_vec.x, dir_vec.z)
-	if world_collision is not None:
+	decoded = None
+	catalog_hit = None
+	while world_collision is not None:
 		world_dist = (world_collision[0] - start_pos).length
 		mat_info = bigworld.wg_getMatInfoNearPoint(
 			spaceID, start_pos,
 			world_collision[0] + dir_vec.scale(0.3),
 			world_collision[0], lambda *unused: False)
 		decoded = _decode_mat_info_1513(mat_info)
-		if _try_destroy_destructible(
-				spaceID, mat_info, shot_yaw, 12.0, True):
+		tree_identity = _validated_tree_shot_identity_1513(spaceID, decoded)
+		if tree_identity is not None:
+			# A catalog-only prop may be closer than this native tree.  Resolve
+			# it before publishing tree destruction so unreachable trees stay put.
+			catalog_hit = _catalog_shot_intersection(
+				spaceID, start_pos, end_pos, world_dist)
+			if catalog_hit is not None:
+				break
+		destruction_accepted = _try_destroy_destructible(
+			spaceID, mat_info, shot_yaw, 12.0, True)
+		if destruction_accepted:
 			if decoded is not None:
 				_diagnostic_contact_1513(
 					'shot_material_accept', decoded[2], decoded[3],
 					fields=(('mat', decoded[4]),))
+		if tree_identity is not None and (
+				destruction_accepted or _get_destr_authority().is_destroyed(
+					tree_identity[0], tree_identity[1], decoded[4])):
+			if tree_identity in ignored_trees:
+				raise RuntimeError(
+					'#1513 transparent tree shot filter did not advance')
+			ignored_trees.add(tree_identity)
+			tree_hits += 1
+			if tree_hits > 64:
+				raise RuntimeError(
+					'#1513 transparent tree shot traversal exceeded 64 hits')
+			world_collision = bigworld.wg_collideSegment(
+				spaceID, start_pos, end_pos, 128, tree_filter)
+			continue
+		if destruction_accepted:
 			if shot is not None:
 				desc = __import__('AreaDestructibles').g_cache.getDescByFilename(
 					decoded[5])
@@ -3508,14 +3574,17 @@ def shot_world_distance(bigworld, spaceID, start_pos, end_pos, dir_vec,
 				end_pos, 128)
 			return ((second[0] - start_pos).length
 				if second is not None else 99999.0)
+		break
+	if world_collision is None:
+		world_dist = 99999.0
+		decoded = None
 
 	# Dynamic destructible BSPs frequently do not participate in mask 128, and
 	# anonymous #1513 slots also make the point-material query return no usable
 	# filename.  Resolve only the nearest unique streamed catalog OBB.  A real
 	# static hit caps the ray, so an object behind an unrelated wall is never
 	# destroyed by this fallback.
-	catalog_hit = None
-	if world_collision is not None:
+	if catalog_hit is None and world_collision is not None:
 		point_candidate = None
 		if decoded is not None:
 			point_candidate = _catalog_candidate_for_native_identity_1513(
