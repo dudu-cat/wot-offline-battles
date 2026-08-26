@@ -1664,7 +1664,8 @@ class ListenerTest(unittest.TestCase):
                 "server_capabilities": [
                     "destructible_catalog_v5", "ram_contact_ledger_v2",
                     "human_ram_timeline_v1", "player_fire_intent_v4",
-                    "player_environment_v1", "effective_params_v1"],
+                    "player_environment_v2", "effective_params_v1",
+                    "ricochet_continuation_v1"],
             }
             reply.update(self.reply_overrides)
             self.reply = (json.dumps(reply) + "\n").encode("utf-8")
@@ -1800,14 +1801,18 @@ class ListenerTest(unittest.TestCase):
                 "DESTRUCTIBLE_CATALOG_V5_CAPABILITY",
                 "RAM_CONTACT_LEDGER_CAPABILITY",
                 "HUMAN_RAM_TIMELINE_CAPABILITY",
-                "PLAYER_FIRE_INTENT_CAPABILITY"):
+                "PLAYER_FIRE_INTENT_CAPABILITY",
+                "PLAYER_ENVIRONMENT_CAPABILITY",
+                "RICOCHET_CONTINUATION_CAPABILITY"):
             self.assertIn(server0922[name], probe["capabilities"])
         self.assertIn("effective_params_v1", probe["capabilities"])
         for name in (
                 "DESTRUCTIBLE_CATALOG_V5_CAPABILITY",
                 "RAM_CONTACT_LEDGER_CAPABILITY",
                 "HUMAN_RAM_TIMELINE_CAPABILITY",
-                "PLAYER_FIRE_INTENT_CAPABILITY"):
+                "PLAYER_FIRE_INTENT_CAPABILITY",
+                "PLAYER_ENVIRONMENT_CAPABILITY",
+                "RICOCHET_CONTINUATION_CAPABILITY"):
             self.assertIn(server0922[name], probe["server_capabilities"])
         self.assertIn("effective_params_v1", probe["server_capabilities"])
 
