@@ -43,6 +43,7 @@ class WorkerStarterTests(unittest.TestCase):
             'static int wait_for_worker_ready', 1)[1].split(
                 'static int launch_player', 1)[0]
         self.assertIn('worker_exited_before_ready', wait_body)
+        self.assertIn('worker_process_exit_before_ready', source)
         self.assertNotIn(
             'failed worker no longer blocks a standalone player',
             wait_body.lower())

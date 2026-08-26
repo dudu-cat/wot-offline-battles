@@ -1457,6 +1457,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 					process.hProcess, 0) == WAIT_OBJECT_0 &&
 					GetExitCodeProcess(
 						process.hProcess, &child_exit_code)) {
+				if (child_exit_code != 0) {
+					log_failure(
+						"worker_process_exit_before_ready",
+						child_exit_code);
+				}
 				worker_crashed = child_exit_code != 0;
 				result = (int)child_exit_code;
 			} else {
