@@ -252,6 +252,55 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertTrue(all('capture_base_id' not in order
                             for order in screen))
 
+    def test_capture_screen_does_not_stop_at_an_intermediate_waypoint(self):
+        planner = BotPlanner()
+        route = _route('long-lane', [
+            (0, -100, False), (0, 0, False), (0, 100, False),
+            (0, 200, False), (0, 300, False), (0, 500, False),
+        ])
+        manifest = [
+            _bot(401 + index, 1, index, route, 'mediumTank')
+            for index in range(4)
+        ]
+        states = [
+            _state(401, 1, 0, 300),
+            _state(402, 1, 0, 300),
+            _state(403, 1, 0, 300),
+            _state(404, 1, 0, 50),
+        ]
+        defense = _capture_defense()
+
+        first = dict((order['id'], order) for order in
+                     planner.build_orders(
+                         manifest, states, [], 1.0, defense)['orders'])
+        self.assertEqual('route', first[404]['combat_mode'])
+        self.assertEqual(2, first[404]['route_index'])
+
+        # The route advances at 13 metres, while screen arrival uses 15. A
+        # vehicle inside that two-metre band at an intermediate point must
+        # keep driving instead of accepting a permanent intentional hold.
+        states[3]['z'] = 86.0
+        intermediate = dict((order['id'], order) for order in
+                            planner.build_orders(
+                                manifest, states, [], 2.0,
+                                defense)['orders'])
+        self.assertEqual('route', intermediate[404]['combat_mode'])
+        self.assertEqual(2, intermediate[404]['route_index'])
+        self.assertEqual(100.0, intermediate[404]['move_position']['z'])
+        self.assertIsNone(intermediate[404]['throttle_override'])
+
+        states[3]['z'] = 100.0
+        planner.build_orders(manifest, states, [], 3.0, defense)
+        states[3]['z'] = 200.0
+        planner.build_orders(manifest, states, [], 4.0, defense)
+        states[3]['z'] = 286.0
+        staged = dict((order['id'], order) for order in
+                      planner.build_orders(
+                          manifest, states, [], 5.0, defense)['orders'])
+        self.assertEqual('base_screen', staged[404]['combat_mode'])
+        self.assertEqual(4, staged[404]['route_index'])
+        self.assertEqual(0.0, staged[404]['throttle_override'])
+
     def test_spgs_yield_capture_slots_to_regular_vehicles(self):
         planner = BotPlanner()
         manifest = [

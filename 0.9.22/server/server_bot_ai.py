@@ -1868,6 +1868,7 @@ class BotPlanner(object):
         if focus is None:
             self._engage_anchors.pop(bot["id"], None)
             if (capture_screen and
+                    self._capture_staged(bot, route_index) and
                     math.hypot(move["x"] - _number(state.get("x")),
                                move["z"] - _number(state.get("z"))) <= 15.0):
                 order["combat_mode"] = "base_screen"
