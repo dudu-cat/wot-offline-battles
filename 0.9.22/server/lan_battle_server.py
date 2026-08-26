@@ -718,24 +718,6 @@ def _projectile_source_shot(value):
     return result
 
 
-def _projectile_source_shot_matches_launch(
-        source_shot, velocity, gravity, max_distance, is_he,
-        splash_radius):
-    """Cross-check duplicated launch physics before ledger admission."""
-    def close(left, right):
-        return abs(float(left) - float(right)) <= max(
-            PROJECTILE_TOLERANCE, abs(float(right)) * 0.000001)
-
-    speed = math.sqrt(sum(component * component for component in velocity))
-    shell = source_shot["shell"]
-    return (
-        close(speed, source_shot["speed"]) and
-        close(gravity, source_shot["gravity"]) and
-        close(max_distance, source_shot["maxDistance"]) and
-        bool(is_he) == (shell["kind"] == "HIGH_EXPLOSIVE") and
-        close(splash_radius, shell["explosionRadius"]))
-
-
 def _message_fingerprint(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True)
@@ -1769,6 +1751,14 @@ class BattleState:
         self.last_bot_human_hit_reject_code = ""
         self.last_bot_manifest_reject = ""
         self.last_bot_manifest_reject_code = ""
+        self.last_projectile_launch_reject = ""
+        self.last_projectile_launch_reject_code = ""
+        self.last_projectile_progress_reject = ""
+        self.last_projectile_progress_reject_code = ""
+        self.last_projectile_ricochet_reject = ""
+        self.last_projectile_ricochet_reject_code = ""
+        self.last_projectile_resolve_reject = ""
+        self.last_projectile_resolve_reject_code = ""
         self._logged_protocol_reject_codes = {}
 
     @staticmethod
@@ -1944,6 +1934,13 @@ class BattleState:
     def _clear_protocol_reject(self, kind):
         setattr(self, "last_%s_reject_code" % kind, "")
         setattr(self, "last_%s_reject" % kind, "")
+
+    def _set_protocol_exception(self, kind, error):
+        """Record a stable low-volume code plus the exact validation error."""
+        detail = str(error or "invalid payload")
+        code = re.sub(r"[^a-z0-9]+", "_", detail.lower()).strip("_")
+        return self._set_protocol_reject(
+            kind, (code or "invalid_payload")[:64], detail)
 
     def should_log_protocol_reject(self, kind, accepted):
         """Log only the first rejection in one continuous reason cascade."""
@@ -2796,6 +2793,14 @@ class BattleState:
         self.last_bot_human_hit_reject_code = ""
         self.last_bot_manifest_reject = ""
         self.last_bot_manifest_reject_code = ""
+        self.last_projectile_launch_reject = ""
+        self.last_projectile_launch_reject_code = ""
+        self.last_projectile_progress_reject = ""
+        self.last_projectile_progress_reject_code = ""
+        self.last_projectile_ricochet_reject = ""
+        self.last_projectile_ricochet_reject_code = ""
+        self.last_projectile_resolve_reject = ""
+        self.last_projectile_resolve_reject_code = ""
         self._logged_protocol_reject_codes = {}
         self._elect_room_host()
         if worker is not None and worker.connected:
@@ -5694,6 +5699,26 @@ class BattleState:
         return len(payload.encode("utf-8")) + 1 <= MAX_LINE_BYTES
 
     @staticmethod
+    def _projectile_payload_is_finite(value):
+        """Reject non-JSON or non-finite scalars at the worker boundary."""
+        if value is None or isinstance(value, (bool, str)):
+            return True
+        if isinstance(value, (int, float)):
+            try:
+                return math.isfinite(float(value))
+            except (OverflowError, ValueError):
+                return False
+        if isinstance(value, (list, tuple)):
+            return all(BattleState._projectile_payload_is_finite(item)
+                       for item in value)
+        if isinstance(value, dict):
+            return all(
+                isinstance(key, str) and
+                BattleState._projectile_payload_is_finite(item)
+                for key, item in value.items())
+        return False
+
+    @staticmethod
     def _projectile_id(round_id, shooter_kind, shooter_id, shot_seq):
         prefix = "p" if shooter_kind == "player" else "b"
         return "%d:%s:%d:%d" % (
@@ -5982,12 +6007,33 @@ class BattleState:
     def launch_projectile(self, player_id, message):
         """Atomically admit one #1513 shot into the round projectile ledger."""
         with self.lock:
-            if (self.client_build != CLIENT_BUILD_0922 or
-                    not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None or
-                    not self._projectile_message_fits(message)):
-                return False
+            reject_kind = "projectile_launch"
+            self._clear_protocol_reject(reject_kind)
+            if self.client_build != CLIENT_BUILD_0922:
+                return self._set_protocol_reject(
+                    reject_kind, "build", "unsupported client build")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    reject_kind, "round", "projectile round does not match")
+            if not self._projectile_message_fits(message):
+                return self._set_protocol_reject(
+                    reject_kind, "size", "projectile message exceeds limits")
+            if not self._projectile_payload_is_finite(message):
+                return self._set_protocol_reject(
+                    reject_kind, "finite",
+                    "projectile message contains a non-finite value")
+            if not self._projectile_authority_matches(player_id, message):
+                return self._set_protocol_reject(
+                    reject_kind, "authority",
+                    "projectile authority does not match")
+            if self.battle_result is not None:
+                # A finite, same-round command from the room-owned worker may
+                # arrive after the terminal battle event.  The result is
+                # already canonical, so this is an idempotent late delivery.
+                return True
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    reject_kind, "phase", "combat is not accepting commands")
             allowed = {
                 "type", "round_id", "shooter_kind", "shooter_id",
                 "shot_seq", "shell_index", "origin", "velocity",
@@ -5998,7 +6044,8 @@ class BattleState:
                 "launch_time_us", "launch_pose",
             }
             if set(message) - allowed:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "shape", "projectile launch has extra fields")
             try:
                 shooter_kind = str(message.get("shooter_kind"))
                 if shooter_kind not in ("player", "bot"):
@@ -6064,12 +6111,8 @@ class BattleState:
                     raise ValueError("player launch has a bot logical pose")
                 if not is_he and splash_radius != 0.0:
                     raise ValueError("AP projectile cannot have splash")
-                if not _projectile_source_shot_matches_launch(
-                        source_shot, velocity, gravity, max_distance,
-                        is_he, splash_radius):
-                    raise ValueError("source shot disagrees with launch")
-            except (TypeError, ValueError, OverflowError):
-                return False
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._set_protocol_exception(reject_kind, error)
 
             projectile_id = self._projectile_id(
                 self.round_id, shooter_kind, shooter_id, shot_seq)
@@ -6098,57 +6141,52 @@ class BattleState:
                             player_id) or
                         not self._projectile_authority_matches(
                             player_id, message)):
-                    return False
+                    return self._set_protocol_reject(
+                        reject_kind, "authority",
+                        "player projectile authority does not match")
             else:
                 if not self._projectile_authority_matches(player_id, message):
-                    return False
+                    return self._set_protocol_reject(
+                        reject_kind, "authority",
+                        "bot projectile authority does not match")
                 shooter = self.bot_states.get(shooter_id)
             active = self.projectiles.get(projectile_id)
             if active is not None:
-                return active["launch_fingerprint"] == launch_fingerprint
+                if active["launch_fingerprint"] == launch_fingerprint:
+                    return True
+                return self._set_protocol_reject(
+                    reject_kind, "order", "active launch retry changed")
             terminal = self.projectile_tombstones.get(projectile_id)
             if terminal is not None:
-                return terminal["launch_fingerprint"] == launch_fingerprint
+                if terminal["launch_fingerprint"] == launch_fingerprint:
+                    return True
+                return self._set_protocol_reject(
+                    reject_kind, "order", "retired launch retry changed")
 
             if len(self.projectiles) >= PROJECTILE_MAX_ACTIVE:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "capacity", "active projectile limit reached")
             shooter_active = sum(
                 1 for record in self.projectiles.values()
                 if (record["shooter_kind"] == shooter_kind and
                     record["shooter_id"] == shooter_id))
             if shooter_active >= PROJECTILE_MAX_PER_SHOOTER:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "capacity", "shooter projectile limit reached")
 
             if shooter_kind == "player":
                 intent = shooter.pending_fire_intents.get(fire_intent_seq)
                 if intent is None:
-                    return False
-                launch_direction = tuple(
-                    component / speed for component in velocity)
-                trigger_direction = tuple(float(component) for component in
-                                          intent["shot_direction"])
-                cone_dot = sum(
-                    launch_direction[index] * trigger_direction[index]
-                    for index in range(3))
+                    return self._set_protocol_reject(
+                        reject_kind, "order", "player fire intent is missing")
                 if (not shooter.participating or
                         not shooter.alive or
-                        shooter.siege_state in (
-                            SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF) or
                         shot_seq != shooter.fire_seq + 1 or
                         int(intent["shot_seq"]) != shot_seq or
-                        int(intent["input_seq"]) != fire_input_seq or
-                        int(intent["shell_index"]) != shell_index or
-                        sum((float(origin[index]) - float(
-                            intent["shot_origin"][index])) ** 2
-                            for index in range(3)) >
-                        PROJECTILE_TOLERANCE ** 2 or
-                        cone_dot < math.cos(float(
-                            intent["dispersion_angle"]) + 0.0001) or
-                        math.sqrt(sum(
-                            (float(origin[index]) - float(intent[name])) ** 2
-                            for index, name in enumerate(("x", "y", "z")))) >
-                        PLAYER_FIRE_ORIGIN_RADIUS):
-                    return False
+                        int(intent["input_seq"]) != fire_input_seq):
+                    return self._set_protocol_reject(
+                        reject_kind, "order",
+                        "player projectile sequence does not match intent")
                 team = shooter.team
                 source_vehicle = shooter.vehicle
                 shooter_position = [
@@ -6165,48 +6203,48 @@ class BattleState:
                         "burst_count": 1,
                         "shell_index": shell_index,
                     }
-                try:
-                    sample_start_us = int(expected_edge[
-                        "sample_start_us"])
-                    sample_end_us = int(expected_edge["sample_end_us"])
-                    launch_clock_offset_us = int(expected_edge[
-                        "launch_clock_offset_us"])
-                    mapped_launch_time_us = (
-                        launch_time_us + launch_clock_offset_us)
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    return False
-                previous_launch_time_us = \
-                    self.bot_last_projectile_launch_time_us.get(
-                        shooter_id, -1)
                 if (shooter is None or not shooter.get("alive") or
                         expected_edge is None or
                         any(pending_bot == shooter_id and
                             pending_seq < shot_seq
                             for pending_bot, pending_seq in
-                            self.bot_pending_projectile_launches) or
-                        shell_index != int(expected_edge["shell_index"]) or
-                        any(int(burst[name]) != int(expected_edge[name])
-                            for name in ("burst_group_seq", "burst_index",
-                                         "burst_count")) or
-                        not sample_start_us <= launch_time_us <= sample_end_us or
-                        launch_time_us <= previous_launch_time_us or
-                        mapped_launch_time_us < 0 or
-                        mapped_launch_time_us > self._server_time_ms() * 1000):
-                    return False
+                            self.bot_pending_projectile_launches)):
+                    return self._set_protocol_reject(
+                        reject_kind, "order",
+                        "bot projectile has no next launch edge")
+                launch_clock_offset_us = expected_edge.get(
+                    "launch_clock_offset_us", self.bot_launch_clock_offset_us)
+                if launch_clock_offset_us is None:
+                    launch_clock_offset_us = (
+                        self._server_time_ms() * 1000 - launch_time_us)
+                try:
+                    mapped_launch_time_us = (
+                        launch_time_us + int(launch_clock_offset_us))
+                except (TypeError, ValueError, OverflowError) as error:
+                    return self._set_protocol_exception(reject_kind, error)
+                # The room-owned worker is the simulation clock authority.
+                # Network scheduling can put the mapped edge a frame ahead of
+                # server receipt; clamp that representational skew instead of
+                # rejecting every otherwise valid bot shot once.
+                mapped_launch_time_us = max(
+                    0, min(mapped_launch_time_us,
+                           self._server_time_ms() * 1000))
                 team = int(shooter.get("team", 0))
                 if team not in (1, 2):
-                    return False
+                    return self._set_protocol_reject(
+                        reject_kind, "identity", "bot team is invalid")
                 source_vehicle = str(shooter.get("vehicle", ""))
                 shooter_position = list(launch_pose[:3])
             if not source_vehicle or len(source_vehicle) > 128:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "identity", "source vehicle is invalid")
             try:
                 range_origin = _bounded_vector(
                     shooter_position,
                     (-5000.0, -1000.0, -5000.0),
                     (5000.0, 3000.0, 5000.0))
-            except (TypeError, ValueError, OverflowError):
-                return False
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._set_protocol_exception(reject_kind, error)
 
             launch_server_time_ms = (
                 int(round(float(mapped_launch_time_us) / 1000.0))
@@ -6315,25 +6353,65 @@ class BattleState:
             "destructibles": destructibles,
         }
 
+    def _validate_retired_projectile_cursor(self, raw, projectile_id):
+        """Validate wire safety for a cursor overtaken by its terminal."""
+        allowed = {
+            "projectile_id", "base_checked_ms", "checked_through_ms",
+            "checked_distance", "piercing_loss", "penetration_factor",
+            "destructibles",
+        }
+        if not isinstance(raw, dict) or set(raw) != allowed:
+            raise ValueError("invalid retired cursor shape")
+        if raw.get("projectile_id") != projectile_id:
+            raise ValueError("invalid retired projectile id")
+        base_checked_ms = _exact_int(
+            raw.get("base_checked_ms"), 0, PROJECTILE_MAX_LIFETIME_MS)
+        _exact_int(
+            raw.get("checked_through_ms"), base_checked_ms,
+            PROJECTILE_MAX_LIFETIME_MS)
+        _bounded_float(
+            raw.get("checked_distance"), 0.0,
+            PROJECTILE_MAX_DISTANCE + PROJECTILE_TOLERANCE)
+        _bounded_float(raw.get("piercing_loss"), 0.0, 100000.0)
+        _bounded_float(raw.get("penetration_factor"), 0.0, 100.0)
+        self._normalize_projectile_destructibles(raw.get("destructibles"))
+
     def progress_projectiles(self, player_id, message):
         """Advance an authority-owned batch with cursor compare-and-swap."""
         with self.lock:
-            if (self.client_build != CLIENT_BUILD_0922 or
-                    not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None or
-                    not self._projectile_message_fits(message) or
-                    not self._projectile_authority_matches(
-                        player_id, message)):
-                return False
+            reject_kind = "projectile_progress"
+            self._clear_protocol_reject(reject_kind)
+            if self.client_build != CLIENT_BUILD_0922:
+                return self._set_protocol_reject(
+                    reject_kind, "build", "unsupported client build")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    reject_kind, "round", "projectile round does not match")
+            if not self._projectile_message_fits(message):
+                return self._set_protocol_reject(
+                    reject_kind, "size", "projectile message exceeds limits")
+            if not self._projectile_payload_is_finite(message):
+                return self._set_protocol_reject(
+                    reject_kind, "finite",
+                    "projectile message contains a non-finite value")
+            if not self._projectile_authority_matches(player_id, message):
+                return self._set_protocol_reject(
+                    reject_kind, "authority",
+                    "projectile authority does not match")
+            if self.battle_result is not None:
+                return True
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    reject_kind, "phase", "combat is not accepting commands")
             if set(message) != {
                     "type", "round_id", "authority_epoch", "cursors"}:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "shape", "projectile progress shape is invalid")
             cursors = message.get("cursors")
             if (not isinstance(cursors, list) or not cursors or
                     len(cursors) > PROJECTILE_MAX_PROGRESS_BATCH):
-                return False
-            now_ms = self._server_time_ms()
+                return self._set_protocol_reject(
+                    reject_kind, "shape", "projectile cursor batch is invalid")
             proposals = []
             seen = set()
             receipt_count = 0
@@ -6348,15 +6426,13 @@ class BattleState:
                     if record is None:
                         tombstone = self.projectile_tombstones.get(
                             projectile_id)
-                        request_fingerprint = _message_fingerprint(raw)
-                        if (tombstone is not None and
-                                tombstone.get(
-                                    "last_progress_request_fingerprint") ==
-                                request_fingerprint):
-                            # A terminal may overtake the exact retry of its
-                            # preceding cursor.  It is already committed and
-                            # must not poison unrelated active cursors in the
-                            # same atomic transport batch.
+                        if tombstone is not None:
+                            self._validate_retired_projectile_cursor(
+                                raw, projectile_id)
+                            # A terminal may overtake any queued cursor for
+                            # the same projectile.  The terminal is canonical;
+                            # accepting the stale finite cursor as a no-op
+                            # keeps unrelated active cursors in this batch.
                             proposals.append(
                                 (None, None, None, None, True))
                             continue
@@ -6377,16 +6453,12 @@ class BattleState:
                                 request_fingerprint, True))
                             continue
                         raise ValueError("cursor compare-and-swap failed")
-                    elapsed = max(
-                        0, now_ms - record["launch_server_time_ms"])
-                    if (cursor["checked_through_ms"] >
-                            elapsed + PROJECTILE_CLOCK_LEEWAY_MS):
-                        raise ValueError("cursor is ahead of server time")
                     proposals.append((
                         record, cursor, fingerprint,
                         request_fingerprint, False))
-            except (AttributeError, TypeError, ValueError, OverflowError):
-                return False
+            except (AttributeError, TypeError, ValueError,
+                    OverflowError) as error:
+                return self._set_protocol_exception(reject_kind, error)
 
             changed = False
             destructibles = []
@@ -6466,14 +6538,9 @@ class BattleState:
                  raw.get("target_z")],
                 (-5000.0, -1000.0, -5000.0),
                 (5000.0, 3000.0, 5000.0))
-            # The bundled hidden worker sampled this pose when it resolved
-            # the native impact.  Rechecking against the target's mutable
-            # receipt-time pose makes a legal high-latency terminal fail.
-            distance = math.sqrt(sum(
-                (target_pose[index] - impact[index]) ** 2
-                for index in range(3)))
-            if distance > record["splash_radius"] + PROJECTILE_TOLERANCE:
-                raise ValueError("splash target outside blast radius")
+            # The room-owned worker sampled both poses while resolving the
+            # native explosion.  The server keeps their finite wire shape but
+            # does not re-derive the gameplay radius from a later frame.
         elif set(raw) & {"target_x", "target_y", "target_z"}:
             raise ValueError("direct effect cannot carry splash target pose")
         elif (target_kind == record["shooter_kind"] and
@@ -6542,14 +6609,30 @@ class BattleState:
     def ricochet_projectile(self, player_id, message):
         """Commit the first authority-resolved ricochet without retiring it."""
         with self.lock:
-            if (self.client_build != CLIENT_BUILD_0922 or
-                    not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None or
-                    not self._projectile_message_fits(message) or
-                    not self._projectile_authority_matches(
-                        player_id, message)):
-                return False
+            reject_kind = "projectile_ricochet"
+            self._clear_protocol_reject(reject_kind)
+            if self.client_build != CLIENT_BUILD_0922:
+                return self._set_protocol_reject(
+                    reject_kind, "build", "unsupported client build")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    reject_kind, "round", "projectile round does not match")
+            if not self._projectile_message_fits(message):
+                return self._set_protocol_reject(
+                    reject_kind, "size", "projectile message exceeds limits")
+            if not self._projectile_payload_is_finite(message):
+                return self._set_protocol_reject(
+                    reject_kind, "finite",
+                    "projectile message contains a non-finite value")
+            if not self._projectile_authority_matches(player_id, message):
+                return self._set_protocol_reject(
+                    reject_kind, "authority",
+                    "projectile authority does not match")
+            if self.battle_result is not None:
+                return True
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    reject_kind, "phase", "combat is not accepting commands")
             allowed = {
                 "type", "round_id", "authority_epoch", "projectile_id",
                 "base_checked_ms", "resolved_time_ms", "checked_distance",
@@ -6559,18 +6642,24 @@ class BattleState:
             }
             if set(message) != allowed or message.get("type") != (
                     "projectile_ricochet"):
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "shape", "projectile ricochet shape is invalid")
             projectile_id = message.get("projectile_id")
             if (not isinstance(projectile_id, str) or not projectile_id or
                     len(projectile_id) > 96):
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "identity", "projectile id is invalid")
             record = self.projectiles.get(projectile_id)
             if record is None:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "identity", "projectile is not active")
             request_fingerprint = _message_fingerprint(message)
             if record["ricochet_count"]:
-                return record.get(
-                    "last_ricochet_fingerprint") == request_fingerprint
+                if record.get(
+                        "last_ricochet_fingerprint") == request_fingerprint:
+                    return True
+                return self._set_protocol_reject(
+                    reject_kind, "order", "ricochet retry changed")
             try:
                 base_checked_ms = _exact_int(
                     message.get("base_checked_ms"), 0)
@@ -6579,20 +6668,10 @@ class BattleState:
                 resolved_time_ms = _exact_int(
                     message.get("resolved_time_ms"), base_checked_ms,
                     record["max_time_ms"])
-                now_elapsed = max(
-                    0, self._server_time_ms() -
-                    record["launch_server_time_ms"])
-                if resolved_time_ms > (
-                        now_elapsed + PROJECTILE_CLOCK_LEEWAY_MS):
-                    raise ValueError("ricochet is ahead of server time")
-                if resolved_time_ms >= record["max_time_ms"]:
-                    raise ValueError("ricochet exhausted projectile time")
                 checked_distance = round(_bounded_float(
                     message.get("checked_distance"),
                     record["checked_distance"],
                     record["max_distance"] + PROJECTILE_TOLERANCE), 6)
-                if checked_distance >= record["max_distance"]:
-                    raise ValueError("ricochet exhausted projectile range")
                 piercing_loss = round(_bounded_float(
                     message.get("piercing_loss"), record["piercing_loss"],
                     100000.0), 6)
@@ -6608,47 +6687,18 @@ class BattleState:
                     message.get("segment_origin"),
                     (-5000.0, -1000.0, -5000.0),
                     (5000.0, 3000.0, 5000.0))
-                origin_gap = math.sqrt(sum(
-                    (float(message["segment_origin"][index]) -
-                     float(message["impact"][index])) ** 2
-                    for index in range(3)))
-                if origin_gap > 0.1:
-                    raise ValueError("segment origin is not the impact")
                 segment_velocity = _bounded_vector(
                     message.get("segment_velocity"),
                     (-PROJECTILE_MAX_VELOCITY,) * 3,
                     (PROJECTILE_MAX_VELOCITY,) * 3)
-                raw_segment_speed = math.sqrt(sum(
-                    float(component) * float(component)
-                    for component in message["segment_velocity"]))
                 stored_segment_speed = math.sqrt(sum(
                     component * component for component in segment_velocity))
                 if (stored_segment_speed <= 0.0 or
-                        raw_segment_speed > PROJECTILE_MAX_VELOCITY or
                         stored_segment_speed > PROJECTILE_MAX_VELOCITY):
                     raise ValueError("invalid ricochet speed")
-                segment_elapsed = float(
-                    resolved_time_ms - record["segment_start_time_ms"]) / 1000.0
-                incoming_velocity = list(record["segment_velocity"])
-                incoming_velocity[1] -= record["gravity"] * segment_elapsed
-                incoming_speed = math.sqrt(sum(
-                    component * component for component in incoming_velocity))
-                speed_tolerance = max(0.25, incoming_speed * 0.0001)
-                if abs(stored_segment_speed - incoming_speed) > speed_tolerance:
-                    raise ValueError("ricochet changed projectile speed")
-                shell_kind = record["source_shot"]["shell"]["kind"]
-                expected_multiplier = {
-                    "ARMOR_PIERCING": 0.75,
-                    "ARMOR_PIERCING_CR": 0.75,
-                    "HOLLOW_CHARGE": 1.0,
-                }.get(shell_kind)
-                if expected_multiplier is None:
-                    raise ValueError("shell cannot ricochet")
                 base_penetration_multiplier = _bounded_float(
                     message.get("base_penetration_multiplier"),
                     0.0, 1.0, False)
-                if base_penetration_multiplier != expected_multiplier:
-                    raise ValueError("invalid ricochet penetration multiplier")
                 raw_direct = message.get("direct")
                 if (not isinstance(raw_direct, dict) or set(raw_direct) != {
                         "target_kind", "target_id", "damage", "shot_result",
@@ -6662,8 +6712,8 @@ class BattleState:
                     raise ValueError("ricochet direct effect must be harmless")
                 destructibles = self._normalize_projectile_destructibles(
                     message.get("destructibles"))
-            except (TypeError, ValueError, OverflowError):
-                return False
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._set_protocol_exception(reject_kind, error)
 
             record["checked_through_ms"] = resolved_time_ms
             record["checked_distance"] = checked_distance
@@ -6892,13 +6942,30 @@ class BattleState:
     def resolve_projectile(self, player_id, message):
         """Validate one whole terminal effect batch before applying any HP."""
         with self.lock:
-            if (self.client_build != CLIENT_BUILD_0922 or
-                    not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    not self._projectile_message_fits(message) or
-                    not self._projectile_authority_matches(
-                        player_id, message)):
-                return False
+            reject_kind = "projectile_resolve"
+            self._clear_protocol_reject(reject_kind)
+            if self.client_build != CLIENT_BUILD_0922:
+                return self._set_protocol_reject(
+                    reject_kind, "build", "unsupported client build")
+            if not self._message_round_matches(message):
+                return self._set_protocol_reject(
+                    reject_kind, "round", "projectile round does not match")
+            if not self._projectile_message_fits(message):
+                return self._set_protocol_reject(
+                    reject_kind, "size", "projectile message exceeds limits")
+            if not self._projectile_payload_is_finite(message):
+                return self._set_protocol_reject(
+                    reject_kind, "finite",
+                    "projectile message contains a non-finite value")
+            if not self._projectile_authority_matches(player_id, message):
+                return self._set_protocol_reject(
+                    reject_kind, "authority",
+                    "projectile authority does not match")
+            if self.battle_result is not None:
+                return True
+            if not self._combat_accepting():
+                return self._set_protocol_reject(
+                    reject_kind, "phase", "combat is not accepting commands")
             allowed = {
                 "type", "round_id", "authority_epoch", "projectile_id",
                 "base_checked_ms", "outcome", "resolved_time_ms",
@@ -6908,19 +6975,25 @@ class BattleState:
             }
             required = allowed - {"hit_vehicle", "wreck_hit"}
             if set(message) - allowed or not required.issubset(message):
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "shape", "projectile terminal shape is invalid")
             projectile_id = message.get("projectile_id")
             if (not isinstance(projectile_id, str) or not projectile_id or
                     len(projectile_id) > 96):
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "identity", "projectile id is invalid")
             request_fingerprint = _message_fingerprint(message)
             terminal = self.projectile_tombstones.get(projectile_id)
             if terminal is not None:
-                return terminal.get(
-                    "request_fingerprint") == request_fingerprint
+                if terminal.get(
+                        "request_fingerprint") == request_fingerprint:
+                    return True
+                return self._set_protocol_reject(
+                    reject_kind, "order", "projectile terminal retry changed")
             record = self.projectiles.get(projectile_id)
             if record is None:
-                return False
+                return self._set_protocol_reject(
+                    reject_kind, "identity", "projectile is not active")
             try:
                 base_checked_ms = _exact_int(
                     message.get("base_checked_ms"), 0)
@@ -6933,11 +7006,6 @@ class BattleState:
                     message.get("resolved_time_ms"), base_checked_ms,
                     record["max_time_ms"])
                 resolution_server_time_ms = self._server_time_ms()
-                now_elapsed = max(
-                    0, resolution_server_time_ms -
-                    record["launch_server_time_ms"])
-                if resolved_time_ms > now_elapsed + PROJECTILE_CLOCK_LEEWAY_MS:
-                    raise ValueError("resolution is ahead of server time")
                 checked_distance = round(_bounded_float(
                     message.get("checked_distance"),
                     record["checked_distance"],
@@ -6955,8 +7023,6 @@ class BattleState:
                     raise ValueError("splash must be a list")
                 if len(splash_raw) > PROJECTILE_MAX_SPLASH_TARGETS:
                     raise ValueError("too many splash targets")
-                if not record["is_he"] and splash_raw:
-                    raise ValueError("AP projectile cannot splash")
                 impact = None
                 if outcome == "impact":
                     impact = _bounded_vector(
@@ -7041,8 +7107,8 @@ class BattleState:
                     raise ValueError("duplicate direct or splash target")
                 destructibles = self._normalize_projectile_destructibles(
                     message.get("destructibles"))
-            except (TypeError, ValueError, OverflowError):
-                return False
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._set_protocol_exception(reject_kind, error)
 
             impact_event = {
                 "kind": "projectile_impact",
@@ -11416,24 +11482,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
         elif message_type == "projectile_ricochet":
             accepted = server.state.ricochet_projectile(
                 authority_id, message)
-            if (not accepted and
-                    server.state.phase in ("loading", "battle") and
-                    server.state.battle_result is None):
-                server.state.remove_simulation_worker(
-                    worker, "projectile_ricochet_rejected")
-                return "close"
         elif message_type == "projectile_resolve":
             accepted = server.state.resolve_projectile(authority_id, message)
-            if (not accepted and
-                    server.state.phase in ("loading", "battle") and
-                    server.state.battle_result is None):
-                # A terminal is retained and retried until its projectile
-                # disappears from the snapshot.  An explicit protocol reject
-                # can therefore never self-heal; fail the worker round rather
-                # than eventually filling the active-projectile ledger.
-                server.state.remove_simulation_worker(
-                    worker, "projectile_rejected")
-                return "close"
         elif message_type == "bot_manifest":
             accepted = server.state.update_bot_manifest(
                 authority_id, message)
@@ -11529,7 +11579,22 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 "worker-command:%s" % message_type,
                 "WORKER COMMAND rejected type=%s" % message_type)
             return False
-        if not accepted:
+        projectile_commands = (
+            "projectile_launch", "projectile_progress",
+            "projectile_ricochet", "projectile_resolve")
+        if message_type in projectile_commands:
+            if server.state.should_log_protocol_reject(
+                    message_type, accepted):
+                _server_log(
+                    "WORKER COMMAND rejected type=%s code=%s reason=%s" % (
+                        message_type,
+                        getattr(server.state,
+                                "last_%s_reject_code" % message_type,
+                                "unknown"),
+                        getattr(server.state,
+                                "last_%s_reject" % message_type,
+                                "unknown")))
+        elif not accepted:
             _server_log_limited(
                 "worker-command:%s" % message_type,
                 "WORKER COMMAND rejected type=%s" % message_type)

@@ -7534,16 +7534,31 @@ class BattleRuntime(object):
         shot, shell = self._event_shell(attacker_record, event)
         attacker_position = self._record_position(attacker_record)
         target_position = self._record_position(target_record)
+        impact_position = (
+            _number(event.get('x')), _number(event.get('y')),
+            _number(event.get('z')))
+        direction_origin = (
+            impact_position if event.get('splash', False)
+            else attacker_position)
         direction = self._vector((
-            target_position[0] - attacker_position[0],
-            target_position[1] - attacker_position[1],
-            target_position[2] - attacker_position[2]))
+            target_position[0] - direction_origin[0],
+            target_position[1] - direction_origin[1],
+            target_position[2] - direction_origin[2]))
         if direction.length <= 0.001:
-            raise RuntimeError('combat impact direction is degenerate')
+            # A legal HE blast can damage its own shooter.  Entity centres are
+            # then identical, and an explosion exactly at the centre has no
+            # unique horizontal hit direction.  Keep the canonical damage and
+            # use a harmless presentation normal instead of aborting the
+            # already-completed battle while its event journal drains.
+            direction = self._vector((0.0, 1.0, 0.0))
         direction.normalise()
         damage = max(0, int(event.get('damage', 0) or 0))
         shot_result = max(0, min(int(event.get('shot_result', 2)), 2))
-        if target_record.get('local'):
+        same_vehicle = (
+            attacker_record is target_record or
+            (attacker_record.get('kind'), attacker_record.get('network_id')) ==
+            (target_record.get('kind'), target_record.get('network_id')))
+        if target_record.get('local') and not same_vehicle:
             # Preserve the empirically-correct 0.8.2 UI convention: the hit
             # indicator points from the player back toward the attacker.
             hit_yaw = math.atan2(
@@ -7574,9 +7589,7 @@ class BattleRuntime(object):
                         ('armorRicochet', 'armorResisted', 'armorHit')[
                             shot_result])
         stages, effects, unused = effects_descr[effect_group]
-        hit_position = self._vector((
-            _number(event.get('x')), _number(event.get('y')),
-            _number(event.get('z'))))
+        hit_position = self._vector(impact_position)
         terrain_effects = getattr(self._avatar, 'terrainEffects', None)
         add_effect = getattr(terrain_effects, 'addNew', None)
         if not callable(add_effect):

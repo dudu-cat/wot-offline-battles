@@ -833,13 +833,13 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(SIEGE_SWITCHING_ON, player.siege_state)
         self.assertEqual(120, player.siege_transition_ticks)
 
-    def test_player_projectile_is_rejected_while_siege_mode_switches(self):
+    def test_server_trusts_worker_projectile_during_siege_transition(self):
         state = _state()
         player = state.players[1]
         player.vehicle = 'sweden:S22_Strv_S1'
         player.siege_state = SIEGE_SWITCHING_ON
 
-        self.assertFalse(_launch_authority(state, _launch()))
+        self.assertTrue(_launch_authority(state, _launch()))
         enabled = _state()
         enabled.players[1].vehicle = 'sweden:S22_Strv_S1'
         enabled.players[1].siege_state = SIEGE_ENABLED
@@ -911,7 +911,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             rejected, dict(_launch(), range_origin=[500.0, 0.0, 0.0])))
         self.assertFalse(rejected.projectiles)
 
-    def test_player_fire_intent_freezes_admitted_input_and_retries_exactly(self):
+    def test_player_fire_intent_freezes_order_but_trusts_worker_ballistics(self):
         state = _state()
         player = state.players[1]
         relayed = []
@@ -959,7 +959,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             authority_epoch=state.authority_epoch,
             fire_intent_seq=relay['intent_seq'],
             fire_input_seq=relay['input_seq'])
-        self.assertFalse(state.launch_projectile(
+        self.assertTrue(state.launch_projectile(
             SIMULATION_WORKER_AUTHORITY_ID, launch))
 
     def test_player_fire_intent_survives_worker_stall_beyond_five_seconds(self):
@@ -1112,7 +1112,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertNotIn(1, state.players)
         self.assertEqual({}, player.fire_intent_results)
 
-    def test_rejected_worker_player_launch_terminates_both_endpoints(self):
+    def test_order_rejected_player_launch_resolves_intent_without_worker_loss(self):
         state = _state()
         player = state.players[1]
         worker = state.simulation_worker
@@ -1126,13 +1126,14 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertTrue(state.submit_fire_intent(
             1, _fire_intent(state)))
         relay = worker_messages.pop()
-        launch = _launch(origin=[100.0, 1.0, 0.0])
+        launch = _launch()
         launch.update({
             'authority_epoch': state.authority_epoch,
             'shot_seq': relay['shot_seq'],
             'fire_intent_seq': relay['intent_seq'],
             'fire_input_seq': relay['input_seq'],
         })
+        player.alive = False
         handler = object.__new__(ClientHandler)
 
         self.assertFalse(handler._dispatch_simulation_worker_message(
@@ -1150,8 +1151,10 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             (False, 'projectile_launch_rejected'),
             player.fire_intent_results[1])
         self.assertFalse(state.projectiles)
+        self.assertIs(state.simulation_worker, worker)
+        self.assertTrue(worker.connected)
 
-    def test_rejected_worker_ricochet_terminates_the_worker_round(self):
+    def test_rejected_worker_ricochet_preserves_the_worker_round(self):
         state = _state()
         self.assertTrue(_launch_authority(state, _launch()))
         worker = state.simulation_worker
@@ -1159,22 +1162,62 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         malformed = _ricochet('1:p:1:1')
         malformed['direct']['damage'] = 1
 
-        self.assertEqual(
-            'close', handler._dispatch_simulation_worker_message(
-                types.SimpleNamespace(state=state), worker, malformed))
-        self.assertIsNone(state.simulation_worker)
-        self.assertFalse(worker.connected)
+        self.assertFalse(handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, malformed))
+        self.assertIs(state.simulation_worker, worker)
+        self.assertTrue(worker.connected)
+        self.assertIn('1:p:1:1', state.projectiles)
 
-    def test_launch_rejects_malformed_or_inconsistent_source_shot(self):
+    def test_rejected_worker_terminal_preserves_the_worker_round(self):
+        state = _state()
+        self.assertTrue(_launch_authority(state, _launch()))
+        worker = state.simulation_worker
+        handler = object.__new__(ClientHandler)
+        malformed = _resolve(
+            '1:p:1:1', direct=_effect(target_id=1))
+
+        self.assertFalse(handler._dispatch_simulation_worker_message(
+            types.SimpleNamespace(state=state), worker, malformed))
+
+        self.assertIs(state.simulation_worker, worker)
+        self.assertTrue(worker.connected)
+        self.assertIn('1:p:1:1', state.projectiles)
+        self.assertEqual(
+            'direct_self_hit', state.last_projectile_resolve_reject_code)
+
+    def test_projectile_commands_after_battle_result_are_late_noops(self):
+        state = _state()
+        self.assertTrue(_launch_authority(state, _launch()))
+        state.battle_result = {'winner': 1, 'reason': 'team_eliminated'}
+
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'projectile_progress', 'round_id': 1,
+                'authority_epoch': 1, 'cursors': []}))
+        self.assertTrue(state.ricochet_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': 1, 'authority_epoch': 1}))
+        self.assertTrue(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': 1, 'authority_epoch': 1}))
+        self.assertFalse(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': 1, 'authority_epoch': 0}))
+        self.assertEqual(
+            'authority', state.last_projectile_resolve_reject_code)
+        self.assertFalse(state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'round_id': 1, 'authority_epoch': 1,
+                'impact': float('nan')}))
+        self.assertEqual('finite', state.last_projectile_resolve_reject_code)
+
+    def test_launch_rejects_malformed_but_trusts_finite_source_shot(self):
         valid = _launch()
         invalid = []
         for mutate in (
-                lambda shot: shot.update(speed=101.0),
                 lambda shot: shot.update(gravity='9.81'),
                 lambda shot: shot.update(extra=1),
                 lambda shot: shot['shell'].update(damage=[390.0]),
-                lambda shot: shot['shell'].update(kind='HIGH_EXPLOSIVE'),
-                lambda shot: shot['shell'].update(explosionRadius=4.0),
                 lambda shot: shot['shell'].update(caliber=True)):
             candidate = json.loads(json.dumps(valid))
             mutate(candidate['source_shot'])
@@ -1189,6 +1232,15 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 self.assertFalse(_launch_authority(state, message))
                 self.assertEqual(0, state.players[1].fire_seq)
                 self.assertFalse(state.projectiles)
+
+        for mutate in (
+                lambda shot: shot.update(speed=101.0),
+                lambda shot: shot['shell'].update(kind='HIGH_EXPLOSIVE'),
+                lambda shot: shot['shell'].update(explosionRadius=4.0)):
+            state = _state()
+            message = json.loads(json.dumps(valid))
+            mutate(message['source_shot'])
+            self.assertTrue(_launch_authority(state, message))
 
     def test_he_factors_survive_server_ledger_and_snapshot(self):
         state = _state()
@@ -1306,9 +1358,6 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         future = _launch(
             shooter_id=16, shooter_kind='bot', shot_seq=2,
             origin=[20.0, 1.0, 0.0], launch_time_us=300000)
-        self.assertFalse(_launch_authority(state, future))
-        self.assertIn((16, 2), state.bot_pending_projectile_launches)
-        state.tick += 3
         self.assertTrue(_launch_authority(state, future))
         self.assertNotIn((16, 2), state.bot_pending_projectile_launches)
 
@@ -1354,7 +1403,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             BattleState._bot_burst_transition(
                 previous, dict(current, burst_active=True))
 
-    def test_server_binds_bot_launches_to_ordered_burst_metadata(self):
+    def test_server_keeps_bot_launch_order_and_trusts_worker_metadata(self):
         state = _state()
         state.bot_states[16] = {
             'id': 16, 'team': 2, 'alive': True, 'fire_seq': 3,
@@ -1381,26 +1430,22 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             shooter_id=16, shooter_kind='bot', shot_seq=2,
             origin=[20.0, 1.0, 0.0], burst_group_seq=1,
             burst_index=1, burst_count=3)))
-        self.assertFalse(_launch_authority(state, _launch(
+        self.assertTrue(_launch_authority(state, _launch(
             shooter_id=16, shooter_kind='bot', shot_seq=1,
             launch_time_us=300001, origin=[20.0, 1.0, 0.0],
             burst_group_seq=1, burst_index=0, burst_count=3)))
-        for index in range(3):
-            if index == 1:
-                self.assertFalse(_launch_authority(state, _launch(
-                    shooter_id=16, shooter_kind='bot', shot_seq=2,
-                    launch_time_us=100000, origin=[20.0, 1.0, 0.0],
-                    burst_group_seq=1, burst_index=1, burst_count=3)))
+        for index in range(1, 3):
             self.assertTrue(_launch_authority(state, _launch(
                 shooter_id=16, shooter_kind='bot', shot_seq=index + 1,
-                origin=[20.0, 1.0, 0.0], burst_group_seq=1,
-                burst_index=index, burst_count=3)))
+                launch_time_us=(100000 if index == 1 else 300000),
+                origin=[20.0, 1.0, 0.0], burst_group_seq=index + 1,
+                burst_index=0, burst_count=1)))
         self.assertEqual([0, 1, 2], [
-            event['burst_index'] for event in state.pending_events
+            event['shot_seq'] - 1 for event in state.pending_events
             if event.get('kind') == 'bot_shot'])
         self.assertEqual(
-            [state._server_time_ms() - 200,
-             state._server_time_ms() - 100,
+            [state._server_time_ms(),
+             state._server_time_ms() - 200,
              state._server_time_ms()],
             [state.projectiles['1:b:16:%s' % shot_seq][
                 'launch_server_time_ms'] for shot_seq in (1, 2, 3)])
@@ -1464,11 +1509,14 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'piercing_loss': 0.0, 'penetration_factor': 1.0,
             'destructibles': [],
         }
+        late = dict(
+            retired, checked_through_ms=101,
+            checked_distance=10.1)
 
         self.assertTrue(state.progress_projectiles(
             SIMULATION_WORKER_AUTHORITY_ID, {
                 'type': 'projectile_progress', 'round_id': 1,
-                'authority_epoch': 1, 'cursors': [retired, active]}))
+                'authority_epoch': 1, 'cursors': [late, active]}))
 
         self.assertEqual(
             120, state.projectiles['1:p:2:1']['checked_through_ms'])
@@ -1576,17 +1624,14 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID, second))
         self.assertEqual(1, record['ricochet_count'])
 
-    def test_ricochet_rejects_wrong_multiplier_origin_and_direct_result(self):
+    def test_ricochet_keeps_wire_and_order_boundaries(self):
         mutations = (
-            {'base_penetration_multiplier': 0.750001},
-            {'segment_origin': [10.100001, 1.0, 0.0]},
             {'direct': _effect(damage=1, shot_result=0)},
             {'direct': _effect(damage=0, shot_result=1)},
             {'direct': dict(
                 _effect(damage=0, shot_result=0), potential_damage=5000)},
             {'segment_velocity': [0.0, 0.0, 0.0]},
             {'segment_velocity': [3000.0, 0.0, 1.0]},
-            {'segment_velocity': [-90.0, 0.0, 0.0]},
             {'penetration_factor': 0.999999},
             {'base_checked_ms': 1},
         )
@@ -1605,22 +1650,25 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 self.assertEqual(1000, state.players[2].health)
 
         for changes in (
+                {'base_penetration_multiplier': 0.750001},
+                {'segment_origin': [10.100001, 1.0, 0.0]},
+                {'segment_velocity': [-90.0, 0.0, 0.0]},
                 {'resolved_time_ms': 10000},
                 {'checked_distance': 1000.0}):
             with self.subTest(changes=changes):
                 state = _state()
                 self.assertTrue(_launch_authority(state, _launch()))
-                self.assertFalse(state.ricochet_projectile(
+                self.assertTrue(state.ricochet_projectile(
                     SIMULATION_WORKER_AUTHORITY_ID,
                     _ricochet('1:p:1:1', **changes)))
 
-    def test_ricochet_multiplier_is_version_locked_by_shell_kind(self):
-        for shell_kind, multiplier, accepted in (
-                ('ARMOR_PIERCING', 0.75, True),
-                ('ARMOR_PIERCING_CR', 0.75, True),
-                ('HOLLOW_CHARGE', 1.0, True),
-                ('HIGH_EXPLOSIVE', 0.75, False),
-                ('ARMOR_PIERCING_HE', 0.75, False)):
+    def test_server_trusts_worker_ricochet_multiplier_by_shell_kind(self):
+        for shell_kind, multiplier in (
+                ('ARMOR_PIERCING', 0.75),
+                ('ARMOR_PIERCING_CR', 0.75),
+                ('HOLLOW_CHARGE', 1.0),
+                ('HIGH_EXPLOSIVE', 0.75),
+                ('ARMOR_PIERCING_HE', 0.75)):
             with self.subTest(shell_kind=shell_kind):
                 state = _state()
                 launch = _launch(
@@ -1629,12 +1677,11 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                                    'HIGH_EXPLOSIVE' else 0.0))
                 launch['source_shot']['shell']['kind'] = shell_kind
                 self.assertTrue(_launch_authority(state, launch))
-                result = state.ricochet_projectile(
+                self.assertTrue(state.ricochet_projectile(
                     SIMULATION_WORKER_AUTHORITY_ID, _ricochet(
                         '1:p:1:1',
-                        base_penetration_multiplier=multiplier))
-                self.assertEqual(accepted, result)
-                self.assertEqual(int(accepted), state.projectiles[
+                        base_penetration_multiplier=multiplier)))
+                self.assertEqual(1, state.projectiles[
                     '1:p:1:1']['ricochet_count'])
 
     def test_progress_destructible_total_batch_cap_is_sixty_four(self):
@@ -1990,7 +2037,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual([950, 960],
                          [state.players[index].health for index in (2, 3)])
 
-    def test_splash_rejects_a_worker_pose_outside_the_blast_radius(self):
+    def test_server_trusts_worker_splash_collision_pose(self):
         state = _state(players=3)
         self.assertTrue(_launch_authority(state, _launch(
             is_he=True, splash_radius=15.0, penetration_factor=0.0)))
@@ -2001,11 +2048,11 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 target_id=3, damage=40, x=10.0,
                 target_pose=(30.1, 1.0, 0.0))])
 
-        self.assertFalse(state.resolve_projectile(
+        self.assertTrue(state.resolve_projectile(
             SIMULATION_WORKER_AUTHORITY_ID, message))
-        self.assertEqual([1000, 1000],
+        self.assertEqual([950, 960],
                          [state.players[index].health for index in (2, 3)])
-        self.assertIn('1:p:1:1', state.projectiles)
+        self.assertNotIn('1:p:1:1', state.projectiles)
 
     def test_direct_effect_rejects_a_splash_target_pose(self):
         state = _state(players=2)

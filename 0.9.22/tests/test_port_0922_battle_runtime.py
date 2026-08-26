@@ -9675,6 +9675,28 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(('splashFx', 'splashStages'),
                          (effect.args[1], effect.args[2]))
 
+    def test_self_splash_with_degenerate_direction_is_presentation_safe(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        vehicle = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                           {'health': 500})
+        runtime.bigworld.entities[10] = vehicle
+        record = {
+            'engine_id': 10, 'state': {'health': 500},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        event = {
+            'kind': 'hit', 'world_pose': True,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'shell_index': 0,
+            'shot_result': 2, 'damage': 40, 'source': 'shot',
+            'splash': True}
+
+        self.assertTrue(battle._present_combat_hit(
+            event, record, record, 10))
+
+        battle._avatar.terrainEffects.addNew.assert_called_once()
+        self.assertEqual([], battle._avatar.hit_directions)
+
     def test_visible_remote_combat_keeps_the_vehicle_impact_effect(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
