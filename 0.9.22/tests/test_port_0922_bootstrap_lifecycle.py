@@ -672,6 +672,46 @@ class BootstrapLifecycleTests(unittest.TestCase):
         self.assertEqual(['repair', 'camouflage'], after.skills)
         self.assertEqual(6, new_skill_count(after, self.ACTIVE_SKILLS))
 
+    def test_battle_progress_commits_against_the_live_garage_snapshot(self):
+        (bootstrap, unused_callbacks, compatibility,
+         unused_app_loader, unused_spaces, unused_events, modules) = self._load()
+        initial = {'vehicles': [{'id': 1, 'compDescr': b'stock'},
+                                {'id': 2, 'compDescr': b'stock'}]}
+        live = {'vehicles': [{'id': 1, 'compDescr': b'stock'},
+                             {'id': 2, 'compDescr': b'top-fitting'}]}
+        applied = []
+        bound = []
+
+        class _GarageStore(object):
+            def apply_battle_crew_xp(self, snapshot, receipt_id,
+                                     vehicle_type_cd, xp, xp_flag,
+                                     tankmen_module=None):
+                applied.append(snapshot)
+                self.assert_not_used = tankmen_module
+                return {'vehicle_id': 1, 'applied': True}
+
+        bootstrap._postbattle_store = types.SimpleNamespace(
+            set_progress_applier=lambda callback: bound.append(callback))
+        compatibility.garage_state = lambda: types.SimpleNamespace(
+            snapshot=lambda: live)
+        context = {
+            'garage_store': _GarageStore(),
+            'selected_vehicle': initial,
+        }
+
+        with mock.patch.dict(sys.modules, modules):
+            self.assertTrue(bootstrap._bind_battle_progress(context))
+            bound[0]({
+                'vehicle': 'ussr:R11_MS-1',
+                'receipt_id': 'server:1:1',
+                'rewards': {'xp': 100},
+            })
+
+        self.assertEqual([live], applied)
+        self.assertIs(live, context['selected_vehicle'])
+        self.assertEqual(
+            b'top-fitting', live['vehicles'][1]['compDescr'])
+
     def test_the_ammunition_layout_mirrors_the_loaded_shells(self):
         (bootstrap, unused_callbacks, unused_compatibility,
          unused_app_loader, unused_spaces, unused_events, modules) = self._load()

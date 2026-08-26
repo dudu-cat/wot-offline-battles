@@ -7770,6 +7770,19 @@ class BattleState:
                 self.bot_reported_ram_fingerprints[key] = fingerprint
                 self._consume_player_ram_contact(target, contact_seq)
                 return True
+            bot_team = int(bot.get("team", 0))
+            target_team = (int(target.get("team", 0))
+                           if target_kind == "bot" else int(target.team))
+            if bot_team in (1, 2) and bot_team == target_team:
+                # Friendly hulls still collide in the vehicle physics paths,
+                # but team contact is never an HP-producing operation.  Treat
+                # an otherwise valid report as a terminal no-op so an older
+                # client cannot strand a receipt or retry it forever.
+                self.bot_reported_rams.add(key)
+                self.bot_reported_ram_fingerprints[key] = fingerprint
+                if ram_contact is not None:
+                    self._consume_player_ram_contact(target, contact_seq)
+                return True
             if (damage_to_bot <= 0 and damage_to_target <= 0 and
                     ram_contact is None):
                 return False
@@ -10540,6 +10553,12 @@ class BattleState:
                         not first.alive or not second.alive):
                     continue
                 pair = (first.player_id, second.player_id)
+                if int(first.team) == int(second.team):
+                    # Native clients retain solid friendly hulls.  The server
+                    # only owns HP and therefore has no same-team ram work.
+                    self._retire_human_ram_probe(pair)
+                    active_contacts.discard(pair)
+                    continue
                 pending_request = self.human_ram_probe_requests.get(pair)
                 if pending_request is not None:
                     # A native probe can outlive the bounded pose history while
@@ -10615,6 +10634,7 @@ class BattleState:
                 for sample_frontier, first_pose, second_pose in timeline:
                     first_body = dict(first_pose, **{
                         "id": first.player_id, "alive": True,
+                        "team": int(first.team),
                         "vehicle": first.vehicle,
                         "mass": first_profile["mass"],
                         "shape": first_profile["shape"],
@@ -10622,6 +10642,7 @@ class BattleState:
                     })
                     second_body = dict(second_pose, **{
                         "id": second.player_id, "alive": True,
+                        "team": int(second.team),
                         "vehicle": second.vehicle,
                         "mass": second_profile["mass"],
                         "shape": second_profile["shape"],

@@ -186,8 +186,8 @@ def _battle_results_store():
 def _bind_battle_progress(context):
     """Bind durable result receipts to the equally durable garage crew."""
     garage_store = context.get('garage_store')
-    snapshot = context.get('selected_vehicle')
-    if garage_store is None or not isinstance(snapshot, dict):
+    bootstrap_snapshot = context.get('selected_vehicle')
+    if garage_store is None or not isinstance(bootstrap_snapshot, dict):
         # Hidden workers intentionally own no result or garage store.  If a
         # live client changes mode in-process, retire an older binding without
         # constructing a new persistent result owner for the worker.
@@ -208,6 +208,16 @@ def _bind_battle_progress(context):
     def apply(receipt):
         from AccountCommands import VEHICLE_SETTINGS_FLAG
         from items import tankmen, vehicles
+        provider = getattr(g_compatibility, 'garage_state', None)
+        live_garage = provider() if callable(provider) else None
+        if live_garage is not None:
+            snapshot_provider = getattr(live_garage, 'snapshot', None)
+            snapshot = (snapshot_provider()
+                        if callable(snapshot_provider) else None)
+        else:
+            snapshot = context.get('selected_vehicle')
+        if not isinstance(snapshot, dict):
+            raise RuntimeError('the live garage snapshot is unavailable')
         descriptor = vehicles.VehicleDescr(typeName=str(receipt['vehicle']))
         nation_id, vehicle_type_id = descriptor.type.id
         vehicle_type_cd = vehicles.makeIntCompactDescrByID(
@@ -216,6 +226,7 @@ def _bind_battle_progress(context):
             snapshot, receipt['receipt_id'], vehicle_type_cd,
             receipt['rewards']['xp'], VEHICLE_SETTINGS_FLAG.XP_TO_TMAN,
             tankmen_module=tankmen)
+        context['selected_vehicle'] = snapshot
         touched.add(int(result['vehicle_id']))
         return result
 

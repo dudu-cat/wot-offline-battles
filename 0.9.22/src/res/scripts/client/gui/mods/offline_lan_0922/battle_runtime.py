@@ -12994,6 +12994,11 @@ class BattleRuntime(object):
         record = self._native_ram_bot_record(other)
         if record is None:
             return False
+        record_team = int(_number(
+            (record.get('state') or {}).get('team')))
+        local_team = int(_number(getattr(self.client, 'team', 0)))
+        if record_team in (1, 2) and record_team == local_team:
+            return False
         bot_id = int(record['network_id'])
         if bot_id in self._local_ram_episode_contacts:
             return False
@@ -13170,6 +13175,10 @@ class BattleRuntime(object):
             if (not other.get('alive', True) or
                     other.get('kind') != 'bot'):
                 continue
+            own_team = int(_number(own.get('team')))
+            other_team = int(_number(other.get('team')))
+            if own_team in (1, 2) and own_team == other_team:
+                continue
             bot_id = int(other['network_id'])
             own_center_y = float(own['y']) + (
                 float(own['shape'][2]) +
@@ -13314,6 +13323,7 @@ class BattleRuntime(object):
                 'presentation_time_us': record.get(
                     'presentation_time_us'),
                 'alive': alive,
+                'team': int(_number(state.get('team'))),
                 # Apply the local body's reciprocal e=0 response for every
                 # live Bot.  The authority receipt applies the Bot's half at
                 # the same presented contact and skips that pair in its
@@ -13351,6 +13361,7 @@ class BattleRuntime(object):
         own = {
             'id': -1,
             'alive': True,
+            'team': int(_number(getattr(self.client, 'team', 0))),
             'x': position[0], 'y': position[1], 'z': position[2],
             'yaw': yaw, 'mass': own_mass,
             'shape': self._collision_shape(entity.typeDescriptor),

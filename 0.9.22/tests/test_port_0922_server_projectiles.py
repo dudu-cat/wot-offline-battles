@@ -671,6 +671,36 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(2, len(events))
         self.assertTrue(all('critical' in event for event in events))
 
+    def test_friendly_bot_ram_report_is_a_terminal_noop(self):
+        state = _state()
+        state.bot_manifest_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        for bot_id in (16, 17):
+            state.bot_states[bot_id] = {
+                'id': bot_id, 'team': 1,
+                'vehicle': 'ussr:R11_MS-1', 'health': 500,
+                'max_health': 500, 'alive': True,
+                'display_health': 500, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+                'critical': {}, 'combat_revision': 0,
+                'combat_base_revision': 0, 'combat_ack_seq': 0,
+                'combat_fire_elapsed': 0.0, 'combat_fire_timer': 0.0,
+            }
+
+        message = {
+            'round_id': state.round_id, 'bot_id': 16,
+            'target_kind': 'bot', 'target_id': 17, 'ram_seq': 1,
+            'damage_to_bot': 200, 'damage_to_target': 300,
+        }
+        self.assertTrue(state.report_bot_ram(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertTrue(state.report_bot_ram(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+
+        self.assertEqual((500, 500), (
+            state.bot_states[16]['health'], state.bot_states[17]['health']))
+        self.assertEqual([], [
+            event for event in state.pending_events
+            if event.get('source') == 'ram'])
+
     def test_1513_siege_transition_is_server_owned_and_caps_speed(self):
         state = _state()
         player = state.players[1]

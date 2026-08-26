@@ -14,8 +14,9 @@ from gui.mods.offline_lan_0922 import tank_collision
 
 def _tank(tank_id, x, z, mass=25000.0, vx=0.0, vz=0.0, y=0.0,
           yaw=0.0, shape=(1.5, 3.5, -0.8, 2.0),
-          contact_armor=100.0, spall=1.0, ramming_bonus=0.0):
-    return {
+          contact_armor=100.0, spall=1.0, ramming_bonus=0.0,
+          team=None):
+    result = {
         'id': tank_id,
         'x': x,
         'y': y,
@@ -32,6 +33,9 @@ def _tank(tank_id, x, z, mass=25000.0, vx=0.0, vz=0.0, y=0.0,
         },
         'alive': True,
     }
+    if team is not None:
+        result['team'] = team
+    return result
 
 
 class _Vector(object):
@@ -305,6 +309,31 @@ class TankCollisionTests(unittest.TestCase):
 
         self.assertLess(approach_result['delta_velocity'][0], 0.0)
         self.assertEqual((0.0, 0.0), separate_result['delta_velocity'])
+
+    def test_friendly_hulls_block_without_dealing_ram_damage(self):
+        first = _tank(
+            1, 0.0, 0.0, mass=25000.0, vx=10.0, team=1)
+        teammate = _tank(
+            2, 0.8, 0.0, mass=30000.0, team=1)
+
+        result = tank_collision.resolve_tank(
+            first, (teammate,), now=10.0)
+
+        self.assertNotEqual((0.0, 0.0), result['correction'])
+        self.assertNotEqual((0.0, 0.0), result['delta_velocity'])
+        self.assertEqual((), result['ram_events'])
+        self.assertEqual(frozenset(), result['contacts'])
+
+    def test_enemy_hulls_still_deal_ram_damage(self):
+        first = _tank(
+            1, 0.0, 0.0, mass=25000.0, vx=10.0, team=1)
+        enemy = _tank(
+            2, 0.8, 0.0, mass=30000.0, team=2)
+
+        result = tank_collision.resolve_tank(
+            first, (enemy,), now=10.0)
+
+        self.assertEqual(1, len(result['ram_events']))
 
     def test_contact_episode_blocks_replay_but_separation_rearms_immediately(self):
         heavy = _tank(9, 0.0, 0.0, mass=60000.0, vx=10.0)

@@ -515,6 +515,16 @@ def _tank_shape(tank):
     return DEFAULT_SHAPE
 
 
+def _same_team(first, second):
+    """Return whether two battle participants belong to one real team."""
+    try:
+        first_team = int(_tank_value(first, 'team'))
+        second_team = int(_tank_value(second, 'team'))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return first_team in (1, 2) and first_team == second_team
+
+
 def resolve_tank(tank, others, now=None, ram_cooldowns=None,
                  active_ram_contacts=None, contact_armor_probe=None):
     """Resolve one hull against other hulls using only plain data.
@@ -628,6 +638,11 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         if _tank_value(other, 'impulse', True):
             delta_velocity_x += response[2]
             delta_velocity_z += response[3]
+
+        # Friendly hulls remain solid and receive the normal separation and
+        # velocity response above, but only enemy contact can cause HP loss.
+        if _same_team(tank, other):
+            continue
 
         closing_speed = planar_closing_speed(
             (velocity_x, velocity_z),

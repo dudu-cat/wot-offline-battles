@@ -4950,11 +4950,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             # being drawn. Contact must use the actual presented pose.
             'state': {'id': 11, 'x': 0.0, 'y': 0.0, 'z': 30.0,
                       'yaw': math.pi, 'speed': 0.0, 'alive': True,
-                      'team': 1}}}
+                      'team': 2}}}
         battle._bots = types.SimpleNamespace(states={11: {
             'id': 11, 'mass': 25000.0,
             'collision_shape': (1.5, 3.5, 0.0, 1.0),
-            'vehicle': 'ussr:T-34', 'team': 1,
+            'vehicle': 'ussr:T-34', 'team': 2,
         }})
         for revision, sample_time, z in (
                 (36, 100000, 6.5), (37, 200000, 6.5),
@@ -5023,12 +5023,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'presentation_time_us': 200000,
             'state': {'id': 11, 'x': 0.0, 'y': 0.0, 'z': 6.5,
                       'yaw': math.pi, 'speed': 0.0, 'alive': True,
-                      'team': 1}}
+                      'team': 2}}
         battle._records = {'bot:11': record}
         battle._bots = types.SimpleNamespace(states={11: {
             'id': 11, 'mass': 25000.0, 'speed': 0.0,
             'collision_shape': (1.5, 3.5, 0.0, 1.0),
-            'vehicle': 'ussr:T-34', 'team': 1,
+            'vehicle': 'ussr:T-34', 'team': 2,
         }})
         for revision, sample_time in (
                 (36, 100000), (37, 200000), (38, 300000)):
@@ -5126,6 +5126,30 @@ class BattleRuntimeContractTests(unittest.TestCase):
         call = battle._queue_ram_contact_proof.call_args
         self.assertEqual(-12.0, call.args[4][1])
         self.assertAlmostEqual(0.9, call.args[3].y)
+
+    def test_local_friendly_bot_contact_does_not_queue_hp_receipt(self):
+        battle = BattleRuntime(_runtime())
+        battle._local_ram_episode_contacts = frozenset()
+        battle._queue_ram_contact_proof = mock.Mock(return_value=True)
+        own = {
+            'team': 1,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
+            'shape': (1.5, 3.5, 0.0, 1.0),
+            'ram_profile': {
+                'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        }
+        teammate = {
+            'network_id': 11, 'kind': 'bot', 'alive': True, 'team': 1,
+            'x': 0.0, 'y': 0.0, 'z': 0.5, 'yaw': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
+            'shape': (1.5, 3.5, 0.0, 1.0),
+            '_record': {'network_id': 11}, '_vehicle': object(),
+        }
+
+        self.assertFalse(battle._poll_local_ram_contact_episodes(
+            object(), own, (teammate,)))
+        battle._queue_ram_contact_proof.assert_not_called()
 
     def test_local_bot_ram_polling_accepts_deep_horizontal_overlap(self):
         battle = BattleRuntime(_runtime())

@@ -5538,16 +5538,20 @@ class BotRuntime(object):
                                             (bot_vx, bot_vz),
                                             (player_vx, player_vz),
                                             (normal_x, normal_z)))
-                                damage_player, damage_bot = (
-                                    tank_collision.ram_damage(
-                                        closing_speed,
-                                        bot['mass'], player['mass'],
-                                        bot_armor, player_armor,
-                                        bot_spall, player_spall,
-                                        bot_bonus, player_bonus,
-                                        bool(bot_vx or bot_vy or bot_vz),
-                                        bool(player_vx or player_vy or
-                                             player_vz)))
+                                if (bot['team'] in (1, 2) and
+                                        bot['team'] == player['team']):
+                                    damage_player = damage_bot = 0
+                                else:
+                                    damage_player, damage_bot = (
+                                        tank_collision.ram_damage(
+                                            closing_speed,
+                                            bot['mass'], player['mass'],
+                                            bot_armor, player_armor,
+                                            bot_spall, player_spall,
+                                            bot_bonus, player_bonus,
+                                            bool(bot_vx or bot_vy or bot_vz),
+                                            bool(player_vx or player_vy or
+                                                 player_vz)))
                                 response = tank_collision.resolve_tank(
                                     bot, (player,), now=None)
                                 if step is not None:
