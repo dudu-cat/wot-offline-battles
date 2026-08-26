@@ -157,22 +157,17 @@ def gun_pitch_step(current, desired, static_pitch, maximum_speed,
         0.0, _finite(maximum_speed, 'maximum gun speed'))
     if maximum_speed == 0.0:
         return current
-    if abs(current - desired) < 1.0e-6:
-        if angle_limits is not None:
-            minimum, maximum = angle_limits
-            return max(float(minimum), min(float(maximum), desired))
-        return desired
-    difference = desired - current
+    bounded_desired = desired
     if angle_limits is not None:
         minimum, maximum = angle_limits
         minimum = _finite(minimum, 'minimum gun pitch')
         maximum = _finite(maximum, 'maximum gun pitch')
         if minimum > maximum:
             raise ValueError('gun pitch limits are inverted')
-        if desired < minimum:
-            difference = minimum - current
-        elif desired > maximum:
-            difference = maximum - current
+        bounded_desired = max(minimum, min(maximum, desired))
+    if abs(current - desired) < 1.0e-6:
+        return bounded_desired
+    difference = bounded_desired - current
     speed_limit = maximum_speed * elapsed
     if static_pitch is not None:
         static_pitch = _finite(static_pitch, 'static pitch')
@@ -187,4 +182,4 @@ def gun_pitch_step(current, desired, static_pitch, maximum_speed,
         return current + speed_limit
     if difference < -speed_limit:
         return current - speed_limit
-    return desired
+    return bounded_desired

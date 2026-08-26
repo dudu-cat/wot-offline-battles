@@ -4794,6 +4794,10 @@ class BattleRuntime(object):
         descriptor = getattr(entity, 'typeDescriptor', None)
         if not bool(getattr(descriptor, 'hasSiegeMode', False)):
             return False
+        states = self._runtime.constants.VEHICLE_SIEGE_STATE
+        siege_state = getattr(entity, 'siegeState', states.DISABLED)
+        if siege_state not in (states.ENABLED, states.SWITCHING_OFF):
+            return False
         vehicle_filter = getattr(entity, 'filter', None)
         get_physics = getattr(vehicle_filter, 'getVehiclePhysics', None)
         if not callable(get_physics):
@@ -4806,18 +4810,14 @@ class BattleRuntime(object):
         if not callable(set_delta):
             raise RuntimeError(
                 '#1513 hydraulic aiming input boundary is unavailable')
-        states = self._runtime.constants.VEHICLE_SIEGE_STATE
-        pitch_delta = 0.0
-        if getattr(entity, 'siegeState', states.DISABLED) in (
-                states.ENABLED, states.SWITCHING_OFF):
-            rotator = getattr(self._avatar, 'gunRotator', None)
-            if self._sender is None or rotator is None:
-                raise RuntimeError('player hydraulic aim source is unavailable')
-            desired_pitch = float(self._sender.gun_pitch)
-            gun_pitch = float(rotator.gunPitch)
-            pitch_delta = ((desired_pitch - float(self._local_pitch) -
-                            gun_pitch + math.pi) %
-                           (2.0 * math.pi) - math.pi)
+        rotator = getattr(self._avatar, 'gunRotator', None)
+        if self._sender is None or rotator is None:
+            raise RuntimeError('player hydraulic aim source is unavailable')
+        desired_pitch = float(self._sender.gun_pitch)
+        gun_pitch = float(rotator.gunPitch)
+        pitch_delta = ((desired_pitch - float(self._local_pitch) -
+                        gun_pitch + math.pi) %
+                       (2.0 * math.pi) - math.pi)
         # The exact x86 wrapper takes yaw delta first and pitch delta second;
         # the four Swedish #1513 vehicles expose pitch hull aiming only.
         set_delta(0.0, pitch_delta)

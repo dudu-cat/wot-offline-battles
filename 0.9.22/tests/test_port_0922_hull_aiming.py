@@ -96,6 +96,24 @@ class HullAiming1513RulesTests(unittest.TestCase):
                 math.radians(-3.0), math.radians(1.0), None,
                 0.0, 10.0, angle_limits=limits))
 
+    def test_pitch_slew_returns_limit_instead_of_raw_target(self):
+        limits = (math.radians(-20.0), math.radians(5.0))
+        self.assertAlmostEqual(
+            limits[1], hull_aiming.gun_pitch_step(
+                math.radians(4.5), math.radians(23.0), None,
+                math.radians(30.0), 1.0 / 30.0, angle_limits=limits))
+
+    def test_pitch_slew_remains_bounded_across_repeated_steps(self):
+        limits = (math.radians(-20.0), math.radians(5.0))
+        pitch = 0.0
+        for unused in range(30):
+            pitch = hull_aiming.gun_pitch_step(
+                pitch, math.radians(23.0), None, math.radians(20.0),
+                1.0 / 30.0, angle_limits=limits)
+            self.assertGreaterEqual(pitch, limits[0])
+            self.assertLessEqual(pitch, limits[1])
+        self.assertAlmostEqual(limits[1], pitch)
+
 
 if __name__ == '__main__':
     unittest.main()

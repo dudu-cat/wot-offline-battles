@@ -11103,7 +11103,33 @@ class BattleRuntimeContractTests(unittest.TestCase):
             self.assertEqual((1.0, 1.0), (
                 battle._sender.forward, battle._sender.turn))
             entity.filter.notifyInputKeysDown.assert_called_with(0, 0)
-            physics.setHullAimingAnglesDelta.assert_called_with(0.0, 0.0)
+            if siege_state == \
+                    runtime.constants.VEHICLE_SIEGE_STATE.SWITCHING_ON:
+                physics.setHullAimingAnglesDelta.assert_not_called()
+            else:
+                physics.setHullAimingAnglesDelta.assert_called_once_with(
+                    0.0, 0.0)
+
+    def test_inactive_siege_does_not_touch_native_vehicle_physics(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor('sweden:S11_Strv_103B')
+        descriptor.hasSiegeMode = True
+        entity = types.SimpleNamespace(
+            typeDescriptor=descriptor,
+            siegeState=runtime.constants.VEHICLE_SIEGE_STATE.DISABLED,
+            filter=types.SimpleNamespace(
+                getVehiclePhysics=mock.Mock(
+                    side_effect=AssertionError(
+                        'inactive siege touched native physics'))))
+
+        self.assertFalse(battle._update_local_hull_aiming(entity))
+        entity.filter.getVehiclePhysics.assert_not_called()
+
+        entity.siegeState = \
+            runtime.constants.VEHICLE_SIEGE_STATE.SWITCHING_ON
+        self.assertFalse(battle._update_local_hull_aiming(entity))
+        entity.filter.getVehiclePhysics.assert_not_called()
 
     def test_enabled_siege_transplants_native_hydraulic_pose_and_aim(self):
         runtime = _runtime()
