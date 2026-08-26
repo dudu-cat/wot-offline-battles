@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import struct
 import subprocess
 import uuid
 import zipfile
@@ -70,7 +71,22 @@ _CHUNK_BYTES = 64 * 1024
 _DUMP_MONITOR_SLOTS = 32
 _VISIBLE_CLIENT_CLEAN_EXIT_SUFFIX = (
     b": INFO: PostProcessing.Phases.fini()")
+_VISIBLE_CLIENT_LOBBY_RESTORED_SUFFIX = (
+    b": INFO: [Offline LAN 0.9.22] deferred lobby Account restored")
 _VISIBLE_CLIENT_EXIT_TAIL_BYTES = 4096
+MINIDUMP_EVIDENCE_ABSENT = "absent"
+MINIDUMP_EVIDENCE_TERMINATION = "termination"
+MINIDUMP_EVIDENCE_EXCEPTION = "exception"
+MINIDUMP_EVIDENCE_UNKNOWN = "unknown"
+VISIBLE_CLIENT_EXIT_CLEAN = "clean"
+VISIBLE_CLIENT_EXIT_EXCEPTION = "exception"
+VISIBLE_CLIENT_EXIT_TERMINATED = "unexpected-termination"
+VISIBLE_CLIENT_EXIT_UNKNOWN = "unknown"
+_MINIDUMP_SIGNATURE = b"MDMP"
+_MINIDUMP_HEADER_BYTES = 32
+_MINIDUMP_DIRECTORY_BYTES = 12
+_MINIDUMP_EXCEPTION_STREAM = 6
+_MINIDUMP_MAX_STREAMS = 4096
 
 
 def _application_directory():
@@ -584,48 +600,10 @@ def _open_valid_source(session, role, source):
         return None
 
 
-def visible_client_exited_cleanly(session):
-    """Return whether this session's client log has a clean final trailer."""
-    if not isinstance(session, dict) or not _is_latest(session):
-        return False
-    try:
-        dump_directory, dump_paths = _recorded_dump_layout(session)
-        if (not _safe_dump_directory(dump_directory, create=False) or
-                os.path.lexists(dump_paths[ROLE_VISIBLE_CLIENT])):
-            return False
-    except (core.LauncherError, IOError, OSError):
-        return False
-    sources = session.get("sources")
-    if not isinstance(sources, dict):
-        return False
-    source = sources.get(ROLE_VISIBLE_CLIENT)
-    if not isinstance(source, dict):
-        return False
-    try:
-        opened = _open_valid_source(session, ROLE_VISIBLE_CLIENT, source)
-    except Exception:
-        return False
-    if opened is None:
-        return False
-    stream, length = opened
-    try:
-        tail_length = min(int(length), _VISIBLE_CLIENT_EXIT_TAIL_BYTES)
-        stream.seek(int(length) - tail_length, os.SEEK_CUR)
-        payload = stream.read(tail_length)
-        if len(payload) != tail_length:
-            return False
-        return payload.rstrip(b"\r\n\t ").endswith(
-            _VISIBLE_CLIENT_CLEAN_EXIT_SUFFIX)
-    except (IOError, OSError, ValueError):
-        return False
-    finally:
-        stream.close()
-
-
-def _open_valid_dump(session, role):
+def _open_recorded_dump(session, role):
+    """Open one fixed launcher-owned dump without selecting it for a ZIP."""
     layout = _recorded_dump_layout(session, required=False)
-    if (layout is None or not session.get("endedAt") or
-            role not in session.get("crashRoles", ())):
+    if layout is None or role not in DUMP_ROLES:
         return None
     directory, paths = layout
     try:
@@ -654,6 +632,144 @@ def _open_valid_dump(session, role):
     except Exception:
         stream.close()
         return None
+
+
+def _read_minidump_evidence(stream, length):
+    # ProcDump's -t mode writes a valid dump for ordinary process termination.
+    # Only a bounded, in-file ExceptionStream distinguishes an exception dump.
+    if int(length) < _MINIDUMP_HEADER_BYTES:
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    header = stream.read(_MINIDUMP_HEADER_BYTES)
+    if (len(header) != _MINIDUMP_HEADER_BYTES or
+            header[:4] != _MINIDUMP_SIGNATURE):
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    try:
+        stream_count, directory_rva = struct.unpack_from("<II", header, 8)
+    except struct.error:
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    if stream_count > _MINIDUMP_MAX_STREAMS:
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    directory_length = int(stream_count) * _MINIDUMP_DIRECTORY_BYTES
+    directory_end = int(directory_rva) + directory_length
+    if ((stream_count and directory_rva < _MINIDUMP_HEADER_BYTES) or
+            directory_end < int(directory_rva) or
+            directory_end > int(length)):
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    try:
+        stream.seek(int(directory_rva))
+        directory = stream.read(directory_length)
+    except (IOError, OSError, ValueError):
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    if len(directory) != directory_length:
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    has_exception = False
+    for offset in range(0, directory_length, _MINIDUMP_DIRECTORY_BYTES):
+        try:
+            stream_type, data_size, data_rva = struct.unpack_from(
+                "<III", directory, offset)
+        except struct.error:
+            return MINIDUMP_EVIDENCE_UNKNOWN
+        if data_size and (
+                data_rva < _MINIDUMP_HEADER_BYTES or
+                data_rva > int(length) or
+                data_size > int(length) - data_rva):
+            return MINIDUMP_EVIDENCE_UNKNOWN
+        if stream_type == _MINIDUMP_EXCEPTION_STREAM:
+            if not data_size:
+                return MINIDUMP_EVIDENCE_UNKNOWN
+            has_exception = True
+    return (MINIDUMP_EVIDENCE_EXCEPTION if has_exception
+            else MINIDUMP_EVIDENCE_TERMINATION)
+
+
+def minidump_evidence(session, role):
+    """Classify a current session dump without trusting its filename alone."""
+    if (not isinstance(session, dict) or not _is_latest(session) or
+            role not in DUMP_ROLES):
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    try:
+        layout = _recorded_dump_layout(session)
+        directory, paths = layout
+        if not _safe_dump_directory(directory, create=False):
+            return MINIDUMP_EVIDENCE_UNKNOWN
+        exists = os.path.lexists(paths[role])
+        opened = _open_recorded_dump(session, role)
+    except (core.LauncherError, IOError, OSError):
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    if opened is None:
+        return (MINIDUMP_EVIDENCE_UNKNOWN if exists
+                else MINIDUMP_EVIDENCE_ABSENT)
+    stream, length = opened
+    try:
+        return _read_minidump_evidence(stream, length)
+    except Exception:
+        return MINIDUMP_EVIDENCE_UNKNOWN
+    finally:
+        stream.close()
+
+
+def _visible_client_exit_tail(session):
+    sources = session.get("sources")
+    if not isinstance(sources, dict):
+        return None
+    source = sources.get(ROLE_VISIBLE_CLIENT)
+    if not isinstance(source, dict):
+        return None
+    try:
+        opened = _open_valid_source(session, ROLE_VISIBLE_CLIENT, source)
+    except Exception:
+        return None
+    if opened is None:
+        return None
+    stream, length = opened
+    try:
+        tail_length = min(int(length), _VISIBLE_CLIENT_EXIT_TAIL_BYTES)
+        stream.seek(int(length) - tail_length, os.SEEK_CUR)
+        payload = stream.read(tail_length)
+        if len(payload) != tail_length:
+            return None
+        payload = payload.rstrip(b"\r\n\t ")
+        if payload.endswith(_VISIBLE_CLIENT_CLEAN_EXIT_SUFFIX):
+            return "clean-shutdown"
+        if payload.endswith(_VISIBLE_CLIENT_LOBBY_RESTORED_SUFFIX):
+            return "lobby-restored"
+        return None
+    except (IOError, OSError, ValueError):
+        return None
+    finally:
+        stream.close()
+
+
+def visible_client_exit_evidence(session):
+    """Classify the visible client's current-session shutdown evidence."""
+    if not isinstance(session, dict) or not _is_latest(session):
+        return VISIBLE_CLIENT_EXIT_UNKNOWN
+    dump_evidence = minidump_evidence(session, ROLE_VISIBLE_CLIENT)
+    if dump_evidence == MINIDUMP_EVIDENCE_EXCEPTION:
+        return VISIBLE_CLIENT_EXIT_EXCEPTION
+    if dump_evidence == MINIDUMP_EVIDENCE_UNKNOWN:
+        return VISIBLE_CLIENT_EXIT_UNKNOWN
+    exit_tail = _visible_client_exit_tail(session)
+    if exit_tail == "clean-shutdown":
+        return VISIBLE_CLIENT_EXIT_CLEAN
+    if (exit_tail == "lobby-restored" and
+            dump_evidence == MINIDUMP_EVIDENCE_TERMINATION):
+        return VISIBLE_CLIENT_EXIT_CLEAN
+    if dump_evidence == MINIDUMP_EVIDENCE_TERMINATION:
+        return VISIBLE_CLIENT_EXIT_TERMINATED
+    return VISIBLE_CLIENT_EXIT_UNKNOWN
+
+
+def visible_client_exited_cleanly(session):
+    """Return whether current-session evidence proves a clean client exit."""
+    return visible_client_exit_evidence(session) == VISIBLE_CLIENT_EXIT_CLEAN
+
+
+def _open_valid_dump(session, role):
+    if (not session.get("endedAt") or
+            role not in session.get("crashRoles", ())):
+        return None
+    return _open_recorded_dump(session, role)
 
 
 def _write_slice(archive, archive_name, stream, length):

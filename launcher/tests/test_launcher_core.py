@@ -1946,7 +1946,7 @@ class GameProcessTest(unittest.TestCase):
         worker = self._Process([None, 7])
 
         self.assertEqual(
-            (1, False),
+            (1, True),
             core.wait_for_paired_player_exit(
                 process, "/game", required_process=worker,
                 window_visible=lambda: True, poll=1.0,

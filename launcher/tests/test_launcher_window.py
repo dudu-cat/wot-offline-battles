@@ -1756,6 +1756,55 @@ class WindowTest(unittest.TestCase):
         self.assertIn("exit code 1", self._log_text())
         self.assertIn("The game closed.", self._log_text())
 
+    def test_worker_authority_exit_is_not_a_visible_client_crash(self):
+        game = _Process(exit_code=None)
+        worker = _Process(exit_code=9)
+        self.window._worker = worker
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(1, True)), \
+                mock.patch.object(self.window, "_log_worker_failure") as log:
+            self.assertFalse(self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True))
+
+        self.assertNotIn(
+            wot_launcher.error_reports.ROLE_VISIBLE_CLIENT,
+            self.window._observed_crash_roles)
+        self.assertIn(
+            wot_launcher.error_reports.ROLE_HIDDEN_WORKER,
+            self.window._observed_crash_roles)
+        log.assert_called_once_with(self.settings_dir)
+        self.assertNotIn("The game stopped with exit code 1", self._log_text())
+        self.assertIn("worker stopped with exit code 9", self._log_text())
+
+    def test_worker_exit_does_not_hide_a_real_visible_exception_stream(self):
+        game = _Process(exit_code=None)
+        worker = _Process(exit_code=9)
+        exception_evidence = (
+            wot_launcher.error_reports.VISIBLE_CLIENT_EXIT_EXCEPTION)
+        self.window._worker = worker
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(1, True)), \
+                mock.patch.object(
+                    wot_launcher.error_reports,
+                    "visible_client_exit_evidence",
+                    return_value=exception_evidence), \
+                mock.patch.object(self.window, "_log_worker_failure"):
+            self.assertTrue(self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True))
+
+        self.assertEqual(
+            {wot_launcher.error_reports.ROLE_VISIBLE_CLIENT,
+             wot_launcher.error_reports.ROLE_HIDDEN_WORKER},
+            self.window._observed_crash_roles)
+
     def test_paired_player_clean_log_makes_nonzero_starter_exit_normal(self):
         boundary = wot_launcher.error_reports.begin_session(
             self.settings_dir,

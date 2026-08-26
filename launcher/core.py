@@ -1870,7 +1870,8 @@ def wait_for_paired_player_exit(
     they no longer participate in the shutdown decision.
 
     If the required hidden worker exits, retire the paired player job instead
-    of leaving a visible client running without its simulation authority.
+    of leaving a visible client running without its simulation authority. The
+    second return value records whether that authority loss caused the close.
     """
     import time as time_module
 
@@ -1891,7 +1892,7 @@ def wait_for_paired_player_exit(
             except subprocess.TimeoutExpired:
                 process.kill()
                 exit_code = process.wait()
-            return exit_code, False
+            return exit_code, True
         sleep(max(0.001, float(poll)))
 
 

@@ -2101,9 +2101,10 @@ class LauncherWindow(object):
         self._game = game_process
         self._game_starter_root = (
             game_root if port_version == core.PORT_0_9_22 else None)
+        closed_for_required_process = False
         try:
             if paired_worker:
-                exit_code, unused_window_closed = (
+                exit_code, closed_for_required_process = (
                     core.wait_for_paired_player_exit(
                         game_process, game_root,
                         required_process=self._worker))
@@ -2112,15 +2113,40 @@ class LauncherWindow(object):
         finally:
             self._game = None
             self._game_starter_root = None
-        self._remember_process_exit(
-            exit_code, error_reports.ROLE_VISIBLE_CLIENT)
+        worker_exit = (self._worker.poll()
+                       if paired_worker and self._worker is not None
+                       else None)
+        worker_authority_failed = bool(
+            paired_worker and not self._stop_requested and
+            (closed_for_required_process or worker_exit is not None))
+        if worker_authority_failed:
+            self._worker_exited_unexpectedly = True
+            self._observed_crash_roles.add(
+                error_reports.ROLE_HIDDEN_WORKER)
+        authority_closed_visible = (
+            closed_for_required_process or worker_authority_failed)
+        if authority_closed_visible:
+            try:
+                visible_exit_evidence = (
+                    error_reports.visible_client_exit_evidence(
+                        self._active_report_session))
+            except Exception:
+                visible_exit_evidence = (
+                    error_reports.VISIBLE_CLIENT_EXIT_UNKNOWN)
+            if (visible_exit_evidence ==
+                    error_reports.VISIBLE_CLIENT_EXIT_EXCEPTION and
+                    error_reports.ROLE_VISIBLE_CLIENT not in
+                    self._forced_stop_roles):
+                self._observed_crash_roles.add(
+                    error_reports.ROLE_VISIBLE_CLIENT)
+        else:
+            self._remember_process_exit(
+                exit_code, error_reports.ROLE_VISIBLE_CLIENT)
         crashed = (error_reports.ROLE_VISIBLE_CLIENT in
                    self._observed_crash_roles)
         if crashed:
             self._log("The game stopped with exit code %s." % exit_code)
         if paired_worker:
-            worker_exit = (self._worker.poll()
-                           if self._worker is not None else None)
             if worker_exit is not None and not self._stop_requested:
                 self._log(
                     "The hidden simulation worker stopped with exit code "

@@ -3,6 +3,7 @@
 import datetime
 import os
 import shutil
+import struct
 import tempfile
 import unittest
 import zipfile
@@ -49,6 +50,26 @@ class ErrorReportTest(unittest.TestCase):
         with zipfile.ZipFile(report["path"], "r") as archive:
             return dict((name, archive.read(name))
                         for name in archive.namelist())
+
+    @staticmethod
+    def _minidump(*stream_types):
+        directory_rva = 32
+        payload_rva = directory_rva + 12 * len(stream_types)
+        entries = []
+        payloads = []
+        for stream_type in stream_types:
+            payload = b"\0" * (168 if stream_type == 6 else 56)
+            entries.append(struct.pack(
+                "<III", stream_type, len(payload), payload_rva))
+            payloads.append(payload)
+            payload_rva += len(payload)
+        return b"".join((
+            struct.pack(
+                "<4sIIIIIQ", b"MDMP", 0, len(stream_types),
+                directory_rva, 0, 0, 0),
+            b"".join(entries),
+            b"".join(payloads),
+        ))
 
     def test_single_player_report_contains_only_this_session_log_slices(self):
         visible = self._game_log(error_reports.ROLE_VISIBLE_CLIENT)
@@ -135,7 +156,7 @@ class ErrorReportTest(unittest.TestCase):
         self.assertFalse(
             error_reports.visible_client_exited_cleanly(session))
 
-    def test_visible_dump_overrides_a_clean_exit_log_trailer(self):
+    def test_termination_dump_does_not_override_a_clean_exit_log_trailer(self):
         session = error_reports.begin_session(
             self.game, session_id=self.SESSION_1, started_at="start")
         self._write(
@@ -143,8 +164,101 @@ class ErrorReportTest(unittest.TestCase):
             b"2026-08-24 13:38:12.444: INFO: "
             b"PostProcessing.Phases.fini()\r\n")
         self._write(error_reports.session_dump_path(
-            session, error_reports.ROLE_VISIBLE_CLIENT), b"crash dump")
+            session, error_reports.ROLE_VISIBLE_CLIENT), self._minidump(7))
 
+        self.assertEqual(
+            error_reports.MINIDUMP_EVIDENCE_TERMINATION,
+            error_reports.minidump_evidence(
+                session, error_reports.ROLE_VISIBLE_CLIENT))
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_CLEAN,
+            error_reports.visible_client_exit_evidence(session))
+        self.assertTrue(
+            error_reports.visible_client_exited_cleanly(session))
+
+    def test_termination_dump_after_lobby_restore_is_normal(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        visible = self._game_log(error_reports.ROLE_VISIBLE_CLIENT)
+        self._write(
+            visible,
+            b"2026-08-26 21:24:19.367: INFO: [Offline LAN 0.9.22] "
+            b"deferred lobby Account restored\r\n")
+
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_UNKNOWN,
+            error_reports.visible_client_exit_evidence(session))
+
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), self._minidump(7))
+
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_CLEAN,
+            error_reports.visible_client_exit_evidence(session))
+        self.assertTrue(
+            error_reports.visible_client_exited_cleanly(session))
+
+        self._write(visible, b"late failure after lobby restore\r\n", "ab")
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_TERMINATED,
+            error_reports.visible_client_exit_evidence(session))
+        self.assertFalse(
+            error_reports.visible_client_exited_cleanly(session))
+
+    def test_exception_stream_overrides_a_clean_exit_log_trailer(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT),
+            b"2026-08-24 13:38:12.444: INFO: "
+            b"PostProcessing.Phases.fini()\r\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), self._minidump(6))
+
+        self.assertEqual(
+            error_reports.MINIDUMP_EVIDENCE_EXCEPTION,
+            error_reports.minidump_evidence(
+                session, error_reports.ROLE_VISIBLE_CLIENT))
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_EXCEPTION,
+            error_reports.visible_client_exit_evidence(session))
+        self.assertFalse(
+            error_reports.visible_client_exited_cleanly(session))
+
+    def test_termination_dump_without_a_clean_trailer_is_unexpected(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT),
+            b"client stopped before final shutdown\r\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), self._minidump(7))
+
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_TERMINATED,
+            error_reports.visible_client_exit_evidence(session))
+        self.assertFalse(
+            error_reports.visible_client_exited_cleanly(session))
+
+    def test_malformed_minidump_never_proves_a_clean_exit(self):
+        session = error_reports.begin_session(
+            self.game, session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_VISIBLE_CLIENT),
+            b"2026-08-24 13:38:12.444: INFO: "
+            b"PostProcessing.Phases.fini()\r\n")
+        malformed = struct.pack(
+            "<4sIIIIIQ", b"MDMP", 0, 1, 4096, 0, 0, 0)
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_VISIBLE_CLIENT), malformed)
+
+        self.assertEqual(
+            error_reports.MINIDUMP_EVIDENCE_UNKNOWN,
+            error_reports.minidump_evidence(
+                session, error_reports.ROLE_VISIBLE_CLIENT))
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_UNKNOWN,
+            error_reports.visible_client_exit_evidence(session))
         self.assertFalse(
             error_reports.visible_client_exited_cleanly(session))
 
@@ -302,6 +416,10 @@ class ErrorReportTest(unittest.TestCase):
             return real_lstat(path)
 
         with mock.patch.object(error_reports.os, "lstat", side_effect=lstat):
+            self.assertEqual(
+                error_reports.MINIDUMP_EVIDENCE_UNKNOWN,
+                error_reports.minidump_evidence(
+                    session, error_reports.ROLE_VISIBLE_CLIENT))
             report = error_reports.create_report()
 
         self.assertEqual(
