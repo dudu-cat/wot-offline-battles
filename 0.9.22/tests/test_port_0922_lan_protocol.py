@@ -69,7 +69,7 @@ class LanProtocolTests(unittest.TestCase):
         self.client._published_player_effective_params[1] = \
             effective_params()
         self.sent = []
-        def send(message):
+        def send(message, **unused_options):
             self.sent.append(message)
             return True
         self.client._send = send
