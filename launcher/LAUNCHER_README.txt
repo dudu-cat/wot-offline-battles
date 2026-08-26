@@ -136,6 +136,10 @@ time the launcher asks about native crash dumps, choosing Enable downloads the
 accepts Microsoft's license terms. If the download fails, crash-dump collection
 stays disabled and the game can still be launched normally.
 
+The optional full-memory checkbox changes future captures from ProcDump's Mini
+format to Full format. It is off by default because Full dumps can be very
+large; enable it only when a difficult crash needs deeper diagnosis.
+
 https://learn.microsoft.com/en-us/sysinternals/downloads/procdump
 https://learn.microsoft.com/en-us/sysinternals/license-faq
 https://learn.microsoft.com/en-us/sysinternals/license-terms

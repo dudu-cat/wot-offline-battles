@@ -251,9 +251,13 @@ class WindowTest(unittest.TestCase):
             self.window.distribution_notice_text,
             self.window.distribution_notice_entry.cget("textvariable"))
         self.assertFalse(self.window.collect_crash_reports.get())
+        self.assertFalse(self.window.full_crash_dumps.get())
         self.assertEqual(
             "Collect a report if the game crashes",
             self.window.crash_report_check.cget("text"))
+        self.assertEqual(
+            "Collect full-memory crash dumps (very large files)",
+            self.window.full_crash_dump_check.cget("text"))
 
     def test_first_run_prompts_once_when_the_launcher_starts(self):
         with mock.patch.object(
@@ -374,9 +378,25 @@ class WindowTest(unittest.TestCase):
         self._game("0.8.2", "")
         self.assertEqual(
             "disabled", self.window.crash_report_check.cget("state"))
+        self.assertEqual(
+            "disabled", self.window.full_crash_dump_check.cget("state"))
 
         self._game()
         self.assertEqual("normal", self.window.crash_report_check.cget("state"))
+        self.assertEqual(
+            "normal", self.window.full_crash_dump_check.cget("state"))
+
+    def test_full_crash_dump_choice_defaults_off_and_persists(self):
+        self.assertFalse(self.window.full_crash_dumps.get())
+
+        self.window.full_crash_dumps.set(True)
+        self.assertTrue(self.window._full_crash_dumps_toggled())
+
+        reopened = wot_launcher.LauncherWindow(
+            _FakeTk, _FakeTtk, self.dialog)
+        self.assertTrue(reopened.full_crash_dumps.get())
+        self.assertTrue(core.load_settings().get(
+            wot_launcher.FULL_CRASH_DUMPS_SETTING))
 
     def test_old_host_setting_migrates_to_the_online_tab(self):
         core.save_settings({"mode": "host"})
@@ -944,8 +964,9 @@ class WindowTest(unittest.TestCase):
             "notRun": (),
         }
 
-        def enable(unused_boundary, requested):
+        def enable(unused_boundary, requested, full_memory=False):
             self.window._crash_capture_enabled = bool(requested)
+            self.window._full_crash_dump_enabled = bool(full_memory)
             self.window._procdump_path = (
                 "C:\\tools\\procdump.exe" if requested else None)
             return bool(requested)
@@ -1012,8 +1033,9 @@ class WindowTest(unittest.TestCase):
             "notRun": (),
         }
 
-        def enable(unused_boundary, unused_requested):
+        def enable(unused_boundary, unused_requested, full_memory=False):
             self.window._crash_capture_enabled = True
+            self.window._full_crash_dump_enabled = bool(full_memory)
             self.window._procdump_path = "C:\\tools\\procdump.exe"
             return True
 
@@ -1550,7 +1572,24 @@ class WindowTest(unittest.TestCase):
             wot_launcher.error_reports.session_dump_path(
                 boundary, wot_launcher.error_reports.ROLE_HIDDEN_WORKER),
             environment[wot_launcher.CRASH_DUMP_PATH_ENV])
+        self.assertEqual(
+            "mini", environment[wot_launcher.CRASH_DUMP_MODE_ENV])
         self.window._stop_worker()
+
+    def test_crash_capture_environment_requests_full_memory_dumps(self):
+        boundary = wot_launcher.error_reports.begin_session(
+            self.settings_dir, needs_worker=True,
+            session_id="20260823T120000Z-222222222222")
+        self.window._active_report_session = boundary
+        self.window._crash_capture_enabled = True
+        self.window._full_crash_dump_enabled = True
+        self.window._procdump_path = "C:\\tools\\procdump.exe"
+
+        environment = self.window._crash_capture_environment(
+            {}, wot_launcher.error_reports.ROLE_HIDDEN_WORKER)
+
+        self.assertEqual(
+            "full", environment[wot_launcher.CRASH_DUMP_MODE_ENV])
 
     def test_worker_stop_waits_for_the_native_starter_cleanup(self):
         worker = _Process(exit_code=None, pid=42)

@@ -69,6 +69,8 @@ _CHINESE = {
         "正式客户端卡在加载界面？点击清理配置…",
     "Reset all offline data...": "重置全部离线数据…",
     "Create error report...": "一键汇报错误…",
+    "Collect full-memory crash dumps (very large files)":
+        "疑难闪退：收集完整内存（文件很大）",
     "Activity log": "运行日志",
     "Close game": "关闭游戏",
     "Select the folder that contains %s.": "请选择包含 %s 的目录。",
@@ -132,9 +134,11 @@ _CHINESE = {
 
 
 COLLECT_CRASH_REPORTS_SETTING = "collect_crash_reports"
+FULL_CRASH_DUMPS_SETTING = "full_crash_dumps"
 PROCDUMP_CONSENT_SETTING = "procdump_download_consent"
 PROCDUMP_PATH_ENV = "WOT_OFFLINE_PROCDUMP_PATH"
 CRASH_DUMP_PATH_ENV = "WOT_OFFLINE_CRASH_DUMP_PATH"
+CRASH_DUMP_MODE_ENV = "WOT_OFFLINE_CRASH_DUMP_MODE"
 
 
 def _no_console_flags():
@@ -295,6 +299,7 @@ class LauncherWindow(object):
         self._report_busy = False
         self._active_report_session = None
         self._crash_capture_enabled = False
+        self._full_crash_dump_enabled = False
         self._procdump_path = None
         self._procdump_download_consent = False
         self._initial_crash_prompt_pending = False
@@ -387,6 +392,15 @@ class LauncherWindow(object):
             borderwidth=2, padx=10)
         self.report_button.grid(
             row=2, column=2, sticky="e", pady=(6, 0))
+        saved_full_dumps = settings.get(FULL_CRASH_DUMPS_SETTING, False)
+        if not isinstance(saved_full_dumps, bool):
+            saved_full_dumps = False
+        self.full_crash_dumps = tk.BooleanVar(value=saved_full_dumps)
+        self.full_crash_dump_check = tk.Checkbutton(
+            self.game_panel, text="", variable=self.full_crash_dumps,
+            command=self._full_crash_dumps_toggled, anchor="w")
+        self.full_crash_dump_check.grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
         self.game_panel.grid_columnconfigure(1, weight=1)
 
         saved_mode = settings.get("mode", core.MODE_SINGLE)
@@ -597,6 +611,8 @@ class LauncherWindow(object):
         self.browse_button.config(text=self._t("Browse..."))
         self.crash_report_check.config(
             text=self._t("Collect a report if the game crashes"))
+        self.full_crash_dump_check.config(text=self._t(
+            "Collect full-memory crash dumps (very large files)"))
         self.battle_tabs.tab(
             self.single_panel, text=self._t("Single player"))
         self.battle_tabs.tab(self.network_panel, text=self._t("Online"))
@@ -766,6 +782,11 @@ class LauncherWindow(object):
         self.report_button.config(
             state="disabled" if self._report_busy else "normal")
         self.crash_report_check.config(
+            state=("normal" if
+                   self._selected_client == core.PORT_0_9_22 and
+                   not self._busy and not self._maintenance_busy
+                   else "disabled"))
+        self.full_crash_dump_check.config(
             state=("normal" if
                    self._selected_client == core.PORT_0_9_22 and
                    not self._busy and not self._maintenance_busy
@@ -1047,6 +1068,10 @@ class LauncherWindow(object):
         self.collect_crash_reports.set(False)
         return self._request_crash_collection()
 
+    def _full_crash_dumps_toggled(self):
+        self._save_settings()
+        return bool(self.full_crash_dumps.get())
+
     def _prompt_initial_crash_collection(self):
         if not self._initial_crash_prompt_pending:
             return False
@@ -1057,8 +1082,10 @@ class LauncherWindow(object):
         self.collect_crash_reports.set(False)
         self._save_settings()
 
-    def _enable_crash_capture(self, report_session, requested):
+    def _enable_crash_capture(self, report_session, requested,
+                              full_memory=False):
         self._crash_capture_enabled = False
+        self._full_crash_dump_enabled = False
         self._procdump_path = None
         if (not requested or report_session is None or
                 not self._procdump_download_consent):
@@ -1072,6 +1099,7 @@ class LauncherWindow(object):
                 self.root.after(0, self._disable_crash_collection)
                 return False
         self._crash_capture_enabled = True
+        self._full_crash_dump_enabled = bool(full_memory)
         self._procdump_path = procdump_path
         return True
 
@@ -1088,6 +1116,8 @@ class LauncherWindow(object):
             return environment
         environment[PROCDUMP_PATH_ENV] = self._procdump_path
         environment[CRASH_DUMP_PATH_ENV] = dump_path
+        environment[CRASH_DUMP_MODE_ENV] = (
+            "full" if self._full_crash_dump_enabled else "mini")
         return environment
 
     def _confirm_crash_report(self):
@@ -1240,6 +1270,8 @@ class LauncherWindow(object):
             "language": self.language_preference,
             COLLECT_CRASH_REPORTS_SETTING:
                 bool(self.collect_crash_reports.get()),
+            FULL_CRASH_DUMPS_SETTING:
+                bool(self.full_crash_dumps.get()),
             PROCDUMP_CONSENT_SETTING:
                 bool(self._procdump_download_consent),
         })
@@ -1595,6 +1627,8 @@ class LauncherWindow(object):
                 self.bot_lineup_profile.get().strip())
             session[COLLECT_CRASH_REPORTS_SETTING] = bool(
                 self.collect_crash_reports.get())
+            session[FULL_CRASH_DUMPS_SETTING] = bool(
+                self.full_crash_dumps.get())
         except (core.LauncherError,
                 bot_lineup_profiles.BotLineupProfileError) as error:
             self._log(str(error))
@@ -1638,7 +1672,8 @@ class LauncherWindow(object):
         self._enable_crash_capture(
             report_session,
             session["client"] == core.PORT_0_9_22 and
-            bool(session.get(COLLECT_CRASH_REPORTS_SETTING, False)))
+            bool(session.get(COLLECT_CRASH_REPORTS_SETTING, False)),
+            full_memory=bool(session.get(FULL_CRASH_DUMPS_SETTING, False)))
         if report_session is not None and reused_server:
             try:
                 error_reports.attach_server(

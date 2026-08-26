@@ -41,6 +41,7 @@
 #define MAX_GAME_PROCESS_IDS 32
 #define PROCDUMP_PATH_ENV L"WOT_OFFLINE_PROCDUMP_PATH"
 #define CRASH_DUMP_PATH_ENV L"WOT_OFFLINE_CRASH_DUMP_PATH"
+#define CRASH_DUMP_MODE_ENV L"WOT_OFFLINE_CRASH_DUMP_MODE"
 #define PROCDUMP_ATTACH_TIMEOUT_MS 10000
 #define PROCDUMP_ATTACH_POLL_MS 25
 #define PROCDUMP_FINISH_TIMEOUT_MS 20000
@@ -414,9 +415,17 @@ static HANDLE start_procdump_configured(HANDLE target_process,
 	DWORD exit_code;
 	DWORD wait_state;
 	BOOL debugger_present = FALSE;
+	WCHAR dump_mode[16];
+	const WCHAR *dump_option = L"-mm";
+	if (GetEnvironmentVariableW(
+			CRASH_DUMP_MODE_ENV, dump_mode, 16) > 0 &&
+			lstrcmpiW(dump_mode, L"full") == 0) {
+		dump_option = L"-ma";
+	}
 	if (FAILED(StringCchPrintfW(command, 4 * MAX_PATH,
-			L"\"%s\" -accepteula -mm -n 1 -e -t %lu \"%s\"",
-			procdump_path, (unsigned long)target_process_id, dump_path))) {
+			L"\"%s\" -accepteula %s -n 1 -e -t %lu \"%s\"",
+			procdump_path, dump_option,
+			(unsigned long)target_process_id, dump_path))) {
 		log_failure("procdump_command", ERROR_INSUFFICIENT_BUFFER);
 		return 0;
 	}

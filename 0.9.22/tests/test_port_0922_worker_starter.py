@@ -119,8 +119,11 @@ class WorkerStarterTests(unittest.TestCase):
 
         self.assertIn('WOT_OFFLINE_PROCDUMP_PATH', source)
         self.assertIn('WOT_OFFLINE_CRASH_DUMP_PATH', source)
+        self.assertIn('WOT_OFFLINE_CRASH_DUMP_MODE', source)
         self.assertIn(
-            '-accepteula -mm -n 1 -e -t %lu', capture)
+            '-accepteula %s -n 1 -e -t %lu', capture)
+        self.assertIn('const WCHAR *dump_option = L"-mm"', capture)
+        self.assertIn('dump_option = L"-ma"', capture)
         self.assertIn('CheckRemoteDebuggerPresent(', capture)
         self.assertIn('WaitForSingleObject(process.hProcess, 0)', capture)
         self.assertIn('procdump_exited_before_attach', capture)
