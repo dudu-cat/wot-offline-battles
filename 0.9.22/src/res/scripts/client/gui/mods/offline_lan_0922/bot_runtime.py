@@ -44,8 +44,11 @@ ARTILLERY_TOTAL_PROOF_SECONDS = 120.0
 ARTILLERY_AIM_STALENESS_METRES = 1.5
 COVER_JOBS_PER_OBSERVATION = 3
 HUMAN_TARGET_ID_BASE = 1000000
-VISIBILITY_MIN_SECONDS = 0.18
-VISIBILITY_JITTER_SECONDS = 0.018
+# The pinned client evaluates spotting at roughly six hertz. Keep the full
+# camouflage/LOS calculation on that fixed authority cadence; intervening
+# planner reads reuse the last pair result. A target fire-sequence edge still
+# invalidates the pair immediately below.
+VISIBILITY_SAMPLE_SECONDS = 1.0 / 6.0
 SHOT_LANE_SECONDS = 0.20
 # Spread full-roster tactical refreshes across the complete observation
 # window.  A selected target still goes through the independent 0.20-second
@@ -3792,34 +3795,71 @@ class BotRuntime(object):
             return True, True, fire_seq
         return _number(now) < previous[1], False, fire_seq
 
-    def _visible(self, source, target, now):
+    def _target_detection_projection(
+            self, target, target_id, now, tick_cache=None):
+        """Project target-only camouflage inputs once per simulation slice."""
+        moving = (abs(_number(target.get('speed'))) >
+                  spotting.MOVING_SPEED_EPSILON)
+        identity = (target.get('kind'), int(target_id))
+        profile_cache = (tick_cache.setdefault('profile', {})
+                         if isinstance(tick_cache, dict) else None)
+        profile_bundle = (profile_cache.get(identity)
+                          if profile_cache is not None else None)
+        if profile_bundle is None:
+            profile_bundle = self._spotting_profile(target)
+            if profile_cache is not None:
+                profile_cache[identity] = profile_bundle
+        token = (_number(now), moving, id(profile_bundle))
+        cache = (tick_cache.setdefault('target', {})
+                 if isinstance(tick_cache, dict) else None)
+        cached = cache.get(identity) if cache is not None else None
+        if cached is not None and cached[0] == token:
+            return cached[1]
+        base_pair, shot_factor, profile = profile_bundle
+        still_seconds = self._target_still_seconds(
+            identity, moving, now)
+        additive, multiplier = _invisibility_aspect(
+            profile, moving, loadout.still_device_active(
+                still_seconds, profile['camouflage_net_delay']))
+        result = (
+            base_pair, shot_factor, profile, moving,
+            additive, multiplier)
+        if cache is not None:
+            # Keep only the latest exact target state. If a target changes
+            # motion class twice in one slice, the second transition must run
+            # the stillness state machine again rather than reuse old data.
+            cache[identity] = (token, result)
+        return result
+
+    def _visible(self, source, target, now, tick_cache=None,
+                 source_position=None, view_range_resolver=None):
         target_id = target.get('network_id', target.get('id', 0))
         source_kind = source.get('kind', 'bot')
         key = (source_kind, int(source.get('id', 0)),
                target.get('kind'), int(target_id))
-        fired_recently, fire_changed, fire_seq = self._target_fired_recently(
-            target, now)
+        fired_recently, fire_changed, fire_seq = \
+            self._target_fired_recently(target, now)
         cached = self._visibility_cache.get(key)
-        ttl = (VISIBILITY_MIN_SECONDS +
-               ((key[1] * 31 + key[3] * 17) % 11) *
-               VISIBILITY_JITTER_SECONDS)
+        ttl = VISIBILITY_SAMPLE_SECONDS
         if (not fire_changed and cached is not None and
                 cached[2] == fire_seq and
                 _number(now) - cached[0] < ttl):
             return cached[1]
-        distance = _distance(_position(source), target.get('position') or
+        source_position = (source_position if source_position is not None else
+                           _position(source))
+        distance = _distance(source_position, target.get('position') or
                              _position(target))
-        view_range = self._source_view_range(source, now)
+        view_range = (view_range_resolver()
+                      if callable(view_range_resolver) else
+                      self._source_view_range(source, now))
         if distance <= spotting.PROXIMITY_SPOT_DISTANCE:
             value = True
         elif distance > spotting.MAX_SPOT_DISTANCE:
             value = False
         else:
-            base_pair, shot_factor, profile = self._spotting_profile(target)
-            moving = (abs(_number(target.get('speed'))) >
-                      spotting.MOVING_SPEED_EPSILON)
-            still_seconds = self._target_still_seconds(
-                (target.get('kind'), int(target_id)), moving, now)
+            (base_pair, shot_factor, profile, moving,
+             additive, multiplier) = self._target_detection_projection(
+                 target, target_id, now, tick_cache)
             if not _detection_upper_bound(
                     distance, view_range, base_pair, moving, shot_factor,
                     fired_recently):
@@ -3847,9 +3887,6 @@ class BotRuntime(object):
                 else:
                     has_line_of_sight = bool(visibility)
                     foliage_bonus = 0.0
-                additive, multiplier = _invisibility_aspect(
-                    profile, moving, loadout.still_device_active(
-                        still_seconds, profile['camouflage_net_delay']))
                 camouflage = spotting.effective_camouflage(
                     base_pair, moving=moving, additive=additive,
                     multiplier=multiplier, shot_factor=shot_factor,
@@ -3975,7 +4012,8 @@ class BotRuntime(object):
         return target
 
     def _append_human_observations(
-            self, players, now, aggregate, team_visibility):
+            self, players, now, aggregate, team_visibility,
+            visibility_tick=None):
         """Merge trusted human direct observers into the contact batch."""
         human_targets = [
             self._human_observation_target(raw)
@@ -4001,11 +4039,22 @@ class BotRuntime(object):
             alive = bool(source.get('alive', True))
             if alive:
                 self._note_human_source_stillness(source, now)
+                source_position = _position(source)
+                source_view_range = [None]
+
+                def resolve_source_view_range():
+                    if source_view_range[0] is None:
+                        source_view_range[0] = self._source_view_range(
+                            source, now)
+                    return source_view_range[0]
+
                 direct_targets = set()
                 for target in targets:
                     if int(target.get('team', 0)) == source_team:
                         continue
-                    if self._visible(source, target, now):
+                    if self._visible(
+                            source, target, now, visibility_tick,
+                            source_position, resolve_source_view_range):
                         direct_targets.add(self._observer_target_key(target))
                 self._human_direct_targets[source['id']] = direct_targets
             elif _number(now) < float(self._human_vengeance_until.get(
@@ -4050,10 +4099,21 @@ class BotRuntime(object):
                 self._renew_team_spot(key, now, duration)
         return True
 
-    def _contacts_for(self, source, players, now, team_spotted=None):
+    def _contacts_for(self, source, players, now, team_spotted=None,
+                      visibility_tick=None):
         contacts = []
         lookup = {}
         source_team = int(source.get('team', 0))
+        source_position = _position(source)
+        source_view_range = [None]
+        remembered_team = (
+            visibility_tick.setdefault('remembered_team', {})
+            if isinstance(visibility_tick, dict) else {})
+
+        def resolve_source_view_range():
+            if source_view_range[0] is None:
+                source_view_range[0] = self._source_view_range(source, now)
+            return source_view_range[0]
 
         def retain_team_known_pose(target):
             key = (source_team, target.get('kind'),
@@ -4088,12 +4148,18 @@ class BotRuntime(object):
         def visible_to_team(target):
             key = (source_team, target.get('kind'),
                    int(target.get('network_id', 0)))
-            direct_visible = self._visible(source, target, now)
+            direct_visible = self._visible(
+                source, target, now, visibility_tick, source_position,
+                resolve_source_view_range)
             if direct_visible:
                 self._renew_team_spot(key, now)
+                remembered_team[key] = True
             if direct_visible and team_spotted is not None:
                 team_spotted[key] = True
-            remembered = self._team_spot_time_left(key, now) > 0.0
+            if key not in remembered_team:
+                remembered_team[key] = \
+                    self._team_spot_time_left(key, now) > 0.0
+            remembered = remembered_team[key]
             fresh_shared = bool(
                 team_spotted is not None and team_spotted.get(key, False))
             return (bool(direct_visible or remembered or fresh_shared),
@@ -7395,9 +7461,14 @@ class BotRuntime(object):
         observation_entries = {}
         observation_pairs = []
         team_visibility = {}
+        # Source-independent camouflage projections are exact for this bounded
+        # simulation slice. Share them across all observers, but never across
+        # slices where motion or equipment state may change.
+        visibility_tick = {}
         if collect_observation:
             self._append_human_observations(
-                players, now, observation_entries, team_visibility)
+                players, now, observation_entries, team_visibility,
+                visibility_tick)
         cover_jobs = []
         tick_poses = {}
         tick_safe = {}
@@ -7448,6 +7519,11 @@ class BotRuntime(object):
                 decision_cache[0] == cache_key and
                 _number(now) < decision_cache[1])
             traffic_neighbours = None
+            traffic_control = None
+            traffic_deadline = None
+            traffic_refreshed = False
+            decision_deadline = None
+            raw_command = None
             planner_probe_samples = {}
 
             def planner_sample_direction(sample_yaw):
@@ -7480,9 +7556,20 @@ class BotRuntime(object):
                 command = dict(decision_cache[3])
                 contacts = decision_cache[4]
                 targets = decision_cache[5]
+                if len(decision_cache) >= 8:
+                    traffic_control = decision_cache[6]
+                    traffic_deadline = decision_cache[7]
+                    if (traffic_control[1] and
+                            _number(now) + 1e-9 >= traffic_deadline):
+                        # A zero-throttle anti-contact result must not be held
+                        # for the whole planner lease after the hull ahead has
+                        # moved. Recheck only these stopped edge cases on the
+                        # next physical publication; ordinary traffic remains
+                        # on the low-frequency decision cadence.
+                        traffic_control = None
             else:
                 contacts, targets = self._contacts_for(
-                    state, players, now, team_visibility)
+                    state, players, now, team_visibility, visibility_tick)
                 if traffic_bodies is None:
                     traffic_bodies, traffic_index = self._traffic_snapshot(
                         neighbours)
@@ -7539,29 +7626,44 @@ class BotRuntime(object):
                 bot_id = int(state['id'])
                 self._decision_counts[bot_id] = self._decision_counts.get(
                     bot_id, 0) + 1
-                self._decision_cache[state['id']] = (
-                    cache_key,
-                    _cache_deadline(
-                        now, state['id'],
-                        DECISION_SECONDS *
-                        DECISION_TIER_FACTOR[self._detail_tier(state)],
-                        3, decision_cache is None),
-                    _number(now), dict(command), contacts, targets)
-            # Traffic is motion feedback, not planner intent.  Re-evaluate it
-            # on every accepted authority tick from the raw cached command and
-            # the current simultaneous traffic snapshot; caching a limited
-            # throttle for a whole decision lease recreated 0.1 s speed steps.
-            if traffic_neighbours is None:
-                if traffic_bodies is None:
-                    traffic_bodies, traffic_index = self._traffic_snapshot(
-                        neighbours)
-                traffic_neighbours = self._neighbours_for(
-                    state, neighbours, traffic_index, traffic_bodies)
-            command['throttle'], waiting_for_traffic = \
-                self._traffic_throttle(
+                decision_deadline = _cache_deadline(
+                    now, state['id'],
+                    DECISION_SECONDS *
+                    DECISION_TIER_FACTOR[self._detail_tier(state)],
+                    3, decision_cache is None)
+                raw_command = dict(command)
+            # Friendly traffic is advisory anti-sticking, not physical
+            # authority. Run the continuous OBB and exact stopping integral at
+            # the same low-frequency decision boundary, then reuse that
+            # throttle through the lease. Actual hull contact remains owned by
+            # the simultaneous tank solver, so a 30 Hz recheck only spent CPU
+            # and amplified minor pose changes into visible stop/go commands.
+            if traffic_control is None:
+                if traffic_neighbours is None:
+                    if traffic_bodies is None:
+                        traffic_bodies, traffic_index = \
+                            self._traffic_snapshot(neighbours)
+                    traffic_neighbours = self._neighbours_for(
+                        state, neighbours, traffic_index, traffic_bodies)
+                traffic_control = self._traffic_throttle(
                     state, command, traffic_neighbours,
                     self._physics_params.get(state['id']),
                     self._cached_traffic_stopping_distance)
+                traffic_refreshed = True
+                traffic_deadline = (
+                    _number(now) + PUBLICATION_SECONDS
+                    if traffic_control[1] else
+                    (decision_deadline if decision_due else
+                     decision_cache[1]))
+            command['throttle'], waiting_for_traffic = traffic_control
+            if decision_due:
+                self._decision_cache[state['id']] = (
+                    cache_key, decision_deadline, _number(now), raw_command,
+                    contacts, targets, traffic_control, traffic_deadline)
+            elif traffic_refreshed:
+                self._decision_cache[state['id']] = (
+                    decision_cache[:6] +
+                    (traffic_control, traffic_deadline))
             if waiting_for_traffic:
                 driver = getattr(self.adapter, 'driver', None)
                 wait = getattr(driver, 'wait_for_traffic', None)

@@ -3,6 +3,7 @@ import io
 import json
 import math
 from pathlib import Path
+import random
 import sys
 import types
 import unittest
@@ -9207,6 +9208,125 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(set(((2, 11), (11, 2))), set(calls))
         self.assertEqual(2, len(calls))
 
+    def test_visibility_fixed_cadence_and_fire_edge_invalidation(self):
+        calls = []
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            visibility_probe=lambda source, target, fired=False: (
+                calls.append((source['id'], target['network_id'], fired)) or
+                True))
+        source = {
+            'id': 11, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'view_range': 445.0,
+        }
+        target = _admit_player({
+            'id': self.module.HUMAN_TARGET_ID_BASE + 2,
+            'kind': 'human', 'network_id': 2,
+            'vehicle': 'ussr:R11_MS-1',
+            'position': (0.0, 0.0, 100.0),
+            'speed': 0.0, 'fire_seq': 0,
+        }, base_moving=0.0, base_still=0.0)
+
+        self.assertTrue(runtime._visible(source, target, 1.0))
+        self.assertTrue(runtime._visible(
+            source, target,
+            1.0 + self.module.VISIBILITY_SAMPLE_SECONDS - 0.000001))
+        self.assertEqual(1, len(calls))
+        self.assertTrue(runtime._visible(
+            source, target,
+            1.0 + self.module.VISIBILITY_SAMPLE_SECONDS + 0.000001))
+        self.assertEqual(2, len(calls))
+
+        target['fire_seq'] = 1
+        self.assertTrue(runtime._visible(
+            source, target,
+            1.0 + self.module.VISIBILITY_SAMPLE_SECONDS + 0.01))
+        self.assertEqual(3, len(calls))
+        self.assertTrue(calls[-1][2])
+
+    def test_visibility_tick_projection_matches_uncached_observer_order(self):
+        calls = [[], []]
+
+        def build(index):
+            return self.module.BotRuntime(
+                1, descriptor_resolver=lambda unused: _combat_descriptor(),
+                visibility_probe=lambda source, target, fired=False: (
+                    calls[index].append((
+                        source['id'], target['network_id'], bool(fired))) or
+                    {'line_of_sight': (source['id'] +
+                                       target['network_id']) % 3 != 0,
+                     'foliage_bonus': (0.05 if source['id'] % 2 else 0.0)}))
+
+        cached_runtime = build(0)
+        baseline_runtime = build(1)
+        sources = [
+            {'id': bot_id, 'x': float(bot_id - 11) * 3.0,
+             'y': 0.0, 'z': 0.0, 'view_range': 445.0}
+            for bot_id in range(11, 16)
+        ]
+        target = _admit_player({
+            'id': self.module.HUMAN_TARGET_ID_BASE + 2,
+            'kind': 'human', 'network_id': 2,
+            'vehicle': 'ussr:R11_MS-1',
+            'position': (0.0, 0.0, 300.0),
+            'speed': 0.0, 'fire_seq': 0,
+        }, base_moving=0.05, base_still=0.10)
+        generator = random.Random(1513)
+        events = (
+            (1.00, 0.0, 0),
+            (1.04, 0.0, 0),
+            (1.08, 8.0, 0),
+            (1.12, 0.0, 1),
+            (1.32, 0.0, 1),
+        )
+        for now, speed, fire_seq in events:
+            target['speed'] = speed
+            target['fire_seq'] = fire_seq
+            order = list(sources)
+            generator.shuffle(order)
+            order.append(order[0])
+            tick_cache = {}
+            cached_values = [cached_runtime._visible(
+                source, target, now, tick_cache) for source in order]
+            baseline_values = [baseline_runtime._visible(
+                source, target, now) for source in order]
+            self.assertEqual(baseline_values, cached_values)
+            self.assertEqual(baseline_runtime._visibility_fire,
+                             cached_runtime._visibility_fire)
+            self.assertEqual(baseline_runtime._visibility_still,
+                             cached_runtime._visibility_still)
+            self.assertEqual(baseline_runtime._visibility_cache,
+                             cached_runtime._visibility_cache)
+        self.assertEqual(calls[1], calls[0])
+
+    def test_contacts_compute_source_view_range_once_per_decision(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            visibility_probe=lambda *unused: True)
+        source = {
+            'id': 11, 'team': 1,
+            'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'view_range': 445.0,
+        }
+        players = [_admit_player({
+            'id': player_id, 'team': 2, 'alive': True,
+            'vehicle': 'ussr:R11_MS-1',
+            'x': 0.0, 'y': 0.0, 'z': float(distance),
+            'speed': 0.0, 'fire_seq': 0,
+        }, base_moving=0.0, base_still=0.0)
+                   for player_id, distance in ((2, 100), (3, 150), (4, 200))]
+        calls = []
+        original = runtime._source_view_range
+
+        def source_view_range(*args):
+            calls.append(args)
+            return original(*args)
+
+        runtime._source_view_range = source_view_range
+        runtime._contacts_for(
+            source, players, 1.0, visibility_tick={})
+        self.assertEqual(1, len(calls))
+
     def test_visibility_upper_bound_skips_only_impossible_native_probes(self):
         descriptor = _combat_descriptor()
         descriptor.type = types.SimpleNamespace(
@@ -9691,7 +9811,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(states))
         self.assertEqual([], states[0]['bots'])
 
-    def test_traffic_feedback_refreshes_between_cached_decisions(self):
+    def test_traffic_feedback_reuses_decision_lease_then_refreshes(self):
         self.runtime.battle_start(self.start)
         calls = []
         original = self.runtime._traffic_throttle
@@ -9702,6 +9822,26 @@ class BotRuntimeTests(unittest.TestCase):
             return original(
                 source, command, neighbours, physics_params,
                 stopping_distance_resolver)
+
+        self.runtime._traffic_throttle = traffic
+        self.runtime.update(.04, 1.00)
+        self.runtime.update(.04, 1.04)
+        self.runtime.update(.04, 1.08)
+
+        self.assertEqual(1, len(self.adapters[0].calls))
+        self.assertEqual(1, len(calls))
+
+        self.runtime.update(.04, 1.20)
+        self.assertEqual(2, len(self.adapters[0].calls))
+        self.assertEqual(2, len(calls))
+
+    def test_zero_traffic_throttle_is_not_held_for_decision_lease(self):
+        self.runtime.battle_start(self.start)
+        calls = []
+
+        def traffic(*unused, **unused_kwargs):
+            calls.append(True)
+            return 0.0, True
 
         self.runtime._traffic_throttle = traffic
         self.runtime.update(.04, 1.00)
