@@ -380,7 +380,13 @@ class LauncherWindow(object):
             self.game_panel, text="", variable=self.collect_crash_reports,
             command=self._crash_collection_toggled, anchor="w")
         self.crash_report_check.grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.report_button = tk.Button(
+            self.game_panel, text="", command=self._create_error_report,
+            font=("TkDefaultFont", 9, "bold"), relief="raised",
+            borderwidth=2, padx=10)
+        self.report_button.grid(
+            row=2, column=2, sticky="e", pady=(6, 0))
         self.game_panel.grid_columnconfigure(1, weight=1)
 
         saved_mode = settings.get("mode", core.MODE_SINGLE)
@@ -541,11 +547,6 @@ class LauncherWindow(object):
             command=self._clean_normal_client_preferences)
         self.normal_preferences_button.grid(
             row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
-        self.report_button = tk.Button(
-            self.repair_panel, text="",
-            command=self._create_error_report)
-        self.report_button.grid(
-            row=2, column=0, columnspan=2, sticky="we", pady=(6, 0))
         self.repair_panel.grid_columnconfigure(0, weight=1)
         self.repair_panel.grid_columnconfigure(1, weight=1)
 

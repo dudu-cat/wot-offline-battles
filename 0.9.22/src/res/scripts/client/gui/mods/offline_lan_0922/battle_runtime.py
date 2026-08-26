@@ -3146,8 +3146,11 @@ class BattleRuntime(object):
             # callback: live attached matrix, then postmortem camera provider.
             if not record.get('local'):
                 entity._postmortem_visible = True
-            if (self._runtime.bigworld.entity(int(engine_id)) is not entity or
-                    int(engine_id) not in self._runtime.bigworld.entities):
+            # Exact #1513 exposes ``BigWorld.entities`` as ``PyEntities``.
+            # It has no membership or iterator slot, so ``id in entities``
+            # raises TypeError.  The public lookup is the authoritative
+            # identity check and is also what the stock callback uses.
+            if self._runtime.bigworld.entity(int(engine_id)) is not entity:
                 raise RuntimeError(
                     '#1513 spectator entity lookup was rejected')
             previous_vehicle_id = attach_vehicle(int(engine_id))

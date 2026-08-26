@@ -13726,6 +13726,41 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(ally_id,
                          battle._avatar.viewpoint_switches[-1][0])
 
+    def test_postmortem_switch_does_not_test_pyentities_membership(self):
+        runtime, battle, factory, unused_camera = \
+            self._postmortem_switch_fixture()
+        ally_id = factory.create(
+            _Descriptor(),
+            {'publicInfo': {'team': 1, 'name': 'Ally'},
+             'health': 500, 'isCrewActive': True,
+             'gunAnglesPacked': 0},
+            _Vector(20.0, 0.0, 10.0), (0.0, 0.0, 0.0))
+        battle._records['bot:2'] = {
+            'engine_id': ally_id,
+            'state': {'team': 1, 'health': 500, 'alive': True},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'ready': True, 'presentation': True}
+
+        entities = runtime.bigworld.entities
+
+        class _PyEntities(object):
+
+            def get(self, key, default=None):
+                return entities.get(key, default)
+
+            def keys(self):
+                return entities.keys()
+
+            def __contains__(self, unused_key):
+                raise TypeError('PyEntities does not support membership')
+
+        runtime.bigworld.entities = _PyEntities()
+
+        self.assertTrue(
+            battle._switch_postmortem_viewpoint(False, ally_id))
+        self.assertIs(factory.get(ally_id),
+                      runtime.bigworld.entity(ally_id))
+
     def test_postmortem_switch_survives_exact_1513_steady_matrix_relink(self):
         runtime, battle, factory, unused_camera = \
             self._postmortem_switch_fixture()

@@ -229,10 +229,11 @@ class WindowTest(unittest.TestCase):
         self.assertIs(
             self.window.normal_preferences_button.master,
             self.window.repair_panel)
-        self.assertIs(self.window.report_button.master, self.window.repair_panel)
+        self.assertIs(self.window.report_button.master, self.window.game_panel)
         self.assertEqual(
             "Create error report...",
             self.window.report_button.cget("text"))
+        self.assertIn("bold", str(self.window.report_button.cget("font")))
         self.assertEqual(
             "作者：伪红学家  Bilibili：@tiancaihb  QQ群：302519768  "
             "GitHub: https://github.com/pengw0048/wot-offline-battles",
