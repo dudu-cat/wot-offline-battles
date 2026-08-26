@@ -468,7 +468,7 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0, 0.0), path[0])
         self.assertEqual((8.0, 0.0, 0.0), path[-1])
 
-    def test_prebaked_shortcuts_use_passable_shallow_water(self):
+    def test_prebaked_shortcuts_prefer_dry_detours(self):
         graph = self._baked_graph(5, 3)
         graph['hazards'] = [
             0, 4, 4, 4, 0,
@@ -485,9 +485,13 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertTrue(navigator.grid.segment_has_baked_hazard(
             start, goal, BAKED_SHALLOW_WATER))
-        self.assertEqual((start, goal), path)
+        self.assertTrue(path)
+        self.assertGreater(max(point[2] for point in path), 20.0)
+        for first, second in zip(path, path[1:]):
+            self.assertFalse(navigator.grid.segment_has_baked_hazard(
+                first, second, BAKED_SHALLOW_WATER))
 
-    def test_prebaked_astar_prefers_short_shallow_water_crossing(self):
+    def test_prebaked_astar_prefers_dry_route_over_short_shallow_crossing(self):
         graph = self._baked_graph(5, 3)
         graph['hazards'] = [
             0, 4, 4, 4, 0,
@@ -502,9 +506,9 @@ class BotAiPortTests(unittest.TestCase):
             prefer_clearance=False)
 
         self.assertTrue(path)
-        self.assertEqual({20.0}, set(point[2] for point in path))
+        self.assertGreater(max(point[2] for point in path), 20.0)
 
-    def test_prebaked_smoothing_and_local_recovery_allow_shallow_water(self):
+    def test_prebaked_smoothing_and_local_recovery_do_not_enter_shallow_water(self):
         graph = self._baked_graph(5, 5)
         graph['hazards'] = [4] * 25
         graph['hazards'][2 * 5 + 2] = 0
@@ -514,11 +518,11 @@ class BotAiPortTests(unittest.TestCase):
         goal = (26.0, 0.0, 28.0)
 
         self.assertEqual(
-            (start, goal),
+            (start, middle, goal),
             grid._smooth((start, middle, goal), prefer_clearance=False))
         local = grid.safe_local_target(start, goal, 1.0)
         self.assertIsNotNone(local)
-        self.assertTrue(grid.segment_has_baked_hazard(
+        self.assertFalse(grid.segment_has_baked_hazard(
             start, local, BAKED_SHALLOW_WATER))
 
     def test_prebaked_hazard_check_allows_tank_to_leave_shallow_water(self):
