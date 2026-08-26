@@ -483,7 +483,7 @@ class LocalDriver(object):
 		# not trigger recovery.  Displacement, velocity and rotation must all
 		# fail; a deliberate pivot or ascent alignment turns in place for
 		# seconds and is progress, not a stall.
-		if (_distance(position, target) > 3.0 and displacement < 0.08 and
+		if (displacement < 0.08 and
 				abs(float(speed)) < 0.35 and yaw_rate < 0.25):
 			state['stuck_time'] += step
 		else:

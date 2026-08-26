@@ -97,6 +97,9 @@ DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 MOTION_PROBE_SECONDS = DECISION_SECONDS
 MOTION_PROBE_LATERAL_BUDGET = 1.0
 MOTION_PROBE_FORWARD_BUDGET = 3.5
+# A validated baked edge needs enough native lookahead to react, not a ray past
+# its next turn. Expand from one grid cell to a 1.5-second horizon with speed.
+BAKED_MOTION_LOOKAHEAD_SECONDS = 1.5
 # Friendly following uses the same one-second time gap that the former hard
 # cutoff attempted to enforce.  Keep its standstill gap separate from hull
 # extents: ``clearance`` below is already measured edge-to-edge.
@@ -1581,11 +1584,11 @@ class BotRuntime(object):
     def _adapt_direction_probe(probe):
         """Adapt injected legacy test probes once, never after side effects.
 
-        The pinned production callback has four arguments. Catching TypeError
+        The pinned production callback has five arguments. Catching TypeError
         around every invocation used to mistake an exception from inside that
         callback for an old arity and execute it again, which is unsafe for a
         native collision seam. Python functions expose an exact code object;
-        opaque/native callables must honor the current four-argument contract.
+        opaque/native callables must honor the current five-argument contract.
         """
         target = getattr(
             probe, 'im_func', getattr(probe, '__func__', probe))
@@ -1598,15 +1601,40 @@ class BotRuntime(object):
         if bound_self is not None:
             argument_count -= 1
         has_varargs = bool(code.co_flags & 0x04)
-        if has_varargs or argument_count >= 4:
+        if has_varargs or argument_count >= 5:
             return probe
+        if argument_count == 4:
+            return lambda position, yaw, speed, descriptor, \
+                    unused_maximum_distance: probe(
+                        position, yaw, speed, descriptor)
         if argument_count == 3:
-            return lambda position, yaw, speed, unused_descriptor: probe(
-                position, yaw, speed)
+            return lambda position, yaw, speed, unused_descriptor, \
+                    unused_maximum_distance: probe(position, yaw, speed)
         if argument_count == 2:
-            return lambda position, yaw, unused_speed, unused_descriptor: probe(
-                position, yaw)
-        raise ValueError('direction probe must accept 2, 3 or 4 arguments')
+            return lambda position, yaw, unused_speed, unused_descriptor, \
+                    unused_maximum_distance: probe(position, yaw)
+        raise ValueError('direction probe must accept 2, 3, 4 or 5 arguments')
+
+    @staticmethod
+    def _adapt_world_receipt_probe(probe):
+        """Add the optional local-target distance to legacy receipt probes."""
+        target = getattr(
+            probe, 'im_func', getattr(probe, '__func__', probe))
+        code = getattr(target, 'func_code', getattr(target, '__code__', None))
+        if code is None:
+            return probe
+        argument_count = int(code.co_argcount)
+        bound_self = getattr(
+            probe, 'im_self', getattr(probe, '__self__', None))
+        if bound_self is not None:
+            argument_count -= 1
+        if bool(code.co_flags & 0x04) or argument_count >= 5:
+            return probe
+        if argument_count == 4:
+            return lambda position, yaw, speed, descriptor, \
+                    unused_maximum_distance: probe(
+                        position, yaw, speed, descriptor)
+        raise ValueError('world receipt probe must accept 4 or 5 arguments')
 
     @staticmethod
     def _adapt_friendly_lane_probe(probe):
@@ -1710,7 +1738,9 @@ class BotRuntime(object):
         self.native_motion = bool(native_motion)
         self.motion_resolver = motion_resolver
         self.motion_report = motion_report
-        self.world_receipt_probe = world_receipt_probe
+        self.world_receipt_probe = (
+            self._adapt_world_receipt_probe(world_receipt_probe)
+            if callable(world_receipt_probe) else None)
         self.ram_contact_probe = (
             ram_contact_probe if callable(ram_contact_probe) else None)
         self.bot_equipment_resolver = (
@@ -1982,12 +2012,14 @@ class BotRuntime(object):
         return self._probe_is_clear(
             self._probe_direction(position, yaw, speed, descriptor))
 
-    def _probe_direction(self, position, yaw, speed=0.0, descriptor=None):
+    def _probe_direction(self, position, yaw, speed=0.0, descriptor=None,
+                         maximum_distance=None):
         """Return one canonical direction sample for planning and physics."""
         self._probe_totals[4] += 1
         probe_started = self._probe_started()
         try:
-            result = self.direction_probe(position, yaw, speed, descriptor)
+            result = self.direction_probe(
+                position, yaw, speed, descriptor, maximum_distance)
         except Exception:
             return {'clear': False, 'collision': True,
                     'water': False, 'slope': 0.0}
@@ -2062,7 +2094,7 @@ class BotRuntime(object):
         self._world_receipt_frame = None
 
     def _probe_world_receipt(self, bot_id, position, yaw, speed, descriptor,
-                             uncached):
+                             uncached, maximum_distance=None):
         """Run one read-only exact-hull proof for the selected travel ray."""
         if not callable(self.world_receipt_probe):
             return None
@@ -2089,12 +2121,13 @@ class BotRuntime(object):
         self._world_receipt_budget -= 1
         frame['attempted'].add(bot_id)
         result = self._call_world_receipt_probe(
-            position, yaw, speed, descriptor)
+            position, yaw, speed, descriptor, maximum_distance)
         if result == 'deferred':
             frame['attempt_deferred'].append(bot_id)
         return result
 
-    def _call_world_receipt_probe(self, position, yaw, speed, descriptor):
+    def _call_world_receipt_probe(self, position, yaw, speed, descriptor,
+                                  maximum_distance=None):
         """Run one measured exact receipt without changing queue ownership."""
         if not callable(self.world_receipt_probe):
             return None
@@ -2102,7 +2135,7 @@ class BotRuntime(object):
         probe_started = self._probe_started()
         try:
             result = self.world_receipt_probe(
-                position, yaw, speed, descriptor)
+                position, yaw, speed, descriptor, maximum_distance)
         except Exception:
             # A receipt is only an optimisation.  Its absence restores the
             # authoritative per-frame world sweep and never grants movement.
@@ -4280,6 +4313,19 @@ class BotRuntime(object):
             return False
         return True
 
+    @staticmethod
+    def _motion_probe_covers_distance(cached, maximum_distance):
+        """Do not reuse a short turn probe for a later, farther target."""
+        if not isinstance(cached, dict):
+            return False
+        cached_distance = cached.get('maximum_distance')
+        if maximum_distance is None:
+            return cached_distance is None
+        if cached_distance is None:
+            return True
+        return (_number(cached_distance) + 1.0e-6 >=
+                _number(maximum_distance))
+
     def motion_world_receipt_reusable(self, bot_id, position, travel_yaw,
                                       speed, now, dt):
         """Return whether the current exact hull rays reuse a typed receipt."""
@@ -4485,7 +4531,11 @@ class BotRuntime(object):
         try:
             if not grid.near_baked_navigation(position, 0):
                 return None
-            distance = 20.0 if abs(_number(speed)) > 5.0 else 15.0
+            # Rank against one baked edge. Looking 15-20 metres straight ahead
+            # rejects valid four-metre turns in tight spawn exits even though the
+            # navigator explicitly selected that adjacent linked cell. The native
+            # motion gate and per-frame hull sweep still prove realised travel.
+            distance = max(1.0, _number(getattr(grid, 'cell_size', 1.0)))
             sine = math.sin(float(yaw))
             cosine = math.cos(float(yaw))
             end = (
@@ -7586,21 +7636,56 @@ class BotRuntime(object):
             travel_yaw = (state['yaw'] if travel_sign > 0.0
                           else state['yaw'] + math.pi)
             attempted_yaws[state['id']] = travel_yaw
+            maximum_probe_distance = None
+            move_position = command.get('move_position')
+            navigation_grid = getattr(self.navigator, 'grid', None)
+            if getattr(navigation_grid, 'prebaked', False):
+                baked_cell_size = _number(
+                    getattr(navigation_grid, 'cell_size',
+                            (self.baked_graph or {}).get('cell_size', 1.0)),
+                    1.0)
+                reactive_horizon = max(
+                    baked_cell_size,
+                    abs(_number(state.get('speed'))) *
+                    BAKED_MOTION_LOOKAHEAD_SECONDS)
+            else:
+                reactive_horizon = None
+            if (travel_sign > 0.0 and reactive_horizon is not None and
+                    move_position is not None and
+                    command.get('movement_intent', True) and
+                    command.get('recovery_mode', 'drive') in
+                    ('drive', 'avoid')):
+                # A local navigation point may deliberately stop just before a
+                # wall and turn onto the next baked edge. Probing past that
+                # point makes the wall after the corner block this safe edge.
+                remaining = max(
+                    0.5,
+                    _distance(position, _point(move_position, position)) -
+                    ai_driver.WAYPOINT_ARRIVAL_RADIUS)
+                maximum_probe_distance = min(remaining, reactive_horizon)
+            elif (travel_sign < 0.0 and reactive_horizon is not None and
+                    command.get('recovery_mode') == 'reverse_turn'):
+                # Recovery is intentionally a short backing manoeuvre. A wall
+                # beyond that escape edge must not veto clear space at the rear.
+                maximum_probe_distance = reactive_horizon
             cached_motion_probe = self._motion_probe_cache.get(state['id'])
             settled_motion = bool(
                 abs(throttle) <= 0.01 and abs(turn) <= 0.01 and
                 abs(_number(state.get('speed'))) <= 0.02 and
                 state.get('grounded_once', False) and
                 not state.get('airborne', False))
-            if not self._motion_probe_reusable(
-                    cached_motion_probe, position, travel_yaw,
-                    state.get('speed', 0.0), now, settled_motion, step):
+            if not ((not decision_due or self._motion_probe_covers_distance(
+                    cached_motion_probe, maximum_probe_distance)) and
+                    self._motion_probe_reusable(
+                        cached_motion_probe, position, travel_yaw,
+                        state.get('speed', 0.0), now, settled_motion, step)):
                 # Planner ranking is intentionally unable to satisfy this
                 # gate.  Every newly selected travel corridor receives its own
                 # complete native generic probe before an exact receipt can be
                 # reused or acquired.
                 motion_probe = self._probe_direction(
-                    position, travel_yaw, state.get('speed', 0.0), descriptor)
+                    position, travel_yaw, state.get('speed', 0.0), descriptor,
+                    maximum_probe_distance)
                 # Planner alternatives keep the mature six horizontal rays.
                 # Only the finally selected, translating, non-turning travel
                 # sample pays for the exact 3x3 receipt used by commit-side
@@ -7635,7 +7720,8 @@ class BotRuntime(object):
                                 receipt_speed, step):
                             refreshed = self._probe_world_receipt(
                                 state['id'], position, travel_yaw,
-                                receipt_speed, descriptor, False)
+                                receipt_speed, descriptor, False,
+                                maximum_probe_distance)
                             if refreshed is False:
                                 # A completed exact probe found a new blocker;
                                 # the older corridor may no longer grant motion.
@@ -7659,7 +7745,8 @@ class BotRuntime(object):
                             state['id'], position, travel_yaw, receipt_speed,
                             descriptor, not isinstance(
                                 ((cached_motion_probe or {}).get('result') or
-                                 {}).get('world_receipt'), dict))
+                                 {}).get('world_receipt'), dict),
+                            maximum_probe_distance)
                         if receipt == 'deferred':
                             motion_probe['deferred'] = True
                             motion_probe['clear'] = False
@@ -7677,6 +7764,7 @@ class BotRuntime(object):
                         'result': motion_probe,
                         'position': position,
                         'yaw': travel_yaw,
+                        'maximum_distance': maximum_probe_distance,
                         'deadline': (
                             _number(now)
                             if motion_probe.get(

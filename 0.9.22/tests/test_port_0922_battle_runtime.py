@@ -8247,6 +8247,47 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual({-2.2, 0.0, 2.2},
                          {round(end.x, 1) for unused, end in horizontal})
 
+    def test_direction_probe_stops_at_the_local_navigation_turn(self):
+        runtime = _runtime()
+        rays = []
+        original = runtime.bigworld.wg_collideSegment
+
+        def collide(space_id, start, end, mask):
+            rays.append((start, end))
+            return original(space_id, start, end, mask)
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+
+        result = battle._direction_probe(
+            (0.0, 0.0, 0.0), 0.0, 6.0, None, 4.0)
+
+        self.assertTrue(result['clear'])
+        horizontal = [(start, end) for start, end in rays
+                      if abs(start.y - end.y) < 0.001]
+        self.assertEqual(6, len(horizontal))
+        self.assertEqual(4.0, max(end.z for unused, end in horizontal))
+
+    def test_direction_probe_keeps_a_wall_before_the_turn_fail_closed(self):
+        runtime = _runtime()
+        original = runtime.bigworld.wg_collideSegment
+
+        def collide(space_id, start, end, mask):
+            if abs(start.y - end.y) < 0.001:
+                return (_Vector(start.x, start.y, start.z + 2.0),)
+            return original(space_id, start, end, mask)
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+
+        result = battle._direction_probe(
+            (0.0, 0.0, 0.0), 0.0, 0.0, None, 4.0)
+
+        self.assertFalse(result['clear'])
+        self.assertTrue(result['collision'])
+
     def test_direction_probe_preserves_a_clear_downhill_grade_sign(self):
         runtime = _runtime()
 
@@ -8304,6 +8345,34 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             {0.6, 1.1, 1.6},
             {round(start.y, 1) for start, unused in receipt_rays})
+
+    def test_final_motion_world_receipt_stops_at_the_local_turn(self):
+        from gui.mods.offline_lan_0922 import destructibles_sensor
+
+        runtime = _runtime()
+        rays = []
+        original = runtime.bigworld.wg_collideSegment
+
+        def collide(space_id, start, end, mask):
+            rays.append((start, end))
+            return original(space_id, start, end, mask)
+
+        runtime.bigworld.wg_collideSegment = collide
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._destructibles = destructibles_sensor
+
+        receipt = battle._direction_world_receipt(
+            (0.0, 0.0, 0.0), 0.0, 4.0, _Descriptor(), 4.0)
+
+        self.assertEqual(4.0, receipt['distance'])
+        receipt_rays = [
+            (start, end) for start, end in rays
+            if (abs(start.y - end.y) < 0.001 and
+                abs(start.z + 0.5) < 0.001 and
+                abs(end.z - 4.0) < 0.001)
+        ]
+        self.assertEqual(9, len(receipt_rays))
 
     def test_reverse_world_receipt_records_exact_travel_heading_and_sign(self):
         from gui.mods.offline_lan_0922 import destructibles_sensor

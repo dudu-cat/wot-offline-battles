@@ -736,6 +736,17 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
 
+    def test_a_wedged_hull_near_a_waypoint_still_reaches_recovery(self):
+        driver = LocalDriver()
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                82, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, 2.0), (), lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+
+        self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
+
     def test_brief_traffic_wait_does_not_trigger_reverse_recovery(self):
         driver = LocalDriver()
         order = None

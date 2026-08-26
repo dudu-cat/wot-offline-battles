@@ -4009,13 +4009,26 @@ class BattleRuntime(object):
             self._navigation_graph, position, shoulder_cells=0)
 
     def _direction_probe(self, position, yaw, speed=0.0,
-                         descriptor=None):
+                         descriptor=None, maximum_distance=None):
         """Copy the 0.8.2 dual-height, three-lane hull corridor probe."""
         x, y, z = _xyz(position)
         current_water = self._water_depth((x, y, z))
         wet_escape = current_water > BOT_WATER_AVOID_DEPTH
         last_water = current_water
         far_distance = 20.0 if abs(float(speed or 0.0)) > 5.0 else 15.0
+        if maximum_distance is not None:
+            try:
+                requested_distance = float(maximum_distance)
+            except (TypeError, ValueError):
+                return {'clear': False, 'collision': True,
+                        'water': False, 'slope': 0.0}
+            if (requested_distance != requested_distance or
+                    abs(requested_distance) == float('inf')):
+                return {'clear': False, 'collision': True,
+                        'water': False, 'slope': 0.0}
+            far_distance = min(
+                far_distance, max(0.5, requested_distance))
+        near_distance = min(8.0, far_distance)
         previous_y = y
         previous_distance = 0.0
         sine = math.sin(float(yaw))
@@ -4036,7 +4049,8 @@ class BattleRuntime(object):
             except (AttributeError, KeyError, TypeError, ValueError):
                 raise RuntimeError(
                     'bot destructible planning speed is unavailable')
-        for height, distance in ((0.7, 8.0), (1.5, far_distance)):
+        for height, distance in (
+                (0.7, near_distance), (1.5, far_distance)):
             nx = x + sine * distance
             nz = z + cosine * distance
             run = distance - previous_distance
@@ -4163,7 +4177,7 @@ class BattleRuntime(object):
         return result
 
     def _direction_world_receipt(self, position, travel_yaw, signed_speed,
-                                 descriptor):
+                                 descriptor, maximum_distance=None):
         """Prove the exact flat-ground 3x3 hull corridor without mutation."""
         try:
             planning_params = vehicle_physics.derive_params(descriptor)
@@ -4184,9 +4198,20 @@ class BattleRuntime(object):
         lateral_z = -sine
         # This is a containment proof, not a planning distance.  Fifteen metres
         # covers the hull, the <=3.5 m cache drift and an ordinary rendered
-        # frame at the copied speed limit.  A long/slow frame simply fails the
-        # containment check and falls back to the authoritative world sweep.
+        # frame at the copied speed limit. A local turn may shorten the receipt;
+        # once it no longer contains the hull, motion falls back to the
+        # authoritative world sweep.
         proof_distance = 15.0
+        if maximum_distance is not None:
+            try:
+                requested_distance = float(maximum_distance)
+            except (TypeError, ValueError):
+                return False
+            if (requested_distance != requested_distance or
+                    abs(requested_distance) == float('inf')):
+                return False
+            proof_distance = min(
+                proof_distance, max(0.5, requested_distance))
         planned_impact_speed = abs(float(signed_speed or 0.0))
         cap_speed = None
         if planning_params is not None:

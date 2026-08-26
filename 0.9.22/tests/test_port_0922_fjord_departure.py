@@ -39,8 +39,8 @@ LINEUP = (
     ('AT-SPG',) * 2 + ('lightTank',) + ('SPG',) * 2)
 
 
-def _flat_fjord_graph():
-    path = PORT_ROOT / 'navgraphs' / '33_fjord.json'
+def _flat_graph(map_name):
+    path = PORT_ROOT / 'navgraphs' / ('%s.json' % map_name)
     graph = copy.deepcopy(json.loads(path.read_text()))
     # Keep the production x/z topology, hazards, routes and formations. The
     # baked graph samples terrain on a four-metre grid, so feeding its nearest
@@ -102,7 +102,7 @@ class _EpisodeMonitor(object):
                 self.record(kind, bot_id, False, now)
 
 
-class FjordDepartureTests(unittest.TestCase):
+class SpawnDepartureTests(unittest.TestCase):
     def setUp(self):
         self._gui_modules = dict(
             (key, value) for key, value in sys.modules.items()
@@ -114,9 +114,8 @@ class FjordDepartureTests(unittest.TestCase):
                 sys.modules.pop(key, None)
         sys.modules.update(self._gui_modules)
 
-    def test_flat_fjord_traffic_departs_at_15_and_24_fps(self):
+    def test_flat_spawn_traffic_departs_at_15_and_24_fps(self):
         module = runtime_fixtures._load()
-        graph = _flat_fjord_graph()
         bots = _bots()
 
         def spawn(team, slot):
@@ -126,22 +125,61 @@ class FjordDepartureTests(unittest.TestCase):
         def flat_ground(unused_x, unused_z, unused_hint=0.0):
             return 0.0
 
-        for fps in (15, 24):
-            with self.subTest(fps=fps):
+        for map_name, fps in (
+                ('33_fjord', 15), ('33_fjord', 24),
+                ('31_airfield', 15), ('31_airfield', 24)):
+            graph = _flat_graph(map_name)
+            with self.subTest(map_name=map_name, fps=fps):
+                runtime_box = {}
+
+                def baked_direction(
+                        position, yaw, speed, unused_descriptor,
+                        maximum_distance):
+                    distance = 20.0 if abs(float(speed)) > 5.0 else 15.0
+                    if maximum_distance is not None:
+                        distance = min(distance, float(maximum_distance))
+                    end = (
+                        float(position[0]) + math.sin(float(yaw)) * distance,
+                        float(position[1]),
+                        float(position[2]) + math.cos(float(yaw)) * distance,
+                    )
+                    grid = runtime_box['runtime'].navigator.grid
+                    clear = grid.segment_clear(position, end)
+                    return {
+                        'clear': clear, 'collision': not clear, 'slope': 0.0,
+                    }
+
+                def baked_receipt(
+                        position, yaw, speed, descriptor, maximum_distance):
+                    result = baked_direction(
+                        position, yaw, speed, descriptor, maximum_distance)
+                    if not result['clear']:
+                        return False
+                    distance = 15.0
+                    if maximum_distance is not None:
+                        distance = min(distance, float(maximum_distance))
+                    return {
+                        'distance': distance, 'half_width': 1.6,
+                        'leading': 3.5, 'origin': tuple(position),
+                        'yaw': float(yaw),
+                        'direction': -1 if float(speed) < 0.0 else 1,
+                    }
+
                 runtime = module.BotRuntime(
                     1,
                     descriptor_resolver=(
                         lambda unused: runtime_fixtures._combat_descriptor()),
-                    direction_probe=(
-                        lambda *unused: {'clear': True, 'slope': 0.0}),
+                    direction_probe=baked_direction,
+                    world_receipt_probe=baked_receipt,
                     spawn_resolver=spawn,
                     ground_probe=flat_ground,
                     physics_ground_probe=flat_ground,
                     baked_graph=graph,
                     visibility_probe=lambda *unused: False,
                     firing_lane_probe=lambda *unused: False)
+                runtime_box['runtime'] = runtime
                 runtime.battle_start({
-                    'map': '33_fjord',
+                    'map': map_name,
                     'round_id': fps,
                     'bot_authority_id': 1,
                     'bots': bots,

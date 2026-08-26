@@ -1230,6 +1230,37 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertIsNone(runtime._planner_corridor_clear(
             (0.0, 0.0, 0.0), 0.0, 0.0, wet_escape=True))
 
+    def test_baked_planner_ranks_only_the_next_link_at_a_tight_turn(self):
+        ends = []
+
+        class Grid(object):
+            prebaked = True
+            cell_size = 4.0
+
+            def near_baked_navigation(self, unused_position, unused_radius):
+                return True
+
+            def segment_has_baked_hazard(
+                    self, unused_start, unused_end, unused_hazards):
+                return False
+
+            def segment_clear(self, unused_start, end):
+                ends.append(end)
+                return True
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(grid=Grid())
+        runtime.baked_graph = {'bake': {
+            'vehicle_half_width': 2.15,
+            'edge_clearance_radii': (3.0,),
+        }}
+
+        self.assertTrue(runtime._planner_corridor_clear(
+            (10.0, 0.0, 20.0), math.pi / 2.0, 20.0))
+        self.assertEqual(1, len(ends))
+        self.assertAlmostEqual(14.0, ends[0][0])
+        self.assertAlmostEqual(20.0, ends[0][2])
+
     def test_bot_drowning_requires_ten_continuous_seconds_and_publishes_death(self):
         depth = [2.0]
         runtime = self.module.BotRuntime(
@@ -1692,14 +1723,19 @@ class BotRuntimeTests(unittest.TestCase):
                 graph_calls.append((start, end))
                 return True
 
-        def direction(position, yaw, speed, type_descriptor):
-            direction_calls.append((position, yaw, speed, type_descriptor))
+        def direction(
+                position, yaw, speed, type_descriptor, maximum_distance):
+            direction_calls.append((
+                position, yaw, speed, type_descriptor, maximum_distance))
             return {'clear': True, 'collision': False, 'slope': 0.0}
 
-        def receipt(position, yaw, speed, type_descriptor):
-            receipt_calls.append((position, yaw, speed, type_descriptor))
+        def receipt(
+                position, yaw, speed, type_descriptor, maximum_distance):
+            receipt_calls.append((
+                position, yaw, speed, type_descriptor, maximum_distance))
             return {
-                'distance': 8.0, 'half_width': 1.6, 'leading': 3.5,
+                'distance': float(maximum_distance),
+                'half_width': 1.6, 'leading': 3.5,
                 'origin': tuple(position), 'yaw': float(yaw),
                 'direction': -1 if float(speed) < 0.0 else 1,
             }
@@ -1734,6 +1770,8 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(receipt_calls))
         self.assertAlmostEqual(0.00004, direction_calls[0][1])
         self.assertAlmostEqual(0.00004, receipt_calls[0][1])
+        self.assertAlmostEqual(6.0, direction_calls[0][4])
+        self.assertAlmostEqual(6.0, receipt_calls[0][4])
         self.assertEqual(1, runtime.states[11]['movement_dir'])
 
     def test_baked_planner_clear_cannot_bypass_native_selected_wall(self):
@@ -1836,8 +1874,10 @@ class BotRuntimeTests(unittest.TestCase):
         }
         receipt_calls = []
 
-        def receipt(position, yaw, speed, unused_descriptor):
-            receipt_calls.append((tuple(position), yaw, speed))
+        def receipt(
+                position, yaw, speed, unused_descriptor, maximum_distance):
+            receipt_calls.append((
+                tuple(position), yaw, speed, maximum_distance))
             return {
                 'distance': 8.0, 'half_width': 1.6, 'leading': 3.5,
                 'origin': tuple(position), 'yaw': float(yaw),
@@ -1862,6 +1902,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(receipt_calls))
         self.assertAlmostEqual(math.pi, receipt_calls[0][1])
         self.assertLess(receipt_calls[0][2], 0.0)
+        self.assertAlmostEqual(6.0, receipt_calls[0][3])
         cached = runtime._motion_probe_cache[11]['result']['world_receipt']
         self.assertAlmostEqual(math.pi, cached['yaw'])
         self.assertEqual(-1, cached['direction'])
@@ -4411,6 +4452,12 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertFalse(reusable(
             cached, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0975))
 
+        covers = self.module.BotRuntime._motion_probe_covers_distance
+        self.assertFalse(covers({'maximum_distance': 4.0}, 6.0))
+        self.assertTrue(covers({'maximum_distance': 6.0}, 4.0))
+        self.assertTrue(covers({}, 6.0))
+        self.assertFalse(covers({'maximum_distance': 4.0}, None))
+
     def test_typed_world_receipt_contains_only_the_actual_motion_step(self):
         runtime = self.module.BotRuntime(1)
         runtime._motion_probe_cache[11] = {
@@ -4436,6 +4483,10 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertFalse(runtime.motion_world_receipt_reusable(
             11, (0.0, 0.0, 3.4), 0.0, 35.0,
             now=1.09, dt=0.04))
+        self.assertFalse(runtime._world_receipt_contains({
+            'distance': 4.0, 'half_width': 1.6, 'leading': 5.0,
+            'origin': (0.0, 0.0, 0.0), 'yaw': 0.0, 'direction': 1,
+        }, (0.0, 0.0, 0.0), 0.0, 0.0, 0.04))
 
     def test_typed_world_receipt_rejects_pose_heading_expiry_and_defer(self):
         runtime = self.module.BotRuntime(1)
