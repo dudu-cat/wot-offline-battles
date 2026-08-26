@@ -10,6 +10,7 @@ import time
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922 import queue_screen
 from gui.mods.offline_lan_0922 import queue_ui
+from gui.mods.offline_lan_0922 import vehicle_configuration
 from gui.mods.offline_lan_0922 import waiting_room_ui
 
 
@@ -89,7 +90,8 @@ def _selected_vehicle_details():
     descriptor = item.descriptor
     type_name = descriptor.type.name
     max_health = int(descriptor.maxHealth)
-    if not type_name or max_health < 1:
+    if (not vehicle_configuration.is_standard_battle_vehicle(
+            descriptor.type) or max_health < 1):
         raise ValueError('the current garage vehicle descriptor is invalid')
     return type_name, max_health
 

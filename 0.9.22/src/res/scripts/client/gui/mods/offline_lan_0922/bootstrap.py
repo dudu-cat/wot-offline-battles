@@ -12,6 +12,7 @@ from gui.mods.offline_lan_0922 import instance_guard
 from gui.mods.offline_lan_0922 import vehicle_blacklist
 from gui.mods.offline_lan_0922.vehicle_configuration import (
     install_top_modules as _install_top_modules,
+    is_standard_battle_vehicle as _is_standard_battle_vehicle,
     top_component as _top_component)
 from gui.mods.offline_lan_0922.account_rpc.state import AccountState
 
@@ -495,8 +496,7 @@ def _selected_vehicle(config, restore_saved=True):
                     descriptor = vehicles.VehicleDescr(typeID=type_id)
 
                 nation_id, vehicle_type_id = descriptor.type.id
-                if set(('event_battles', 'premiumIGR', 'observer')).intersection(
-                        descriptor.type.tags):
+                if not _is_standard_battle_vehicle(descriptor.type):
                     raise ValueError(
                         'vehicle type is not available in standard battles')
                 if vehicle_blacklist.is_unusable(descriptor.type.name):

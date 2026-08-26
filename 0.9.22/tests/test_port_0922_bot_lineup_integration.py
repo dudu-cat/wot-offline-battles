@@ -18,6 +18,8 @@ import bot_lineup_ui  # noqa: E402
 import core as launcher_core  # noqa: E402
 import windows_server  # noqa: E402
 from gui.mods.offline_lan_0922 import vehicle_blacklist  # noqa: E402
+from gui.mods.offline_lan_0922 import descriptor_donation  # noqa: E402
+from gui.mods.offline_lan_0922 import vehicle_configuration  # noqa: E402
 from gui.mods.offline_lan_0922.battle_runtime import BattleRuntime  # noqa: E402
 
 
@@ -131,6 +133,37 @@ class BotLineupIntegrationTests(unittest.TestCase):
         self.assertEqual(
             frozenset(vehicle_blacklist.UNUSABLE_VEHICLES),
             bot_lineup_profiles.UNUSABLE_BOT_VEHICLES_0922)
+
+    def test_all_catalogues_share_the_standard_battle_exclusions(self):
+        entries = {
+            1: types.SimpleNamespace(
+                name='ussr:R11_MS-1', level=1, tags=('lightTank',)),
+            2: types.SimpleNamespace(
+                name='germany:Env_Artillery', level=5,
+                tags=('SPG', 'secret', 'unrecoverable')),
+            3: types.SimpleNamespace(
+                name='ussr:EventTank', level=5,
+                tags=('mediumTank', 'event_battles')),
+            4: types.SimpleNamespace(
+                name='germany:IgrTank', level=5,
+                tags=('heavyTank', 'premiumIGR')),
+            5: types.SimpleNamespace(
+                name='ussr:Observer', level=1,
+                tags=('lightTank', 'observer')),
+        }
+        runtime = types.SimpleNamespace(
+            nations=types.SimpleNamespace(
+                AVAILABLE_NAMES=('all',), INDICES={'all': 0}),
+            vehicles=types.SimpleNamespace(g_list=types.SimpleNamespace(
+                getList=lambda unused_nation_id: entries)))
+
+        self.assertEqual(
+            ['ussr:R11_MS-1'],
+            [row['name'] for row in
+             descriptor_donation.vehicle_catalog(runtime)])
+        for entry in list(entries.values())[1:]:
+            self.assertFalse(
+                vehicle_configuration.is_standard_battle_vehicle(entry))
 
     def test_missing_exact_vehicle_is_rejected_by_hidden_worker(self):
         lineup = [{

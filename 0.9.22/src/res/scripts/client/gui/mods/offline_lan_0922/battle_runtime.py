@@ -3685,13 +3685,10 @@ class BattleRuntime(object):
 
     @staticmethod
     def _vehicle_excluded(entry):
-        tags = _field(entry, 'tags', ()) or ()
-        if 'secret' in tags:
-            return True
         name = _field(entry, 'name')
         if vehicle_blacklist.is_unusable(name):
             return True
-        return name == 'usa:T23'
+        return not vehicle_configuration.is_standard_battle_vehicle(entry)
 
     @staticmethod
     def _vehicle_class_order(entry):

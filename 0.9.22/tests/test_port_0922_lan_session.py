@@ -1311,6 +1311,21 @@ class LANSessionTests(unittest.TestCase):
                 ('germany:G04_PzVI_Tiger_I', 1500),
                 self.module._selected_vehicle_details())
 
+    def test_default_provider_rejects_a_secret_environment_vehicle(self):
+        current_vehicle = types.ModuleType('CurrentVehicle')
+        current_vehicle.g_currentVehicle = types.SimpleNamespace(
+            item=types.SimpleNamespace(
+                descriptor=types.SimpleNamespace(
+                    type=types.SimpleNamespace(
+                        name='germany:Env_Artillery',
+                        tags=('SPG', 'secret', 'unrecoverable')),
+                    maxHealth=300)))
+
+        with mock.patch.dict(
+                sys.modules, {'CurrentVehicle': current_vehicle}):
+            with self.assertRaisesRegex(ValueError, 'descriptor is invalid'):
+                self.module._selected_vehicle_details()
+
     def test_picker_is_not_open_before_server_welcome(self):
         self.assertEqual('connecting', self.session.state)
         self.assertEqual([], self.opens)

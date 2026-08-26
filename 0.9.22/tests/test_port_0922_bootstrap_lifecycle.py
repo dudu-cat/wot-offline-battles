@@ -316,6 +316,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
             (2, 1): make_descriptor(2, 1, 7000, ('event_battles',)),
             (2, 2): make_descriptor(2, 2, 8000, ('premiumIGR',)),
             (2, 3): make_descriptor(2, 3, 9000, ('observer',)),
+            (2, 4): make_descriptor(2, 4, 10000, ('SPG', 'secret',
+                                                   'unrecoverable')),
         }
         delattr(descriptors[(1, 9)], 'gun')
         descriptors[(1, 9)].type.turrets = [[]]
@@ -334,7 +336,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
                 return {
                     0: {11: object(), 12: object()},
                     1: {7: object(), 8: object(), 9: object()},
-                    2: {1: object(), 2: object(), 3: object()},
+                    2: {1: object(), 2: object(), 3: object(), 4: object()},
                 }.get(nation_id, {})
 
         customization = types.SimpleNamespace(
@@ -780,7 +782,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
         self.assertEqual(len(all_tankman_ids), len(set(all_tankman_ids)))
         runtime_vehicles = modules['items'].vehicles
         self.assertTrue(
-            {(1, 8), (1, 9), (2, 1), (2, 2), (2, 3)}.issubset(
+            {(1, 8), (1, 9), (2, 1), (2, 2), (2, 3), (2, 4)}.issubset(
                 set(runtime_vehicles.attemptedTypeIDs)))
         self.assertTrue({(1, 8), (1, 9)}.issubset(
                         set(runtime_vehicles.crewTypeIDs)))
@@ -788,7 +790,7 @@ class BootstrapLifecycleTests(unittest.TestCase):
             {0},
             set(modules['items'].tankmen.generatedSkillMasks))
         self.assertTrue(
-            {(2, 1), (2, 2), (2, 3)}.isdisjoint(
+            {(2, 1), (2, 2), (2, 3), (2, 4)}.isdisjoint(
                 set(runtime_vehicles.crewTypeIDs)))
 
     def test_account_is_created_after_login_state_clear_and_next_tick(self):

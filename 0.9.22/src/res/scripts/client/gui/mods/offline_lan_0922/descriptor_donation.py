@@ -3,6 +3,7 @@ from __future__ import print_function
 """Freeze only the mounted shot law and lobby vehicle tiers for LAN."""
 
 from gui.mods.offline_lan_0922 import vehicle_blacklist
+from gui.mods.offline_lan_0922 import vehicle_configuration
 
 
 def _value(source, name, default=None):
@@ -119,7 +120,9 @@ def vehicle_catalog(runtime):
         entries = iterator() if callable(iterator) else values.values()
         for entry in entries:
             name = str(_value(entry, "name", "") or "")
-            if not name or vehicle_blacklist.is_unusable(name):
+            if (not name or vehicle_blacklist.is_unusable(name) or
+                    not vehicle_configuration.is_standard_battle_vehicle(
+                        entry)):
                 continue
             try:
                 level = int(_value(entry, "level", 1) or 1)

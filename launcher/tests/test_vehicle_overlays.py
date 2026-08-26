@@ -226,7 +226,7 @@ class VehicleOverlayTest(unittest.TestCase):
             ])),
             (b"Observer", element([
                 (b"tags", scalar(
-                    packed.TYPE_STRING, b"observer secret lightTank")),
+                    packed.TYPE_STRING, b"secret lightTank")),
             ])),
         ])
         return {

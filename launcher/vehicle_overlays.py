@@ -38,8 +38,10 @@ except ImportError:
 
 try:
     from . import core
+    from .bot_lineup_profiles import vehicle_choice_is_eligible
 except ImportError:
     import core
+    from bot_lineup_profiles import vehicle_choice_is_eligible
 
 
 TARGET_VERSION = "0.9.22.0.1"
@@ -868,15 +870,16 @@ def _vehicle_roster_from_archive(archive, counts, nation=None):
                             _scalar_text(values[0]))
                     except VehicleOverlayError:
                         pass
-            records.append({
+            record = {
                 "nation": roster_nation,
                 "vehicle": vehicle,
                 "member": member,
                 "tags": tuple(tags.split()),
-                "selectable": "observer" not in tags.split(),
                 "userString": user_strings.get("userString", ""),
                 "shortUserString": user_strings.get("shortUserString", ""),
-            })
+            }
+            record["selectable"] = vehicle_choice_is_eligible(record)
+            records.append(record)
     return sorted(records, key=lambda record: (
         record["nation"], record["vehicle"], record["member"]))
 

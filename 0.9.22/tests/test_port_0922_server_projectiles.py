@@ -735,6 +735,32 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             (2.0, 1.3, 8.0 / 3.6, 2.0),
             SIEGE_VEHICLE_PARAMS['sweden:S22_Strv_S1'])
 
+    def test_bot_siege_speed_limit_uses_wire_precision(self):
+        for offset, (vehicle, params) in enumerate(sorted(
+                SIEGE_VEHICLE_PARAMS.items())):
+            identity = {
+                'id': 16 + offset, 'team': 2, 'slot': offset,
+                'name': 'Bot%d' % offset, 'vehicle': vehicle,
+                'max_health': 1000,
+            }
+            base = {
+                'id': 16 + offset, 'health': 1000, 'alive': True,
+                'x': 10.0, 'y': 1.0, 'z': 20.0, 'yaw': 0.25,
+                'pitch': 0.0, 'roll': 0.0,
+                'movement_dir': 1, 'rotation_dir': 0,
+                'siege_state': SIEGE_ENABLED,
+                'siege_time_left_ms': 0,
+                'siege_transition_total_ms': 0,
+            }
+            wire_limit = round(float(params[2]), 4)
+            for speed in (wire_limit, -wire_limit):
+                sanitized = BattleState._sanitize_bot_state(
+                    dict(base, speed=speed), identity, None)
+                self.assertEqual(speed, sanitized['speed'])
+            with self.assertRaisesRegex(ValueError, 'Siege speed'):
+                BattleState._sanitize_bot_state(
+                    dict(base, speed=wire_limit + 0.0001), identity, None)
+
     def test_bot_siege_transition_publication_cannot_advance_hull_pose(self):
         identity = {
             'id': 16, 'team': 2, 'slot': 0, 'name': 'Bot',

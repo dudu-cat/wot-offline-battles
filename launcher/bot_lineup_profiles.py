@@ -17,6 +17,10 @@ MAX_VEHICLE_TYPE_NAME_LENGTH = 96
 UNUSABLE_BOT_VEHICLES_0922 = frozenset((
     "germany:G138_VK168_02_Mauerbrecher",
 ))
+NON_STANDARD_BOT_TAGS_0922 = frozenset((
+    "event_battles", "premiumIGR", "observer", "secret",
+))
+NON_STANDARD_BOT_VEHICLES_0922 = frozenset(("usa:T23",))
 
 _NATION = re.compile(r"^[a-z][a-z0-9_]*$")
 _VEHICLE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -77,8 +81,8 @@ def vehicle_choice_is_eligible(choice):
     if not isinstance(tags, (list, tuple, set, frozenset)):
         raise BotLineupProfileError("The vehicle tags are invalid.")
     tags = set(str(tag) for tag in tags)
-    return ("observer" not in tags and "secret" not in tags and
-            type_name != "usa:T23" and
+    return (not NON_STANDARD_BOT_TAGS_0922.intersection(tags) and
+            type_name not in NON_STANDARD_BOT_VEHICLES_0922 and
             type_name not in UNUSABLE_BOT_VEHICLES_0922)
 
 

@@ -624,10 +624,13 @@ def _bounded_float(value, low, high, inclusive_low=True):
 
 def _bot_lineup_allowed_names(catalog):
     """Return selectable catalog identities without hidden test vehicles."""
+    excluded_tags = {
+        "event_battles", "premiumIGR", "observer", "secret",
+    }
     return set(
         row.get("name") for row in (catalog or ())
         if isinstance(row, dict) and row.get("name") and
-        "secret" not in (row.get("tags") or ()) and
+        not excluded_tags.intersection(row.get("tags") or ()) and
         row.get("name") != "usa:T23")
 
 
@@ -4575,10 +4578,16 @@ class BattleState:
                 reload_progress
         siege_values = SIEGE_VEHICLE_PARAMS.get(str(identity.get(
             "vehicle", "")))
+        # Bot snapshots serialize speed to four decimal places above.  Compare
+        # against the same wire precision so a legal descriptor ceiling such
+        # as 10 / 3.6 does not become 2.7778 > 2.777777... after transport.
+        siege_speed_limit = (
+            round(float(siege_values[2]), 4)
+            if siege_values is not None else None)
         if (siege_values is not None and
                 siege_state == SIEGE_ENABLED and
                 abs(float(result["speed"])) >
-                float(siege_values[2]) + 1.0e-6):
+                siege_speed_limit + 1.0e-6):
             raise ValueError("bot Siege speed exceeds vehicle law")
         siege_motion_locked = (
             siege_state in (SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF) or

@@ -39,6 +39,12 @@ class BotLineupProfilesTests(unittest.TestCase):
              "tags": ("secret",)},
             {"nation": "ussr", "vehicle": "Observer",
              "tags": ("observer",)},
+            {"nation": "germany", "vehicle": "Env_Artillery",
+             "tags": ("SPG", "secret", "unrecoverable")},
+            {"nation": "ussr", "vehicle": "EventTank",
+             "tags": ("event_battles",)},
+            {"nation": "germany", "vehicle": "IgrTank",
+             "tags": ("premiumIGR",)},
         ]
 
         self.assertEqual(
