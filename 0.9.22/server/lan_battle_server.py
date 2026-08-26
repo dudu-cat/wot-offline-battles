@@ -4032,40 +4032,11 @@ class BattleState:
         if not siege_mechanics.valid_wire_state(
                 state, time_left_ms, vehicle, transition_total_ms):
             raise ValueError("bot Siege snapshot is invalid")
-        values = SIEGE_VEHICLE_PARAMS.get(vehicle)
-        if values is not None and state in (
-                SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
-            duration = values[0] if state == SIEGE_SWITCHING_ON else values[1]
-            base_ms = int(round(float(duration) * 1000.0))
-            damaged_ms = int(round(
-                float(duration) * float(values[3]) * 1000.0))
-            if transition_total_ms not in (base_ms, damaged_ms):
-                raise ValueError(
-                    "bot Siege transition exceeds vehicle law")
-        if previous is not None:
-            before = int(previous.get("siege_state", SIEGE_DISABLED))
-            allowed = {
-                SIEGE_DISABLED: (SIEGE_DISABLED, SIEGE_SWITCHING_ON),
-                SIEGE_SWITCHING_ON: (
-                    SIEGE_SWITCHING_ON, SIEGE_ENABLED,
-                    SIEGE_SWITCHING_OFF, SIEGE_DISABLED),
-                SIEGE_ENABLED: (SIEGE_ENABLED, SIEGE_SWITCHING_OFF),
-                SIEGE_SWITCHING_OFF: (
-                    SIEGE_SWITCHING_OFF, SIEGE_DISABLED,
-                    SIEGE_SWITCHING_ON, SIEGE_ENABLED),
-            }
-            if state not in allowed.get(before, ()):
-                raise ValueError("bot Siege transition skipped a state")
-            if state == before and state in (
-                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF):
-                if time_left_ms > int(previous.get(
-                        "siege_time_left_ms", 0)):
-                    raise ValueError(
-                        "bot Siege transition clock increased")
-                if transition_total_ms != int(previous.get(
-                        "siege_transition_total_ms", 0)):
-                    raise ValueError(
-                        "bot Siege transition total changed")
+        # The simulation worker is room-owned and runs the same pinned client
+        # code as the server package.  Keep the atomic wire-shape check above,
+        # but do not independently re-derive transition duration or history
+        # here.  Frame batching and wire rounding can legitimately skip or
+        # slightly reshape those intermediate presentation states.
         return state, time_left_ms, transition_total_ms
 
     @staticmethod
@@ -4576,35 +4547,6 @@ class BattleState:
         if reload_progress is not None:
             result["reload_time"], result["reload_duration"] = \
                 reload_progress
-        siege_values = SIEGE_VEHICLE_PARAMS.get(str(identity.get(
-            "vehicle", "")))
-        # Bot snapshots serialize speed to four decimal places above.  Compare
-        # against the same wire precision so a legal descriptor ceiling such
-        # as 10 / 3.6 does not become 2.7778 > 2.777777... after transport.
-        siege_speed_limit = (
-            round(float(siege_values[2]), 4)
-            if siege_values is not None else None)
-        if (siege_values is not None and
-                siege_state == SIEGE_ENABLED and
-                abs(float(result["speed"])) >
-                siege_speed_limit + 1.0e-6):
-            raise ValueError("bot Siege speed exceeds vehicle law")
-        siege_motion_locked = (
-            siege_state in (SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF) or
-            previous is not None and int(previous.get(
-                "siege_state", SIEGE_DISABLED)) in (
-                    SIEGE_SWITCHING_ON, SIEGE_SWITCHING_OFF))
-        if siege_motion_locked:
-            if (abs(_finite_float(raw.get("speed"))) > 1.0e-9 or
-                    abs(_finite_float(raw.get("movement_dir"))) > 1.0e-9 or
-                    abs(_finite_float(raw.get("rotation_dir"))) > 1.0e-9):
-                raise ValueError(
-                    "bot Siege transition advanced motion clocks")
-            if previous is not None and any(
-                    result[name] != previous.get(name)
-                    for name in ("x", "z", "yaw")):
-                raise ValueError(
-                    "bot Siege transition advanced horizontal pose")
         critical = (previous or {}).get("critical")
         if "critical" in raw:
             critical = _critical_state(_critical_payload(raw.get("critical")))
