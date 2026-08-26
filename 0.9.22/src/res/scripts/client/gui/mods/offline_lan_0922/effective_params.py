@@ -76,6 +76,9 @@ _SOURCE_SHOT_KEYS = frozenset((
     'speed', 'gravity', 'maxDistance', 'piercingPower', 'deadeye', 'shell'))
 _SOURCE_SHELL_KEYS = frozenset((
     'kind', 'caliber', 'damage', 'explosionRadius'))
+_SOURCE_SHELL_HE_FACTOR_KEYS = frozenset((
+    'explosionDamageFactor', 'explosionDamageAbsorptionFactor',
+    'explosionEdgeDamageFactor'))
 _PROJECTILE_SHELL_KINDS = frozenset((
     'HOLLOW_CHARGE', 'HIGH_EXPLOSIVE', 'ARMOR_PIERCING',
     'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
@@ -290,7 +293,10 @@ def _canonical_source_shot(value):
     if not _mapping(value, _SOURCE_SHOT_KEYS):
         return None
     shell = value.get('shell')
-    if not _mapping(shell, _SOURCE_SHELL_KEYS):
+    if (not isinstance(shell, dict) or
+            set(shell) not in (
+                _SOURCE_SHELL_KEYS,
+                _SOURCE_SHELL_KEYS | _SOURCE_SHELL_HE_FACTOR_KEYS)):
         return None
     kind = shell.get('kind')
     deadeye = _bool(value.get('deadeye'))
@@ -304,11 +310,24 @@ def _canonical_source_shot(value):
     caliber = _number(shell.get('caliber'), 0.000001, 1000.0)
     damage = _tuple(shell.get('damage'), 2, 0.0, 10000.0)
     radius = _number(shell.get('explosionRadius'), 0.0, 100.0)
+    he_factors = None
+    if _SOURCE_SHELL_HE_FACTOR_KEYS.issubset(set(shell)):
+        he_factors = {
+            'explosionDamageFactor': _number(
+                shell.get('explosionDamageFactor'), 0.000001, 10000.0),
+            'explosionDamageAbsorptionFactor': _number(
+                shell.get('explosionDamageAbsorptionFactor'),
+                0.000001, 10000.0),
+            'explosionEdgeDamageFactor': _number(
+                shell.get('explosionEdgeDamageFactor'), 0.000001, 1.0),
+        }
     if (speed is None or gravity is None or maximum is None or
             piercing is None or caliber is None or damage is None or
-            damage[0] <= 0.0 or radius is None):
+            damage[0] <= 0.0 or radius is None or
+            (he_factors is not None and
+             any(entry is None for entry in he_factors.values()))):
         return None
-    return {
+    result = {
         'speed': speed,
         'gravity': gravity,
         'maxDistance': maximum,
@@ -321,6 +340,9 @@ def _canonical_source_shot(value):
             'explosionRadius': radius,
         },
     }
+    if he_factors is not None:
+        result['shell'].update(he_factors)
+    return result
 
 
 def _canonical_gun(value):

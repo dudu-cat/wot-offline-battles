@@ -200,6 +200,49 @@ class EffectiveParamsContractTests(unittest.TestCase):
         source['loadout']['reload_factor'] = 99.0
         self.assertEqual(0.96, result['loadout']['reload_factor'])
 
+    def test_snapshot_preserves_complete_he_shell_factors(self):
+        source = effective_params()
+        shell = source['gun']['shots'][0]['source_shot']['shell']
+        shell.update({
+            'kind': 'HIGH_EXPLOSIVE',
+            'explosionRadius': 2.5,
+            'explosionDamageFactor': 0.55,
+            'explosionDamageAbsorptionFactor': 1.4,
+            'explosionEdgeDamageFactor': 0.2,
+        })
+
+        result = contract.canonical(source)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            0.55,
+            result['gun']['shots'][0]['source_shot']['shell'][
+                'explosionDamageFactor'])
+        self.assertEqual(
+            1.4,
+            result['gun']['shots'][0]['source_shot']['shell'][
+                'explosionDamageAbsorptionFactor'])
+        self.assertEqual(
+            0.2,
+            result['gun']['shots'][0]['source_shot']['shell'][
+                'explosionEdgeDamageFactor'])
+
+    def test_snapshot_rejects_partial_or_invalid_he_shell_factors(self):
+        partial = effective_params()
+        partial_shell = partial['gun']['shots'][0]['source_shot']['shell']
+        partial_shell['explosionDamageFactor'] = 0.55
+        self.assertIsNone(contract.canonical(partial))
+
+        invalid = effective_params()
+        invalid_shell = invalid['gun']['shots'][0]['source_shot']['shell']
+        invalid_shell.update({
+            'kind': 'HIGH_EXPLOSIVE',
+            'explosionDamageFactor': 0.55,
+            'explosionDamageAbsorptionFactor': 1.4,
+            'explosionEdgeDamageFactor': 1.1,
+        })
+        self.assertIsNone(contract.canonical(invalid))
+
     def test_schema_rejects_omission_non_finite_and_duplicate_ammo(self):
         missing = effective_params()
         del missing['skills']
