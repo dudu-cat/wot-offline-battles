@@ -6495,7 +6495,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             adopt_descriptor=mock.Mock(return_value=True))
         battle._local_matrix = object()
         battle._select_local_siege_pose = mock.Mock(return_value=True)
-        battle._update_local_hull_aiming = mock.Mock(return_value=True)
         battle._local_physics = {'speedFwd': 19.0}
         battle._local_factors = mock.Mock(return_value={'engine/power': 1.0})
         battle._targeting_signature = ('old',)
@@ -6512,7 +6511,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.update_vehicle_siege_state.assert_called_once_with(
             10, 1, 2.0)
         battle._select_local_siege_pose.assert_called_once_with(vehicle, False)
-        battle._update_local_hull_aiming.assert_called_once_with(vehicle)
         battle._gun_state.adopt_descriptor.assert_called_once_with(descriptor)
         derive.assert_called_once_with(
             descriptor, {'engine/power': 1.0})
@@ -6529,7 +6527,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             update_vehicle_siege_state=mock.Mock(return_value=True))
         battle._local_matrix = object()
         battle._select_local_siege_pose = mock.Mock(return_value=True)
-        battle._update_local_hull_aiming = mock.Mock(return_value=True)
         record = {
             'engine_id': 10, 'local': True,
             'presented_siege_state': 2}
@@ -6538,7 +6535,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'siege_state': 3, 'siege_time_left_ms': 1200}))
 
         battle._select_local_siege_pose.assert_called_once_with(vehicle, True)
-        battle._update_local_hull_aiming.assert_called_once_with(vehicle)
 
     def test_old_siege_echo_does_not_rewrite_atomic_projectile_pose(self):
         runtime = _runtime()
@@ -11069,9 +11065,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             entity.filter.groundPlacingMatrix = _Matrix()
             entity.filter.groundPlacingMatrixFiltered = _Matrix()
             entity.filter.stabilisedMatrix = _Matrix()
-            physics = types.SimpleNamespace(
-                setHullAimingAnglesDelta=mock.Mock())
-            entity.filter.getVehiclePhysics = lambda: physics
+            entity.filter.getVehiclePhysics = mock.Mock(
+                side_effect=AssertionError(
+                    'client-only siege touched native physics'))
             runtime.bigworld.entities[10] = entity
             battle._server = types.SimpleNamespace(vehicle_id=10)
             battle._sender = types.SimpleNamespace(
@@ -11103,35 +11099,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
             self.assertEqual((1.0, 1.0), (
                 battle._sender.forward, battle._sender.turn))
             entity.filter.notifyInputKeysDown.assert_called_with(0, 0)
-            if siege_state == \
-                    runtime.constants.VEHICLE_SIEGE_STATE.SWITCHING_ON:
-                physics.setHullAimingAnglesDelta.assert_not_called()
-            else:
-                physics.setHullAimingAnglesDelta.assert_called_once_with(
-                    0.0, 0.0)
+            entity.filter.getVehiclePhysics.assert_not_called()
 
-    def test_inactive_siege_does_not_touch_native_vehicle_physics(self):
-        runtime = _runtime()
-        battle = BattleRuntime(runtime)
-        descriptor = _Descriptor('sweden:S11_Strv_103B')
-        descriptor.hasSiegeMode = True
-        entity = types.SimpleNamespace(
-            typeDescriptor=descriptor,
-            siegeState=runtime.constants.VEHICLE_SIEGE_STATE.DISABLED,
-            filter=types.SimpleNamespace(
-                getVehiclePhysics=mock.Mock(
-                    side_effect=AssertionError(
-                        'inactive siege touched native physics'))))
-
-        self.assertFalse(battle._update_local_hull_aiming(entity))
-        entity.filter.getVehiclePhysics.assert_not_called()
-
-        entity.siegeState = \
-            runtime.constants.VEHICLE_SIEGE_STATE.SWITCHING_ON
-        self.assertFalse(battle._update_local_hull_aiming(entity))
-        entity.filter.getVehiclePhysics.assert_not_called()
-
-    def test_enabled_siege_transplants_native_hydraulic_pose_and_aim(self):
+    def test_enabled_siege_transplants_native_hydraulic_pose_without_physics_sync(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.client = _Client()
@@ -11150,9 +11120,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         entity.filter.groundPlacingMatrix = native_ground
         entity.filter.groundPlacingMatrixFiltered = native_ground_filtered
         entity.filter.stabilisedMatrix = native_stabilised
-        physics = types.SimpleNamespace(
-            setHullAimingAnglesDelta=mock.Mock())
-        entity.filter.getVehiclePhysics = lambda: physics
+        entity.filter.getVehiclePhysics = mock.Mock(
+            side_effect=AssertionError(
+                'client-only siege touched native physics'))
         runtime.bigworld.entities[10] = entity
         battle._server = types.SimpleNamespace(vehicle_id=10)
         battle._sender = types.SimpleNamespace(
@@ -11184,23 +11154,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             battle._local_siege_ground_matrix,
             battle._local_steady_rotation_matrix.a)
-        self.assertTrue(battle._update_local_hull_aiming(entity))
-        physics.setHullAimingAnglesDelta.assert_called_once()
-        yaw_delta, pitch_delta = \
-            physics.setHullAimingAnglesDelta.call_args[0]
-        self.assertEqual(0.0, yaw_delta)
-        self.assertAlmostEqual(-0.15, pitch_delta)
-
-        physics.setHullAimingAnglesDelta.reset_mock()
         entity.siegeState = 3
         self.assertTrue(battle._select_local_siege_pose(entity, True))
-        self.assertTrue(battle._update_local_hull_aiming(entity))
         self.assertIs(
             battle._local_siege_body_matrix,
             battle._local_pose_matrix.a)
-        self.assertAlmostEqual(
-            -0.15,
-            physics.setHullAimingAnglesDelta.call_args[0][1])
+        entity.filter.getVehiclePhysics.assert_not_called()
 
         self.assertTrue(battle._select_local_siege_pose(entity, False))
         self.assertIs(

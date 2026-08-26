@@ -4789,40 +4789,6 @@ class BattleRuntime(object):
         self._refresh_local_stabilised_snapshot()
         return True
 
-    def _update_local_hull_aiming(self, entity):
-        """Feed the native #1513 hydraulic solver its unclamped aim delta."""
-        descriptor = getattr(entity, 'typeDescriptor', None)
-        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
-            return False
-        states = self._runtime.constants.VEHICLE_SIEGE_STATE
-        siege_state = getattr(entity, 'siegeState', states.DISABLED)
-        if siege_state not in (states.ENABLED, states.SWITCHING_OFF):
-            return False
-        vehicle_filter = getattr(entity, 'filter', None)
-        get_physics = getattr(vehicle_filter, 'getVehiclePhysics', None)
-        if not callable(get_physics):
-            raise RuntimeError(
-                '#1513 Siege vehicle physics boundary is unavailable')
-        physics = get_physics()
-        if physics is None:
-            return False
-        set_delta = getattr(physics, 'setHullAimingAnglesDelta', None)
-        if not callable(set_delta):
-            raise RuntimeError(
-                '#1513 hydraulic aiming input boundary is unavailable')
-        rotator = getattr(self._avatar, 'gunRotator', None)
-        if self._sender is None or rotator is None:
-            raise RuntimeError('player hydraulic aim source is unavailable')
-        desired_pitch = float(self._sender.gun_pitch)
-        gun_pitch = float(rotator.gunPitch)
-        pitch_delta = ((desired_pitch - float(self._local_pitch) -
-                        gun_pitch + math.pi) %
-                       (2.0 * math.pi) - math.pi)
-        # The exact x86 wrapper takes yaw delta first and pitch delta second;
-        # the four Swedish #1513 vehicles expose pitch hull aiming only.
-        set_delta(0.0, pitch_delta)
-        return True
-
     def _prepare_local_presentation(self, entity):
         """Publish one canonical pose before stock local-vehicle startup."""
         if self._local_matrix is not None:
@@ -4931,7 +4897,6 @@ class BattleRuntime(object):
         self._local_matrix.setRotateYPR((
             self._local_yaw, self._local_pitch, self._local_roll))
         self._local_matrix.translation = position
-        self._update_local_hull_aiming(entity)
         self._refresh_local_stabilised_snapshot()
         # Exact #1513's CompoundAppearance.__linkCompound rebinds
         # ``compoundModel.matrix`` from Vehicle.matrix after every model
@@ -15830,7 +15795,6 @@ class BattleRuntime(object):
             self._select_local_siege_pose(
                 entity, siege_state in (
                     siege_states.ENABLED, siege_states.SWITCHING_OFF))
-            self._update_local_hull_aiming(entity)
         if record.get('local') and self._gun_state is not None:
             self._gun_state.adopt_descriptor(entity.typeDescriptor)
             self._targeting_signature = None

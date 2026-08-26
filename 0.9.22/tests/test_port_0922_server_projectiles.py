@@ -1312,6 +1312,26 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             BattleState._bot_burst_transition(
                 previous, dict(current, burst_group_seq=2))
 
+    def test_idle_bot_may_normalize_completed_burst_history(self):
+        previous = {
+            'fire_seq': 3, 'shell_index': 0,
+            'burst_active': False, 'burst_group_seq': 1,
+            'burst_count': 3, 'burst_next_index': 3,
+            'burst_interval': 0.1, 'burst_time_left': 0.0,
+            'burst_shell_index': 0,
+        }
+        current = dict(
+            previous, shell_index=1, burst_group_seq=3,
+            burst_count=1, burst_next_index=1,
+            burst_interval=0.0, burst_shell_index=1)
+
+        self.assertEqual(
+            (), BattleState._bot_burst_transition(previous, current))
+
+        with self.assertRaisesRegex(ValueError, 'idle burst state changed'):
+            BattleState._bot_burst_transition(
+                previous, dict(current, burst_active=True))
+
     def test_server_binds_bot_launches_to_ordered_burst_metadata(self):
         state = _state()
         state.bot_states[16] = {

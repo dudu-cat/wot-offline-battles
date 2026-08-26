@@ -4408,9 +4408,13 @@ class BattleState:
                     float(previous_burst["burst_interval"]))
                 if not (same_active or cancelled):
                     raise ValueError("bot active burst state changed")
-            elif any(current[name] != previous_burst[name] for name in
-                     burst_mechanics.BurstClock.WIRE_FIELDS):
+            elif current_active:
                 raise ValueError("bot idle burst state changed")
+            # Once both snapshots are idle, completed-group metadata has no
+            # future firing authority.  A worker may normalize that history
+            # while an ordinary reload edge changes the selected shell; the
+            # ammunition validator below still proves the loaded/next shell,
+            # clip and inventory transition independently.
             return ()
 
         if previous_active:
