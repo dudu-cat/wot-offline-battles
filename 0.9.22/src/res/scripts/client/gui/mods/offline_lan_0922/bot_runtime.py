@@ -4973,12 +4973,12 @@ class BotRuntime(object):
             path_key = ('local', int(bot_id), mode,
                         strategic.get('target_id'))
             anchor = None
-        avoid = []
-        for neighbour in state.get('neighbours') or ():
-            other = (neighbour.get('position') if isinstance(neighbour, dict)
-                     else neighbour)
-            if other is not None:
-                avoid.append(other)
+        # Moving hulls are not terrain. The simultaneous tank-contact solver
+        # keeps them solid and LocalDriver separates an existing overlap. Feeding
+        # every live neighbour back into the navigation fallback made a moving
+        # teammate repeatedly change the selected waypoint and produced visible
+        # drive/stop cycles, especially for slow heavy tanks.
+        avoid = None
         return self.navigator.next_target(
             bot_id, position, goal, path_key, state.get('now', 0.0),
             anchor, avoid)
@@ -7455,7 +7455,9 @@ class BotRuntime(object):
         shot_lanes_ready = True
         neighbours = list(neighbours or []) + self._player_neighbours(players)
         # Native terrain and visibility probes run on BigWorld's render thread.
-        # Build the traffic view lazily, only when a staggered decision is due.
+        # Build the local-overlap view lazily, only when a staggered decision is
+        # due. It steers apart hulls which already touch; it never predicts
+        # traffic or changes their strategic terrain path.
         traffic_bodies = None
         traffic_index = None
         observation_entries = {}
@@ -7518,10 +7520,6 @@ class BotRuntime(object):
                 decision_cache is not None and
                 decision_cache[0] == cache_key and
                 _number(now) < decision_cache[1])
-            traffic_neighbours = None
-            traffic_control = None
-            traffic_deadline = None
-            traffic_refreshed = False
             decision_deadline = None
             raw_command = None
             planner_probe_samples = {}
@@ -7546,8 +7544,15 @@ class BotRuntime(object):
                     BOT_WATER_AVOID_DEPTH)
                 if advisory is not None:
                     return bool(advisory)
-                return self._probe_is_clear(
-                    planner_sample_direction(sample_yaw))
+                sample = planner_sample_direction(sample_yaw)
+                # Exhausting the soft-static recast budget is not a wall. Keep
+                # the previous drive intent; commit-side world collision still
+                # stops the hull if this corridor reaches real hard geometry.
+                if (sample is None or
+                        (isinstance(sample, dict) and
+                         sample.get('deferred', False))):
+                    return True
+                return self._probe_is_clear(sample)
 
             if not decision_due:
                 if len(decision_cache) < 6:
@@ -7556,17 +7561,6 @@ class BotRuntime(object):
                 command = dict(decision_cache[3])
                 contacts = decision_cache[4]
                 targets = decision_cache[5]
-                if len(decision_cache) >= 8:
-                    traffic_control = decision_cache[6]
-                    traffic_deadline = decision_cache[7]
-                    if (traffic_control[1] and
-                            _number(now) + 1e-9 >= traffic_deadline):
-                        # A zero-throttle anti-contact result must not be held
-                        # for the whole planner lease after the hull ahead has
-                        # moved. Recheck only these stopped edge cases on the
-                        # next physical publication; ordinary traffic remains
-                        # on the low-frequency decision cadence.
-                        traffic_control = None
             else:
                 contacts, targets = self._contacts_for(
                     state, players, now, team_visibility, visibility_tick)
@@ -7595,7 +7589,6 @@ class BotRuntime(object):
                     'half_length': _number(state.get('half_length'), 3.5),
                     'half_width': _number(state.get('half_width'), 1.7),
                 }
-                traffic_neighbours = decision_state['neighbours']
                 reposition_order, reposition_expired = \
                     self._friendly_reposition_order(state, targets, now)
                 if (reposition_order is not None and
@@ -7632,43 +7625,17 @@ class BotRuntime(object):
                     DECISION_TIER_FACTOR[self._detail_tier(state)],
                     3, decision_cache is None)
                 raw_command = dict(command)
-            # Friendly traffic is advisory anti-sticking, not physical
-            # authority. Run the continuous OBB and exact stopping integral at
-            # the same low-frequency decision boundary, then reuse that
-            # throttle through the lease. Actual hull contact remains owned by
-            # the simultaneous tank solver, so a 30 Hz recheck only spent CPU
-            # and amplified minor pose changes into visible stop/go commands.
-            if traffic_control is None:
-                if traffic_neighbours is None:
-                    if traffic_bodies is None:
-                        traffic_bodies, traffic_index = \
-                            self._traffic_snapshot(neighbours)
-                    traffic_neighbours = self._neighbours_for(
-                        state, neighbours, traffic_index, traffic_bodies)
-                traffic_control = self._traffic_throttle(
-                    state, command, traffic_neighbours,
-                    self._physics_params.get(state['id']),
-                    self._cached_traffic_stopping_distance)
-                traffic_refreshed = True
-                traffic_deadline = (
-                    _number(now) + PUBLICATION_SECONDS
-                    if traffic_control[1] else
-                    (decision_deadline if decision_due else
-                     decision_cache[1]))
-            command['throttle'], waiting_for_traffic = traffic_control
+            # Hull contact is already solved simultaneously after every Bot's
+            # copied step. Friendly ramming no longer deals damage, so a second
+            # predictive headway controller only makes slow vehicles coast and
+            # accelerate in visible pulses. Preserve the planner's last valid
+            # command until terrain/world collision gives a completed veto.
+            command['throttle'] = max(
+                -1.0, min(1.0, _number(command.get('throttle'))))
             if decision_due:
                 self._decision_cache[state['id']] = (
                     cache_key, decision_deadline, _number(now), raw_command,
-                    contacts, targets, traffic_control, traffic_deadline)
-            elif traffic_refreshed:
-                self._decision_cache[state['id']] = (
-                    decision_cache[:6] +
-                    (traffic_control, traffic_deadline))
-            if waiting_for_traffic:
-                driver = getattr(self.adapter, 'driver', None)
-                wait = getattr(driver, 'wait_for_traffic', None)
-                if callable(wait):
-                    wait(state['id'])
+                    contacts, targets)
             # Preserve the old refresh point: in copied-physics mode, a later
             # bot observes poses integrated by earlier bots in this same tick.
             # Human records do not change inside update, so index them once at
@@ -7976,8 +7943,12 @@ class BotRuntime(object):
                             })
                         elif isinstance(receipt, dict):
                             motion_probe['world_receipt'] = receipt
-                if not (isinstance(motion_probe, dict) and
-                        motion_probe.get('deferred', False)):
+                if (motion_probe is not None and
+                        not (isinstance(motion_probe, dict) and
+                             motion_probe.get('deferred', False))):
+                    receipt_pending = bool(
+                        isinstance(motion_probe, dict) and
+                        motion_probe.get('_world_receipt_pending', False))
                     self._motion_probe_cache[state['id']] = {
                         'result': motion_probe,
                         'position': position,
@@ -7985,8 +7956,7 @@ class BotRuntime(object):
                         'maximum_distance': maximum_probe_distance,
                         'deadline': (
                             _number(now)
-                            if motion_probe.get(
-                                    '_world_receipt_pending', False)
+                            if receipt_pending
                             else _motion_probe_deadline(
                                 now, state['id'],
                                 cached_motion_probe is None)),
@@ -8002,7 +7972,8 @@ class BotRuntime(object):
             probe_deferred = bool(
                 isinstance(motion_probe, dict) and
                 motion_probe.get('deferred', False))
-            path_clear = (True if ((abs(throttle) <= 0.01 and
+            path_clear = (True if (probe_deferred or motion_probe is None or
+                                   (abs(throttle) <= 0.01 and
                                     abs(_number(state.get('speed'))) <=
                                     0.0001) or
                                    state.get('airborne', False)) else
@@ -8060,13 +8031,7 @@ class BotRuntime(object):
                 contact_position = position
                 contact_deflected = False
                 if not path_clear:
-                    if probe_deferred:
-                        # Native-query scheduling is not a collision.  Pause
-                        # this copied pose for one render frame while retaining
-                        # its real pre-step momentum; never feed the scheduler
-                        # into route failure recovery or hard-wall damping.
-                        speed = previous_speed
-                    elif (isinstance(motion_probe, dict) and
+                    if (isinstance(motion_probe, dict) and
                           motion_probe.get('collision', False)):
                         hard_contact = True
                     else:

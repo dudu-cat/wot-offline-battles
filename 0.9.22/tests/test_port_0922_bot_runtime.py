@@ -9811,31 +9811,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(states))
         self.assertEqual([], states[0]['bots'])
 
-    def test_traffic_feedback_reuses_decision_lease_then_refreshes(self):
-        self.runtime.battle_start(self.start)
-        calls = []
-        original = self.runtime._traffic_throttle
-
-        def traffic(source, command, neighbours, physics_params,
-                    stopping_distance_resolver=None):
-            calls.append((source['id'], source['speed']))
-            return original(
-                source, command, neighbours, physics_params,
-                stopping_distance_resolver)
-
-        self.runtime._traffic_throttle = traffic
-        self.runtime.update(.04, 1.00)
-        self.runtime.update(.04, 1.04)
-        self.runtime.update(.04, 1.08)
-
-        self.assertEqual(1, len(self.adapters[0].calls))
-        self.assertEqual(1, len(calls))
-
-        self.runtime.update(.04, 1.20)
-        self.assertEqual(2, len(self.adapters[0].calls))
-        self.assertEqual(2, len(calls))
-
-    def test_zero_traffic_throttle_is_not_held_for_decision_lease(self):
+    def test_runtime_keeps_planner_throttle_without_traffic_feedback(self):
         self.runtime.battle_start(self.start)
         calls = []
 
@@ -9844,12 +9820,67 @@ class BotRuntimeTests(unittest.TestCase):
             return 0.0, True
 
         self.runtime._traffic_throttle = traffic
+        state = self.runtime.states[11]
+        start_z = state['z']
         self.runtime.update(.04, 1.00)
         self.runtime.update(.04, 1.04)
         self.runtime.update(.04, 1.08)
 
         self.assertEqual(1, len(self.adapters[0].calls))
-        self.assertEqual(3, len(calls))
+        self.assertEqual([], calls)
+        self.assertEqual(1, state['movement_dir'])
+        self.assertGreater(abs(state['z'] - start_z), 0.0)
+
+        self.runtime.update(.04, 1.20)
+        self.assertEqual(2, len(self.adapters[0].calls))
+        self.assertEqual([], calls)
+
+    def test_unavailable_motion_probe_holds_last_drive_command(self):
+        command = {
+            'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False, 'target_id': None,
+            'fire_range': 0.0, 'combat_mode': 'route',
+            'aim_position': (0.0, 0.0, 200.0),
+            'face_position': (0.0, 0.0, 200.0),
+            'move_position': (0.0, 0.0, 200.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        }
+        unavailable = (
+            None,
+            {'clear': False, 'collision': False, 'slope': 0.0,
+             'deferred': True},
+        )
+        for probe_result in unavailable:
+            with self.subTest(probe_result=probe_result):
+                adapter = _FixedAdapter(command)
+                runtime = self.module.BotRuntime(
+                    1,
+                    descriptor_resolver=lambda unused: _combat_descriptor(),
+                    adapter_factory=lambda *unused, **kwargs: adapter,
+                    direction_probe=lambda *unused, value=probe_result: value,
+                    ground_probe=lambda *unused: 0.0,
+                    physics_ground_probe=lambda *unused: 0.0,
+                    spawn_resolver=_spawn_resolver, baked_graph=_graph())
+                runtime.battle_start(self.start)
+                runtime.adapter.decide = (
+                    lambda unused_state, unused_clear: dict(command))
+                state = runtime.states[11]
+                start_z = state['z']
+                positions = [start_z]
+
+                for index in range(4):
+                    runtime.update(.04, 1.00 + index * .04)
+                    self.assertEqual(1, state['movement_dir'])
+                    positions.append(state['z'])
+
+                self.assertGreater(abs(state['z'] - start_z), 0.0)
+                self.assertTrue(all(
+                    abs(current - previous) > 0.0
+                    for previous, current in zip(
+                        positions[:-1], positions[1:])))
+                self.assertGreater(state['speed'], 0.0)
+                self.assertIn(11, runtime._decision_cache)
+                self.assertNotIn(11, runtime._motion_probe_cache)
 
     def test_new_server_order_revision_invalidates_decision_cache(self):
         self.runtime.battle_start(self.start)

@@ -696,6 +696,27 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual(1.0, order['throttle'])
         self.assertGreater(order['turn'], 0.9)
 
+    def test_same_lane_vehicle_does_not_replace_route_with_predictive_stop(self):
+        driver = LocalDriver()
+        neighbour = {
+            'position': (0.0, 0.0, 10.0),
+            'yaw': 0.0,
+            'velocity': (0.0, 0.0, 1.0),
+            'half_length': 3.5,
+            'half_width': 1.7,
+        }
+
+        order = driver.drive(
+            133, (0.0, 0.0, 0.0), 0.0, 8.0, 0.1,
+            (0.0, 0.0, 50.0), (neighbour,),
+            lambda unused_yaw: True,
+            velocity=(0.0, 0.0, 8.0),
+            half_length=3.5, half_width=1.7)
+
+        self.assertEqual('drive', order['recovery_mode'])
+        self.assertEqual(1.0, order['throttle'])
+        self.assertAlmostEqual(0.0, order['target_yaw'])
+
     def test_slow_callback_advances_the_complete_planner_interval(self):
         driver = LocalDriver()
 

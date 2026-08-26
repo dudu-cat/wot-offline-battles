@@ -250,9 +250,9 @@ class LocalDriver(object):
 			half_length, half_width):
 		"""Return an escape heading only for hulls that already overlap.
 
-		Moving OBB prediction handles impending collisions. Treating every tank
-		inside a broad radius as an emergency made harmless side-by-side traffic
-		continually override the route and visibly reconsider its steering.
+		The simultaneous contact solver handles impending collisions. Treating
+		every tank inside a broad radius as an emergency made harmless side-by-side
+		traffic continually override the route and reconsider its steering.
 		"""
 		push_x = 0.0
 		push_z = 0.0
@@ -418,9 +418,7 @@ class LocalDriver(object):
 		# Probe in score order and return the first fully viable direction. Most
 		# frames need one terrain ray set instead of probing all seven candidates.
 		for unused_score, candidate in candidates:
-			if (self._clear(direction_clear, candidate) and
-					self._prediction_clear(position, candidate, speed, velocity,
-					neighbours, half_length, half_width)):
+			if self._clear(direction_clear, candidate):
 				return candidate
 		return None
 
@@ -539,9 +537,7 @@ class LocalDriver(object):
 		if (old_yaw is not None and state['plan_age'] < hold_seconds and
 				abs(_angle_delta(desired_yaw, old_yaw)) < 2.15 and
 				self._failure_penalty(state, old_yaw) <= 0.0 and
-				self._clear(direction_clear, old_yaw) and
-				self._prediction_clear(position, old_yaw, speed, velocity,
-					neighbours, own_half_length, own_half_width)):
+				self._clear(direction_clear, old_yaw)):
 			chosen_yaw = old_yaw
 		if chosen_yaw is None:
 			chosen_yaw = self._choose_yaw(
