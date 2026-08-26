@@ -404,6 +404,22 @@ class ProjectileWireTests(unittest.TestCase):
         invalid['unexpected'] = True
         self.assertFalse(client._handle_landing_observation_result(invalid))
 
+    def test_invalid_landing_result_preserves_pending_observation(self):
+        client = self.active_client()
+        self.assertTrue(self.send_player_input(client))
+        self.assertEqual(1, client.send_landing_observation(20.0))
+        pending = client._landing_observation_pending
+        client._handle_message({
+            'type': 'landing_observation_result', 'round_id': 3,
+            'authority_epoch': 4, 'observation_seq': 1,
+            'input_seq': 1, 'committed_seq': 1,
+            'accepted': True, 'reason': '', 'unexpected': True,
+        })
+
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertIs(pending, client._landing_observation_pending)
+
     def test_failed_landing_enqueue_retries_same_physical_observation(self):
         client = self.active_client()
         self.assertTrue(self.send_player_input(client))
@@ -1090,8 +1106,10 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3, 'server_tick': 11,
             'authority_epoch': 2, 'events': [],
         })
-        self.assertFalse(client.running)
-        self.assertEqual('invalid events message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(1000, client.server_time_ms)
+        self.assertEqual(2, client.authority_epoch)
 
         client = client_at()
         client._handle_message({
@@ -1099,8 +1117,10 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3, 'server_tick': 11,
             'server_time_ms': 1001, 'events': [],
         })
-        self.assertFalse(client.running)
-        self.assertEqual('invalid events message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(1000, client.server_time_ms)
+        self.assertEqual(2, client.authority_epoch)
 
         client = client_at()
         client._handle_message({
@@ -1108,8 +1128,10 @@ class ProjectileWireTests(unittest.TestCase):
             'round_id': 3, 'server_tick': 11,
             'server_time_ms': 1001, 'authority_epoch': 1, 'events': [],
         })
-        self.assertFalse(client.running)
-        self.assertEqual('invalid events message', client.last_error)
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(1000, client.server_time_ms)
+        self.assertEqual(2, client.authority_epoch)
 
         client = client_at()
         client._handle_message({
@@ -1139,10 +1161,12 @@ class ProjectileWireTests(unittest.TestCase):
             }],
         })
 
-        self.assertFalse(client.running)
-        self.assertEqual('invalid bot authority event', client.last_error)
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(1000, client.server_time_ms)
+        self.assertEqual(2, client.authority_epoch)
 
-    def test_invalid_snapshot_ledger_stops_client(self):
+    def test_invalid_snapshot_ledger_keeps_last_good_state(self):
         invalid_projectiles = []
         bad_origin = self.active_projectile()
         bad_origin['origin'] = (0.0, 2.0, 0.0)
@@ -1176,9 +1200,9 @@ class ProjectileWireTests(unittest.TestCase):
                     'players': [],
                     'bots': [],
                 })
-                self.assertFalse(client.running)
-                self.assertEqual(
-                    'invalid snapshot message', client.last_error)
+                self.assertTrue(client.running)
+                self.assertIsNone(client.last_error)
+                self.assertIsNone(client.last_snapshot)
 
     def test_regressing_wire_time_is_clamped_without_dropping_events(self):
         received = []
@@ -1204,10 +1228,11 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual(1000, client.server_time_ms)
         self.assertEqual(1000, received[-1][1]['server_time_ms'])
 
-    def test_malformed_server_time_still_stops_client(self):
+    def test_malformed_runtime_server_time_drops_only_that_message(self):
         client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
         client.running = True
         client._handle_message(self.welcome())
+        client.phase = 'battle'
         client.server_time_ms = 1000
         client._handle_message({
             'type': 'events', 'protocol': module.PROTOCOL_VERSION,
@@ -1215,8 +1240,9 @@ class ProjectileWireTests(unittest.TestCase):
             'server_time_ms': -1, 'authority_epoch': 2, 'events': [],
         })
 
-        self.assertFalse(client.running)
-        self.assertEqual('invalid server time', client.last_error)
+        self.assertTrue(client.running)
+        self.assertIsNone(client.last_error)
+        self.assertEqual(1000, client.server_time_ms)
 
 
 if __name__ == '__main__':

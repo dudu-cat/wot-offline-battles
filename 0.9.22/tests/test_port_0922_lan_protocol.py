@@ -780,15 +780,19 @@ class LanProtocolTests(unittest.TestCase):
         stale = dict(message, round_id=6)
         self.client._handle_message(stale)
         self.assertEqual(1, len(received))
+        self.client._handle_message(dict(stale, protocol='obsolete'))
+        self.assertTrue(self.client.ready)
+        self.assertIsNone(self.client.last_error)
 
         malformed = dict(message)
         malformed['contacts'] = [dict(
             message['contacts'][0], visible=1)]
         self.client.running = True
         self.client._handle_message(malformed)
-        self.assertEqual('invalid bot observation message',
-                         self.client.last_error)
-        self.assertFalse(self.client.ready)
+        self.assertTrue(self.client.running)
+        self.assertTrue(self.client.ready)
+        self.assertIsNone(self.client.last_error)
+        self.assertEqual(1, len(received))
 
     def test_server_timing_projects_receive_time_and_half_rtt(self):
         self.client.rtt_ms = 100.0
@@ -811,7 +815,62 @@ class LanProtocolTests(unittest.TestCase):
                 'phase': 'prebattle', 'start_in_ms': 15000,
                 'remaining_ms': 900001, 'duration_ms': 900000}}))
 
-    def test_snapshot_missing_bot_combat_contract_disconnects_before_runtime(self):
+    def test_invalid_snapshot_timing_keeps_state_and_old_clock(self):
+        self.client.running = True
+        message = {
+            'type': 'snapshot', 'protocol': 5, 'round_id': 7,
+            'server_tick': 1, 'bot_state_revision': 0,
+            'bot_authority_id': -1, 'bot_manifest': [],
+            'players': [_snapshot_player()], 'bots': [],
+            'timing': {
+                'phase': 'battle', 'start_in_ms': 0,
+                'remaining_ms': 900001, 'duration_ms': 900000},
+        }
+
+        self.client._handle_message(message)
+
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+        self.assertEqual(1, self.client.last_snapshot['server_tick'])
+        self.assertNotIn('timing', self.client.last_snapshot)
+        self.assertEqual(-1, self.client._combat_timing_tick)
+
+    def test_future_runtime_round_still_fails_lineage(self):
+        self.client.running = True
+        self.client._handle_message({
+            'type': 'events', 'protocol': 5, 'round_id': 8,
+            'server_tick': 1, 'events': [],
+        })
+
+        self.assertFalse(self.client.running)
+        self.assertEqual('invalid events message', self.client.last_error)
+
+    def test_current_runtime_message_without_protocol_is_recoverable(self):
+        self.client.running = True
+        message = {
+            'type': 'snapshot', 'round_id': 7, 'server_tick': 1,
+            'players': [], 'bots': [],
+        }
+        self.client._handle_message(message)
+        self.client._handle_message(message)
+
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+        self.assertIsNone(self.client.last_snapshot)
+        self.assertEqual(
+            1, self.client._runtime_drop_diagnostics['snapshot'][1])
+
+    def test_explicit_runtime_protocol_conflict_remains_fatal(self):
+        self.client.running = True
+        self.client._handle_message({
+            'type': 'events', 'protocol': 4, 'round_id': 7,
+            'server_tick': 1, 'events': [],
+        })
+
+        self.assertFalse(self.client.running)
+        self.assertEqual('protocol mismatch', self.client.last_error)
+
+    def test_snapshot_missing_bot_combat_contract_keeps_last_good_state(self):
         self.client.running = True
         self.client._handle_message({
             'type': 'snapshot', 'protocol': 5, 'round_id': 7,
@@ -822,8 +881,9 @@ class LanProtocolTests(unittest.TestCase):
             'bots': [{'id': 11, 'health': 500, 'alive': True}],
         })
 
-        self.assertEqual('invalid snapshot message', self.client.last_error)
-        self.assertEqual('disconnected', self.client.phase)
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+        self.assertEqual('battle', self.client.phase)
         self.assertIsNone(self.client.last_snapshot)
 
     def test_lean_snapshot_inherits_the_last_static_bot_manifest(self):
@@ -876,10 +936,7 @@ class LanProtocolTests(unittest.TestCase):
 
     def test_lean_snapshot_requires_server_capability(self):
         self.client.running = True
-        player = {
-            'id': 1, 'critical_revision': 0,
-            'critical_base_revision': 0, 'critical_ack_seq': 0,
-        }
+        player = _snapshot_player()
         first = {
             'type': 'snapshot', 'protocol': 5, 'round_id': 7,
             'server_tick': 1, 'bot_state_revision': 0,
@@ -890,17 +947,16 @@ class LanProtocolTests(unittest.TestCase):
         second.pop('bot_manifest')
 
         self.client._handle_message(first)
+        accepted = self.client.last_snapshot
         self.client._handle_message(second)
 
-        self.assertEqual('invalid snapshot message', self.client.last_error)
-        self.assertEqual('disconnected', self.client.phase)
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+        self.assertIs(accepted, self.client.last_snapshot)
 
     def test_lean_snapshot_requires_existing_same_lineage_manifest(self):
         self.client.running = True
-        player = {
-            'id': 1, 'critical_revision': 0,
-            'critical_base_revision': 0, 'critical_ack_seq': 0,
-        }
+        player = _snapshot_player()
         self.client.server_capabilities = (
             LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
         first = {
@@ -930,9 +986,11 @@ class LanProtocolTests(unittest.TestCase):
             LEAN_SNAPSHOT_MANIFEST_CAPABILITY,)
         first.pop('bot_manifest')
         missing._handle_message(first)
-        self.assertEqual('invalid snapshot message', missing.last_error)
+        self.assertTrue(missing.running)
+        self.assertIsNone(missing.last_error)
+        self.assertIsNone(missing.last_snapshot)
 
-    def test_snapshot_rejects_non_exact_bot_combat_revisions(self):
+    def test_snapshot_drops_non_exact_bot_combat_revisions(self):
         cases = (
             ('combat_revision', True),
             ('combat_base_revision', True),
@@ -972,12 +1030,12 @@ class LanProtocolTests(unittest.TestCase):
                 'bots': [bot],
             })
 
-            self.assertEqual(
-                'invalid snapshot message', client.last_error,
-                '%s=%r' % (field, value))
-            self.assertEqual('disconnected', client.phase)
+            self.assertTrue(client.running, '%s=%r' % (field, value))
+            self.assertIsNone(client.last_error, '%s=%r' % (field, value))
+            self.assertEqual('battle', client.phase)
+            self.assertIsNone(client.last_snapshot)
 
-    def test_snapshot_rejects_missing_or_non_object_bot_critical(self):
+    def test_snapshot_drops_missing_or_non_object_bot_critical(self):
         for critical in (None, [], 'broken'):
             client = LANClient('127.0.0.1', 28782, 'P', 'ussr:MS-1')
             client.running = True
@@ -1006,8 +1064,10 @@ class LanProtocolTests(unittest.TestCase):
                 'bots': [bot],
             })
 
-            self.assertEqual('invalid snapshot message', client.last_error)
-            self.assertEqual('disconnected', client.phase)
+            self.assertTrue(client.running)
+            self.assertIsNone(client.last_error)
+            self.assertEqual('battle', client.phase)
+            self.assertIsNone(client.last_snapshot)
 
     def test_loading_ready_and_battle_live_form_one_transition(self):
         self.client.phase = 'loading'

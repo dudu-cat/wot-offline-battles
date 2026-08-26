@@ -116,6 +116,7 @@ BOT_TIER_MODES = frozenset((
 SENDER_JOIN_TIMEOUT = 0.1
 SEND_STALL_TIMEOUT = 5.0
 LEAVE_SEND_TIMEOUT = 0.05
+RUNTIME_DROP_LOG_INTERVAL = 5.0
 LEAVE_PAYLOAD = b'{"type":"leave"}\n'
 _BOT_STATE_WIRE_FIELDS = (
     'id', 'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
@@ -144,6 +145,9 @@ SERVER_STATE_TYPES = frozenset((
     'team_denied', 'team_size_denied', 'bot_tier_mode_denied', 'snapshot',
     'events', 'bot_observation',
     'battle_receipt', 'player_destructible_contact'))
+RECOVERABLE_RUNTIME_TYPES = frozenset((
+    'snapshot', 'events', 'bot_observation',
+    'landing_observation_result'))
 
 
 def _monotonic_time():
@@ -1491,6 +1495,7 @@ class LANClient(object):
         self._landing_observation_pending = None
         self._landing_observation_queue = []
         self._projectile_lock = threading.Lock()
+        self._runtime_drop_diagnostics = {}
 
     def start(self):
         with self._outbound_lock:
@@ -1519,6 +1524,7 @@ class LANClient(object):
             self._landing_observation_round = None
             self._landing_observation_pending = None
             self._landing_observation_queue = []
+            self._runtime_drop_diagnostics = {}
         with self._pending_lock:
             self._pending = []
             self._recv_buffer = u''
@@ -3580,10 +3586,76 @@ class LANClient(object):
         self._combat_timing_tick = server_tick
         return True
 
+    def _runtime_recovery_enabled(self):
+        """Return whether one bad live-state payload may be ignored.
+
+        The visible client always has a last-known-good presentation state to
+        keep rendering while it waits for the next server tick.  Handshake and
+        waiting-room barriers intentionally remain fail-closed.
+        """
+        return self.phase in ('loading', 'battle')
+
+    def _ignore_runtime_payload(self, kind, reason, message):
+        """Rate-limit one diagnostic and preserve the active transport.
+
+        This method never writes ``last_error``: the session uses that field as
+        a user-visible failure boundary.  Callers must also avoid mutating any
+        state before reaching this boundary.
+        """
+        if not self._runtime_recovery_enabled():
+            return False
+        key = _safe_text(kind, 'unknown', 32)
+        now = _monotonic_time()
+        diagnostic = self._runtime_drop_diagnostics.get(key)
+        suppressed = 0
+        if diagnostic is not None:
+            last_time, suppressed = diagnostic
+            if now - last_time < RUNTIME_DROP_LOG_INTERVAL:
+                self._runtime_drop_diagnostics[key] = (
+                    last_time, suppressed + 1)
+                return True
+        round_id = (message.get('round_id')
+                    if isinstance(message, dict) else None)
+        server_tick = (message.get('server_tick')
+                       if isinstance(message, dict) else None)
+        suffix = (' suppressed=%s' % suppressed) if suppressed else ''
+        print(
+            '[Offline LAN 0.9.22] ignored recoverable %s payload '
+            'reason=%s round=%s tick=%s%s' % (
+                key, _safe_text(reason, 'invalid', 160), round_id,
+                server_tick, suffix))
+        self._runtime_drop_diagnostics[key] = (now, 0)
+        return True
+
+    def _runtime_round_disposition(self, kind, message, error):
+        """Classify a live payload round without hiding identity conflicts."""
+        round_id = _exact_int(message.get('round_id'))
+        if round_id is None:
+            if self._ignore_runtime_payload(kind, 'invalid_round', message):
+                return None
+            self.last_error = error
+            self.stop()
+            return None
+        if self.round_id is not None and round_id < self.round_id:
+            return None
+        if round_id != self.round_id:
+            # A future live-state packet without its roster/start barrier is a
+            # real lineage conflict, not ordinary packet damage.
+            self.last_error = error
+            self.stop()
+            return None
+        return round_id
+
     def _handle_message(self, message):
         if not isinstance(message, dict):
             return
         kind = message.get('type')
+        message_round = _exact_int(message.get('round_id'))
+        if (kind in RECOVERABLE_RUNTIME_TYPES and
+                self.round_id is not None and
+                message_round is not None and
+                message_round < self.round_id):
+            return
         protocol = message.get('protocol')
         if protocol is not None or kind in SERVER_STATE_TYPES:
             try:
@@ -3591,15 +3663,23 @@ class LANClient(object):
             except (TypeError, ValueError):
                 matches_protocol = False
             if not matches_protocol:
+                if (protocol is None and
+                        kind in RECOVERABLE_RUNTIME_TYPES and
+                        self._ignore_runtime_payload(
+                            kind, 'missing_protocol', message)):
+                    return
                 self.last_error = 'protocol mismatch'
                 self.stop()
                 return
-        message_round = _exact_int(message.get('round_id'))
+        atomic_runtime = kind in RECOVERABLE_RUNTIME_TYPES
         if (message_round is not None and message_round == self.round_id and
                 'server_time_ms' in message):
             server_time_ms = _projectile_int_range(
                 message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
             if server_time_ms is None:
+                if (atomic_runtime and self._ignore_runtime_payload(
+                        kind, 'invalid_server_time', message)):
+                    return
                 self.last_error = 'invalid server time'
                 self.stop()
                 return
@@ -3613,7 +3693,8 @@ class LANClient(object):
                 message = dict(message)
                 server_time_ms = self.server_time_ms
                 message['server_time_ms'] = server_time_ms
-            self.server_time_ms = server_time_ms
+            if not atomic_runtime:
+                self.server_time_ms = server_time_ms
         if kind == 'welcome':
             if _safe_text(message.get('client_build'), '') != CLIENT_BUILD:
                 self.last_error = 'client build mismatch'
@@ -3983,9 +4064,13 @@ class LANClient(object):
                 self.stop()
                 return
             if not self._load_server_timing(message):
-                self.last_error = 'invalid battle timing'
-                self.stop()
-                return
+                if not self._ignore_runtime_payload(
+                        kind, 'invalid_timing', message):
+                    self.last_error = 'invalid battle timing'
+                    self.stop()
+                    return
+                message = dict(message)
+                message.pop('timing', None)
             if self._battle_live_round_id == round_id:
                 return
             self.phase = 'battle'
@@ -4044,12 +4129,17 @@ class LANClient(object):
                 return
             self.bot_tier_mode = mode
         elif kind == 'snapshot':
-            round_id = _exact_int(message.get('round_id'))
+            round_id = self._runtime_round_disposition(
+                kind, message, 'invalid snapshot message')
             if round_id is None:
+                return
+            authority_id = _exact_int(message.get('bot_authority_id'))
+            if (authority_id is not None and
+                    authority_id != WORKER_AUTHORITY_ID):
+                # A well-formed alternate authority is an identity conflict,
+                # not a damaged state sample.
                 self.last_error = 'invalid snapshot message'
                 self.stop()
-                return
-            if round_id != self.round_id:
                 return
             server_tick = _exact_int(message.get('server_tick'))
             server_time_ms = _projectile_int_range(
@@ -4242,6 +4332,10 @@ class LANClient(object):
                      destructible_revision < 0)):
                 invalid_reasons.append('destructibles')
             if invalid_reasons:
+                if self._ignore_runtime_payload(
+                        kind, 'invalid_snapshot:' +
+                        ','.join(invalid_reasons), message):
+                    return
                 bad_bot = next((
                     value for value in bots or ()
                     if not _valid_bot_combat_contract(value)), None)
@@ -4279,9 +4373,13 @@ class LANClient(object):
                 return
             if ('timing' in message and
                     not self._load_server_timing(message)):
-                self.last_error = 'invalid battle timing'
-                self.stop()
-                return
+                if not self._ignore_runtime_payload(
+                        kind, 'invalid_timing', message):
+                    self.last_error = 'invalid battle timing'
+                    self.stop()
+                    return
+                message = dict(message)
+                message.pop('timing', None)
             players = self._remember_player_outfits(players)
             if players != message.get('players'):
                 message = dict(message)
@@ -4308,17 +4406,21 @@ class LANClient(object):
                 self.authority_epoch = authority_epoch
             self._adopt_player_input_frontier(players)
         elif kind == 'landing_observation_result':
+            round_id = self._runtime_round_disposition(
+                kind, message, 'invalid landing observation result')
+            if round_id is None:
+                return
             if not self._handle_landing_observation_result(message):
+                if self._ignore_runtime_payload(
+                        kind, 'invalid_result', message):
+                    return
                 self.last_error = 'invalid landing observation result'
                 self.stop()
                 return
         elif kind == 'events':
-            round_id = _exact_int(message.get('round_id'))
+            round_id = self._runtime_round_disposition(
+                kind, message, 'invalid events message')
             if round_id is None:
-                self.last_error = 'invalid events message'
-                self.stop()
-                return
-            if round_id != self.round_id:
                 return
             server_tick = _exact_int(message.get('server_tick'))
             events = _strict_mapping_list(message.get('events'), 256)
@@ -4327,23 +4429,42 @@ class LANClient(object):
                 message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
             events_authority_epoch = _projectile_int_range(
                 message.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
+            if (events_authority_epoch is not None and
+                    self.authority_epoch is not None and
+                    events_authority_epoch < self.authority_epoch):
+                # Server threads may publish an older envelope after a newer
+                # one. It is stale state, not a broken transport.
+                return
             if (server_tick is None or server_tick < 0 or events is None or
                     (ledger_required and events_server_time is None) or
                     (ledger_required and events_authority_epoch is None) or
                     (ledger_required and self.authority_epoch is not None and
                      events_authority_epoch < self.authority_epoch)):
+                if self._ignore_runtime_payload(
+                        kind, 'invalid_envelope', message):
+                    return
                 self.last_error = 'invalid events message'
                 self.stop()
                 return
+            authority_updates = []
             for event in events:
                 if event.get('kind') not in ('authority', 'bot_authority'):
                     continue
                 event_authority_epoch = _projectile_int_range(
                     event.get('authority_epoch'), 0, MAX_PROJECTILE_ID)
                 authority_id = event.get('player_id')
+                parsed_authority_id = _exact_int(authority_id)
+                if (parsed_authority_id is not None and
+                        parsed_authority_id != WORKER_AUTHORITY_ID):
+                    self.last_error = 'invalid bot authority event'
+                    self.stop()
+                    return
                 if not (_valid_visible_authority_id(authority_id) or
                         (authority_id is None and
                          _valid_visible_authority_message(message))):
+                    if self._ignore_runtime_payload(
+                            kind, 'invalid_authority_event', message):
+                        return
                     self.last_error = 'invalid bot authority event'
                     self.stop()
                     return
@@ -4354,20 +4475,25 @@ class LANClient(object):
                          event_authority_epoch < self.authority_epoch) or
                         (ledger_required and
                          event_authority_epoch > events_authority_epoch)):
+                    if self._ignore_runtime_payload(
+                            kind, 'invalid_authority_epoch', message):
+                        return
                     self.last_error = 'invalid bot authority event'
                     self.stop()
                     return
+                authority_updates.append(
+                    (authority_id, event_authority_epoch))
+            for authority_id, event_authority_epoch in authority_updates:
                 self.bot_authority_id = authority_id
                 self.authority_epoch = event_authority_epoch
             if events_authority_epoch is not None:
                 self.authority_epoch = events_authority_epoch
+            if events_server_time is not None:
+                self.server_time_ms = events_server_time
         elif kind == 'bot_observation':
-            round_id = _exact_int(message.get('round_id'))
+            round_id = self._runtime_round_disposition(
+                kind, message, 'invalid bot observation message')
             if round_id is None:
-                self.last_error = 'invalid bot observation message'
-                self.stop()
-                return
-            if round_id != self.round_id:
                 return
             contacts = _strict_mapping_list(message.get('contacts'), 64)
             valid_contacts = contacts is not None and all(
@@ -4416,11 +4542,17 @@ class LANClient(object):
                  not contact.get('shootable_by_bot_ids'))
                 for contact in (contacts or ()))
             if self.phase != 'battle' or not valid_contacts:
+                if self._ignore_runtime_payload(
+                        kind, 'invalid_contacts', message):
+                    return
                 self.last_error = 'invalid bot observation message'
                 self.stop()
                 return
             message = dict(message)
             message['contacts'] = contacts
+            if 'server_time_ms' in message:
+                self.server_time_ms = _projectile_int_range(
+                    message.get('server_time_ms'), 0, MAX_PROJECTILE_ID)
         elif kind == 'pong':
             client_time = _finite_float(message.get('client_time'), 0.0)
             if client_time > 0.0:

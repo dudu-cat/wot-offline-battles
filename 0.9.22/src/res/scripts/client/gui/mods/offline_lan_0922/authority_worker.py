@@ -185,6 +185,10 @@ class AuthorityWorkerLANClient(LANClient):
             self.player_id == WORKER_AUTHORITY_ID and
             self.bot_authority_id == WORKER_AUTHORITY_ID)
 
+    def _runtime_recovery_enabled(self):
+        """Keep the sole simulation authority strict on state corruption."""
+        return False
+
     def _hello_payload(self):
         """Advertise only a worker role; no dummy player data crosses wire."""
         return {
