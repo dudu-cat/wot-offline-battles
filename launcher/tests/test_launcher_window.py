@@ -239,7 +239,7 @@ class WindowTest(unittest.TestCase):
             "GitHub: https://github.com/pengw0048/wot-offline-battles",
             self.window.author_text.get())
         self.assertEqual(
-            "坦克世界QQ群1：302519768（已满）  QQ群2：1108778562",
+            "个人QQ：692827763  坦克世界QQ群：1108778562",
             self.window.qq_group_text.get())
         self.assertEqual(
             "本mod免费传播、开源、欢迎二创，使用无需付费，售卖与本人无关，仅供个人学习交流",
