@@ -4844,8 +4844,14 @@ class BattleRuntime(object):
         self._local_matrix = matrix
         self._local_native_matrix = native_matrix
         self._local_native_stabilised_matrix = native_stabilised
-        self._prepare_local_siege_pose(
-            entity, native_filter, native_stabilised)
+        # The exact #1513 WGVehicleFilter creates its hydraulic providers
+        # later in Vehicle.onEnterWorld than PlayerAvatar.vehicle_onEnterWorld.
+        # This callback runs from that inner Avatar boundary, so publish the
+        # copied base pose now and transplant the hydraulic providers from
+        # _attach_local_presentation after the native lifecycle completes.
+        self._local_pose_matrix = self._local_matrix
+        self._local_stabilised_matrix = self._local_matrix
+        self._local_steady_rotation_matrix = self._local_matrix
         self._runtime.compatibility.set_vehicle_pose_overlay(
             entity, position, self._local_yaw, self._local_body_pose(),
             self._local_speed, self._local_turn_speed,
@@ -4868,6 +4874,29 @@ class BattleRuntime(object):
             # production path prepares it from vehicle_onEnterWorld before
             # AvatarInputHandler.start() can capture any native provider.
             self._prepare_local_presentation(entity)
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if (bool(getattr(descriptor, 'hasSiegeMode', False)) and
+                self._local_siege_body_matrix is None):
+            native_attribute = getattr(
+                self._runtime.compatibility,
+                'native_vehicle_attribute', None)
+            if not callable(native_attribute):
+                raise RuntimeError(
+                    'native Vehicle filter boundary is unavailable')
+            native_filter = native_attribute(entity, 'filter')
+            native_stabilised = getattr(
+                native_filter, 'stabilisedMatrix', None)
+            self._prepare_local_siege_pose(
+                entity, native_filter, native_stabilised)
+            self._local_native_stabilised_matrix = native_stabilised
+            zero_motion = (self._local_camera_velocity or
+                           self._vector((0.0, 0.0, 0.0)))
+            self._runtime.compatibility.set_vehicle_pose_overlay(
+                entity, self._vector(self._local_position), self._local_yaw,
+                self._local_body_pose(), self._local_speed,
+                self._local_turn_speed, zero_motion, zero_motion,
+                steady_rotation_matrix=self._local_steady_rotation(),
+                stabilised_matrix=self._local_stabilised_pose())
         model = getattr(entity, 'model', None)
         if model is None:
             raise RuntimeError('player compound model is unavailable')

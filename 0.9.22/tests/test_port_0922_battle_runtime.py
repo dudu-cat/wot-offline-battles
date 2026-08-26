@@ -11180,6 +11180,50 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             battle._local_matrix, battle._local_pose_matrix.a)
 
+    def test_local_siege_waits_for_native_vehicle_enter_to_finish(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor('sweden:S11_Strv_103B')
+        descriptor.hasSiegeMode = True
+        entity = _Vehicle(
+            10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=0.0, aim_yaw=0.0, gun_pitch=0.0,
+            handbrake=False, send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = descriptor
+
+        # PlayerAvatar.vehicle_onEnterWorld runs before #1513 creates these
+        # four WGVehicleFilter providers. The base copied pose must still be
+        # admitted at that inner callback instead of rejecting the vehicle.
+        self.assertTrue(battle._prepare_local_presentation(entity))
+        self.assertIsNone(battle._local_siege_body_matrix)
+        self.assertIs(
+            battle._local_matrix,
+            runtime.compatibility.pose_overlays[id(entity)]['matrix'])
+
+        native_body = _Matrix()
+        native_ground = _Matrix()
+        native_ground_filtered = _Matrix()
+        native_stabilised = _Matrix()
+        entity.filter.bodyMatrix = native_body
+        entity.filter.groundPlacingMatrix = native_ground
+        entity.filter.groundPlacingMatrixFiltered = native_ground_filtered
+        entity.filter.stabilisedMatrix = native_stabilised
+
+        self.assertTrue(battle._attach_local_presentation())
+        self.assertIs(
+            battle._local_pose_matrix,
+            runtime.compatibility.pose_overlays[id(entity)]['matrix'])
+        self.assertIs(native_stabilised,
+                      battle._local_native_stabilised_matrix)
+        self.assertIs(battle._local_pose_matrix, entity.model.matrix)
+
     def test_limited_traverse_autorotation_follows_unclamped_mouse_target(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
