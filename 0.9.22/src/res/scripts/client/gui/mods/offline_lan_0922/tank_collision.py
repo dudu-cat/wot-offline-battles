@@ -47,6 +47,9 @@ WEIGHT_SCALE = 0.001
 RAM_KINETIC_FACTOR = 0.5
 RAM_HE_DAMAGE_FACTOR = 0.5
 RAM_ARMOR_ABSORPTION_FACTOR = 1.1
+# Temporary product tuning while the exact #1513 ramming curve is audited.
+# Keep every physical input and modifier intact; scale only the final HP loss.
+RAM_DAMAGE_COEFFICIENT = 0.25
 RAMMING_BONUS_MAX = 0.15
 
 
@@ -478,7 +481,8 @@ def ram_damage(relative_speed, mass_self, mass_other,
     if moving_other:
         raw_other *= 1.0 - other_bonus
         raw_self *= 1.0 + other_bonus
-    return int(raw_other), int(raw_self)
+    return (int(raw_other * RAM_DAMAGE_COEFFICIENT),
+            int(raw_self * RAM_DAMAGE_COEFFICIENT))
 
 
 def _tank_value(tank, name, default=None):

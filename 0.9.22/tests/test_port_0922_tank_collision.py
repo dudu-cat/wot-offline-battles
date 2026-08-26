@@ -377,7 +377,7 @@ class TankCollisionTests(unittest.TestCase):
         result = tank_collision.resolve_tank(light, (heavy,), now=10.0)
         event = result['ram_events'][0]
 
-        self.assertEqual((0, 193), (
+        self.assertEqual((0, 48), (
             event['damage_to_other'], event['damage_to_self']))
         self.assertEqual(('ussr:T-50', 'germany:Maus'), (
             event['self_vehicle'], event['other_vehicle']))
@@ -482,8 +482,8 @@ class TankCollisionTests(unittest.TestCase):
         light_owner = tank_collision.ram_damage(
             10.0, 25000.0, 75000.0, 0.0, 0.0)
 
-        self.assertEqual((1875, 625), heavy_owner)
-        self.assertEqual((625, 1875), light_owner)
+        self.assertEqual((468, 156), heavy_owner)
+        self.assertEqual((156, 468), light_owner)
         self.assertEqual(heavy_owner, tuple(reversed(light_owner)))
 
     def test_documented_he_reduction_uses_1_1_and_spall_liner(self):
@@ -491,7 +491,7 @@ class TankCollisionTests(unittest.TestCase):
             10.0, 75000.0, 25000.0,
             100.0, 200.0, spall_self=1.5, spall_other=1.0)
 
-        self.assertEqual((1655, 460), damage)
+        self.assertEqual((413, 115), damage)
 
     def test_controlled_impact_modifies_final_damage_only_while_moving(self):
         stationary = tank_collision.ram_damage(
@@ -501,8 +501,8 @@ class TankCollisionTests(unittest.TestCase):
             10.0, 50000.0, 50000.0, 100.0, 100.0,
             bonus_self=0.15, moving_self=True, moving_other=False)
 
-        self.assertEqual((1140, 1140), stationary)
-        self.assertEqual((1311, 969), moving)
+        self.assertEqual((285, 285), stationary)
+        self.assertEqual((327, 242), moving)
 
     def test_ram_has_no_safe_speed_cap_or_mass_ratio_clamp(self):
         low_speed = tank_collision.ram_damage(
@@ -510,8 +510,17 @@ class TankCollisionTests(unittest.TestCase):
         extreme_ratio = tank_collision.ram_damage(
             20.0, 99000.0, 1000.0, 0.0, 0.0)
 
-        self.assertEqual((6, 6), low_speed)
-        self.assertEqual((9900, 100), extreme_ratio)
+        self.assertEqual((1, 1), low_speed)
+        self.assertEqual((2475, 25), extreme_ratio)
+
+    def test_temporary_final_ram_damage_coefficient(self):
+        # 2026-08-26 Type 62 -> KV-2 report: retain the measured contact
+        # inputs, but apply the explicitly requested 0.25 final coefficient.
+        damage_to_kv2, damage_to_type62 = tank_collision.ram_damage(
+            5.77736, 21300.0, 53100.0, 30.0, 75.0)
+
+        self.assertEqual((23, 102), (
+            damage_to_kv2, damage_to_type62))
 
     def test_type62_v_k3002db_ram_is_owner_invariant(self):
         bot_owner = tank_collision.ram_damage(
