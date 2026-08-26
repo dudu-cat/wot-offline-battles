@@ -12704,27 +12704,57 @@ class BattleRuntime(object):
                 return record
         return None
 
+    @staticmethod
+    def _validated_ram_contact_normal(contact):
+        if not isinstance(contact, (list, tuple)) or len(contact) < 2:
+            return None
+        try:
+            normal_x = float(contact[0])
+            normal_z = float(contact[1])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        length = math.sqrt(normal_x * normal_x + normal_z * normal_z)
+        if (math.isnan(length) or math.isinf(length) or
+                length <= 0.000001):
+            return None
+        return normal_x / length, normal_z / length
+
     def _native_ram_vehicle_armor(self, vehicle, matrix, hit_point,
-                                  chassis_matrix=None):
-        """Return the first real structural plate reached from the contact."""
+                                  inward_normal, chassis_matrix=None):
+        """Return HE-like nominal armour from a contact-normal probe."""
         descriptor = getattr(vehicle, 'typeDescriptor', None)
         if descriptor is None or matrix is None:
             return None
-        center = self._vector(_xyz(getattr(matrix, 'translation',
-                                       getattr(vehicle, 'position', None))))
-        hit = self._vector(hit_point)
-        outward = hit - center
-        if outward.length <= 0.000001:
+        inward_normal = self._validated_ram_contact_normal(inward_normal)
+        if inward_normal is None:
             return None
-        outward.normalise()
+        hit = _xyz(hit_point)
+        center = _xyz(getattr(
+            matrix, 'translation', getattr(vehicle, 'position', None)))
         shape = self._collision_shape(descriptor)
-        reach = math.sqrt(shape[0] * shape[0] + shape[1] * shape[1])
-        start = hit + outward.scale(reach)
+        reach = math.sqrt(shape[0] * shape[0] + shape[1] * shape[1]) + 1.0
+        center_depth = ((center[0] - hit[0]) * inward_normal[0] +
+                        (center[2] - hit[2]) * inward_normal[1])
+        if math.isnan(center_depth) or math.isinf(center_depth):
+            return None
+        # Enter from the contacted side and stop on the centre plane along
+        # this normal. Continuing through the far half could mistake a remote
+        # plate for structure behind a near-side track or skirt.
+        center_depth = max(0.0, center_depth)
+        start = self._vector((
+            hit[0] - inward_normal[0] * reach,
+            hit[1],
+            hit[2] - inward_normal[1] * reach))
+        end = self._vector((
+            hit[0] + inward_normal[0] * center_depth,
+            hit[1],
+            hit[2] + inward_normal[1] * center_depth))
         collisions = collide_vehicle_at_matrix(
-            vehicle, matrix, start, center, self._runtime.math,
+            vehicle, matrix, start, end, self._runtime.math,
             chassis_matrix=chassis_matrix)
         if not collisions:
             return None
+        external_layer = False
         for collision in sorted(
                 collisions, key=lambda item: float(item.dist)):
             material = getattr(collision, 'matInfo', None)
@@ -12738,16 +12768,22 @@ class BattleRuntime(object):
                     math.isnan(damage_factor) or math.isinf(damage_factor)):
                 continue
             if damage_factor <= 0.0:
-                # The documented ramming law resolves its impact as an HE-like
-                # explosion.  Match the existing #1513 HE collision adapter:
-                # tracks, side skirts and other external layers do not carry
-                # hull HP, so nominal armour comes from the first structural
-                # plate reached by the same native ray.
+                external_layer = True
                 continue
             return {'armor': armor, 'screened': False}
+        if external_layer:
+            # A ram uses the same nominal-armour boundary as the existing HE
+            # adapter. Tracks and skirts do not carry hull HP, but an external
+            # hit that misses structure on this exact ray still blasts against
+            # the descriptor's thinnest real hull plate. Do not collapse that
+            # supported contact into the same None as a failed native probe.
+            armor = float(combat_rules.he_hull_armor(descriptor))
+            if (armor > 0.0 and not math.isnan(armor) and
+                    not math.isinf(armor)):
+                return {'armor': armor, 'screened': False}
         return None
 
-    def _ram_contact_armor_status(self, first, second):
+    def _ram_contact_armor_status(self, first, second, contact=None):
         """Classify one native contact probe without folding transient state."""
         if not self._worker_mode:
             return 'pending', None
@@ -12780,6 +12816,13 @@ class BattleRuntime(object):
         overlap_point = self._ram_obb_overlap_point(first, second)
         if overlap_point is None:
             return 'invalid', None
+        if contact is None:
+            contact = tank_collision.obb_contact(
+                first['x'], first['z'], first['yaw'], first['shape'],
+                second['x'], second['z'], second['yaw'], second['shape'])
+        contact_normal = self._validated_ram_contact_normal(contact)
+        if contact_normal is None:
+            return 'invalid', None
         low = max(
             float(first['y']) + float(first['shape'][2]),
             float(second['y']) + float(second['shape'][2]))
@@ -12791,27 +12834,30 @@ class BattleRuntime(object):
         hit_point = self._vector((
             overlap_point[0], (low + high) * 0.5, overlap_point[1]))
         plates = []
-        for body, vehicle, record in zip(
-                (first, second), vehicles, records):
+        for index, (body, vehicle, record) in enumerate(zip(
+                (first, second), vehicles, records)):
             ground_matrix = self._ram_pose_matrix(
                 (body['x'], body['y'], body['z']), body['yaw'],
                 _number(body.get('pitch')), _number(body.get('roll')))
             matrix, chassis_matrix = self._projectile_vehicle_matrices(
                 record, vehicle, ground_matrix=ground_matrix)
+            inward_normal = (contact_normal if index == 0 else
+                              (-contact_normal[0], -contact_normal[1]))
             plate = self._native_ram_vehicle_armor(
-                vehicle, matrix, hit_point,
+                vehicle, matrix, hit_point, inward_normal,
                 chassis_matrix=chassis_matrix)
             if plate is None:
                 # At this point both exact entities and their contact geometry
-                # are ready. None now means the native ray found no structural
-                # armour, rather than an asynchronous startup failure.
+                # are ready. None now means the native ray found no supported
+                # contact layer, rather than an asynchronous startup failure.
                 return 'unavailable', None
             plates.append(float(plate['armor']))
         return 'available', tuple(plates)
 
-    def _bot_ram_contact_armor(self, first, second, unused_contact):
+    def _bot_ram_contact_armor(self, first, second, contact):
         """Probe both real #1513 hit testers at one worker-owned contact."""
-        status, armors = self._ram_contact_armor_status(first, second)
+        status, armors = self._ram_contact_armor_status(
+            first, second, contact)
         return armors if status == 'available' else None
 
     @staticmethod
@@ -12930,7 +12976,8 @@ class BattleRuntime(object):
     def _queue_ram_contact_proof(self, record, local_vehicle, bot_vehicle,
                                  hit_point, player_velocity, bot_velocity,
                                  contact_time_us, own_pose=None,
-                                 bot_pose=None, player_ram_profile=None):
+                                 bot_pose=None, player_ram_profile=None,
+                                 contact_normal=None):
         """Queue one immutable contact episode without applying HP locally."""
         if len(self._native_ram_contact_proofs) >= 16:
             return False
@@ -12950,6 +12997,16 @@ class BattleRuntime(object):
         if player_ram_profile is None:
             player_ram_profile = self._ram_profile(
                 local_vehicle.typeDescriptor, local=True)
+        if contact_normal is None:
+            player_shape = self._collision_shape(local_vehicle.typeDescriptor)
+            bot_shape = self._collision_shape(bot_vehicle.typeDescriptor)
+            contact = tank_collision.obb_contact(
+                own_pose[0], own_pose[2], own_pose[3], player_shape,
+                bot_pose[0], bot_pose[2], bot_pose[3], bot_shape)
+            contact_normal = self._validated_ram_contact_normal(contact)
+        else:
+            contact_normal = self._validated_ram_contact_normal(
+                contact_normal)
         player_spall = float(player_ram_profile['spall_coefficient'])
         player_bonus = float(player_ram_profile['ramming_bonus'])
         proof = {
@@ -12966,6 +13023,7 @@ class BattleRuntime(object):
                 own_pose[:3], own_pose[3], own_pose[4], own_pose[5]),
             'bot_matrix': self._ram_pose_matrix(
                 bot_pose[:3], bot_pose[3], bot_pose[4], bot_pose[5]),
+            'contact_normal': contact_normal,
             'contact_spall_player': player_spall,
             'contact_bonus_player': player_bonus,
             'vx': float(player_velocity[0]),
@@ -13036,10 +13094,16 @@ class BattleRuntime(object):
         revision = self._ram_bot_revision_at(bot_id, presentation_time_us)
         local_matrix = proof['local_matrix']
         bot_matrix = proof['bot_matrix']
-        player_plate = self._native_ram_vehicle_armor(
-            proof['local_vehicle'], local_matrix, proof['hit_point'])
-        bot_plate = self._native_ram_vehicle_armor(
-            proof['bot_vehicle'], bot_matrix, proof['hit_point'])
+        contact_normal = proof.get('contact_normal')
+        if contact_normal is None:
+            player_plate = bot_plate = None
+        else:
+            player_plate = self._native_ram_vehicle_armor(
+                proof['local_vehicle'], local_matrix, proof['hit_point'],
+                contact_normal)
+            bot_plate = self._native_ram_vehicle_armor(
+                proof['bot_vehicle'], bot_matrix, proof['hit_point'],
+                (-contact_normal[0], -contact_normal[1]))
         if (revision is None or presentation_time_us is None or
                 player_plate is None or bot_plate is None):
             if proof['attempts'] < 2:
@@ -13259,7 +13323,8 @@ class BattleRuntime(object):
                 bot_pose=(other['x'], other['y'], other['z'], other['yaw'],
                           _number(other.get('pitch')),
                           _number(other.get('roll'))),
-                player_ram_profile=own['ram_profile'])
+                player_ram_profile=own['ram_profile'],
+                contact_normal=contact[:2])
             # Queue admission, including one next-frame plate retry, owns the
             # episode. A sustained overlap must never generate another HP
             # proposal merely because rendering/polling continues.

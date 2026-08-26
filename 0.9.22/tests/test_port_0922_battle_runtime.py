@@ -5004,6 +5004,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
             receipt['pitch'], receipt['roll']))
         self.assertGreater(receipt['vz'], 0.0)
         self.assertLess(battle._local_speed, 10.0)
+        player_inward = battle._native_ram_vehicle_armor.call_args_list[
+            0].args[3]
+        bot_inward = battle._native_ram_vehicle_armor.call_args_list[
+            1].args[3]
+        self.assertEqual((0.0, -1.0), player_inward)
+        self.assertEqual((-0.0, 1.0), bot_inward)
 
     def test_local_bot_ram_polling_emits_one_receipt_per_overlap_episode(self):
         runtime = _runtime()
@@ -5126,6 +5132,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         call = battle._queue_ram_contact_proof.call_args
         self.assertEqual(-12.0, call.args[4][1])
         self.assertAlmostEqual(0.9, call.args[3].y)
+        self.assertEqual((1.0, -0.0), call.kwargs['contact_normal'])
 
     def test_local_friendly_bot_contact_does_not_queue_hp_receipt(self):
         battle = BattleRuntime(_runtime())
@@ -5179,6 +5186,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         call = battle._queue_ram_contact_proof.call_args
         self.assertEqual((0.0, 0.0, 10.0), call.args[4])
         self.assertAlmostEqual(0.5, call.args[3].y)
+        self.assertEqual((1.0, -0.0), call.kwargs['contact_normal'])
 
     def test_local_bot_ram_polling_freezes_slope_pose_at_world_midpoint(self):
         battle = BattleRuntime(_runtime())
@@ -5216,6 +5224,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             (10.0, 5.2, 26.5, math.pi, -0.04, 0.07),
             call.kwargs['bot_pose'])
+        self.assertEqual((0.0, -1.0), call.kwargs['contact_normal'])
 
     def test_local_ram_ledger_stops_resending_at_admission_and_retires_at_resolution(self):
         battle = BattleRuntime(_runtime())
@@ -5271,9 +5280,37 @@ class BattleRuntimeContractTests(unittest.TestCase):
             {'health': 500})
 
         armor = battle._native_ram_vehicle_armor(
-            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5))
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5),
+            (0.0, -1.0))
 
         self.assertEqual({'armor': 73.0, 'screened': False}, armor)
+
+    def test_native_ram_plate_traces_along_contact_normal(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        structural = types.SimpleNamespace(
+            armor=73.0, vehicleDamageFactor=1.0)
+        hit_tester = types.SimpleNamespace(
+            bbox=descriptor.hull.hitTester.bbox,
+            localHitTest=mock.Mock(return_value=[
+                (1.0, None, 1.0, 7)]))
+        descriptor.hull.hitTester = hit_tester
+        descriptor.hull.materials = {7: structural}
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+
+        armor = battle._native_ram_vehicle_armor(
+            vehicle, vehicle.matrix, _Vector(1.4, 0.0, 2.5),
+            (-1.0, 0.0))
+
+        self.assertEqual({'armor': 73.0, 'screened': False}, armor)
+        start, end = hit_tester.localHitTest.call_args.args
+        self.assertGreater(start.x, 1.4)
+        self.assertAlmostEqual(0.0, end.x)
+        self.assertEqual(start.z, end.z)
+        self.assertAlmostEqual(2.5, end.z)
 
     def test_native_ram_plate_skips_external_screen_to_structure(self):
         runtime = _runtime()
@@ -5298,7 +5335,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             {'health': 500})
 
         armor = battle._native_ram_vehicle_armor(
-            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5))
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5),
+            (0.0, -1.0))
 
         self.assertEqual({'armor': 73.0, 'screened': False}, armor)
 
@@ -5344,6 +5382,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((first_hit.x, first_hit.y, first_hit.z),
                          (second_hit.x, second_hit.y, second_hit.z))
         self.assertAlmostEqual(0.5, first_hit.y)
+        first_inward = battle._native_ram_vehicle_armor.call_args_list[
+            0].args[3]
+        second_inward = battle._native_ram_vehicle_armor.call_args_list[
+            1].args[3]
+        self.assertEqual((-1.0, 0.0), first_inward)
+        self.assertEqual((1.0, -0.0), second_inward)
 
     def test_worker_publishes_exact_human_ram_probe_with_player_entities(self):
         runtime = _runtime()
@@ -5411,6 +5455,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
                       battle._native_ram_vehicle_armor.call_args_list[1][0][0])
         self.assertIs(second_matrix,
                       battle._native_ram_vehicle_armor.call_args_list[1][0][1])
+        first_inward = battle._native_ram_vehicle_armor.call_args_list[
+            0].args[3]
+        second_inward = battle._native_ram_vehicle_armor.call_args_list[
+            1].args[3]
+        self.assertEqual((0.0, -1.0), first_inward)
+        self.assertEqual((-0.0, 1.0), second_inward)
         battle.client.send_projected_bot_state.assert_called_once_with(
             [], sample_time_us=40000,
             source_batch_horizon_us=40000, human_ram_armors=[{
@@ -5516,12 +5566,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          battle._retry_native_ram_contact_proof.call_args_list)
         self.assertEqual(1, len(battle._native_ram_contact_proofs))
 
-    def test_native_ram_plate_fails_closed_without_structure(self):
+    def test_native_ram_plate_uses_hull_fallback_after_external_only(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         descriptor = _Descriptor()
         screen = types.SimpleNamespace(
             armor=20.0, vehicleDamageFactor=0.0)
+        hull = types.SimpleNamespace(
+            armor=73.0, vehicleDamageFactor=1.0)
         descriptor.chassis.hitTester = types.SimpleNamespace(
             bbox=descriptor.chassis.hitTester.bbox,
             localHitTest=mock.Mock(return_value=[
@@ -5530,12 +5582,30 @@ class BattleRuntimeContractTests(unittest.TestCase):
         descriptor.hull.hitTester = types.SimpleNamespace(
             bbox=descriptor.hull.hitTester.bbox,
             localHitTest=mock.Mock(return_value=[]))
+        descriptor.hull.materials = {7: hull}
         vehicle = _Vehicle(
             11, descriptor, _Vector(), (0.0, 0.0, 0.0),
             {'health': 500})
 
         armor = battle._native_ram_vehicle_armor(
-            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5))
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5),
+            (0.0, -1.0))
+
+        self.assertEqual({'armor': 73.0, 'screened': False}, armor)
+
+    def test_native_ram_plate_fails_closed_without_any_layer(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        descriptor.hull.materials = {7: types.SimpleNamespace(
+            armor=73.0, vehicleDamageFactor=1.0)}
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+
+        armor = battle._native_ram_vehicle_armor(
+            vehicle, vehicle.matrix, _Vector(0.0, 0.0, 3.5),
+            (0.0, -1.0))
 
         self.assertIsNone(armor)
 
