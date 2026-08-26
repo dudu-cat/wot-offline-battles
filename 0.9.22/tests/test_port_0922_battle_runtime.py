@@ -20610,8 +20610,12 @@ class DescriptorReuseTests(unittest.TestCase):
         class _Vehicles(object):
             @staticmethod
             def VehicleDescr(typeName=None, compactDescr=None):
-                built.append(typeName)
-                return types.SimpleNamespace(name=typeName)
+                name = typeName or compactDescr
+                if typeName is not None:
+                    built.append(typeName)
+                return types.SimpleNamespace(
+                    name=name, type=types.SimpleNamespace(name=name),
+                    makeCompactDescr=lambda: name)
 
         runtime = BattleRuntime.__new__(BattleRuntime)
         runtime._descriptor_cache = {}
@@ -20629,6 +20633,36 @@ class DescriptorReuseTests(unittest.TestCase):
         self.assertIs(first, second)
         self.assertIsNot(first, other)
         self.assertEqual(['ussr:T-34', 'germany:PzVI'], built)
+
+    def test_bot_top_fitting_precedes_native_descriptor_preparation(self):
+        events = []
+        descriptor = types.SimpleNamespace(
+            type=types.SimpleNamespace(name='ussr:T-34'),
+            makeCompactDescr=lambda: 'top-fitting')
+        canonical = types.SimpleNamespace(
+            type=types.SimpleNamespace(name='ussr:T-34'))
+        runtime = BattleRuntime.__new__(BattleRuntime)
+        runtime._runtime = types.SimpleNamespace(
+            vehicles=types.SimpleNamespace(
+                VehicleDescr=lambda typeName=None, compactDescr=None: (
+                    events.append(('construct', typeName, compactDescr)) or
+                    (descriptor if typeName is not None else canonical))))
+        runtime._remote_factory = types.SimpleNamespace(
+            prepare_descriptor=lambda value: (
+                events.append(('prepare', value)) or value))
+
+        with mock.patch.object(
+                battle_runtime_module.vehicle_configuration,
+                'install_top_modules',
+                side_effect=lambda value: (
+                    events.append(('top', value)) or value)):
+            result = runtime._prepare_vehicle_descriptor('ussr:T-34')
+
+        self.assertIs(canonical, result)
+        self.assertEqual([
+            ('construct', 'ussr:T-34', None), ('top', descriptor),
+            ('construct', None, 'top-fitting'), ('prepare', canonical),
+        ], events)
 
 
 class UnusableVehicleTests(unittest.TestCase):

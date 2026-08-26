@@ -115,6 +115,9 @@ _FIELD_LABELS = {
     "maxRegenHealth": "Repair threshold",
     "power": "Power",
     "rotationSpeed": "Traverse speed",
+    "hullRotationSpeed": "Hull traverse speed (deg/s)",
+    "terrainResistance": (
+        "Ground resistance (hard, medium, soft; lower is better)"),
     "pitchLimits": "Gun elevation limits",
     "minPitch": "Depression curve",
     "maxPitch": "Elevation curve",
@@ -125,6 +128,8 @@ _FIELD_LABELS = {
     "pitchMax": "Maximum pitch",
     "reloadTime": "Reload time",
     "rate": "Magazine firing rate (higher is a shorter reload)",
+    "clip": "Magazine",
+    "count": "Rounds per magazine",
     "aimingTime": "Aiming time",
     "shotDispersionRadius": "Base accuracy",
     "shotDispersionFactors": "Dispersion factors",
@@ -286,6 +291,9 @@ _NONNEGATIVE = _rule(
 _MAX_AMMO = _rule(
     "max-ammo", "ammunition capacity must be a non-negative integer",
     0, True, True)
+_CLIP_COUNT = _rule(
+    "clip-count", "magazine capacity must be a positive integer",
+    1, True, True)
 _MAX_HEALTH = _rule(
     "max-health", "device maximum health must be at least one", 1, True)
 _MAX_REGEN = _rule(
@@ -298,6 +306,13 @@ _PIERCING_PAIR = {
         "penetration must contain exactly two positive finite numbers; "
         "the first value must be no less than the second"),
     "arity": 2,
+}
+_TERRAIN_RESISTANCE = {
+    "id": "terrain-resistance",
+    "description": (
+        "ground resistance must contain exactly three positive finite "
+        "numbers in hard / medium / soft order; lower is better"),
+    "sequence": "terrain",
 }
 _PITCH_CURVE = {
     "id": "pitch-curve",
@@ -342,6 +357,8 @@ def _gun_value_rule(parts):
         return _NONNEGATIVE
     if len(parts) == 2 and parts == ["clip", "rate"]:
         return _POSITIVE
+    if len(parts) == 2 and parts == ["clip", "count"]:
+        return _CLIP_COUNT
     if len(parts) == 1 and parts[-1] == "invisibilityFactorAtShot":
         return _NONNEGATIVE
     if (len(parts) == 3 and parts[0] == "shots" and
@@ -381,6 +398,12 @@ def _field_rule(member, field_path):
         if (len(parts) == 3 and parts[0] == "chassis" and
                 parts[2] in ("weight", "maxLoad")):
             return _POSITIVE
+        if (len(parts) == 3 and parts[0] == "chassis" and
+                parts[-1] == "rotationSpeed"):
+            return _POSITIVE
+        if (len(parts) == 3 and parts[0] == "chassis" and
+                parts[-1] == "terrainResistance"):
+            return _TERRAIN_RESISTANCE
         if (len(parts) == 4 and parts[0] == "chassis" and
                 parts[2] == "shotDispersionFactors" and
                 parts[-1] in ("vehicleMovement", "vehicleRotation")):
@@ -638,6 +661,17 @@ def _normalize_yaw_limits(raw_value, label):
     return " ".join(format(number, ".15g") for number in numbers)
 
 
+def _normalize_terrain_resistance(raw_value, label):
+    numbers = _finite_numbers(raw_value, label)
+    if len(numbers) != 3:
+        raise VehicleOverlayError(
+            "%s must contain hard, medium, and soft values." % label)
+    if any(number <= 0.0 for number in numbers):
+        raise VehicleOverlayError(
+            "%s values must be positive." % label)
+    return " ".join(format(number, ".15g") for number in numbers)
+
+
 def _validate_original(value, rule):
     if rule.get("arity") == 2:
         if value.value_type != packed_xml.TYPE_STRING:
@@ -659,6 +693,13 @@ def _validate_original(value, rule):
                 "turretYawLimits must use the stock Packed string type.")
         _normalize_yaw_limits(
             _scalar_text(value), "Original horizontal traverse")
+        return
+    if rule.get("sequence") == "terrain":
+        if value.value_type != packed_xml.TYPE_STRING:
+            raise VehicleOverlayError(
+                "terrainResistance must use the stock Packed string type.")
+        _normalize_terrain_resistance(
+            _scalar_text(value), "Original ground resistance")
         return
     numeric = _numeric_value(value)
     if rule.get("bounded") is not None:
@@ -1070,6 +1111,8 @@ def _field_label(category, field_path):
     if (category != "shells" and len(parts) >= 2 and
             parts[-2] == "armor"):
         parts = parts[:-2] + ["Armor thickness (%s)" % parts[-1]]
+    if category == "chassis" and parts[-1:] == ["rotationSpeed"]:
+        parts[-1] = "hullRotationSpeed"
     return " / ".join(_FIELD_LABELS.get(part, part) for part in parts)
 
 
@@ -1380,17 +1423,20 @@ def _parse_replacement(raw_value, original, rule):
             packed_xml.TYPE_STRING, manifest_value.encode("ascii")),
                 manifest_value)
 
-    if rule.get("sequence") in ("pitch", "yaw"):
+    if rule.get("sequence") in ("pitch", "yaw", "terrain"):
         if original.value_type != packed_xml.TYPE_STRING:
             raise VehicleOverlayError(
-                "This angle sequence must preserve the stock Packed string "
+                "This numeric sequence must preserve the stock Packed string "
                 "type.")
         if rule["sequence"] == "pitch":
             manifest_value = _normalize_pitch_curve(
                 text, "Replacement gun elevation curve")
-        else:
+        elif rule["sequence"] == "yaw":
             manifest_value = _normalize_yaw_limits(
                 text, "Replacement horizontal traverse")
+        else:
+            manifest_value = _normalize_terrain_resistance(
+                text, "Replacement ground resistance")
         return (packed_xml.PackedValue(
             packed_xml.TYPE_STRING, manifest_value.encode("ascii")),
                 manifest_value)
@@ -1631,6 +1677,35 @@ def _validate_health_relations(member, element, prefix=()):
                 member, value.value, prefix + (name.decode("utf-8"),))
 
 
+def _validate_clip_relations(element, prefix=()):
+    """Keep #1513 burst size within the installed magazine capacity."""
+    direct = {}
+    for name, value in element.children:
+        direct.setdefault(name.decode("utf-8"), []).append(value)
+    clip = direct.get("clip", ())
+    burst = direct.get("burst", ())
+    if (len(clip) == 1 and len(burst) == 1 and
+            clip[0].value_type == packed_xml.TYPE_ELEMENT and
+            burst[0].value_type == packed_xml.TYPE_ELEMENT):
+        values = {}
+        for container_name, container in (("clip", clip[0].value),
+                                           ("burst", burst[0].value)):
+            rows = {}
+            for name, value in container.children:
+                rows.setdefault(name.decode("utf-8"), []).append(value)
+            if len(rows.get("count", ())) == 1:
+                values[container_name] = _numeric_value(rows["count"][0])
+        if ("clip" in values and "burst" in values and
+                values["clip"] < values["burst"]):
+            raise VehicleOverlayError(
+                "%s clip/count must be at least burst/count (%s)." % (
+                    "/".join(prefix), format(values["burst"], ".15g")))
+    for name, value in element.children:
+        if value.value_type == packed_xml.TYPE_ELEMENT:
+            _validate_clip_relations(
+                value.value, prefix + (name.decode("utf-8"),))
+
+
 def _pitch_curve_points(value, label):
     normalized = _normalize_pitch_curve(
         _scalar_text(value), label, scalar_shortcut=False)
@@ -1738,6 +1813,7 @@ def _build_member(package_path, entry):
         normalized_edits.append(normalized)
 
     _validate_health_relations(member, rebuilt_root)
+    _validate_clip_relations(rebuilt_root)
     _validate_angle_relations(rebuilt_root)
     try:
         output = packed_xml.write_packed_xml(rebuilt_root)

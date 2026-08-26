@@ -222,6 +222,8 @@ static HANDLE start_procdump_cancel(const WCHAR *procdump_path,
 	}
 	ZeroMemory(&startup, sizeof(startup));
 	startup.cb = sizeof(startup);
+	startup.dwFlags = STARTF_USESHOWWINDOW;
+	startup.wShowWindow = SW_HIDE;
 	ZeroMemory(&process, sizeof(process));
 	if (!CreateProcessW(procdump_path, command, 0, 0, FALSE,
 			CREATE_NO_WINDOW, 0, g_root, &startup, &process)) {
@@ -421,6 +423,8 @@ static HANDLE start_procdump_configured(HANDLE target_process,
 
 	ZeroMemory(&startup, sizeof(startup));
 	startup.cb = sizeof(startup);
+	startup.dwFlags = STARTF_USESHOWWINDOW;
+	startup.wShowWindow = SW_HIDE;
 	ZeroMemory(&process, sizeof(process));
 	if (!CreateProcessW(procdump_path, command, 0, 0, FALSE,
 			CREATE_NO_WINDOW, 0, g_root, &startup, &process)) {

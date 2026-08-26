@@ -450,6 +450,16 @@ class VehicleEditorWindowTest(unittest.TestCase):
                 "Magazine firing rate (higher is a shorter reload)"))
         self.assertEqual(
             "基础精度", window._field_label("Base accuracy"))
+        self.assertEqual(
+            "履带地形阻力（硬地 / 中地 / 软地，越低越好）",
+            window._field_label(
+                "Ground resistance (hard, medium, soft; lower is better)"))
+        self.assertEqual(
+            "车体转向速度（度/秒）",
+            window._field_label("Hull traverse speed (deg/s)"))
+        self.assertEqual(
+            "弹夹 / 弹夹容量（发）",
+            window._field_label("Magazine / Rounds per magazine"))
 
         self.assertFalse(window.restore_defaults())
         self.assertIn("清除", messagebox.calls[-1][0][0])

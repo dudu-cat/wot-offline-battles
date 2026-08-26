@@ -49,7 +49,8 @@ from gui.mods.offline_lan_0922 import (
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
     prebaked_navigation, native_mapping_mask, shot_geometry, spotting,
     tank_collision,
-    vehicle_blacklist, vehicle_physics, world_collision)
+    vehicle_blacklist, vehicle_configuration, vehicle_physics,
+    world_collision)
 
 
 # BigWorld callbacks run on rendered frames.  The mature 0.8.2 battle asks for
@@ -3634,12 +3635,16 @@ class BattleRuntime(object):
         return snapshot
 
     def _prepare_vehicle_descriptor(self, vehicle_name):
-        try:
-            descriptor = self._runtime.vehicles.VehicleDescr(
-                typeName=vehicle_name)
-        except Exception:
-            descriptor = self._runtime.vehicles.VehicleDescr(
-                typeName=self._config['vehicle'])
+        descriptor = self._runtime.vehicles.VehicleDescr(
+            typeName=vehicle_name)
+        vehicle_configuration.install_top_modules(descriptor)
+        compact_descr = descriptor.makeCompactDescr()
+        descriptor = self._runtime.vehicles.VehicleDescr(
+            compactDescr=compact_descr)
+        if str(getattr(descriptor.type, 'name', '') or '') != vehicle_name:
+            raise RuntimeError(
+                '#1513 top vehicle descriptor type mismatch for %s' %
+                vehicle_name)
         if self._remote_factory is None:
             raise RuntimeError(
                 '#1513 vehicle descriptor geometry owner is unavailable')

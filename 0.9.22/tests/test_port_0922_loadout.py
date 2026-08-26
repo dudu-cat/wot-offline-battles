@@ -322,6 +322,48 @@ class ClientFactorTests(unittest.TestCase):
         '_aspects': (0, 1),
     }
 
+    def test_native_modules_follow_the_pinned_1513_package_layout(self):
+        constants = types.ModuleType('constants')
+        constants.VEHICLE_TTC_ASPECTS = object()
+        items = types.ModuleType('items')
+        items.__path__ = []
+        tankmen = types.ModuleType('items.tankmen')
+        utils = types.ModuleType('items.utils')
+        vehicles = types.ModuleType('items.vehicles')
+        qualifiers = types.ModuleType('items.qualifiers')
+        qualifiers.QUALIFIER_TYPE = object()
+        descriptor_crew = types.ModuleType('items.VehicleDescrCrew')
+        descriptor_crew.VehicleDescrCrew = object()
+        qualifiers_applier = types.ModuleType('VehicleQualifiersApplier')
+        qualifiers_applier.VehicleQualifiersApplier = object()
+        items.tankmen = tankmen
+        items.utils = utils
+        items.vehicles = vehicles
+
+        modules = {
+            'constants': constants,
+            'items': items,
+            'items.tankmen': tankmen,
+            'items.utils': utils,
+            'items.vehicles': vehicles,
+            'items.qualifiers': qualifiers,
+            'items.VehicleDescrCrew': descriptor_crew,
+            'VehicleQualifiersApplier': qualifiers_applier,
+        }
+        missing = object()
+        old_top_level = sys.modules.pop('VehicleDescrCrew', missing)
+        try:
+            with mock.patch.dict(sys.modules, modules):
+                result = loadout._client_modules()
+        finally:
+            if old_top_level is not missing:
+                sys.modules['VehicleDescrCrew'] = old_top_level
+
+        self.assertIsNotNone(result)
+        self.assertIs(result[5], descriptor_crew.VehicleDescrCrew)
+        self.assertIs(
+            result[6], qualifiers_applier.VehicleQualifiersApplier)
+
     def _gun_descriptor(self):
         descriptor = _descriptor([])
         descriptor.miscAttrs = {'gunReloadTimeFactor': 0.875,

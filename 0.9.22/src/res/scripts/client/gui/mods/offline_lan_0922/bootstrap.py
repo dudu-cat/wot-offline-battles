@@ -10,6 +10,9 @@ from gui.mods.offline_lan_0922.compat import g_compatibility
 from gui.mods.offline_lan_0922 import config as port_config
 from gui.mods.offline_lan_0922 import instance_guard
 from gui.mods.offline_lan_0922 import vehicle_blacklist
+from gui.mods.offline_lan_0922.vehicle_configuration import (
+    install_top_modules as _install_top_modules,
+    top_component as _top_component)
 from gui.mods.offline_lan_0922.account_rpc.state import AccountState
 
 
@@ -441,51 +444,6 @@ def _default_consumables(vehicles):
             raise ValueError('client equipment %r is unavailable' % (name,))
         slots.append(int(descriptor.compactDescr))
     return slots
-
-
-def _top_component(components):
-    """Return the highest ``level``, ties broken by the later list position.
-
-    ``_readLevel`` gives every chassis, turret, gun, engine, fuel tank and
-    radio a level of 1 to 10, so this rule is total.  The last list entry is
-    not the top one: nineteen vehicles list a low-tier howitzer last.  Nor is
-    the leaf of ``unlocksDescrs``, because a top module is usually a
-    prerequisite of the next vehicle's own unlock entry.
-    """
-    best = None
-    for index, descriptor in enumerate(components or ()):
-        key = (int(getattr(descriptor, 'level', 1)), index)
-        if best is None or key >= best[0]:
-            best = (key, descriptor)
-    return None if best is None else best[1]
-
-
-def _install_top_modules(descriptor):
-    """Fit the top module of every slot, in the order #1513 accepts.
-
-    A vehicle with nothing to research, which is every premium, keeps the
-    exact fitting retail gives it, because each list then holds one entry.
-    """
-    vehicle_type = descriptor.type
-    # The chassis goes first: installTurret reruns __selectBestHull against
-    # the mounted chassis, so the hull is chosen once against the final pair.
-    chassis = _top_component(vehicle_type.chassis)
-    if chassis is not None:
-        descriptor.installComponent(chassis.compactDescr, 0)
-    # installComponent ends in ``assert False`` for a turret.  installTurret
-    # takes the pair and resolves the gun against the new turret's own guns,
-    # which is the only order that accepts a top gun.
-    for position in range(len(vehicle_type.turrets)):
-        turret = _top_component(vehicle_type.turrets[position])
-        gun = None if turret is None else _top_component(turret.guns)
-        if gun is not None:
-            descriptor.installTurret(
-                turret.compactDescr, gun.compactDescr, position)
-    for attribute in ('engines', 'radios', 'fuelTanks'):
-        component = _top_component(getattr(vehicle_type, attribute, None))
-        if component is not None:
-            descriptor.installComponent(component.compactDescr, 0)
-    return descriptor
 
 
 def _turret_descriptors(vehicle_type):

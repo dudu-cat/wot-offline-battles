@@ -21,6 +21,7 @@ def _real_module(name):
 
 
 VEHICLE_BLACKLIST = _real_module('vehicle_blacklist')
+VEHICLE_CONFIGURATION = _real_module('vehicle_configuration')
 
 
 MAX_SKILL_LEVEL = 100
@@ -439,6 +440,8 @@ class BootstrapLifecycleTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.lan_session': lan_session_module,
             'gui.mods.offline_lan_0922.lobby_ui': lobby_ui_module,
             'gui.mods.offline_lan_0922.vehicle_blacklist': VEHICLE_BLACKLIST,
+            'gui.mods.offline_lan_0922.vehicle_configuration': (
+                VEHICLE_CONFIGURATION),
             'gui.app_loader': app_loader_module,
             'gui.app_loader.settings': settings_module,
             'items': items,

@@ -62,7 +62,7 @@ def _client_modules():
         from items import utils
         from items import vehicles
         from items.qualifiers import QUALIFIER_TYPE
-        from VehicleDescrCrew import VehicleDescrCrew
+        from items.VehicleDescrCrew import VehicleDescrCrew
         from VehicleQualifiersApplier import VehicleQualifiersApplier
     except Exception:
         return None

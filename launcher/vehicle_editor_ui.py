@@ -91,6 +91,9 @@ _FIELD_CHINESE = {
     "Load limit": "载重上限", "Maximum health": "最大耐久",
     "Repair threshold": "修复阈值", "Power": "功率",
     "Traverse speed": "旋转速度", "Gun elevation limits": "火炮俯仰范围",
+    "Hull traverse speed (deg/s)": "车体转向速度（度/秒）",
+    "Ground resistance (hard, medium, soft; lower is better)":
+        "履带地形阻力（硬地 / 中地 / 软地，越低越好）",
     "Depression curve": "俯角曲线", "Elevation curve": "仰角曲线",
     "Horizontal traverse limits": "水平射界", "Hull aiming": "车体瞄准",
     "Suspension pitch limits": "悬挂俯仰范围", "Minimum pitch": "最小俯仰角",
@@ -98,6 +101,7 @@ _FIELD_CHINESE = {
     "Siege mode": "攻城模式", "Reload time": "装填时间",
     "Magazine firing rate (higher is a shorter reload)":
         "弹夹短装填射速（越高越短）",
+    "Magazine": "弹夹", "Rounds per magazine": "弹夹容量（发）",
     "Aiming time": "瞄准时间", "Ammunition capacity": "弹药容量",
     "Base accuracy": "基础精度", "Dispersion factors": "扩圈系数",
     "Hull movement dispersion": "车体移动扩圈",
@@ -124,6 +128,10 @@ _CONSTRAINT_CHINESE = (
     ("stock parser requires a positive number", "原版解析器要求正数"),
     ("stock parser requires a non-negative number", "原版解析器要求非负数"),
     ("ammunition capacity must be a non-negative integer", "弹药容量必须是非负整数"),
+    ("magazine capacity must be a positive integer", "弹夹容量必须是正整数"),
+    ("ground resistance must contain exactly three positive finite numbers "
+     "in hard / medium / soft order; lower is better",
+     "履带地形阻力必须依次包含硬地、中地、软地三个正的有限数，且越低越好"),
     ("device maximum health must be at least one", "模块最大耐久必须至少为 1"),
     ("regeneration health must be non-negative and no greater than maxHealth",
      "修复耐久必须为非负数，且不得超过 maxHealth"),

@@ -187,6 +187,20 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('return !timed_out && completed;', wait)
         self.assertNotIn('INFINITE', wait)
 
+    def test_procdump_processes_are_explicitly_hidden(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        cancel = source.split(
+            'static HANDLE start_procdump_cancel', 1)[1].split(
+                'static BOOL wait_for_procdump', 1)[0]
+        monitor = source.split(
+            'static HANDLE start_procdump_configured', 1)[1].split(
+                'static int starter_stop_event_name', 1)[0]
+
+        for body in (cancel, monitor):
+            self.assertIn('startup.dwFlags = STARTF_USESHOWWINDOW;', body)
+            self.assertIn('startup.wShowWindow = SW_HIDE;', body)
+            self.assertIn('CREATE_NO_WINDOW', body)
+
     def test_procdump_status_cannot_discard_a_complete_dump(self):
         source = SOURCE.read_text(encoding='utf-8')
         close = source.split(
