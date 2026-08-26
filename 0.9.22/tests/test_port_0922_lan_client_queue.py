@@ -111,6 +111,62 @@ class LanClientQueueTests(unittest.TestCase):
 
         self.assertEqual(protected + [incoming], client._pending)
 
+    def test_receive_overflow_preserves_each_manifest_lineage_barrier(self):
+        client = self.activate()
+        first_manifest = {
+            'type': 'snapshot', 'round_id': 7, 'authority_epoch': 1,
+            'bot_authority_id': -1, 'server_tick': 1,
+            'bot_manifest': [{'id': 11}],
+        }
+        first_lean = dict(first_manifest, server_tick=2)
+        first_lean.pop('bot_manifest')
+        second_manifest = dict(
+            first_manifest, round_id=8, authority_epoch=1,
+            server_tick=1)
+        second_lean = dict(second_manifest, server_tick=2)
+        second_lean.pop('bot_manifest')
+        incoming = dict(second_lean, server_tick=3)
+        original_limit = lan_client_module.MAX_PENDING_MESSAGES
+        lan_client_module.MAX_PENDING_MESSAGES = 4
+        try:
+            client._pending = [
+                first_manifest, first_lean, second_manifest, second_lean]
+
+            client._queue_message(incoming)
+        finally:
+            lan_client_module.MAX_PENDING_MESSAGES = original_limit
+
+        self.assertEqual([
+            (7, 1, True), (7, 2, False), (8, 1, True), (8, 3, False),
+        ], [(value['round_id'], value['server_tick'],
+             'bot_manifest' in value) for value in client._pending])
+
+    def test_receive_overflow_replaces_same_lineage_manifest_barrier(self):
+        client = self.activate()
+        manifest = {
+            'type': 'snapshot', 'round_id': 7, 'authority_epoch': 1,
+            'bot_authority_id': -1, 'server_tick': 1,
+            'bot_manifest': [{'id': 11}],
+        }
+        lean = dict(manifest, server_tick=2)
+        lean.pop('bot_manifest')
+        replacement = dict(manifest, server_tick=3)
+        incoming = dict(lean, server_tick=4)
+        original_limit = lan_client_module.MAX_PENDING_MESSAGES
+        lan_client_module.MAX_PENDING_MESSAGES = 2
+        try:
+            client._pending = [manifest, lean]
+
+            client._queue_message(replacement)
+            client._queue_message(incoming)
+        finally:
+            lan_client_module.MAX_PENDING_MESSAGES = original_limit
+
+        self.assertEqual([
+            (3, True), (4, False),
+        ], [(value['server_tick'], 'bot_manifest' in value)
+            for value in client._pending])
+
     def test_receive_overflow_fails_closed_for_each_new_terminal_message(self):
         client = self.activate()
         protected = [

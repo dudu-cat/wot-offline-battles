@@ -3165,6 +3165,20 @@ class LANClient(object):
             except Exception:
                 pass
 
+    @staticmethod
+    def _snapshot_lineage(message):
+        if (not isinstance(message, dict) or
+                message.get('type') != 'snapshot'):
+            return None
+        lineage = (
+            message.get('round_id'), message.get('authority_epoch'),
+            message.get('bot_authority_id'))
+        try:
+            hash(lineage)
+        except TypeError:
+            return None
+        return lineage
+
     def _queue_message(self, message, generation=None):
         if not isinstance(message, dict):
             return
@@ -3174,14 +3188,37 @@ class LANClient(object):
                      self._stopping or not self.running)):
                 return
             if len(self._pending) >= MAX_PENDING_MESSAGES:
+                latest_manifests = {}
+                for index, value in enumerate(self._pending):
+                    lineage = self._snapshot_lineage(value)
+                    if (lineage is not None and
+                            'bot_manifest' in value):
+                        latest_manifests[lineage] = index
+                incoming_lineage = self._snapshot_lineage(message)
+                if (incoming_lineage is not None and
+                        'bot_manifest' in message):
+                    # The incoming full snapshot supersedes an older barrier
+                    # for this exact lineage.
+                    latest_manifests.pop(incoming_lineage, None)
+                protected_snapshots = set(latest_manifests.values())
                 snapshot_index = next((
                     index for index, value in enumerate(self._pending)
-                    if value.get('type') == 'snapshot'), None)
+                    if (index not in protected_snapshots and
+                        value.get('type') == 'snapshot' and
+                        'bot_manifest' not in value and
+                        self._snapshot_lineage(value) == incoming_lineage)),
+                    None)
+                if snapshot_index is None:
+                    snapshot_index = next((
+                        index for index, value in enumerate(self._pending)
+                        if (index not in protected_snapshots and
+                            value.get('type') == 'snapshot')), None)
                 removable_index = snapshot_index
                 if removable_index is None:
                     removable_index = next((
                         index for index, value in enumerate(self._pending)
-                        if value.get('type') not in ORDERED_RECEIVE_TYPES),
+                        if (value.get('type') != 'snapshot' and
+                            value.get('type') not in ORDERED_RECEIVE_TYPES)),
                         None)
                 if removable_index is not None:
                     del self._pending[removable_index]
