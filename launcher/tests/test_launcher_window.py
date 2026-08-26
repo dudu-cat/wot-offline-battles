@@ -205,7 +205,7 @@ class WindowTest(unittest.TestCase):
         return game_root
 
     def test_layout_separates_play_vehicle_and_repair_controls(self):
-        self.assertEqual("0.6.0 alpha.5", wot_launcher.LAUNCHER_VERSION)
+        self.assertEqual("0.6.0 alpha.6", wot_launcher.LAUNCHER_VERSION)
         self.assertEqual(
             "Single player",
             self.window.battle_tabs.tab(self.window.single_panel).get("text"))
