@@ -6228,6 +6228,40 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._publish_reload_event = mock.Mock()
         return battle, state, runtime.constants.VEHICLE_SETTING
 
+    def _pending_fire_shell_change_battle(self, clip_size=1, clip=None):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        descriptor = _Descriptor()
+        descriptor.gun.clip = (clip_size, 1.0)
+        second_shot = copy.copy(descriptor.gun.shots[0])
+        second_shot.shell = copy.copy(second_shot.shell)
+        second_shot.shell.compactDescr = 102
+        descriptor.gun.shots.append(second_shot)
+        entity = _Vehicle(
+            10, descriptor, _Vector(0, 0, 0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        record = {
+            'engine_id': 10, 'state': {'health': 500, 'alive': True},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        battle.client = client
+        battle.state = 'running'
+        battle._battle_live = True
+        battle._avatar = runtime.bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = _LANInputSender(battle)
+        battle._start_message = {'round_id': 7}
+        battle._records = {'player:1': record}
+        battle._gun_state = gun_mechanics.GunState(
+            descriptor, ammo_layout={101: 20, 102: 10})
+        battle._gun_state.reload_time = 0.0
+        battle._gun_state.clip = clip_size if clip is None else clip
+        battle._roll_loader_intuition = mock.Mock(return_value=False)
+        return (
+            battle, battle._gun_state,
+            runtime.constants.VEHICLE_SETTING, client, record)
+
     def test_next_shell_setting_waits_for_the_loaded_round(self):
         battle, state, settings = self._shell_change_battle()
 
@@ -6255,6 +6289,128 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._publish_ammo_state.assert_called_once_with(state, force=True)
         battle._publish_reload_event.assert_called_once_with(
             state.reload_time, state.reload_duration, force=True)
+
+    def test_pending_fire_commits_loaded_round_before_current_shell_switch(self):
+        battle, state, settings, client, record = \
+            self._pending_fire_shell_change_battle()
+
+        self.assertTrue(battle.shoot(0.0, 0.0))
+        pending = dict(battle._local_fire_intent)
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.NEXT_SHELLS, 102))
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(1, state.pending_index)
+        self.assertEqual(1, state.clip)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual([20, 10], state.ammo)
+
+        self.assertTrue(battle._accept_player_fire_commit({
+            'shooter_kind': 'player', 'shooter_id': 1,
+            'fire_intent_seq': pending['intent_seq'],
+            'fire_input_seq': pending['input_seq'],
+            'shot_seq': 1, 'shell_index': 0,
+        }, record))
+
+        self.assertEqual([19, 10], state.ammo)
+        self.assertEqual(1, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertIsNone(battle._local_fire_intent)
+        checkpoint = [message for message in client.sent
+                      if message[0] == 'input'][-1][2]
+        self.assertEqual(1, checkpoint['shell_index'])
+        self.assertEqual(1, checkpoint['next_shell_index'])
+        self.assertFalse(checkpoint['shell_change_pending'])
+
+    def test_rejected_fire_applies_deferred_current_shell_switch(self):
+        battle, state, settings, client, unused_record = \
+            self._pending_fire_shell_change_battle()
+
+        self.assertTrue(battle.shoot(0.0, 0.0))
+        pending = dict(battle._local_fire_intent)
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.NEXT_SHELLS, 102))
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(1, state.pending_index)
+        self.assertEqual(1, state.clip)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual([20, 10], state.ammo)
+
+        self.assertTrue(battle.on_fire_intent_result({
+            'type': 'fire_intent_result', 'round_id': 7,
+            'player_id': 1, 'intent_seq': pending['intent_seq'],
+            'accepted': False, 'reason': 'projectile_launch_rejected',
+        }))
+
+        self.assertEqual([20, 10], state.ammo)
+        self.assertEqual(1, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertIsNone(battle._local_fire_intent)
+        battle._avatar.cancelWaitingForShot.assert_called_once_with()
+        checkpoint = [message for message in client.sent
+                      if message[0] == 'input'][-1][2]
+        self.assertEqual(1, checkpoint['shell_index'])
+        self.assertEqual(1, checkpoint['next_shell_index'])
+        self.assertFalse(checkpoint['shell_change_pending'])
+
+    def test_pending_fire_commits_round_before_partial_clip_reload(self):
+        battle, state, settings, unused_client, record = \
+            self._pending_fire_shell_change_battle(clip_size=3, clip=2)
+
+        self.assertTrue(battle.shoot(0.0, 0.0))
+        pending = dict(battle._local_fire_intent)
+        self.assertTrue(battle.change_vehicle_setting(
+            settings.RELOAD_PARTIAL_CLIP, 0))
+
+        self.assertEqual(2, state.clip)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual([20, 10], state.ammo)
+
+        self.assertTrue(battle._accept_player_fire_commit({
+            'shooter_kind': 'player', 'shooter_id': 1,
+            'fire_intent_seq': pending['intent_seq'],
+            'fire_input_seq': pending['input_seq'],
+            'shot_seq': 1, 'shell_index': 0,
+        }, record))
+
+        self.assertEqual([19, 10], state.ammo)
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertIsNone(battle._local_fire_intent)
+
+    def test_rejected_fire_applies_deferred_partial_clip_reload(self):
+        battle, state, settings, unused_client, unused_record = \
+            self._pending_fire_shell_change_battle(clip_size=3, clip=2)
+
+        self.assertTrue(battle.shoot(0.0, 0.0))
+        pending = dict(battle._local_fire_intent)
+        self.assertTrue(battle.change_vehicle_setting(
+            settings.RELOAD_PARTIAL_CLIP, 0))
+
+        self.assertEqual(2, state.clip)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual([20, 10], state.ammo)
+
+        self.assertTrue(battle.on_fire_intent_result({
+            'type': 'fire_intent_result', 'round_id': 7,
+            'player_id': 1, 'intent_seq': pending['intent_seq'],
+            'accepted': False, 'reason': 'projectile_launch_rejected',
+        }))
+
+        self.assertEqual([20, 10], state.ammo)
+        self.assertEqual(0, state.clip)
+        self.assertEqual(state.reload, state.reload_time)
+        self.assertIsNone(battle._local_fire_intent)
+        battle._avatar.cancelWaitingForShot.assert_called_once_with()
 
     def test_partial_clip_setting_starts_one_full_native_reload_cycle(self):
         runtime = _runtime()

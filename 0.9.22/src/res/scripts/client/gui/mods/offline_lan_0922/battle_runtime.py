@@ -5968,6 +5968,48 @@ class BattleRuntime(object):
         callback(self._server.vehicle_id, status, 0, ())
         return True
 
+    def _reload_partial_clip_now(self, state):
+        previous_reload = state.reload_time
+        previous_duration = state.reload_duration
+        if not state.reload_partial_clip():
+            return False
+        if previous_reload > 0.0:
+            self._publish_reload_event(
+                0.0, previous_duration, force=True)
+        self._publish_ammo_state(state, force=True)
+        self._publish_reload_event(
+            state.reload_time, state.reload_duration, force=True)
+        return True
+
+    def _publish_loaded_shell_change(
+            self, state, previous_reload, previous_duration):
+        # #1513 ReloadingTimeState retains its original _startTime while
+        # actualTime stays positive. A shell switch during an active reload is
+        # a new cycle. Close that old cycle before CURRENT_SHELLS is
+        # republished, then start the new shell's cycle. This is the event order
+        # consumed by both stock HUD subscribers and prevents their -0.01
+        # sentinel from becoming the lasting reload value for the new shell.
+        if previous_reload > 0.0:
+            self._publish_reload_event(
+                0.0, previous_duration, force=True)
+        self._publish_ammo_state(state, force=True)
+        self._publish_reload_event(
+            state.reload_time, state.reload_duration, force=True)
+        self._sender.send_current()
+
+    def _switch_current_shell(self, state, index):
+        previous_reload = state.reload_time
+        previous_duration = state.reload_duration
+        instant = self._roll_loader_intuition()
+        changed = state.sync_shell_index(index, instant=instant)
+        if not changed:
+            return False
+        if instant:
+            self._present_loader_intuition()
+        self._publish_loaded_shell_change(
+            state, previous_reload, previous_duration)
+        return True
+
     def change_vehicle_setting(self, code, value):
         settings = self._runtime.constants.VEHICLE_SETTING
         if code == getattr(settings, 'SIEGE_MODE_ENABLED', None):
@@ -5999,17 +6041,13 @@ class BattleRuntime(object):
             if self._gun_state is None:
                 return False
             state = self._gun_state
-            previous_reload = state.reload_time
-            previous_duration = state.reload_duration
-            if not state.reload_partial_clip():
-                return False
-            if previous_reload > 0.0:
-                self._publish_reload_event(
-                    0.0, previous_duration, force=True)
-            self._publish_ammo_state(state, force=True)
-            self._publish_reload_event(
-                state.reload_time, state.reload_duration, force=True)
-            return True
+            pending_fire = self._local_fire_intent
+            if isinstance(pending_fire, dict):
+                if state.clip_size <= 1 or not state.shots:
+                    return False
+                pending_fire['deferred_partial_clip_reload'] = True
+                return True
+            return self._reload_partial_clip_now(state)
         current_shells = getattr(settings, 'CURRENT_SHELLS', None)
         next_shells = getattr(settings, 'NEXT_SHELLS', None)
         if code not in (current_shells, next_shells) or self._gun_state is None:
@@ -6023,30 +6061,26 @@ class BattleRuntime(object):
             previous_duration = state.reload_duration
             previous_selection = (
                 int(state.shot_index), state.pending_index)
-            if code == next_shells:
-                changed = state.request_shell_index(index)
-            else:
-                instant = self._roll_loader_intuition()
-                changed = state.sync_shell_index(index, instant=instant)
-                if changed and instant:
-                    self._present_loader_intuition()
+            if code == current_shells:
+                pending_fire = self._local_fire_intent
+                if isinstance(pending_fire, dict):
+                    # The physical round was frozen at the trigger edge. Keep
+                    # it loaded until that shot is accepted or rejected; the
+                    # requested shell can still be queued for the shot boundary.
+                    state.request_shell_index(index)
+                    pending_fire['deferred_current_shell_index'] = int(index)
+                    if previous_selection != (
+                            int(state.shot_index), state.pending_index):
+                        self._sender.send_current()
+                    return True
+                self._switch_current_shell(state, index)
+                return True
+            changed = state.request_shell_index(index)
             if changed:
-                # #1513 ReloadingTimeState retains its original _startTime
-                # while actualTime stays positive.  A shell switch during an
-                # active reload is a new cycle. Close that old cycle before
-                # CURRENT_SHELLS is republished, then start the new shell's
-                # cycle. This is the event order consumed by both stock HUD
-                # subscribers and prevents their -0.01 sentinel from becoming
-                # the lasting reload value for the newly selected shell.
-                if previous_reload > 0.0:
-                    self._publish_reload_event(
-                        0.0, previous_duration, force=True)
-                self._publish_ammo_state(state, force=True)
-                self._publish_reload_event(
-                    state.reload_time, state.reload_duration, force=True)
-                self._sender.send_current()
-            elif (code == next_shells and previous_selection != (
-                    int(state.shot_index), state.pending_index)):
+                self._publish_loaded_shell_change(
+                    state, previous_reload, previous_duration)
+            elif previous_selection != (
+                    int(state.shot_index), state.pending_index):
                 # NEXT_SHELLS changes no loaded-round HUD state, but it is a
                 # real ordered player input. Donate it now so the hidden gun
                 # authority promotes the same shell at the canonical shot
@@ -6586,8 +6620,15 @@ class BattleRuntime(object):
         sys.stdout.write(
             '[Offline LAN 0.9.22] FIRE INTENT rejected intent=%d reason=%s\n'
             % (sequence, reason))
+        deferred_shell = pending.get('deferred_current_shell_index')
+        deferred_partial_reload = bool(
+            pending.get('deferred_partial_clip_reload'))
         self._local_fire_intent = None
         self._cancel_native_shot_wait()
+        if deferred_shell is not None and self._gun_state is not None:
+            self._switch_current_shell(self._gun_state, deferred_shell)
+        if deferred_partial_reload and self._gun_state is not None:
+            self._reload_partial_clip_now(self._gun_state)
         return True
 
     def _cancel_native_shot_wait(self):
@@ -8545,6 +8586,8 @@ class BattleRuntime(object):
                         self._server_entity(record['engine_id']), 'reload')):
                 raise RuntimeError(
                     'canonical local shot violates presented gun state')
+            if pending.get('deferred_partial_clip_reload'):
+                gun.reload_partial_clip()
             self._publish_ammo_state(gun, force=True)
             self._publish_reload_event(
                 gun.reload_time, gun.reload_duration, force=True)
