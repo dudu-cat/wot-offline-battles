@@ -421,7 +421,7 @@ class TankCollisionTests(unittest.TestCase):
     def test_ram_uses_normal_closing_speed_not_tangential_scrape(self):
         light = _tank(
             4, 0.0, 0.0, mass=10000.0, vx=3.0, vz=30.0)
-        heavy = _tank(9, 0.8, 0.0, mass=60000.0)
+        heavy = _tank(9, 2.9, 0.0, mass=60000.0)
 
         result = tank_collision.resolve_tank(light, (heavy,), now=10.0)
 
@@ -458,9 +458,44 @@ class TankCollisionTests(unittest.TestCase):
     def test_high_speed_side_scrape_does_not_create_a_ram_event(self):
         light = _tank(
             4, 0.0, 0.0, mass=10000.0, vx=0.2, vz=30.0)
-        heavy = _tank(9, 0.8, 0.0, mass=60000.0)
+        heavy = _tank(9, 2.99, 0.0, mass=60000.0)
 
         result = tank_collision.resolve_tank(light, (heavy,), now=10.0)
+
+        self.assertEqual((), result['ram_events'])
+
+    def test_deep_front_overlap_keeps_the_first_impact_normal(self):
+        first = _tank(
+            4, 0.0, 0.0, mass=25000.0, vz=10.0,
+            contact_armor=None)
+        second = _tank(
+            9, 0.0, 0.5, mass=30000.0,
+            contact_armor=None)
+        probes = []
+
+        def probe(owner, other, contact):
+            probes.append((owner['id'], other['id'], contact))
+            return 80.0, 100.0
+
+        result = tank_collision.resolve_tank(
+            first, (second,), now=10.0, contact_armor_probe=probe)
+
+        self.assertEqual(1, len(probes))
+        self.assertAlmostEqual(0.0, probes[0][2][0])
+        self.assertAlmostEqual(-1.0, probes[0][2][1])
+        self.assertEqual(1, len(result['ram_events']))
+        event = result['ram_events'][0]
+        self.assertEqual((0.0, -1.0), event['contact_normal'])
+        self.assertEqual(10.0, event['closing_speed'])
+
+    def test_deep_overlap_while_separating_does_not_rewind_through_tank(self):
+        first = _tank(
+            4, 0.0, 0.0, mass=25000.0, vz=-10.0)
+        second = _tank(
+            9, 0.0, 0.5, mass=30000.0)
+
+        result = tank_collision.resolve_tank(
+            first, (second,), now=10.0)
 
         self.assertEqual((), result['ram_events'])
 

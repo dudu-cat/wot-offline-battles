@@ -12721,7 +12721,7 @@ class BattleRuntime(object):
 
     def _native_ram_vehicle_armor(self, vehicle, matrix, hit_point,
                                   inward_normal, chassis_matrix=None):
-        """Return HE-like nominal armour from a contact-normal probe."""
+        """Return structural armour from a contact-normal probe."""
         descriptor = getattr(vehicle, 'typeDescriptor', None)
         if descriptor is None or matrix is None:
             return None
@@ -12740,6 +12740,8 @@ class BattleRuntime(object):
         # Enter from the contacted side and stop on the centre plane along
         # this normal. Continuing through the far half could mistake a remote
         # plate for structure behind a near-side track or skirt.
+        if center_depth < -1.0e-6:
+            return None
         center_depth = max(0.0, center_depth)
         start = self._vector((
             hit[0] - inward_normal[0] * reach,
@@ -12754,7 +12756,6 @@ class BattleRuntime(object):
             chassis_matrix=chassis_matrix)
         if not collisions:
             return None
-        external_layer = False
         for collision in sorted(
                 collisions, key=lambda item: float(item.dist)):
             material = getattr(collision, 'matInfo', None)
@@ -12768,22 +12769,11 @@ class BattleRuntime(object):
                     math.isnan(damage_factor) or math.isinf(damage_factor)):
                 continue
             if damage_factor <= 0.0:
-                external_layer = True
                 continue
             return {'armor': armor, 'screened': False}
-        if external_layer:
-            # A ram uses the same nominal-armour boundary as the existing HE
-            # adapter. Tracks and skirts do not carry hull HP, but an external
-            # hit that misses structure on this exact ray still blasts against
-            # the descriptor's thinnest real hull plate. Do not collapse that
-            # supported contact into the same None as a failed native probe.
-            armor = float(combat_rules.he_hull_armor(descriptor))
-            if (armor > 0.0 and not math.isnan(armor) and
-                    not math.isinf(armor)):
-                return {'armor': armor, 'screened': False}
         return None
 
-    def _ram_contact_armor_status(self, first, second, contact=None):
+    def _ram_contact_armor_status(self, first, second, contact):
         """Classify one native contact probe without folding transient state."""
         if not self._worker_mode:
             return 'pending', None
@@ -12816,10 +12806,6 @@ class BattleRuntime(object):
         overlap_point = self._ram_obb_overlap_point(first, second)
         if overlap_point is None:
             return 'invalid', None
-        if contact is None:
-            contact = tank_collision.obb_contact(
-                first['x'], first['z'], first['yaw'], first['shape'],
-                second['x'], second['z'], second['yaw'], second['shape'])
         contact_normal = self._validated_ram_contact_normal(contact)
         if contact_normal is None:
             return 'invalid', None
@@ -12908,17 +12894,25 @@ class BattleRuntime(object):
         seen = set()
         for raw in raw_requests:
             if not isinstance(raw, dict) or set(raw) != set((
-                    'seq', 'first', 'second')):
+                    'seq', 'contact_normal', 'first', 'second')):
                 raise RuntimeError('worker human ram probe is invalid')
             sequence = lan_protocol._exact_int(raw.get('seq'))
             if (sequence is None or not 0 < sequence <= 2147483647 or
                     sequence in seen):
                 raise RuntimeError('worker human ram probe is invalid')
             seen.add(sequence)
+            contact_normal = self._validated_ram_contact_normal(
+                raw.get('contact_normal'))
+            if contact_normal is None:
+                raise RuntimeError('worker human ram probe is invalid')
             first = self._validated_human_ram_probe_body(raw.get('first'))
             second = self._validated_human_ram_probe_body(raw.get('second'))
             if first['id'] >= second['id']:
                 raise RuntimeError('worker human ram probe order is invalid')
+            if (contact_normal[0] * (first['x'] - second['x']) +
+                    contact_normal[1] *
+                    (first['z'] - second['z'])) <= 1.0e-6:
+                raise RuntimeError('worker human ram probe is invalid')
             ready = True
             for body in (first, second):
                 record = self._records.get('player:%s' % body['network_id'])
@@ -12941,7 +12935,8 @@ class BattleRuntime(object):
                 # Entity startup is asynchronous. Omit this response so the
                 # server retains and republishes the exact pending substep.
                 continue
-            status, armors = self._ram_contact_armor_status(first, second)
+            status, armors = self._ram_contact_armor_status(
+                first, second, contact_normal)
             if status == 'pending':
                 continue
             if status == 'invalid':
@@ -13000,9 +12995,11 @@ class BattleRuntime(object):
         if contact_normal is None:
             player_shape = self._collision_shape(local_vehicle.typeDescriptor)
             bot_shape = self._collision_shape(bot_vehicle.typeDescriptor)
-            contact = tank_collision.obb_contact(
+            contact = tank_collision.obb_impact_contact(
                 own_pose[0], own_pose[2], own_pose[3], player_shape,
-                bot_pose[0], bot_pose[2], bot_pose[3], bot_shape)
+                (player_velocity[0], player_velocity[2]),
+                bot_pose[0], bot_pose[2], bot_pose[3], bot_shape,
+                (bot_velocity[0], bot_velocity[2]))
             contact_normal = self._validated_ram_contact_normal(contact)
         else:
             contact_normal = self._validated_ram_contact_normal(
@@ -13133,6 +13130,8 @@ class BattleRuntime(object):
             'contact_x': float(hit[0]),
             'contact_y': float(hit[1]),
             'contact_z': float(hit[2]),
+            'contact_normal_x': float(contact_normal[0]),
+            'contact_normal_z': float(contact_normal[1]),
             'contact_armor_player': float(player_armor),
             'contact_armor_bot': float(bot_armor),
             'contact_screened_player': bool(player_plate['screened']),
@@ -13293,6 +13292,13 @@ class BattleRuntime(object):
                     closing_gaps.add(bot_id)
                 continue
             overlapping.add(bot_id)
+            impact_contact = tank_collision.obb_impact_contact(
+                own['x'], own['z'], own['yaw'], own['shape'],
+                (own['vx'], own['vz']),
+                other['x'], other['z'], other['yaw'], other['shape'],
+                (other['vx'], other['vz']))
+            if impact_contact is None:
+                continue
             overlap_point = self._ram_obb_overlap_point(own, other)
             if overlap_point is None:
                 continue
@@ -13324,7 +13330,7 @@ class BattleRuntime(object):
                           _number(other.get('pitch')),
                           _number(other.get('roll'))),
                 player_ram_profile=own['ram_profile'],
-                contact_normal=contact[:2])
+                contact_normal=impact_contact[:2])
             # Queue admission, including one next-frame plate retry, owns the
             # episode. A sustained overlap must never generate another HP
             # proposal merely because rendering/polling continues.

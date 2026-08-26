@@ -776,5 +776,110 @@ class ServerBotArtilleryTests(unittest.TestCase):
             planner._route_assignments[donor_id]['until'], 9.0)
 
 
+class ServerHumanRamNormalTests(unittest.TestCase):
+    @staticmethod
+    def _body(player_id, z):
+        return {
+            'id': player_id, 'vehicle': 'ussr:R11_MS-1',
+            'x': 0.0, 'y': 0.0, 'z': float(z), 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0,
+            'shape': (1.5, 3.5, -0.8, 2.0),
+        }
+
+    def test_worker_probe_freezes_first_impact_normal(self):
+        state = BattleState()
+
+        request = state._queue_human_ram_probe(
+            (1, 2), self._body(1, 0.0), self._body(2, 0.5),
+            123000, (0.0, -2.0, 6.5))
+
+        self.assertEqual([0.0, -1.0], request['contact_normal'])
+        self.assertEqual([0.0, -1.0],
+                         state._human_ram_probe_snapshot()[0][
+                             'contact_normal'])
+
+    def test_worker_probe_rejects_a_normal_facing_away_from_first_body(self):
+        state = BattleState()
+
+        request = state._queue_human_ram_probe(
+            (1, 2), self._body(1, 0.0), self._body(2, 0.5),
+            123000, (0.0, 1.0, 6.5))
+
+        self.assertIsNone(request)
+
+    def test_player_receipt_preserves_frozen_first_impact_normal(self):
+        state = BattleState()
+        state.bot_states[11] = {'id': 11}
+        state.bot_state_revision = 1
+        state.bot_state_time_us = 123000
+        state.human_collision_profiles[1] = {
+            'shape': (1.5, 3.5, -0.8, 2.0),
+            'ram_profile': {
+                'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        }
+        player = Player(
+            1, object(), ('127.0.0.1', 1), team=1, slot=0)
+        raw = {
+            'seq': 1, 'bot_id': 11, 'bot_state_revision': 1,
+            'presentation_time_us': 123000,
+            'native_contact_time_us': 123000,
+            'contact_x': 0.0, 'contact_y': 0.0, 'contact_z': 3.0,
+            'contact_normal_x': 0.0, 'contact_normal_z': -1.0,
+            'contact_armor_player': 80.0, 'contact_armor_bot': 100.0,
+            'contact_spall_player': 1.0, 'contact_bonus_player': 0.0,
+            'contact_screened_player': False,
+            'contact_screened_bot': False,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
+            'bot_vx': 0.0, 'bot_vy': 0.0, 'bot_vz': 0.0,
+        }
+
+        normalized, reason = state._validate_ram_contact(player, raw)
+
+        self.assertIsNone(reason)
+        self.assertEqual((0.0, -1.0), (
+            normalized['contact_normal_x'],
+            normalized['contact_normal_z']))
+
+    def test_player_receipt_rejects_flipped_or_perpendicular_normal(self):
+        state = BattleState()
+        state.bot_states[11] = {'id': 11}
+        state.bot_state_revision = 1
+        state.bot_state_time_us = 123000
+        state.human_collision_profiles[1] = {
+            'shape': (1.5, 3.5, -0.8, 2.0),
+            'ram_profile': {
+                'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        }
+        player = Player(
+            1, object(), ('127.0.0.1', 1), team=1, slot=0)
+        raw = {
+            'seq': 1, 'bot_id': 11, 'bot_state_revision': 1,
+            'presentation_time_us': 123000,
+            'native_contact_time_us': 123000,
+            'contact_x': 0.0, 'contact_y': 0.0, 'contact_z': 3.0,
+            'contact_normal_x': 0.0, 'contact_normal_z': -1.0,
+            'contact_armor_player': 80.0, 'contact_armor_bot': 100.0,
+            'contact_spall_player': 1.0, 'contact_bonus_player': 0.0,
+            'contact_screened_player': False,
+            'contact_screened_bot': False,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
+            'bot_vx': 0.0, 'bot_vy': 0.0, 'bot_vz': 0.0,
+        }
+
+        for normal in ((0.0, 1.0), (1.0, 0.0)):
+            candidate = dict(
+                raw, contact_normal_x=normal[0],
+                contact_normal_z=normal[1])
+            normalized, reason = state._validate_ram_contact(
+                player, candidate)
+
+            self.assertIsNone(normalized)
+            self.assertEqual('contact_normal_mismatch', reason)
+
+
 if __name__ == '__main__':
     unittest.main()

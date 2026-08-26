@@ -5477,6 +5477,10 @@ class BotRuntime(object):
                             player_armor = float(
                                 receipt['contact_armor_player'])
                             bot_armor = float(receipt['contact_armor_bot'])
+                            player_normal_x = float(
+                                receipt['contact_normal_x'])
+                            player_normal_z = float(
+                                receipt['contact_normal_z'])
                         except (KeyError, TypeError, ValueError,
                                 OverflowError):
                             native_supported = False
@@ -5485,6 +5489,13 @@ class BotRuntime(object):
                                 receipt.get('contact_spall_player'))
                             player_bonus = _number(
                                 receipt.get('contact_bonus_player'), -1.0)
+                            normal_length = math.hypot(
+                                player_normal_x, player_normal_z)
+                            normal_alignment = (
+                                player_normal_x *
+                                (player_x - bot['x']) +
+                                player_normal_z *
+                                (player_z - bot['z']))
                             native_supported = bool(
                                 player_armor > 0.0 and bot_armor > 0.0 and
                                 not math.isnan(player_armor) and
@@ -5493,6 +5504,10 @@ class BotRuntime(object):
                                 not math.isinf(bot_armor) and
                                 1.0 <= player_spall <= 1.5 and
                                 0.0 <= player_bonus <= 0.15 and
+                                not math.isnan(normal_length) and
+                                not math.isinf(normal_length) and
+                                0.999 <= normal_length <= 1.001 and
+                                normal_alignment > 1.0e-6 and
                                 not receipt.get('contact_screened_player') and
                                 not receipt.get('contact_screened_bot') and
                                 self._native_ram_hit_supported(player, hit) and
@@ -5507,11 +5522,10 @@ class BotRuntime(object):
                                     bot_id, player_id, seq)]
                         else:
                             # The immutable receipt already proves one contact
-                            # episode and its real armour layers.  Its frozen
-                            # poses provide a stable horizontal contact normal;
-                            # use that for impact energy instead of allowing
-                            # tangential or vertical relative velocity to turn
-                            # a scrape into a high-damage ram.
+                            # episode and its real armour layers. Its proof also
+                            # carries the frozen player-oriented first-impact
+                            # normal. Reverse it for Bot -> player damage instead
+                            # of re-solving a later deep overlap.
                             bot_profile = bot.get('ram_profile') or {}
                             bot_spall = _number(bot_profile.get(
                                 'spall_coefficient'), -1.0)
@@ -5523,21 +5537,14 @@ class BotRuntime(object):
                                     self._terminal_human_ram_report(
                                         bot_id, player_id, seq)]
                             else:
-                                contact = tank_collision.obb_contact(
-                                    bot['x'], bot['z'], bot['yaw'],
-                                    bot['shape'],
-                                    player['x'], player['z'], player['yaw'],
-                                    player['shape'])
-                                if contact is None:
-                                    normal_x = normal_z = penetration = 0.0
-                                    closing_speed = 0.0
-                                else:
-                                    normal_x, normal_z, penetration = contact
-                                    closing_speed = (
-                                        tank_collision.planar_closing_speed(
-                                            (bot_vx, bot_vz),
-                                            (player_vx, player_vz),
-                                            (normal_x, normal_z)))
+                                normal_x = -player_normal_x / normal_length
+                                normal_z = -player_normal_z / normal_length
+                                penetration = 0.0
+                                closing_speed = (
+                                    tank_collision.planar_closing_speed(
+                                        (bot_vx, bot_vz),
+                                        (player_vx, player_vz),
+                                        (normal_x, normal_z)))
                                 if (bot['team'] in (1, 2) and
                                         bot['team'] == player['team']):
                                     damage_player = damage_bot = 0

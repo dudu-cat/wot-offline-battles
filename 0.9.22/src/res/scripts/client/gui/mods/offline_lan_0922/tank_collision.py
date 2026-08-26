@@ -363,6 +363,72 @@ def obb_contact(x_a, z_a, yaw_a, shape_a,
     return best_x, best_z, best_overlap
 
 
+def obb_impact_contact(x_a, z_a, yaw_a, shape_a, velocity_a,
+                       x_b, z_b, yaw_b, shape_b, velocity_b):
+    """Return the first horizontal impact face for an overlapping OBB pair.
+
+    ``obb_contact`` is the current minimum-translation axis. That is the right
+    direction for separating interpenetrating bodies, but it can rotate from
+    front/rear to side after one delayed step creates a deep overlap. Recover
+    the entry face by sweeping the current intervals backward at their frozen
+    relative velocity. The returned normal is the historical B -> A normal at
+    first contact, not the current shortest escape direction.
+    """
+    axes_a = _axes(yaw_a)
+    axes_b = _axes(yaw_b)
+    delta_x = float(x_a) - float(x_b)
+    delta_z = float(z_a) - float(z_b)
+    relative_x = float(velocity_a[0]) - float(velocity_b[0])
+    relative_z = float(velocity_a[1]) - float(velocity_b[1])
+    if not all(_finite(value) for value in (
+            delta_x, delta_z, relative_x, relative_z)):
+        return None
+    best_age = None
+    best_contact = None
+
+    for axis in (axes_a[0], axes_a[1], axes_b[0], axes_b[1]):
+        axis_x, axis_z = axis
+        radius_a = (
+            shape_a[0] * abs(
+                axis_x * axes_a[0][0] + axis_z * axes_a[0][1]) +
+            shape_a[1] * abs(
+                axis_x * axes_a[1][0] + axis_z * axes_a[1][1]))
+        radius_b = (
+            shape_b[0] * abs(
+                axis_x * axes_b[0][0] + axis_z * axes_b[0][1]) +
+            shape_b[1] * abs(
+                axis_x * axes_b[1][0] + axis_z * axes_b[1][1]))
+        radius = radius_a + radius_b
+        signed_distance = delta_x * axis_x + delta_z * axis_z
+        overlap = radius - abs(signed_distance)
+        if overlap <= 0.0:
+            return None
+        axis_velocity = relative_x * axis_x + relative_z * axis_z
+        if abs(axis_velocity) <= 1.0e-9:
+            continue
+        if axis_velocity > 0.0:
+            entry_age = (radius + signed_distance) / axis_velocity
+            normal_x, normal_z = -axis_x, -axis_z
+        else:
+            entry_age = (radius - signed_distance) / -axis_velocity
+            normal_x, normal_z = axis_x, axis_z
+        if entry_age < -1.0e-9:
+            continue
+        if best_age is None or entry_age < best_age - 1.0e-9:
+            best_age = max(0.0, entry_age)
+            best_contact = (normal_x, normal_z, overlap)
+    if best_contact is None:
+        return None
+    # An unbounded rewind can otherwise trace a separating body through the
+    # entire other hull and invent an entry on its opposite face. The impact
+    # normal must still point from B toward A at the observed overlap; once
+    # the centres have crossed that face plane, the entry side is ambiguous.
+    if (best_contact[0] * delta_x +
+            best_contact[1] * delta_z) <= 1.0e-9:
+        return None
+    return best_contact
+
+
 def planar_closing_speed(velocity_a, velocity_b, normal):
     """Return the horizontal speed compressing an already-contacting pair.
 
@@ -625,6 +691,10 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             other_velocity_x = float(_tank_value(other, 'vx', 0.0) or 0.0)
             other_velocity_y = float(_tank_value(other, 'vy', 0.0) or 0.0)
             other_velocity_z = float(_tank_value(other, 'vz', 0.0) or 0.0)
+        impact_contact = obb_impact_contact(
+            x, z, yaw, own_shape, (velocity_x, velocity_z),
+            other_x, other_z, other_yaw, other_shape,
+            (other_velocity_x, other_velocity_z))
         response = pair_response(
             contact, inverse_self, inverse_other,
             (velocity_x, velocity_z),
@@ -644,9 +714,11 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         if _same_team(tank, other):
             continue
 
+        if impact_contact is None:
+            continue
         closing_speed = planar_closing_speed(
             (velocity_x, velocity_z),
-            (other_velocity_x, other_velocity_z), contact)
+            (other_velocity_x, other_velocity_z), impact_contact)
         if closing_speed <= 0.0:
             continue
 
@@ -661,7 +733,7 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
         other_ram_inputs = _contact_ram_inputs(other)
         if ((own_ram_inputs is None or other_ram_inputs is None) and
                 callable(contact_armor_probe)):
-            probed = contact_armor_probe(tank, other, contact)
+            probed = contact_armor_probe(tank, other, impact_contact)
             if probed is not None:
                 if not isinstance(probed, (list, tuple)) or len(probed) != 2:
                     raise RuntimeError(
@@ -724,8 +796,8 @@ def resolve_tank(tank, others, now=None, ram_cooldowns=None,
             'yaw_other': other_yaw,
             'shape_self': own_shape,
             'shape_other': other_shape,
-            'contact_normal': (contact[0], contact[1]),
-            'contact_penetration': contact[2],
+            'contact_normal': (impact_contact[0], impact_contact[1]),
+            'contact_penetration': impact_contact[2],
             'closing_speed': closing_speed,
             'relative_speed': relative_speed,
             'impact_speed': closing_speed,

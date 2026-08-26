@@ -8267,10 +8267,14 @@ class BattleState:
             bot_armor = float(raw_ram.get("contact_armor_bot"))
             player_spall = float(raw_ram.get("contact_spall_player"))
             player_bonus = float(raw_ram.get("contact_bonus_player"))
+            contact_normal_x = float(raw_ram.get("contact_normal_x"))
+            contact_normal_z = float(raw_ram.get("contact_normal_z"))
             pitch = float(raw_ram.get("pitch", 0.0))
             roll = float(raw_ram.get("roll", 0.0))
         except (TypeError, ValueError, OverflowError):
             return None, "malformed_contact"
+        contact_normal_length = math.hypot(
+            contact_normal_x, contact_normal_z)
         if (seq is None or bot_id not in self.bot_states or
                 revision is None or revision > self.bot_state_revision or
                 revision + 255 < self.bot_state_revision or
@@ -8287,6 +8291,8 @@ class BattleState:
                 not 1.0 <= player_spall <= 1.5 or
                 not math.isfinite(player_bonus) or
                 not 0.0 <= player_bonus <= 0.15 or
+                not math.isfinite(contact_normal_length) or
+                not 0.999 <= contact_normal_length <= 1.001 or
                 not math.isfinite(pitch) or not -0.61 <= pitch <= 0.61 or
                 not math.isfinite(roll) or not -0.61 <= roll <= 0.61 or
                 not isinstance(raw_ram.get("contact_screened_player"), bool) or
@@ -8317,6 +8323,9 @@ class BattleState:
                 "shape": profile["shape"],
         }, (hit_x, hit_y, hit_z)):
             return None, "contact_outside_player_body"
+        if (contact_normal_x * (center_x - hit_x) +
+                contact_normal_z * (center_z - hit_z)) <= 0.000001:
+            return None, "contact_normal_mismatch"
         return {
             "seq": seq,
             "bot_id": bot_id,
@@ -8326,6 +8335,10 @@ class BattleState:
             "contact_x": round(_clamp(hit_x, -2000.0, 2000.0), 4),
             "contact_y": round(_clamp(hit_y, -1000.0, 1000.0), 4),
             "contact_z": round(_clamp(hit_z, -2000.0, 2000.0), 4),
+            "contact_normal_x": round(
+                contact_normal_x / contact_normal_length, 6),
+            "contact_normal_z": round(
+                contact_normal_z / contact_normal_length, 6),
             "contact_armor_player": round(player_armor, 4),
             "contact_armor_bot": round(bot_armor, 4),
             "contact_screened_player": raw_ram["contact_screened_player"],
@@ -10233,15 +10246,32 @@ class BattleState:
                       for value in body["shape"]],
         }
 
-    def _queue_human_ram_probe(self, pair, first, second, frontier_time_us):
+    def _queue_human_ram_probe(
+            self, pair, first, second, frontier_time_us, contact):
         request = self.human_ram_probe_requests.get(pair)
         if request is not None:
             return request
         if len(self.human_ram_probe_requests) >= MAX_HUMAN_RAM_PROBES:
             return None
+        try:
+            normal_x = float(contact[0])
+            normal_z = float(contact[1])
+            normal_length = math.hypot(normal_x, normal_z)
+            center_delta_x = float(first["x"]) - float(second["x"])
+            center_delta_z = float(first["z"]) - float(second["z"])
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(normal_length) or normal_length <= 0.000001:
+            return None
+        if (normal_x * center_delta_x +
+                normal_z * center_delta_z) <= 0.000001:
+            return None
         self.human_ram_probe_seq += 1
         request = {
             "seq": self.human_ram_probe_seq,
+            "contact_normal": [
+                round(normal_x / normal_length, 6),
+                round(normal_z / normal_length, 6)],
             "first": self._human_ram_probe_body(first),
             "second": self._human_ram_probe_body(second),
             "frontier_time_us": int(frontier_time_us),
@@ -10254,6 +10284,7 @@ class BattleState:
     def _human_ram_probe_snapshot(self):
         return [{
             "seq": int(request["seq"]),
+            "contact_normal": list(request["contact_normal"]),
             "first": copy.deepcopy(request["first"]),
             "second": copy.deepcopy(request["second"]),
         } for unused_pair, request in sorted(
@@ -10360,9 +10391,9 @@ class BattleState:
             self.human_ram_retired_probe_pairs.popitem(last=False)
 
     def _human_ram_contact_armors(
-            self, pair, first, second, frontier_time_us):
+            self, pair, first, second, frontier_time_us, contact):
         request = self._queue_human_ram_probe(
-            pair, first, second, frontier_time_us)
+            pair, first, second, frontier_time_us, contact)
         if request is None:
             return None, False
         result = request.get("result")
@@ -10379,9 +10410,9 @@ class BattleState:
             active_contacts):
         probe_state = {"resolved": False}
 
-        def contact_armor_probe(probe_first, probe_second, unused_contact):
+        def contact_armor_probe(probe_first, probe_second, contact):
             armors, resolved = self._human_ram_contact_armors(
-                pair, probe_first, probe_second, frontier_time_us)
+                pair, probe_first, probe_second, frontier_time_us, contact)
             probe_state["resolved"] = resolved
             return armors
 

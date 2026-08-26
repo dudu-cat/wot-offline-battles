@@ -8593,6 +8593,8 @@ class BotRuntimeTests(unittest.TestCase):
                 'native_contact_time_us': 150000,
                 'contact_x': 0.0, 'contact_y': 0.0,
                 'contact_z': 3.25,
+                'contact_normal_x': 0.0,
+                'contact_normal_z': -1.0,
                 'contact_armor_player': 20.0,
                 'contact_armor_bot': 20.0,
                 'contact_spall_player': 1.0,
@@ -8675,6 +8677,8 @@ class BotRuntimeTests(unittest.TestCase):
                 'native_contact_time_us': 160000,
                 'contact_x': 0.0, 'contact_y': 0.0,
                 'contact_z': 3.25,
+                'contact_normal_x': 0.0,
+                'contact_normal_z': -1.0,
                 'contact_armor_player': 20.0,
                 'contact_armor_bot': 20.0,
                 'contact_spall_player': 1.0,
@@ -8721,13 +8725,15 @@ class BotRuntimeTests(unittest.TestCase):
         player = _admit_player({
             'id': 2, 'team': 1, 'vehicle': 'ussr:R11_MS-1',
             'x': 2.8, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-            'speed': 0.0, 'alive': True,
+            'speed': 10.0, 'alive': True,
             'ram_contact': {
                 'seq': 9, 'bot_id': 11, 'bot_state_revision': 39,
                 'presentation_time_us': 170000,
                 'native_contact_time_us': 170000,
                 'contact_x': 1.4, 'contact_y': 0.0,
                 'contact_z': 0.0,
+                'contact_normal_x': 1.0,
+                'contact_normal_z': 0.0,
                 'contact_armor_player': 20.0,
                 'contact_armor_bot': 20.0,
                 'contact_spall_player': 1.0,
@@ -8735,7 +8741,7 @@ class BotRuntimeTests(unittest.TestCase):
                 'contact_screened_player': False,
                 'contact_screened_bot': False,
                 'x': 2.8, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
-                'vx': 0.0, 'vy': 0.0, 'vz': 0.0,
+                'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
                 'bot_vx': 0.2, 'bot_vy': 0.0, 'bot_vz': 10.0,
             },
             '_ram_contact_bot_state': historical,
@@ -8752,6 +8758,12 @@ class BotRuntimeTests(unittest.TestCase):
         try:
             reports = runtime._resolve_human_ram_receipts(
                 [player], 10.0)
+            flipped = dict(player)
+            flipped['ram_contact'] = dict(
+                player['ram_contact'], seq=10,
+                contact_normal_x=-1.0)
+            rejected = runtime._resolve_human_ram_receipts(
+                [flipped], 10.1)
         finally:
             self.module.tank_collision.ram_damage = original
 
@@ -8760,6 +8772,10 @@ class BotRuntimeTests(unittest.TestCase):
             reports[0]['damage_to_bot'], reports[0]['damage_to_target']))
         self.assertEqual(1, len(calls))
         self.assertAlmostEqual(0.2, calls[0][0])
+        self.assertEqual(1, len(rejected))
+        self.assertEqual((0, 0), (
+            rejected[0]['damage_to_bot'],
+            rejected[0]['damage_to_target']))
 
     def test_human_ram_ledger_resolves_every_contact_and_terminal_noop(self):
         descriptor = _combat_descriptor()
@@ -8786,6 +8802,8 @@ class BotRuntimeTests(unittest.TestCase):
                 'native_contact_time_us': presentation_time_us,
                 'contact_x': 0.0, 'contact_y': 0.0,
                 'contact_z': 3.25,
+                'contact_normal_x': 0.0,
+                'contact_normal_z': -1.0,
                 'contact_armor_player': 20.0,
                 'contact_armor_bot': 20.0,
                 'contact_spall_player': 1.0,
@@ -8898,6 +8916,8 @@ class BotRuntimeTests(unittest.TestCase):
                 'native_contact_time_us': 10000000,
                 'contact_x': 3.25, 'contact_y': 0.0,
                 'contact_z': 0.0,
+                'contact_normal_x': 1.0,
+                'contact_normal_z': 0.0,
                 'contact_armor_player': 20.0,
                 'contact_armor_bot': 20.0,
                 'contact_spall_player': 1.0,
