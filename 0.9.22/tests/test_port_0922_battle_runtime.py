@@ -9229,6 +9229,30 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(battle._local_damage_report)
         self.assertFalse(battle._local_critical_owned)
 
+    def test_local_track_repair_restores_stock_track_visual_on_completion(self):
+        descriptor = _Descriptor()
+        descriptor.chassis.maxHealth = 100
+        descriptor.chassis.maxRegenHealth = 50
+        entity = _Vehicle(10, descriptor, _Vector(), (0, 0, 0),
+                          {'health': 500})
+        entity.devices_hp = {'leftTrackHealth': 0.0}
+        entity._destroyed_devices = set(['leftTrackHealth'])
+        entity._critical_devices = set()
+        entity.appearance.addCrashedTrack = mock.Mock()
+        entity.appearance.delCrashedTrack = mock.Mock()
+        loadout = {'has_big_kit': False, 'repair_factor': 0.5}
+
+        partial = BattleRuntime._tick_local_track_repair(
+            entity, 5.0, loadout)
+        repaired = BattleRuntime._tick_local_track_repair(
+            entity, 5.0, loadout)
+
+        self.assertEqual('destroyed', partial['devices'][0]['state'])
+        self.assertEqual('critical', repaired['devices'][0]['state'])
+        self.assertNotIn('leftTrackHealth', entity._destroyed_devices)
+        entity.appearance.delCrashedTrack.assert_called_once_with(True)
+        entity.appearance.addCrashedTrack.assert_not_called()
+
     def test_input_sender_retries_pending_track_repair_separately(self):
         battle = BattleRuntime(_runtime())
         battle.client = _Client()

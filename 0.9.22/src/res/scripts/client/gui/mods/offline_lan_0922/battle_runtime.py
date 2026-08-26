@@ -8335,8 +8335,12 @@ class BattleRuntime(object):
         entity._destroyed_devices = destroyed
         entity._critical_devices = critical
         critical_damage._refresh_mobility_flags(entity)
+        after = critical_damage._state(entity)
+        # The owner-CAS echo is suppressed, so this local edge is the only
+        # chance to restore the stock crashed-track model.
+        critical_damage._sync_crashed_track(entity, before, after)
         return critical_damage._payload(
-            before, critical_damage._state(entity),
+            before, after,
             entity.typeDescriptor, 'repair')
 
     def _tick_critical_states(self, dt):
