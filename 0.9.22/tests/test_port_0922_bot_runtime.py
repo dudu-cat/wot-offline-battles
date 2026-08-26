@@ -2533,6 +2533,49 @@ class BotRuntimeTests(unittest.TestCase):
                 soft_speed, .04)[0],
             hard_state['speed'])
 
+    def test_five_hz_lookahead_collision_defers_to_exact_motion_resolver(self):
+        command = {
+            'target_yaw': math.pi * 0.5, 'throttle': 1.0, 'turn': 0.0,
+            'shell_index': 0, 'fire_allowed': False, 'target_id': None,
+            'fire_range': 0.0, 'combat_mode': 'route',
+            'aim_position': (200.0, 0.0, 0.0),
+            'face_position': (200.0, 0.0, 0.0),
+            'move_position': (200.0, 0.0, 0.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        }
+        exact_calls = []
+
+        def resolver(*args):
+            exact_calls.append(args)
+            return 'clear'
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {
+                'clear': False, 'collision': True, 'water': False,
+                'slope': 0.0},
+            motion_resolver=resolver,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=math.pi * 0.5, speed=4.0,
+                     grounded_once=True)
+        positions = []
+
+        for now in (1.0, 1.2, 1.4):
+            runtime.update(.2, now)
+            positions.append(state['x'])
+
+        self.assertEqual(3, len(exact_calls))
+        self.assertEqual(1, state['movement_dir'])
+        self.assertLess(0.0, positions[0])
+        self.assertLess(positions[0], positions[1])
+        self.assertLess(positions[1], positions[2])
+        self.assertEqual(0, runtime._hard_contact_grinds.get(11, 0))
+
     def test_bot_hard_contact_uses_shared_second_glancing_path(self):
         command = {
             'target_yaw': 0.0, 'throttle': 1.0, 'turn': 0.0,
@@ -2617,7 +2660,8 @@ class BotRuntimeTests(unittest.TestCase):
             1, descriptor_resolver=lambda unused: _combat_descriptor(),
             adapter_factory=lambda *unused, **kwargs: adapter,
             direction_probe=lambda *unused: {
-                'clear': True, 'collision': False, 'slope': 0.0},
+                'clear': False, 'collision': True, 'water': False,
+                'slope': 0.0},
             motion_resolver=lambda *unused: status[0],
             ground_probe=lambda *unused: 0.0,
             physics_ground_probe=lambda *unused: 0.0,
@@ -2626,9 +2670,12 @@ class BotRuntimeTests(unittest.TestCase):
         state = runtime.states[11]
         state.update(x=0.0, y=0.0, z=0.0, yaw=attempted_yaw,
                      speed=4.0, grounded_once=True)
+        before_position = (state['x'], state['y'], state['z'])
 
         runtime.update(.04, 1.0)
 
+        self.assertEqual(before_position,
+                         (state['x'], state['y'], state['z']))
         self.assertNotIn(11, runtime._decision_cache)
         self.assertNotIn(11, runtime._motion_probe_cache)
         self.assertEqual([(11, attempted_yaw, 5.0)],
@@ -2638,6 +2685,8 @@ class BotRuntimeTests(unittest.TestCase):
         status[0] = 'clear'
         runtime.update(.04, 1.04)
 
+        self.assertNotEqual(before_position,
+                            (state['x'], state['y'], state['z']))
         self.assertEqual(2, len(adapter.calls))
         self.assertIn(11, runtime._decision_cache)
         self.assertIn(11, runtime._motion_probe_cache)
@@ -9897,6 +9946,75 @@ class BotRuntimeTests(unittest.TestCase):
         self.runtime.update(.04, 1.04)
 
         self.assertEqual(2, len(self.adapters[0].calls))
+
+    def test_unfireable_moving_target_order_keeps_worker_caches(self):
+        def order(**changes):
+            result = {
+                'id': 11, 'target_kind': 'human', 'target_id': 2,
+                'fire_allowed': False, 'shell_index': 0,
+                'fire_range': 500.0, 'combat_mode': 'advance_contact',
+                'aim_position': (0.0, 1.0, 80.0),
+                'face_position': (0.0, 1.0, 80.0),
+                'move_position': (0.0, 1.0, 80.0),
+            }
+            result.update(changes)
+            return result
+
+        runtime = self.module.BotRuntime(1)
+        self.assertTrue(runtime._apply_orders({
+            'bot_order_revision': 1, 'bot_orders': [order()],
+        }))
+        decision = object()
+        motion = object()
+        runtime._decision_cache[11] = decision
+        runtime._motion_probe_cache[11] = motion
+        token = runtime._server_order_tokens[11]
+        moved = (20.0, 1.0, 70.0)
+
+        self.assertTrue(runtime._apply_orders({
+            'bot_order_revision': 2,
+            'bot_orders': [order(
+                aim_position=moved, face_position=moved,
+                move_position=moved)],
+        }))
+
+        self.assertIs(decision, runtime._decision_cache[11])
+        self.assertIs(motion, runtime._motion_probe_cache[11])
+        self.assertEqual(token, runtime._server_order_tokens[11])
+
+    def test_real_server_order_changes_still_invalidate_worker_caches(self):
+        base = {
+            'id': 11, 'target_kind': 'human', 'target_id': 2,
+            'fire_allowed': False, 'shell_index': 0,
+            'fire_range': 500.0, 'combat_mode': 'advance_contact',
+            'aim_position': (20.0, 1.0, 70.0),
+            'face_position': (20.0, 1.0, 70.0),
+            'move_position': (20.0, 1.0, 70.0),
+        }
+        for field, value in (
+                ('target_id', 3),
+                ('fire_allowed', True),
+                ('shell_index', 1),
+                ('combat_mode', 'engage')):
+            with self.subTest(field=field):
+                runtime = self.module.BotRuntime(1)
+                self.assertTrue(runtime._apply_orders({
+                    'bot_order_revision': 1, 'bot_orders': [dict(base)],
+                }))
+                runtime._decision_cache[11] = object()
+                runtime._motion_probe_cache[11] = object()
+                token = runtime._server_order_tokens[11]
+                changed = dict(base)
+                changed[field] = value
+
+                self.assertTrue(runtime._apply_orders({
+                    'bot_order_revision': 2, 'bot_orders': [changed],
+                }))
+
+                self.assertNotIn(11, runtime._decision_cache)
+                self.assertNotIn(11, runtime._motion_probe_cache)
+                self.assertEqual(
+                    token + 1, runtime._server_order_tokens[11])
 
     def test_server_order_revision_invalidates_only_semantically_changed_bot(self):
         runtime = self.module.BotRuntime(

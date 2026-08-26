@@ -1570,8 +1570,7 @@ def _server_order_signature(order):
     them as a new strategic decision only flushes valid perception caches.
     """
     result = dict(order or {})
-    if (result.get('target_id') is not None and
-            bool(result.get('fire_allowed'))):
+    if result.get('target_id') is not None:
         result.pop('aim_position', None)
         result.pop('face_position', None)
         if result.get('combat_mode') == 'advance_contact':
@@ -7972,7 +7971,18 @@ class BotRuntime(object):
             probe_deferred = bool(
                 isinstance(motion_probe, dict) and
                 motion_probe.get('deferred', False))
+            # The generic/world corridor looks beyond this simulation step.
+            # When the exact resolver is available, only its current hull
+            # sweep may turn that forecast into a realised hard contact.
+            exact_motion_owns_collision = bool(
+                callable(self.motion_resolver) and
+                isinstance(motion_probe, dict) and
+                not probe_deferred and
+                motion_probe.get('collision', False) and
+                not motion_probe.get('water', False) and
+                abs(_number(motion_probe.get('slope', 0.0))) <= 0.55)
             path_clear = (True if (probe_deferred or motion_probe is None or
+                                   exact_motion_owns_collision or
                                    (abs(throttle) <= 0.01 and
                                     abs(_number(state.get('speed'))) <=
                                     0.0001) or

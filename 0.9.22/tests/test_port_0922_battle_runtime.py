@@ -9010,37 +9010,44 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
     def test_direction_and_graph_probes_reject_drowning_depth_water(self):
         runtime = _runtime()
-        runtime.bigworld.wg_collideWater = lambda *unused: 18.5
+        runtime.bigworld.wg_collideWater = lambda start, *unused: (
+            20.0 if abs(float(start.z)) < 1.0 else 18.5)
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
 
-        self.assertEqual(1.5, battle._water_depth((0.0, 0.0, 0.0)))
+        self.assertEqual(1.5, battle._water_depth((0.0, 0.0, 8.0)))
         result = battle._direction_probe((0.0, 0.0, 0.0), 0.0)
 
         self.assertTrue(result['water'])
         self.assertFalse(result['clear'])
         self.assertIsNone(battle._navigation_ground(0.0, 8.0, 0.0))
 
-    def test_direction_probe_allows_a_submerged_bot_to_escape_shallower(self):
+    def test_direction_probe_allows_submerged_bot_to_continue_not_deeper(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
-        battle._water_depth = mock.Mock(side_effect=(2.0, 1.5, 0.5))
+        cases = (
+            ((2.0, 2.0, 2.0), 'equal depth'),
+            ((2.0, 1.9, 1.9), 'slightly shallower'),
+            ((2.0, 1.5, 0.5), 'shallower escape'),
+        )
 
-        result = battle._direction_probe((0.0, 0.0, 0.0), 0.0)
+        for depths, label in cases:
+            with self.subTest(label=label):
+                battle._water_depth = mock.Mock(side_effect=depths)
+                result = battle._direction_probe(
+                    (0.0, 0.0, 0.0), 0.0)
+                self.assertTrue(result['clear'])
+                self.assertFalse(result['water'])
+                self.assertEqual(3, battle._water_depth.call_count)
 
-        self.assertTrue(result['clear'])
-        self.assertFalse(result['water'])
-        self.assertEqual(3, battle._water_depth.call_count)
-
-    def test_direction_probe_rejects_new_deep_water_and_failed_escape(self):
+    def test_direction_probe_rejects_new_or_deeper_water(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         cases = (
             ((0.0, 0.91), 'dry entry'),
             ((2.0, 2.11), 'deeper water'),
-            ((2.0, 1.9, 1.9), 'no final improvement'),
         )
 
         for depths, label in cases:

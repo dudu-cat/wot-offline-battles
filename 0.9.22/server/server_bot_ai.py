@@ -75,6 +75,20 @@ def _point(raw):
     }
 
 
+def _order_signature(order):
+    """Return the strategic fields which advance the order revision."""
+    signature = dict(order or {})
+    if signature.get("target_id") is not None:
+        # The worker overlays these coordinates from the live target pose.
+        # Movement of that pose is not a new tactical decision, including
+        # while an SPG is still waiting for permission to fire.
+        signature.pop("aim_position", None)
+        signature.pop("face_position", None)
+        if signature.get("combat_mode") == "advance_contact":
+            signature.pop("move_position", None)
+    return signature
+
+
 class BotPlanner(object):
     """Server-side route, focus-fire, and last-contact order coordinator."""
 
@@ -345,19 +359,7 @@ class BotPlanner(object):
                 orders.append(order)
         orders.sort(key=lambda value: value["id"])
         payload = {"orders": orders}
-        signature_orders = []
-        for order in orders:
-            signature = dict(order)
-            if (signature.get("target_id") is not None and
-                    bool(signature.get("fire_allowed"))):
-                # The authority client resolves a visible target's rendered live
-                # pose by id. Sub-metre contact movement must not create a new
-                # 29-order payload and revision on every observation frame.
-                signature.pop("aim_position", None)
-                signature.pop("face_position", None)
-                if signature.get("combat_mode") == "advance_contact":
-                    signature.pop("move_position", None)
-            signature_orders.append(signature)
+        signature_orders = [_order_signature(order) for order in orders]
         signature_payload = {"orders": signature_orders}
         if signature_payload != self._last_order_signature:
             self.revision += 1

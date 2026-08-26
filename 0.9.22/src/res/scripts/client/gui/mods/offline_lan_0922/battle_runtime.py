@@ -104,7 +104,6 @@ BOT_SOFT_RECAST_BUDGET = 24
 # A bot already beyond the shared baked/native limit may still choose an
 # escape corridor below; otherwise the first wet sample traps it.
 BOT_WATER_ESCAPE_DEEPEN_EPSILON = 0.10
-BOT_WATER_ESCAPE_IMPROVEMENT = 0.15
 CRITICAL_REPAIR_NETWORK_SECONDS = 1.0
 # tankmen.xml commander_expert.delay in the pinned #1513 client.
 EXPERT_DEVICE_DELAY_SECONDS = 4.0
@@ -4014,7 +4013,6 @@ class BattleRuntime(object):
         x, y, z = _xyz(position)
         current_water = self._water_depth((x, y, z))
         wet_escape = current_water > BOT_WATER_AVOID_DEPTH
-        last_water = current_water
         far_distance = 20.0 if abs(float(speed or 0.0)) > 5.0 else 15.0
         if maximum_distance is not None:
             try:
@@ -4077,7 +4075,6 @@ class BattleRuntime(object):
             if not wet_escape and water_depth > BOT_WATER_AVOID_DEPTH:
                 return {'clear': False, 'collision': False,
                         'water': True, 'slope': 0.0}
-            last_water = water_depth
             delta = next_y - previous_y
             slope = delta / max(0.1, run)
             if abs(slope) > abs(maximum_slope):
@@ -4164,12 +4161,6 @@ class BattleRuntime(object):
                             'water': False, 'slope': slope}
             previous_y = next_y
             previous_distance = distance
-        if (wet_escape and
-                last_water > max(
-                    BOT_WATER_AVOID_DEPTH,
-                    current_water - BOT_WATER_ESCAPE_IMPROVEMENT)):
-            return {'clear': False, 'collision': False,
-                    'water': True, 'slope': 0.0}
         result = {'clear': True, 'collision': False,
                   'water': False, 'slope': maximum_slope}
         if deferred:

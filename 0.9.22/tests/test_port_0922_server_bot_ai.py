@@ -6,7 +6,7 @@ import unittest
 PORT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
-from server_bot_ai import BotPlanner  # noqa: E402
+from server_bot_ai import BotPlanner, _order_signature  # noqa: E402
 from lan_battle_server import BattleState, Player  # noqa: E402
 from gui.mods.offline_lan_0922.bot_runtime import (  # noqa: E402
     _overlay_live_target_pose,
@@ -119,6 +119,34 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual(len(contacts), planner.report_contacts(
             contacts, planner.known_targets(self.states, players), 1.0))
         return players
+
+    def test_order_signature_ignores_live_target_pose_before_fire_permission(self):
+        order = {
+            'id': 11, 'target_kind': 'human', 'target_id': 2,
+            'fire_allowed': False, 'shell_index': 0,
+            'combat_mode': 'advance_contact',
+            'aim_position': {'x': 0.0, 'y': 1.0, 'z': 80.0},
+            'face_position': {'x': 0.0, 'y': 1.0, 'z': 80.0},
+            'move_position': {'x': 0.0, 'y': 1.0, 'z': 80.0},
+        }
+        moved = dict(order)
+        moved.update({
+            'aim_position': {'x': 20.0, 'y': 1.0, 'z': 70.0},
+            'face_position': {'x': 20.0, 'y': 1.0, 'z': 70.0},
+            'move_position': {'x': 20.0, 'y': 1.0, 'z': 70.0},
+        })
+
+        self.assertEqual(_order_signature(order), _order_signature(moved))
+        for field, value in (
+                ('target_id', 3),
+                ('fire_allowed', True),
+                ('shell_index', 1),
+                ('combat_mode', 'engage')):
+            changed = dict(moved)
+            changed[field] = value
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    _order_signature(order), _order_signature(changed))
 
     def test_recent_attacker_preempts_target_lease_and_withdraws(self):
         planner = BotPlanner()
