@@ -136,7 +136,7 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
     def test_contract_is_pinned_to_client_1513(self):
         self.assertEqual('offline-lan-0922-destructible-catalog',
                          self.baker.FORMAT_NAME)
-        self.assertEqual(5, self.baker.FORMAT_VERSION)
+        self.assertEqual(6, self.baker.FORMAT_VERSION)
         self.assertEqual(
             'offline-lan-0922-destructible-catalog-manifest',
             self.baker.MANIFEST_FORMAT)
@@ -182,15 +182,15 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
             return self.baker.bake_compiled_map(
                 'synthetic', b'pkg', b'space', b'xml', descriptors)
 
-    def test_synthetic_wgde_wires_compact_empty_items(self):
+    def test_synthetic_wgde_wires_retain_empty_item_slots(self):
         sections, descriptors = _synthetic_scene()
         data = self._bake_synthetic(sections, descriptors)
         by_file = {row[12]: row for row in data['instances']}
         self.assertEqual(3, len(data['instances']))
         # Chunk 100 holds a SpeedTree item and an empty WGDE row before the
-        # fragile. The streamed #1513 API keeps the tree but omits the empty
-        # row, so the fragile's native itemIndex is 1.
-        self.assertEqual([100, 1], by_file[SYNTH_FRAGILE][14:16])
+        # fragile. The pinned #1513 API retains the empty native slot, so the
+        # fragile's itemIndex is its table-2 position, 2.
+        self.assertEqual([100, 2], by_file[SYNTH_FRAGILE][14:16])
         # Both shed module rows form one multi-reference native item.
         self.assertEqual([200, 0], by_file[SYNTH_SHED][14:16])
         self.assertIsNone(by_file[SYNTH_SHED][13])
@@ -202,6 +202,21 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
         unused_rows, unused_wire_rows, speedtree_wires = \
             self.baker.native_wires(compiled, 4)
         self.assertEqual({0: (100, 0)}, speedtree_wires)
+
+    def test_speedtree_wire_after_empty_wgde_row_retains_table_position(self):
+        compiled = types.SimpleNamespace(sections={
+            'WGDE': _FakeSection({
+                '1': [(100, 0, 3)],
+                '2': [(0, 0), (1, 0), (1, 1)],
+                '3': [0x80000000, 0x80000001],
+            }),
+            'SpTr': _FakeSection({
+                'speedtree_list': [object(), object()],
+            }),
+        })
+        unused_rows, unused_wire_rows, speedtree_wires = \
+            self.baker.native_wires(compiled, 0)
+        self.assertEqual({0: (100, 0), 1: (100, 2)}, speedtree_wires)
 
     def test_synthetic_wgde_rejects_broken_chunk_ranges_and_spans(self):
         sections, descriptors = _synthetic_scene()
@@ -290,6 +305,7 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                         'complete #1513 destructible batch is missing')
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         self.assertEqual(self.baker.MANIFEST_FORMAT, manifest['format'])
+        self.assertEqual(self.baker.FORMAT_VERSION, manifest['version'])
         self.assertEqual(self.baker.GAME_VERSION, manifest['game_version'])
         self.assertEqual(self.baker.LOCATOR_QUANTIZATION,
                          manifest['locator_quantization'])
@@ -326,6 +342,7 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
             data = json.loads(path.read_text(encoding='utf-8'))
             self.assertEqual(record['map'], data['map'])
             self.assertEqual(self.baker.FORMAT_NAME, data['format'])
+            self.assertEqual(self.baker.FORMAT_VERSION, data['version'])
             self.assertEqual(self.baker.GAME_VERSION, data['game_version'])
             self.assertEqual(self.baker.LOCATOR_QUANTIZATION,
                              data['locator_quantization'])
@@ -495,6 +512,50 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
             if len(row[12]) == 2 and row[12][0] == row[12][1] and
             dday['resources'][row[12][0][0]]['kind'] == 'structure')
         self.assertIsNone(repeated_structure[12][0][1])
+
+    def test_real_catalogs_retain_known_empty_wgde_slot_offsets(self):
+        sentinels = {
+            '07_lakeville': (
+                (204385, -4826, 156370, -442, 0, 897,
+                 0, 1000, 0, -897, 0, -442),
+                'content/Environment/env414_Pole/normal/lod0/'
+                'env414_Pole4.model', (33152, 170)),
+            '11_murovanka': (
+                (-544200, 10219, -84800, 465, 0, 192,
+                 0, 503, 0, -192, 0, 465),
+                'content/GatesAndFences/gaf004_FactoryFence/normal/lod0/'
+                'gaf004_FactoryFenceEnd1.model', (31102, 48)),
+            '18_cliff': (
+                (-398922, -15130, 150940, -999, 0, -44,
+                 0, 1000, 0, 44, 0, -999),
+                'content/Environment/env009_FirewoodStack/normal/lod0/'
+                'env009_FirewoodStack1.model', (31616, 19)),
+            '23_westfeld': (
+                (-272304, 58182, 42155, 777, -19, -629,
+                 10, 1000, -18, 629, 7, 777),
+                'content/Environment/env208_Log_Firewood/normal/lod0/'
+                'env208_Log_Firewood04.model', (31871, 111)),
+            '34_redshire': (
+                (101444, 4652, -102045, 671, 0, -741,
+                 0, 1000, 0, 741, 0, 671),
+                'content/Environment/env413_StreetLamp/normal/lod0/'
+                'env413_StreetLamp4.model', (32893, 200)),
+            '36_fishing_bay': (
+                (98938, 9842, 46403, 118, -31, -993,
+                 51, 998, -26, 992, -48, 119),
+                'content/GatesAndFences/gafBR_002_FieldFence/normal/lod0/'
+                'gafBR_002_FieldFence1.model', (32895, 46)),
+        }
+        for map_name, (signature, filename, expected_wire) in \
+                sentinels.items():
+            data = json.loads(
+                (DATA_ROOT / (map_name + '.json')).read_text(
+                    encoding='utf-8'))
+            row = next(
+                row for row in data['instances']
+                if tuple(row[:12]) == signature)
+            self.assertEqual(filename, row[12], map_name)
+            self.assertEqual(expected_wire, tuple(row[14:16]), map_name)
 
     def test_highway_contains_exact_poles_fence_truck_and_shed(self):
         data = json.loads(

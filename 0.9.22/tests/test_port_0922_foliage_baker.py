@@ -36,7 +36,7 @@ class FoliageBaker0922Tests(unittest.TestCase):
     def test_contract_is_pinned_to_client_1513(self):
         self.assertEqual('offline-lan-0922-foliage',
                          self.baker.FORMAT_NAME)
-        self.assertEqual(2, self.baker.FORMAT_VERSION)
+        self.assertEqual(3, self.baker.FORMAT_VERSION)
         self.assertEqual('offline-lan-0922-foliage-manifest',
                          self.baker.MANIFEST_FORMAT)
         self.assertEqual('0.9.22.0.1-cn-1513', self.baker.GAME_VERSION)
@@ -168,6 +168,7 @@ class FoliageBaker0922Tests(unittest.TestCase):
                         'complete #1513 foliage batch is missing')
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         self.assertEqual(self.baker.MANIFEST_FORMAT, manifest['format'])
+        self.assertEqual(self.baker.FORMAT_VERSION, manifest['version'])
         self.assertEqual(self.baker.GAME_VERSION, manifest['game_version'])
         self.assertEqual(
             list(self.baker.SUPPORTED_MAPS),
@@ -180,12 +181,30 @@ class FoliageBaker0922Tests(unittest.TestCase):
             data = json.loads(path.read_text(encoding='utf-8'))
             self.assertEqual(record['map'], data['map'])
             self.assertEqual(self.baker.FORMAT_NAME, data['format'])
+            self.assertEqual(self.baker.FORMAT_VERSION, data['version'])
             self.assertEqual(self.baker.GAME_VERSION, data['game_version'])
             self.assertGreater(len(data['instances']), 0)
             self.assertTrue(all(len(row) == 10 for row in data['instances']))
             self.assertGreater(len(data['fallen_trees']), 0)
             self.assertTrue(all(
                 len(row) == 9 for row in data['fallen_trees']))
+
+    def test_known_fallen_trees_retain_empty_wgde_slot_offsets(self):
+        sentinels = {
+            '07_lakeville': (
+                (33149, 192),
+                (-2.4453, -0.0003, -2.7824,
+                 3.0829, 5.9032, 2.3934, None)),
+            '23_westfeld': (
+                (31871, 129),
+                (-2.7035, -0.001, -3.1126,
+                 2.3801, 6.3586, 1.32, None)),
+        }
+        for map_name, (wire, profile) in sentinels.items():
+            data = json.loads(
+                (DATA_ROOT / (map_name + '.json')).read_text(
+                    encoding='utf-8'))
+            self.assertIn(list(wire) + list(profile), data['fallen_trees'])
 
     def test_runtime_loader_only_validates_selected_foliage_record(self):
         with tempfile.TemporaryDirectory() as directory:
