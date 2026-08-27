@@ -18,6 +18,3 @@ python.log
 launcher/build/
 launcher/dist/
 deliverables/
-
-# A source checkout materializes the swappable dev client package here.
-client/

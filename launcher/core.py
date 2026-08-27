@@ -841,90 +841,13 @@ def server_root(base_dir=None):
 
 
 def client_archive(port_version, base_dir=None):
-    """Return the client archive this launcher should install, when it exists.
-
-    Packaged launchers read the archive embedded in the bundle.  A source
-    checkout first uses a swappable archive in the current directory
-    (``./client/<port>.zip``); when it is missing, the launcher copies or
-    rebuilds one there from the checkout's own built payload, so a developer
-    can iterate on the client package without rebuilding the launcher.
-    """
-    if base_dir is not None:
-        path = os.path.join(
-            base_dir, CLIENT_PAYLOAD_DIR, "%s.zip" % port_version)
-        return path if os.path.isfile(path) else None
-    bundle_dir = getattr(sys, "_MEIPASS", None)
-    if bundle_dir is not None:
-        path = os.path.join(
-            bundle_dir, CLIENT_PAYLOAD_DIR, "%s.zip" % port_version)
-        return path if os.path.isfile(path) else None
-    return _dev_client_archive(port_version)
-
-
-def _dev_client_archive(port_version):
-    """Resolve the client archive for a source checkout.
-
-    The current-directory package wins, so a developer can drop in a newer
-    build without rebuilding the launcher.  When it is missing, one is
-    materialized there from the checkout's own built payload.
-    """
-    target_dir = os.path.join(os.getcwd(), CLIENT_PAYLOAD_DIR)
-    target = os.path.join(target_dir, "%s.zip" % port_version)
-    if os.path.isfile(target):
-        return target
-    import shutil
-
-    source = _dev_client_archive_source(port_version)
-    if source is None:
-        overlay = _dev_client_overlay(port_version)
-        if overlay is None:
-            return None
-        try:
-            import stage_payload
-
-            stage_payload.stage_clients(
-                target_dir, source_root=repository_root(),
-                client_0922=overlay)
-        except (IOError, OSError, ValueError) as error:
-            raise LauncherError(
-                "The built %s mod could not be staged into the current "
-                "directory: %s" % (port_version, error))
-        return target if os.path.isfile(target) else None
-    try:
-        if not os.path.isdir(target_dir):
-            os.makedirs(target_dir)
-        shutil.copy2(source, target)
-    except (IOError, OSError) as error:
-        raise LauncherError(
-            "The bundled %s mod could not be copied into the current "
-            "directory: %s" % (port_version, error))
-    return target
-
-
-def _dev_client_archive_source(port_version):
-    """Return an already-built client archive a dev launcher can copy."""
-    repo = repository_root()
-    candidates = (
-        os.path.join(repo, CLIENT_PAYLOAD_DIR, "%s.zip" % port_version),
-        os.path.join(repo, "launcher", "build", "payload",
-                     CLIENT_PAYLOAD_DIR, "%s.zip" % port_version),
-    )
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
-def _dev_client_overlay(port_version):
-    """Return the newest built client overlay directory, when one exists."""
-    if port_version != PORT_0_9_22:
-        return None
-    overlays = [path for path in glob.glob(os.path.join(
-        repository_root(), "0.9.22", "dist", "WoT-0.9.22-LAN-Client-*"))
-        if os.path.isdir(path)]
-    if not overlays:
-        return None
-    return max(overlays, key=lambda path: os.path.getmtime(path))
+    """Return the bundled client archive for one port, when it exists."""
+    if base_dir is None:
+        bundle_dir = getattr(sys, "_MEIPASS", None)
+        base_dir = bundle_dir or repository_root()
+    path = os.path.join(base_dir, CLIENT_PAYLOAD_DIR,
+                        "%s.zip" % port_version)
+    return path if os.path.isfile(path) else None
 
 
 def _payload_identity(path):
