@@ -1054,7 +1054,53 @@ class WindowTest(unittest.TestCase):
         self.assertIn("Installed the host vehicle data profile", self._log_text())
         self.assertIn("Fast MS-1", self._log_text())
 
-    def test_join_refuses_when_the_owned_room_profile_was_changed(self):
+    def test_owned_room_keeps_its_pinned_vehicle_data(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": core.LOCAL_HOST,
+            "tcp_port": core.DEFAULT_SERVER_PORT,
+            "needs_server": False,
+            "mode": core.MODE_JOIN,
+            "vehicle_profile": "Fast MS-1",
+        }
+        self.window._server = mock.Mock()
+        self.window._server.poll.return_value = None
+        self.window._server_context = {
+            "game_root": os.path.normcase(os.path.realpath(
+                self.settings_dir)),
+        }
+        digest, fetch, install = self._join_session_overlay_mocks(
+            {"supported": True, "present": True, "digest": "d" * 64,
+             "profile": "Fast MS-1"}, local_digest="d" * 64)
+        with mock.patch(
+                "core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    return_value={"profile": None, "installedMembers": 0,
+                                  "removedMembers": 0}) as prepare, \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    return_value=0), digest, fetch, install as install_mock, \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated"), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch("core.listener_status",
+                           return_value=core.LISTENER_COMPATIBLE), \
+                mock.patch.object(self.window, "_run_game") as run_game, \
+                mock.patch.object(self.window, "_stop_worker"), \
+                mock.patch.object(self.window, "_stop_server"), \
+                mock.patch("core.wait_for_game_shutdown", return_value=True):
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        # The running room's hidden worker is a WorldOfTanks.exe; the local
+        # prepare must not touch the pinned overlay and must not be called.
+        prepare.assert_not_called()
+        install_mock.assert_not_called()
+        run_game.assert_called_once()
+        self.assertIn("keeps the vehicle data it pinned", self._log_text())
+
+    def test_owned_room_refuses_when_local_data_changed(self):
         session = {
             "client": core.PORT_0_9_22,
             "host": core.LOCAL_HOST,
@@ -1077,7 +1123,7 @@ class WindowTest(unittest.TestCase):
                 mock.patch(
                     "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
                     return_value={"profile": None, "installedMembers": 0,
-                                  "removedMembers": 0}), \
+                                  "removedMembers": 0}) as prepare, \
                 mock.patch(
                     "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
                     return_value=0), digest, fetch, install as install_mock, \
@@ -1093,6 +1139,7 @@ class WindowTest(unittest.TestCase):
                 mock.patch("core.wait_for_game_shutdown", return_value=True):
             self.window._run_session(self.settings_dir, session, "Peng")
 
+        prepare.assert_not_called()
         install_mock.assert_not_called()
         run_game.assert_not_called()
         self.assertIn("pinned to the vehicle profile", self._log_text())
