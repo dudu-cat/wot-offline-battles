@@ -96,6 +96,13 @@ python2.7 0.9.22/build_wotmod.py
 pwsh -NoProfile -File launcher/build_launcher.ps1
 ```
 
+Running the launcher from a source checkout (no packaged bundle) installs the
+client mod from a swappable `client/0.9.22.zip` in the current directory:
+when the file is missing, the launcher copies or rebuilds it there from the
+latest `0.9.22/dist/WoT-0.9.22-LAN-Client-*` overlay, so iterating on the
+client package does not require rebuilding the launcher. The packaged
+launcher always uses its embedded bundle.
+
 The launcher carries both LAN servers and both client mods. It writes the
 server address into the file each port already reads at startup, installs the
 mod, starts the game and stops the server when the game closes.

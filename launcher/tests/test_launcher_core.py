@@ -2279,5 +2279,134 @@ class VehicleOverlayFetchTest(unittest.TestCase):
             self._fetch(manifest=self._manifest(), member_reply=reply)
 
 
+class DevClientArchiveTest(unittest.TestCase):
+    """A source checkout reads or materializes ``./client/<port>.zip``."""
+
+    @staticmethod
+    def _write_0_9_22_data(overlay):
+        runtime_files = (
+            "offline_worker_starter.exe",
+            "mods/0.9.22.0.1/offline_instance_guard_native.pyd",
+            "res_mods/0.9.22.0.1/engine_config.offline-player.xml",
+            "res_mods/0.9.22.0.1/engine_config.offline-worker.xml",
+        )
+        for relative in runtime_files:
+            path = os.path.join(overlay, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as stream:
+                stream.write("runtime")
+        data_root = os.path.join(
+            overlay, "mods", "configs", "offline_lan_0922")
+        for dataset in ("navgraphs", "foliage", "destructibles"):
+            dataset_root = os.path.join(data_root, dataset)
+            os.makedirs(dataset_root)
+            records = []
+            for index in range(41):
+                filename = "map-%02d.json" % index
+                records.append({"file": filename})
+                with open(os.path.join(dataset_root, filename), "w") as stream:
+                    stream.write("{}")
+            with open(os.path.join(dataset_root, "manifest.json"), "w") as stream:
+                json.dump({"maps": records}, stream)
+
+    def _environment(self):
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cwd, True)
+        repo = os.path.join(tempfile.mkdtemp(), "repo")
+        self.addCleanup(shutil.rmtree, os.path.dirname(repo), True)
+        return (mock.patch("core.repository_root", return_value=repo),
+                mock.patch("core.os.getcwd", return_value=cwd),
+                repo, cwd)
+
+    @staticmethod
+    def _write(root, relative, data=b"package"):
+        path = os.path.join(root, *relative.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as stream:
+            stream.write(data)
+        return path
+
+    def test_current_directory_package_wins(self):
+        repo_patch, cwd_patch, repo, cwd = self._environment()
+        self._write(cwd, "client/0.9.22.zip", b"current")
+        self._write(repo, "client/0.9.22.zip", b"repo")
+        with repo_patch, cwd_patch:
+            archive = core.client_archive(core.PORT_0_9_22)
+
+        self.assertEqual(
+            os.path.join(cwd, "client", "0.9.22.zip"), archive)
+        with open(archive, "rb") as stream:
+            self.assertEqual(b"current", stream.read())
+
+    def test_repo_client_zip_is_copied_into_the_current_directory(self):
+        repo_patch, cwd_patch, repo, cwd = self._environment()
+        self._write(repo, "client/0.9.22.zip", b"repo-package")
+        with repo_patch, cwd_patch:
+            archive = core.client_archive(core.PORT_0_9_22)
+
+        self.assertEqual(
+            os.path.join(cwd, "client", "0.9.22.zip"), archive)
+        with open(archive, "rb") as stream:
+            self.assertEqual(b"repo-package", stream.read())
+
+    def test_staged_payload_zip_is_copied_into_the_current_directory(self):
+        repo_patch, cwd_patch, repo, cwd = self._environment()
+        self._write(repo, "launcher/build/payload/client/0.9.22.zip",
+                    b"staged-package")
+        with repo_patch, cwd_patch:
+            archive = core.client_archive(core.PORT_0_9_22)
+
+        self.assertEqual(
+            os.path.join(cwd, "client", "0.9.22.zip"), archive)
+        with open(archive, "rb") as stream:
+            self.assertEqual(b"staged-package", stream.read())
+
+    def test_built_overlay_is_staged_when_no_zip_exists(self):
+        repo_patch, cwd_patch, repo, cwd = self._environment()
+        overlay = os.path.join(
+            repo, "0.9.22", "dist", "WoT-0.9.22-LAN-Client-dev1")
+        self._write(overlay, "mods/0.9.22.0.1/"
+                             "org.peng.offline_lan_0922_0.6.0-alpha.7.wotmod")
+        self._write(overlay, "mods/configs/offline_lan_0922/config.json",
+                    b"{}")
+        self._write_0_9_22_data(overlay)
+        with repo_patch, cwd_patch:
+            archive = core.client_archive(core.PORT_0_9_22)
+
+        self.assertEqual(
+            os.path.join(cwd, "client", "0.9.22.zip"), archive)
+        with zipfile.ZipFile(archive) as bundled:
+            names = set(bundled.namelist())
+        self.assertIn(
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.7.wotmod",
+            names)
+        self.assertIn("mods/configs/offline_lan_0922/config.json", names)
+        self.assertIn(
+            "mods/configs/offline_lan_0922/navgraphs/manifest.json", names)
+
+    def test_missing_build_reports_no_mod_files(self):
+        repo_patch, cwd_patch, repo, cwd = self._environment()
+        with repo_patch, cwd_patch:
+            self.assertIsNone(core.client_archive(core.PORT_0_9_22))
+            with self.assertRaisesRegex(
+                    core.LauncherError, "carries no 0.9.22 mod files"):
+                core.install_client_mod(cwd, core.PORT_0_9_22)
+
+    def test_packaged_mode_uses_the_embedded_bundle(self):
+        bundle = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bundle, True)
+        self._write(bundle, "client/0.9.22.zip", b"embedded")
+        with mock.patch.object(sys, "_MEIPASS", bundle, create=True):
+            archive = core.client_archive(core.PORT_0_9_22)
+        self.assertEqual(
+            os.path.join(bundle, "client", "0.9.22.zip"), archive)
+
+    def test_packaged_mode_without_a_bundle_reports_no_mod_files(self):
+        bundle = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, bundle, True)
+        with mock.patch.object(sys, "_MEIPASS", bundle, create=True):
+            self.assertIsNone(core.client_archive(core.PORT_0_9_22))
+
+
 if __name__ == "__main__":
     unittest.main()
