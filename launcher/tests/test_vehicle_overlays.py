@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import shutil
@@ -9,7 +10,6 @@ from unittest import mock
 
 import core
 import vehicle_overlays
-
 
 packed = vehicle_overlays.packed_xml
 
@@ -1572,6 +1572,92 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertIn('--paths', content)
         self.assertIn('--hidden-import packed_xml', content)
         self.assertIn('Launcher build dependency is missing', content)
+
+
+class FetchedOverlayTest(VehicleOverlayTest):
+    """A room host's overlay can be read, installed, and restored."""
+
+    def _activated_payload(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast MS-1", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        activated = vehicle_overlays.activate_vehicle_profile(
+            self.game, "Fast MS-1", is_running=lambda: False)
+        self.assertEqual(1, activated)
+        manifest, payload, digest = vehicle_overlays.active_vehicle_overlay(
+            self.game, is_running=lambda: False)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(1, len(payload))
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        return manifest, payload, digest
+
+    def test_digest_is_empty_without_an_overlay(self):
+        self.assertEqual(
+            "", vehicle_overlays.vehicle_overlay_digest(
+                self.game, is_running=lambda: False))
+
+    def test_install_round_trip_matches_the_activated_overlay(self):
+        manifest, payload, digest = self._activated_payload()
+        self.assertTrue(os.path.exists(self._overlay(self.VEHICLE)))
+        self.assertTrue(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
+
+        removed = vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        self.assertEqual(1, removed)
+        self.assertEqual(
+            "", vehicle_overlays.vehicle_overlay_digest(
+                self.game, is_running=lambda: False))
+
+        installed = vehicle_overlays.install_vehicle_overlay(
+            self.game, manifest, payload, is_running=lambda: False)
+        self.assertEqual(1, installed)
+        again, again_payload, again_digest = (
+            vehicle_overlays.active_vehicle_overlay(
+                self.game, is_running=lambda: False))
+        self.assertEqual(manifest, again)
+        self.assertEqual(payload, again_payload)
+        self.assertEqual(digest, again_digest)
+
+        # The fetched install is removed by the same stock-restore path.
+        removed = vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        self.assertEqual(1, removed)
+
+    def test_install_rejects_a_tampered_member(self):
+        manifest, payload, digest = self._activated_payload()
+        vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        payload = dict(payload)
+        payload[self.VEHICLE] = payload[self.VEHICLE] + b"tampered"
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "checksum"):
+            vehicle_overlays.install_vehicle_overlay(
+                self.game, manifest, payload, is_running=lambda: False)
+
+    def test_install_rejects_a_manifest_member_mismatch(self):
+        manifest, payload, digest = self._activated_payload()
+        vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        payload = dict(payload)
+        del payload[self.VEHICLE]
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "members do not match"):
+            vehicle_overlays.install_vehicle_overlay(
+                self.game, manifest, payload, is_running=lambda: False)
+
+    def test_install_rejects_a_foreign_manifest(self):
+        manifest, payload, digest = self._activated_payload()
+        vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        manifest = copy.deepcopy(manifest)
+        manifest["members"][0]["edits"] = []
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "logical edits"):
+            vehicle_overlays.install_vehicle_overlay(
+                self.game, manifest, payload, is_running=lambda: False)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ settings files that the port already reads at client startup.
 
 from __future__ import annotations
 
+import base64
 import fnmatch
 import glob
 import json
@@ -69,6 +70,8 @@ SERVER_TEAM1_SIZE_ENV_0922 = "WOT_0922_TEAM1_SIZE"
 SERVER_TEAM2_SIZE_ENV_0922 = "WOT_0922_TEAM2_SIZE"
 SERVER_BOT_LINEUP_ENV_0922 = "WOT_0922_BOT_LINEUP"
 SERVER_LOOPBACK_ONLY_ENV_0922 = "WOT_0922_LOOPBACK_ONLY"
+SERVER_VEHICLE_OVERLAY_ROOT_ENV_0922 = "WOT_0922_VEHICLE_OVERLAY_ROOT"
+VEHICLE_OVERLAY_CAPABILITY = "vehicle_overlay_v1"
 CLIENT_SERVER_HOST_ENV_0922 = "OFFLINE_LAN_0922_SERVER_HOST"
 CLIENT_SERVER_PORT_ENV_0922 = "OFFLINE_LAN_0922_SERVER_PORT"
 CLIENT_MODE_ENV_0922 = "OFFLINE_LAN_0922_CLIENT_MODE"
@@ -354,10 +357,9 @@ def plan_session(status, mode, join_text="", team_size=DEFAULT_TEAM_SIZE,
             effective_team1_size, effective_team2_size)
     effective_preferred_team = parse_preferred_team(preferred_team)
     profile_name = str(vehicle_profile or "").strip() or None
-    if profile_name is not None and (
-            port_version != PORT_0_9_22 or mode != MODE_SINGLE):
+    if profile_name is not None and port_version != PORT_0_9_22:
         raise LauncherError(
-            "Modified vehicle profiles are limited to 0.9.22 single player.")
+            "Modified vehicle profiles are limited to the 0.9.22 client.")
     return {
         "client": port_version,
         "mode": mode,
@@ -1456,6 +1458,8 @@ def server_environment(port_version, game_root, environment=None,
         environment[SERVER_TEAM2_SIZE_ENV_0922] = str(team2_size)
         environment[SERVER_BOT_LINEUP_ENV_0922] = json.dumps(
             list(bot_lineup or ()), separators=(",", ":"))
+        environment[SERVER_VEHICLE_OVERLAY_ROOT_ENV_0922] = os.path.abspath(
+            game_root)
         if loopback_only:
             environment[SERVER_LOOPBACK_ONLY_ENV_0922] = "1"
         else:
@@ -1609,6 +1613,147 @@ def probe_server_protocol(port_version, host, port, timeout=1.5, connect=None):
                 connection.close()
             except (IOError, OSError, socket.error):
                 pass
+
+
+_OVERLAY_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+MAX_OVERLAY_MEMBER_BYTES = 8 * 1024 * 1024
+MAX_OVERLAY_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_OVERLAY_LINE_BYTES = MAX_OVERLAY_MEMBER_BYTES * 4 // 3 + 1024 * 1024
+
+
+def _read_json_line(connection, cap):
+    """Read one JSON line from a socket, bounded by ``cap`` bytes."""
+    payload = b""
+    while b"\n" not in payload:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise LauncherError("The server closed the connection.")
+        payload += chunk
+        if len(payload) > cap:
+            raise LauncherError("The server reply is too large.")
+    line, separator, unused = payload.partition(b"\n")
+    if not separator:
+        raise LauncherError("The server reply is invalid.")
+    try:
+        value = json.loads(line.decode("utf-8"))
+    except (TypeError, ValueError) as error:
+        raise LauncherError("The server reply is invalid: %s" % error)
+    return value
+
+
+def fetch_vehicle_overlay(host, port, timeout=5.0, connect=None):
+    """Fetch the vehicle-data overlay a 0.9.22 room host shares.
+
+    Returns one dict:
+
+    - ``{"supported": False, "present": False, ...}`` when the server
+      predates vehicle-data sharing (its room cannot share data);
+    - ``{"supported": True, "present": False, ...}`` when the room runs stock
+      vehicle data;
+    - ``{"supported": True, "present": True, "manifest": ..., "payload": ...}``
+      with the host overlay ready to install.
+    """
+    contract = _SERVER_PROBES.get(PORT_0_9_22)
+    if contract is None:
+        raise LauncherError("The 0.9.22 vehicle-data probe is unavailable.")
+    connect = connect or socket.create_connection
+    connection = connect((host, int(port)), timeout)
+    try:
+        settimeout = getattr(connection, "settimeout", None)
+        if callable(settimeout):
+            settimeout(timeout)
+        hello = {
+            "type": "hello",
+            "protocol": contract["protocol"],
+            "client_build": contract["client_build"],
+            "name": "Launcher-Probe",
+            "vehicle": contract["vehicle"],
+            "max_health": 1,
+            "role": "probe",
+            "vehicle_compact_descr": "AA==",
+            "capabilities": list(contract["capabilities"]),
+        }
+        connection.sendall(
+            (json.dumps(hello, separators=(",", ":")) + "\n").encode(
+                "utf-8"))
+        welcome = _read_json_line(connection, 256 * 1024)
+        if (not isinstance(welcome, dict) or
+                welcome.get("type") != "welcome" or
+                int(welcome.get("protocol", -1)) != contract["protocol"] or
+                welcome.get("client_build") != contract["client_build"]):
+            raise LauncherError("The server is not a compatible 0.9.22 room.")
+        if VEHICLE_OVERLAY_CAPABILITY not in set(
+                welcome.get("server_capabilities") or ()):
+            return {"supported": False, "present": False, "digest": "",
+                    "profile": "", "manifest": None, "payload": {}}
+        connection.sendall(b'{"type":"vehicle_overlay_query"}\n')
+        reply = _read_json_line(connection, 256 * 1024)
+        if (not isinstance(reply, dict) or
+                reply.get("type") != "vehicle_overlay_manifest"):
+            raise LauncherError("The host vehicle-data reply is invalid.")
+        if not reply.get("present"):
+            digest = str(reply.get("digest") or "")
+            if digest and not _OVERLAY_DIGEST.fullmatch(digest):
+                raise LauncherError("The host vehicle-data digest is invalid.")
+            return {"supported": True, "present": False, "digest": digest,
+                    "profile": str(reply.get("profile") or ""),
+                    "manifest": None, "payload": {}}
+        manifest = reply.get("manifest")
+        if not isinstance(manifest, dict):
+            raise LauncherError("The host vehicle-data manifest is invalid.")
+        digest = str(reply.get("digest") or "")
+        if not _OVERLAY_DIGEST.fullmatch(digest):
+            raise LauncherError("The host vehicle-data digest is invalid.")
+        members = manifest.get("members")
+        if not isinstance(members, list) or not members:
+            raise LauncherError("The host vehicle-data manifest is empty.")
+        payload = {}
+        total = 0
+        for entry in members:
+            if not isinstance(entry, dict):
+                raise LauncherError(
+                    "The host vehicle-data manifest is invalid.")
+            member = entry.get("sourceMember")
+            if not isinstance(member, str) or not member:
+                raise LauncherError(
+                    "The host vehicle-data manifest is invalid.")
+            connection.sendall((json.dumps(
+                {"type": "vehicle_overlay_member", "sourceMember": member},
+                separators=(",", ":")) + "\n").encode("utf-8"))
+            data_reply = _read_json_line(connection, MAX_OVERLAY_LINE_BYTES)
+            if (not isinstance(data_reply, dict) or
+                    data_reply.get("type") != "vehicle_overlay_member_data" or
+                    data_reply.get("sourceMember") != member):
+                raise LauncherError(
+                    "The host vehicle-data member reply is invalid.")
+            try:
+                raw = base64.b64decode(
+                    str(data_reply.get("data_b64") or ""), validate=True)
+            except (TypeError, ValueError):
+                raise LauncherError(
+                    "The host vehicle-data member is corrupt: %s" % member)
+            if not raw or len(raw) > MAX_OVERLAY_MEMBER_BYTES:
+                raise LauncherError(
+                    "The host vehicle-data member size is invalid: %s" %
+                    member)
+            total += len(raw)
+            if total > MAX_OVERLAY_TOTAL_BYTES:
+                raise LauncherError(
+                    "The host vehicle-data overlay is too large.")
+            payload[member] = raw
+        return {"supported": True, "present": True, "digest": digest,
+                "profile": str(reply.get("profile") or ""),
+                "manifest": manifest, "payload": payload}
+    except LauncherError:
+        raise
+    except (IOError, OSError, socket.error, ValueError) as error:
+        raise LauncherError(
+            "The host vehicle data could not be fetched: %s" % error)
+    finally:
+        try:
+            connection.close()
+        except (IOError, OSError, socket.error):
+            pass
 
 
 def listener_status(port_version, host, port, timeout=1.5,

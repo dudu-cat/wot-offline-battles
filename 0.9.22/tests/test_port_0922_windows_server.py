@@ -29,6 +29,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
             team_size=15,
             team1_size=15, team2_size=15,
             bot_lineup=[],
+            vehicle_overlay_root=None,
         )
 
     def test_firewall_request_precedes_server_bind(self):
@@ -74,6 +75,7 @@ class WindowsServerLauncherTests(unittest.TestCase):
             team_size=15,
             team1_size=15, team2_size=15,
             bot_lineup=[],
+            vehicle_overlay_root=None,
         )
 
     def test_launcher_environment_selects_the_total_tanks_per_team(self):

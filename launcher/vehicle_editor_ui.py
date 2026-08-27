@@ -18,14 +18,14 @@ DEFAULT_VEHICLE = "R11_MS-1"
 _CHINESE = {
     "0.9.22 vehicle profile: %s": "0.9.22 车辆属性方案：%s",
     "Editing profile '%s'. Choose a nation and vehicle, then a category and "
-    "field. Changes are saved outside res_mods and are materialized only "
-    "while this profile runs in single player. Shared guns, engines and "
-    "other components show every vehicle they affect. IDs, resource paths, "
-    "topology and unknown fields remain locked.":
+    "field. Changes are saved outside res_mods and are materialized while "
+    "this profile runs in single player or is pinned by a LAN room you host. "
+    "Shared guns, engines and other components show every vehicle they "
+    "affect. IDs, resource paths, topology and unknown fields remain locked.":
         "正在编辑方案“%s”。请依次选择系别、车辆、类别和属性。修改保存在 "
-        "res_mods 之外，只会在单人游戏使用该方案时生效。共用的火炮、"
-        "发动机等部件会列出所有受影响的车辆。ID、资源路径、数据结构和"
-        "未知属性不可修改。",
+        "res_mods 之外，会在单人游戏使用该方案、或您开房时固定该方案时生效。"
+        "共用的火炮、发动机等部件会列出所有受影响的车辆。ID、资源路径、"
+        "数据结构和未知属性不可修改。",
     "Nation": "系别",
     "Only nations found in the original vehicle definitions.":
         "只显示原始车辆数据中存在的系别。",

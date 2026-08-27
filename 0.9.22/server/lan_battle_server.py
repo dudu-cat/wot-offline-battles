@@ -40,6 +40,11 @@ if _CLIENT_SCRIPT_ROOT not in sys.path:
 
 from server_bot_ai import BotPlanner
 from offline_rewards import compute_offline_rewards
+from vehicle_overlay_store import (
+    MAX_OVERLAY_MEMBER_BYTES,
+    VehicleOverlayStore,
+    VehicleOverlayStoreError,
+)
 from gui.mods.offline_lan_0922 import tank_collision
 from gui.mods.offline_lan_0922 import burst_mechanics
 from gui.mods.offline_lan_0922 import effective_params as effective_params_wire
@@ -76,6 +81,9 @@ PLAYER_LANDING_HISTORY = 64
 BOT_FIRE_DURATION_SECONDS = 10.0
 BOT_FIRE_TICK_SECONDS = 1.0
 MAX_LINE_BYTES = 256 * 1024
+# Overlay member payloads travel as one base64 JSON line; the store bounds
+# member size, so the line cap is the base64 expansion plus framing slack.
+MAX_OVERLAY_LINE_BYTES = MAX_OVERLAY_MEMBER_BYTES * 4 // 3 + 1024 * 1024
 MAX_RELIABLE_OUTBOUND_MESSAGES = 64
 MAX_RELIABLE_OUTBOUND_BYTES = 4 * 1024 * 1024
 OUTBOUND_SYNC_TIMEOUT_SECONDS = 2.0
@@ -227,6 +235,7 @@ HUMAN_RAM_TIMELINE_CAPABILITY = "human_ram_timeline_v1"
 PLAYER_FIRE_INTENT_CAPABILITY = "player_fire_intent_v4"
 PLAYER_ENVIRONMENT_CAPABILITY = "player_environment_v2"
 EFFECTIVE_PARAMS_CAPABILITY = effective_params_wire.CAPABILITY
+VEHICLE_OVERLAY_CAPABILITY = "vehicle_overlay_v1"
 TEAM_SIZE_SELECTION_CAPABILITY = "team_size_selection_v1"
 MODERN_INPUT_FIELDS = frozenset((
     "type", "round_id", "input_seq",
@@ -252,6 +261,7 @@ SERVER_CAPABILITIES = (
     RANDOM_MAP_CAPABILITY,
     "team_selection_v1",
     TEAM_SIZE_SELECTION_CAPABILITY,
+    VEHICLE_OVERLAY_CAPABILITY,
 )
 SIEGE_DISABLED = 0
 SIEGE_SWITCHING_ON = 1
@@ -11820,6 +11830,52 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "server_capabilities": list(SERVER_CAPABILITIES),
                 })
                 _server_log("PROBE OK %s:%d" % self.client_address)
+                overlay = getattr(server, "vehicle_overlay", None)
+                if overlay is None:
+                    return
+                # A launcher probe may ask for the pinned vehicle-data overlay
+                # before the game starts.  The exchange is bounded by a short
+                # read timeout, so a probe that only checks compatibility
+                # still closes quickly.
+                conn.settimeout(5.0)
+                while True:
+                    while b"\n" not in buffer:
+                        try:
+                            chunk = conn.recv(4096)
+                        except socket.timeout:
+                            return
+                        if not chunk:
+                            return
+                        buffer += chunk
+                        if len(buffer) > MAX_OVERLAY_LINE_BYTES * 2:
+                            return
+                    line, _, buffer = buffer.partition(b"\n")
+                    if not line:
+                        continue
+                    if len(line) > MAX_OVERLAY_LINE_BYTES:
+                        return
+                    try:
+                        message = json.loads(line.decode("utf-8"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(message, dict):
+                        continue
+                    message_type = message.get("type")
+                    if message_type == "vehicle_overlay_query":
+                        self._send_raw(conn, overlay.manifest_payload())
+                    elif message_type == "vehicle_overlay_member":
+                        payload = overlay.member_payload(
+                            message.get("sourceMember"))
+                        if payload is None:
+                            self._send_raw(conn, {
+                                "type": "error",
+                                "code": "unknown_member",
+                                "message": "unknown vehicle overlay member",
+                            })
+                        else:
+                            self._send_raw(conn, payload)
+                    elif message_type == "leave":
+                        return
                 return
             if role == SIMULATION_WORKER_ROLE:
                 self._handle_simulation_worker(
@@ -12294,7 +12350,8 @@ def _run_tick_loop(state, tick_clock=None, sleeper=None):
 def run_server(host, port, map_name, max_players,
                team_size=15, receipt_state_path=None,
                team1_size=None, team2_size=None,
-               bot_tier_mode="random", bot_lineup=None):
+               bot_tier_mode="random", bot_lineup=None,
+               vehicle_overlay_root=None):
     if receipt_state_path is None:
         receipt_state_path = _default_result_receipt_state_path(port)
     state = BattleState(map_name=map_name, max_players=max_players,
@@ -12303,8 +12360,25 @@ def run_server(host, port, map_name, max_players,
                         team1_size=team1_size, team2_size=team2_size,
                         bot_tier_mode=bot_tier_mode,
                         bot_lineup=bot_lineup)
+    if vehicle_overlay_root:
+        try:
+            overlay = VehicleOverlayStore(vehicle_overlay_root)
+        except VehicleOverlayStoreError as error:
+            _server_log("VEHICLE OVERLAY refused: %s" % error)
+            raise
+        if overlay.present:
+            _server_log(
+                "VEHICLE OVERLAY pinned profile=%s digest=%s members=%d" % (
+                    overlay.profile, overlay.digest, overlay.member_count))
+        else:
+            _server_log("VEHICLE OVERLAY none; the room runs stock data")
+    else:
+        overlay = VehicleOverlayStore()
     tcp_server = ThreadedTCPServer((host, port), ClientHandler)
-    tcp_server.game_server = type("GameServer", (), {"state": state})()
+    tcp_server.game_server = type("GameServer", (), {
+        "state": state,
+        "vehicle_overlay": overlay,
+    })()
 
     thread = threading.Thread(
         target=_run_tick_loop, args=(state,),
