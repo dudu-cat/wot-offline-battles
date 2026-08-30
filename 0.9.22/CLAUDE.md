@@ -191,10 +191,11 @@ the real object rejects the call until another field is initialized.
 - Keep one owner for each native pose, filter, projectile visual, callback, or
   authority state. Two plausible writers usually create jitter, duplicate
   effects, or cleanup races.
-- Fail closed when a missing descriptor, native node, collision body, or
-  resource makes the physical result uncertain. Do not launch from a guessed
-  muzzle, pass through an unknown obstacle, or accept an unproved hit merely to
-  keep the battle moving.
+- Do not fabricate a physical result when a descriptor, native node, collision
+  body, or resource is missing: do not launch from a guessed muzzle, pass
+  through an unknown obstacle, or accept an unproved hit. Contain that failure
+  to the current operation, publish an explicit terminal outcome, and keep the
+  rest of the battle running whenever the shared state remains coherent.
 - Every scheduled callback must check battle/round/entity identity and become
   harmless after cleanup. Teardown should be idempotent even after partial
   startup.
@@ -228,6 +229,11 @@ the boundary so neither runtime depends on the other's object model.
 
 ## LAN, authority, and asynchronous work
 
+- Every room has one mandatory hidden native worker. The only simulation path
+  is visible client -> LAN server -> hidden worker -> LAN server -> replicas.
+  Visible clients submit player input and fire intent and never become Bot or
+  projectile authority. The removed visible-client and pure-Python simulation
+  fallbacks must not be reintroduced.
 - A client `_send()` returning true may mean only that an immutable payload was
   admitted to a local sender queue. It is not a server acknowledgement.
 - Freeze or project mutable state at the wire boundary. JSON mapping keys must
@@ -242,11 +248,20 @@ the boundary so neither runtime depends on the other's object model.
   Do not rely on FIFO order between two separately admitted messages when the
   invariant requires atomicity.
 - Repeated messages should be either idempotent with the same fingerprint or
-  rejected before any partial mutation. Validate a complete batch before
-  applying its first item.
+  contained before any partial mutation. Validate a complete batch before
+  applying its first item. A recoverable bad or unverifiable message is local
+  to that message; it must not end the round, freeze all Bots, or disconnect
+  every player.
+- Coalesce only genuinely superseded state. Preserve barriers, accepted fire
+  intents, projectile terminals, destruction events, and other one-shot
+  transitions. Apply elapsed time when a legal update is delayed instead of
+  silently discarding the interval.
 
-The server owns room, round, health, damage and bot authority. Do not infer
-authority from which side happens to calculate a presentation value.
+The server owns room admission, round lifecycle, timing and shared ledgers.
+The hidden worker is the sole native simulation authority for Bot movement,
+map collision and projectile progression; the server validates and commits
+its shared outcomes. Do not infer authority from which side happens to
+calculate a presentation value.
 
 ## Performance investigations
 
@@ -273,6 +288,14 @@ Do not lower projectile/ray safety budgets merely to make a microbenchmark
 green. That can move the cost into catch-up frames or make visuals and damage
 diverge. Native Windows frame pacing remains the performance acceptance.
 
+Bot planning and motion must remain decoupled. If a planning update is late,
+the Bot continues its last valid movement command unless it has an explicit
+tactical or physical reason to stop. Lowering planning, avoidance, or spotting
+cadence is preferable to emitting repeated throttle-zero commands. Hazard
+policy must be identical in A*, direct shortcuts, smoothing, local recovery,
+and runtime probes; otherwise a dry A* route can still turn into a shallow-
+water shortcut and a visible move/reject loop.
+
 ## Failure evidence
 
 For a Python failure, preserve the first traceback and enough preceding
@@ -282,7 +305,8 @@ message. Avoid enabling unbounded per-frame logs before reproducing it.
 For a native crash, collect at minimum:
 
 - exact `WorldOfTanks.exe` identity and client build;
-- exact WOTMOD/overlay SHA-256 and Git commit;
+- matching WOTMOD/overlay and Git revision; calculate a checksum only when an
+  integrity question actually requires it;
 - reproduction steps and whether the crash is deterministic;
 - `python.log` and server log with synchronized timestamps;
 - first-chance/full dump or minidump from the crashing process.
@@ -312,6 +336,10 @@ Windows CI, not by pretending a macOS artifact proves the Windows executable.
 The packaged default endpoint is loopback; the user-owned
 `server_endpoint.json` must never ship in the overlay.
 
+Current desktop-launcher releases are Windows x64 and contain only 0.9.22.
+Inspect the final Actions artifact's PE machine type, nested `0.9.22.zip` and
+Alpha `.wotmod`; do not add 0.8.2 or Map Studio to this distribution.
+
 ## Recurring traps
 
 - Old `ports/0.9.22` commands and old test counts are stale. Discover the live
@@ -327,6 +355,11 @@ The packaged default endpoint is loopback; the user-owned
   it is a perspective effect.
 - A unit-test fake that omits a native guard can produce a false green.
 - A fixed sleep can produce a false red or false green in asynchronous tests.
+- A planner can run at a healthy frequency while repeatedly issuing stop or
+  probe-rejected movement. Log combat mode, target, water depth, probe verdict,
+  throttle and queue age before blaming worker throughput.
+- A hazard penalty in A* is ineffective if direct-link, smoothing, or local-
+  recovery paths bypass the same hazard classification.
 - Updating source-audit hashes before behavior freezes turns a review gate into
   a rubber stamp.
 - Running Python 3 imports against the client source can leave ignored

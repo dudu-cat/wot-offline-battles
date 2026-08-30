@@ -1,7 +1,9 @@
-# Claude working agreement
+# Repository working agreement
 
-This file contains repository-specific working knowledge that is not obvious
-from the implementation. Read it before changing the repository. When working
+This file is the single source of truth for repository-wide agent guidance.
+`AGENTS.md` is a symlink to this file so tools that discover either filename
+receive the same instructions. Do not duplicate or independently edit the
+symlink target. Read this file before changing the repository. When working
 under a client version, also read its version-local guide before investigating
 or editing that implementation: `0.8.2/CLAUDE.md` or `0.9.22/CLAUDE.md`.
 
@@ -24,10 +26,12 @@ or editing that implementation: `0.8.2/CLAUDE.md` or `0.9.22/CLAUDE.md`.
   ambiguous; inspect the exact map, client data, logs, and lifecycle.
 - Fix an in-scope bug directly rather than handing it to an imaginary future
   owner. Preserve unrelated user changes in a dirty worktree.
-- Peng has explicitly permitted validated changes to be committed and pushed
-  directly to `main`. Never force-push. Do not create or push a release tag, or
-  publish a release, until Peng explicitly requests it and the required native
-  acceptance is complete.
+- Peng has explicitly permitted in-scope changes to be committed and pushed
+  directly to `main`. Never force-push. Create a tag or publish a release only
+  when Peng explicitly requests it. Keep validation proportional to his
+  instruction: report missing Windows evidence honestly, but do not invent an
+  extra review, full-CI, or native-acceptance gate after he explicitly asks to
+  commit, package, or release without it.
 
 ## Start every task from the exact current state
 
@@ -68,6 +72,9 @@ committed; remove only exact generated targets after verifying what they are.
   only after proving the target adapter.
 - `ports/0.9.22` is a retired path. The live port is the top-level `0.9.22/`
   directory.
+- Current desktop-launcher releases contain only 0.9.22. Keep 0.8.2 and Map
+  Studio as separate work and separate artifacts unless Peng explicitly
+  changes that packaging decision.
 
 ## Evidence ladder
 
@@ -91,11 +98,102 @@ For example, a Python unit test can prove that a native call is made with the
 reviewed arguments. It cannot prove that the native implementation renders,
 owns memory safely, or feels identical to retail.
 
+## Current 0.9.22 operating model
+
+- Every room has one mandatory hidden native worker. The only simulation path
+  is `visible client -> LAN server -> hidden worker -> LAN server -> replicas`.
+  Visible clients submit player input and fire intent; they never become Bot or
+  projectile authority. Do not restore visible-client authority or the removed
+  pure-Python simulation fallback.
+- The launcher installs and starts the matching server and worker together.
+  Do not build speculative compatibility machinery for combinations it never
+  creates. This is a trusted-LAN product, not an anti-cheat boundary.
+- Validate wire shape, actor/round identity, and safe numeric bounds, but do
+  not reject legal #1513 behavior because a narrow invariant guessed that it
+  was impossible. A recoverable bad, stale, duplicate, or locally
+  unverifiable message must be contained to that message or operation; it
+  must not freeze every Bot, end the round as a system-error draw, disconnect
+  all clients, or return everyone to the garage.
+- Coalesce only state that is genuinely superseded. Preserve barriers,
+  accepted fire intents, projectile terminal events, destruction events, and
+  other one-shot transitions. Never silently discard an admitted shot or a
+  frame merely because the next update arrived late.
+- An accepted operation needs an observable terminal outcome. A fire intent,
+  for example, must become a launched/terminal projectile or an explicit local
+  failure with correct ammunition and reload state. A sound-only no-op that
+  permits immediate refiring is a bug.
+- Use exact client descriptors and client-owned input for the vehicle, gun,
+  shell, crew, equipment, muzzle, pose, and control state the client already
+  knows. Do not invent coefficients, clamps, fallback parameters, or simplified
+  formulas to make a result look plausible.
+
+## Runtime lessons from Windows playtesting
+
+### Bot motion and navigation
+
+- Planning cadence and motion cadence are separate. When no new decision
+  arrives, continue the last valid movement command. Stop only for an explicit
+  tactical hold, terminal state, proved physical blocker, or safety condition.
+  Apply elapsed time when an update is late rather than throwing the interval
+  away.
+- Do not make vehicle avoidance or contact prediction expensive enough to
+  produce repeated throttle-zero commands. Reduced planning or spotting
+  cadence is acceptable; visible walk-stop-walk motion is not. Friendly ram
+  damage is currently disabled, so elaborate teammate avoidance is lower
+  priority than continuous movement.
+- Navigation hazards must agree across A*, direct shortcuts, path smoothing,
+  local recovery, and the runtime motion probe. Shallow water is a high-cost
+  passable fallback when no dry path exists, not a preferred shortcut that
+  ends in a deeper-water rejection loop.
+- Route endpoints, capture targets, and tactical objectives are distinct. Do
+  not send the whole team to one base coordinate when staging, screening,
+  artillery deployment, or map-authored routes are available.
+- Diagnose a stationary Bot by separating presentation from authoritative
+  motion. At a bounded cadence record Bot ID, combat mode, route target, water
+  depth, motion-probe verdict, throttle, planner age, and queue age. A healthy
+  planning frequency does not prove that it issued movement.
+
+### Projectiles, collision, and native presentation
+
+- Freeze an accepted shot's shell, muzzle, direction, dispersion, timing, and
+  relevant vehicle state exactly once. Deferred shell selection must not
+  rebind it. A projectile/native-query failure is local to that projectile and
+  must preserve terminal, reload, and ammunition bookkeeping.
+- Human and Bot paths need parity coverage. Bot-only projectile tests do not
+  prove that a human shot advances, resolves, damages, reports feedback, and
+  settles ammunition correctly.
+- Evaluate moving targets against the correct pose and time. Never leave
+  collision, reticle, or projectile code using a vehicle's spawn pose, and do
+  not mix a current client reticle with an unrelated historical target pose
+  without an explicit latency model.
+- Keep one owner for each remote pose, gun/turret angle, track state,
+  visibility state, projectile visual, and native callback. Competing native
+  and replicated writers cause jitter, extreme gun angles, stale shadows,
+  frozen minimap markers, and birth-pose collision errors.
+- Visibility covers the complete presentation: entity, compound, decals,
+  tracks, shadow, outline, marker, minimap notification, and repeated spotted
+  sound. Render/AOI range applies to friendly vehicles as well as enemies.
+- Collision damage uses horizontal contact-normal closing speed, not full
+  relative or vertical velocity. Preserve the first-impact face; a later SAT
+  separation normal is not a new impact. Do not select the whole vehicle's
+  thinnest armour when the contact ray cannot establish a matching plate.
+- Do not tune collision formulas by feel. The current explicit product choice
+  is no friendly ram damage and a temporary 25% enemy-ram scale while exact
+  retail calibration remains under investigation.
+- Once a fragile destructible is positively identified locally, its collision
+  and presentation may yield immediately while the worker publishes the
+  canonical event. Do not stop or rewind the tank while waiting. Real walls
+  and unidentified objects must continue to block.
+
 ## Canonical documentation
 
 Keep the documentation small. These files have owners; do not duplicate them:
 
+- Root `CLAUDE.md`: repository-wide agent guidance; `AGENTS.md` only links to
+  it.
 - Root `README.md`: what the project is, how a player runs it, how to build it.
+- `0.8.2/CLAUDE.md` and `0.9.22/CLAUDE.md`: version-local technical guidance
+  that supplements this file without redefining repository-wide policy.
 - `0.9.22/INSTALL.txt`: what the 0.9.22 package contains and how to play.
 - `0.9.22/COMPATIBILITY_REVIEW.md`: exact-client interfaces and lifecycle
   evidence for the #1513 port.
@@ -111,15 +209,18 @@ source hash in this instruction file.
 
 - Diagnose with read-only checks first. Implement only when the task includes a
   change.
-- Test the narrow failure first, then the relevant subsystem, then the complete
-  required gate. Use `PYTHONDONTWRITEBYTECODE=1` for Python tests where
-  possible.
+- Test the narrow failure first, then the relevant subsystem, and run a broader
+  gate only when the risk or explicit request requires it. Use
+  `PYTHONDONTWRITEBYTECODE=1` for Python tests where possible. If Peng asks for
+  no review, no CI, or an immediate commit/package, obey rather than adding
+  process theatre.
 - For asynchronous tests, wait for a state transition or acknowledgement. Do
   not use a small fixed sleep as proof that a handler or worker consumed a
   message.
-- Before pushing, inspect the staged diff, run `git diff --check`, commit one
-  coherent change, push `main`, and verify the exact pushed commit's CI when
-  the change affects runtime, packaging, CI, or release behavior.
+- Unless Peng explicitly asks to skip them, inspect the staged diff, run the
+  proportional checks, commit one coherent change, push `main` when requested,
+  and verify the exact pushed commit's relevant CI for runtime, packaging, CI,
+  or release behavior.
 
 A useful final handoff records:
 
@@ -132,3 +233,26 @@ A useful final handoff records:
 
 Never describe a task as complete merely because the static tree is green when
 the stated acceptance requires native Windows evidence.
+
+## Peng's Windows VM, diagnostics, and release delivery
+
+- Windows `C:\\Mac\\Home\\Desktop` maps to macOS `/Users/peng/Desktop`.
+  Shared-folder writes can leave files owned by root on macOS. If a precise
+  replacement is blocked, use `prlctl exec` to perform it from Windows rather
+  than weakening permissions broadly.
+- Deploy test builds through the launcher. Do not manually leave another mod
+  copy in the game directory; stale copies and cross-owner moves have caused
+  installation failures. Keep the shared Desktop free of ambiguous old builds.
+- Treat one report as a coherent session: server log, visible-client
+  `python.log`, hidden-worker log, launcher log, and dump when present. Start
+  ProcDump and helpers without a visible console or focus steal. Normal Alt+F4
+  or launcher-requested termination is not a crash.
+- Persist valid garage, module, and crew changes at safe change boundaries;
+  avoid per-frame disk writes, but do not make persistence depend on a perfect
+  shutdown or one particular launcher button.
+- For releases, align every version pin, build the final Windows launcher from
+  the intended `main` commit with the x64 GitHub Actions workflow, and inspect
+  the outer ZIP, PE machine type, nested `0.9.22.zip`, and contained `.wotmod`.
+  Automated packaging proves the artifact contract, not untested gameplay.
+- Do not calculate or report checksums unless explicitly requested or required
+  by an integrity gate.
