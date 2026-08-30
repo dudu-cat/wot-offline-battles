@@ -66,6 +66,9 @@ from gui.mods.offline_lan_0922.navigation_graph_schema import (
 
 PROTOCOL_VERSION = 5
 TICK_HZ = 30.0
+# #1513 ingests observations and damage immediately, but only needs one
+# full-team tactical order synthesis per second.
+BOT_PLANNER_INTERVAL_TICKS = max(1, int(round(TICK_HZ)))
 REPLICA_SNAPSHOT_HZ = 15.0
 REPLICA_SNAPSHOT_TICKS = max(
     1, int(round(TICK_HZ / REPLICA_SNAPSHOT_HZ)))
@@ -257,6 +260,15 @@ MODERN_INPUT_FIELDS = frozenset((
     "up_cosine",
 ))
 MODERN_INPUT_REQUIRED_FIELDS = frozenset(("round_id",))
+HUMAN_RAM_CONTACT_FIELDS = frozenset((
+    "seq", "bot_id", "bot_state_revision", "presentation_time_us",
+    "native_contact_time_us", "contact_x", "contact_y", "contact_z",
+    "contact_normal_x", "contact_normal_z", "contact_armor_player",
+    "contact_armor_bot", "contact_screened_player",
+    "contact_screened_bot", "contact_spall_player",
+    "contact_bonus_player", "x", "y", "z", "yaw", "pitch", "roll",
+    "vx", "vy", "vz", "bot_vx", "bot_vy", "bot_vz",
+))
 SERVER_CAPABILITIES = (
     DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     LEAN_SNAPSHOT_MANIFEST_CAPABILITY,
@@ -1765,6 +1777,7 @@ class BattleState:
         # snapshot timestamps and recreate a presentation hold.
         self.motion_time_offset_us = 0
         self.bot_orders = {"revision": 0, "orders": []}
+        self._next_bot_planner_tick = 0
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
         self.bot_reported_ram_fingerprints = {}
@@ -2810,6 +2823,7 @@ class BattleState:
         self.motion_time_offset_us = 0
         self.bot_planner.reset()
         self.bot_orders = {"revision": 0, "orders": []}
+        self._next_bot_planner_tick = 0
         self.bot_reported_hits = set()
         self.bot_reported_rams = set()
         self.bot_reported_ram_fingerprints = {}
@@ -3194,6 +3208,7 @@ class BattleState:
             return None
         self.phase = "battle"
         self.tick = 0
+        self._next_bot_planner_tick = 0
         self.state_revision += 1
         live_message = {
             "type": "battle_live",
@@ -3401,9 +3416,7 @@ class BattleState:
     def report_destructible(self, player_id, message):
         """Admit one resolved map destruction into shared LAN state."""
         with self.lock:
-            if (not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None):
+            if not self._message_round_matches(message):
                 return False
             dedicated_authority = (
                 player_id == self.bot_authority_id and
@@ -3418,6 +3431,13 @@ class BattleState:
                     return False
             event = self._sanitize_destructible(message)
             if event is None:
+                return False
+            if self.battle_result is not None:
+                # A native destruction callback may already be queued when
+                # the round terminal overtakes it. Its validated current-round
+                # receipt has no remaining state to change.
+                return True
+            if not self._combat_accepting():
                 return False
             key = (event["destructible_kind"], event["chunk_id"],
                    event["item_index"], event.get("mat_kind"))
@@ -5424,9 +5444,7 @@ class BattleState:
                         "sample_seq", "observations"} or
                     message.get("type") != "player_environment" or
                     authority_id != self.bot_authority_id or
-                    authority_id != SIMULATION_WORKER_AUTHORITY_ID or
-                    not self._combat_accepting() or
-                    self.battle_result is not None):
+                    authority_id != SIMULATION_WORKER_AUTHORITY_ID):
                 return False
             worker = self.simulation_worker
             if worker is None or not worker.connected:
@@ -5443,16 +5461,21 @@ class BattleState:
             except ValueError:
                 return False
             if (round_id != self.round_id or
-                    authority_epoch != self.authority_epoch or
-                    (self.player_environment_authority_epoch ==
-                     authority_epoch and
-                     sample_seq <= self.player_environment_seq)):
+                    authority_epoch != self.authority_epoch):
                 return False
+            terminal_noop = bool(
+                not self._combat_accepting() or
+                self.battle_result is not None)
+            stale_noop = bool(
+                self.player_environment_authority_epoch ==
+                authority_epoch and
+                sample_seq <= self.player_environment_seq)
             raw_observations = message.get("observations")
             if (not isinstance(raw_observations, list) or
                     len(raw_observations) > self.max_players):
                 return False
             observations = {}
+            seen_player_ids = set()
             for raw in raw_observations:
                 if (not isinstance(raw, dict) or
                         set(raw) not in (
@@ -5469,27 +5492,49 @@ class BattleState:
                 except ValueError:
                     return False
                 player = self.players.get(player_id)
+                if player_id in seen_player_ids:
+                    return False
+                seen_player_ids.add(player_id)
+                drowning_critical = None
+                if "drowning_critical" in raw:
+                    if level != 2:
+                        return False
+                    try:
+                        drowning_critical = _critical_payload(
+                            raw["drowning_critical"])
+                    except ValueError:
+                        return False
+                # The worker may have sampled a player immediately before the
+                # connection was removed from this room.  The row still has to
+                # pass the complete trusted-worker envelope above, but it no
+                # longer has canonical state to update and must not poison live
+                # rows in the same batch.
+                if player is None:
+                    continue
                 previous = self.player_environment.get(player_id)
-                if (player_id in observations or player is None or
-                        not player.connected or not player.participating or
+                # A snapshot can be overtaken independently by player death,
+                # leaving the battle, or a newer visible-client pose.  Skip
+                # only that stale row so unrelated live observations in the
+                # same trusted-worker batch continue to converge.
+                if (not player.connected or not player.participating or
                         not player.alive or input_seq > player.input_seq or
                         (previous is not None and
                          input_seq < int(previous["input_seq"]))):
-                    return False
+                    continue
                 observation = {
                     "input_seq": input_seq,
                     "level": level,
                     "observed_tick": int(self.tick),
                 }
-                if "drowning_critical" in raw:
-                    if level != 2:
-                        return False
-                    try:
-                        observation["drowning_critical"] = _critical_payload(
-                            raw["drowning_critical"])
-                    except ValueError:
-                        return False
+                if drowning_critical is not None:
+                    observation["drowning_critical"] = drowning_critical
                 observations[player_id] = observation
+            # The worker can finish an already-queued observation after the
+            # player dies, a newer sample commits, or the round reaches its
+            # terminal result. Validate the complete batch first, then retain
+            # the last canonical water state as a successful no-op.
+            if terminal_noop or stale_noop:
+                return True
             self.player_environment = observations
             self.player_environment_seq = sample_seq
             self.player_environment_authority_epoch = authority_epoch
@@ -6464,11 +6509,16 @@ class BattleState:
         checked_through_ms = _exact_int(
             raw.get("checked_through_ms"), base_checked_ms,
             record["max_time_ms"])
+        # A progress message can be queued before a newer canonical snapshot
+        # reaches the worker.  Validate the absolute physical envelope here;
+        # convergence against the current cursor happens below.  Using the
+        # canonical distance/loss as parser lower bounds made a harmless stale
+        # retry reject the whole batch before it could be recognised as stale.
         checked_distance = round(_bounded_float(
-            raw.get("checked_distance"), record["checked_distance"],
+            raw.get("checked_distance"), 0.0,
             record["max_distance"] + PROJECTILE_TOLERANCE), 6)
         piercing_loss = round(_bounded_float(
-            raw.get("piercing_loss"), record["piercing_loss"], 100000.0), 6)
+            raw.get("piercing_loss"), 0.0, 100000.0), 6)
         penetration_factor = round(_bounded_float(
             raw.get("penetration_factor"), 0.0, 100.0), 6)
         if penetration_factor != record["penetration_factor"]:
@@ -6500,6 +6550,39 @@ class BattleState:
         # the terminal is canonical, the queued cursor's exact time, distance
         # and receipts are obsolete and cannot affect server state.
 
+    @staticmethod
+    def _validate_projectile_progress_envelope(message):
+        """Validate shape while leaving terminal cursor values obsolete."""
+        if (not isinstance(message, dict) or
+                set(message) != {
+                    "type", "round_id", "authority_epoch", "cursors"} or
+                message.get("type") != "projectile_progress"):
+            raise ValueError("projectile progress shape is invalid")
+        cursors = message.get("cursors")
+        if (not isinstance(cursors, list) or not cursors or
+                len(cursors) > PROJECTILE_MAX_PROGRESS_BATCH):
+            raise ValueError("projectile cursor batch is invalid")
+        allowed = {
+            "projectile_id", "base_checked_ms", "checked_through_ms",
+            "checked_distance", "piercing_loss", "penetration_factor",
+            "destructibles",
+        }
+        seen = set()
+        for raw in cursors:
+            if not isinstance(raw, dict) or set(raw) != allowed:
+                raise ValueError("projectile cursor shape is invalid")
+            projectile_id = raw.get("projectile_id")
+            if (not isinstance(projectile_id, str) or not projectile_id or
+                    len(projectile_id) > 96 or projectile_id in seen):
+                raise ValueError("projectile cursor id is invalid")
+            seen.add(projectile_id)
+            destructibles = raw.get("destructibles")
+            if (not isinstance(destructibles, list) or
+                    len(destructibles) > PROJECTILE_MAX_DESTRUCTIBLES):
+                raise ValueError(
+                    "projectile cursor destructible batch is invalid")
+        return cursors
+
     def progress_projectiles(self, player_id, message):
         """Advance an authority-owned batch with cursor compare-and-swap."""
         with self.lock:
@@ -6522,20 +6605,16 @@ class BattleState:
                 return self._set_protocol_reject(
                     reject_kind, "authority",
                     "projectile authority does not match")
+            try:
+                cursors = self._validate_projectile_progress_envelope(message)
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._set_protocol_reject(
+                    reject_kind, "shape", str(error))
             if self.battle_result is not None:
                 return True
             if not self._combat_accepting():
                 return self._set_protocol_reject(
                     reject_kind, "phase", "combat is not accepting commands")
-            if set(message) != {
-                    "type", "round_id", "authority_epoch", "cursors"}:
-                return self._set_protocol_reject(
-                    reject_kind, "shape", "projectile progress shape is invalid")
-            cursors = message.get("cursors")
-            if (not isinstance(cursors, list) or not cursors or
-                    len(cursors) > PROJECTILE_MAX_PROGRESS_BATCH):
-                return self._set_protocol_reject(
-                    reject_kind, "shape", "projectile cursor batch is invalid")
             proposals = []
             seen = set()
             receipt_count = 0
@@ -6567,19 +6646,35 @@ class BattleState:
                     if receipt_count > PROJECTILE_MAX_DESTRUCTIBLES:
                         raise ValueError(
                             "too many projectile destructible receipts")
+                    # Progress fields are cumulative trusted-worker facts.  A
+                    # delayed, duplicated, reordered, post-snapshot, or
+                    # skipped-intermediate cursor therefore converges by
+                    # taking each monotonic frontier.  The trusted worker is
+                    # the only projectile simulation authority; its base is
+                    # advisory rather than a reason to poison the whole batch.
+                    # Any stale component is a no-op, while newer components
+                    # and idempotent destructible receipts are retained.
+                    cursor["base_checked_ms"] = int(
+                        record["checked_through_ms"])
+                    cursor["checked_through_ms"] = max(
+                        int(record["checked_through_ms"]),
+                        int(cursor["checked_through_ms"]))
+                    cursor["checked_distance"] = max(
+                        float(record["checked_distance"]),
+                        float(cursor["checked_distance"]))
+                    cursor["piercing_loss"] = max(
+                        float(record["piercing_loss"]),
+                        float(cursor["piercing_loss"]))
                     fingerprint = _message_fingerprint(cursor)
-                    if cursor["base_checked_ms"] != record[
-                            "checked_through_ms"]:
-                        if record.get(
-                            "last_progress_fingerprint") == fingerprint:
-                            proposals.append((
-                                record, cursor, fingerprint,
-                                request_fingerprint, True))
-                            continue
-                        raise ValueError("cursor compare-and-swap failed")
+                    changed = (
+                        cursor["checked_through_ms"] !=
+                        record["checked_through_ms"] or
+                        cursor["checked_distance"] !=
+                        record["checked_distance"] or
+                        cursor["piercing_loss"] != record["piercing_loss"])
                     proposals.append((
                         record, cursor, fingerprint,
-                        request_fingerprint, False))
+                        request_fingerprint, changed))
             except (AttributeError, TypeError, ValueError,
                     OverflowError) as error:
                 return self._set_protocol_exception(reject_kind, error)
@@ -6587,10 +6682,12 @@ class BattleState:
             changed = False
             destructibles = []
             for (record, cursor, fingerprint, request_fingerprint,
-                 repeated) in proposals:
-                if repeated:
+                 cursor_changed) in proposals:
+                if record is None:
                     continue
                 destructibles.extend(cursor["destructibles"])
+                if not cursor_changed:
+                    continue
                 record["checked_through_ms"] = cursor["checked_through_ms"]
                 record["checked_distance"] = cursor["checked_distance"]
                 record["piercing_loss"] = cursor["piercing_loss"]
@@ -8372,9 +8469,10 @@ class BattleState:
         """Compatibility surface for direct validators and older tests."""
         return self._validate_ram_contact(player, raw_ram)[0]
 
-    def _validate_ram_contact(self, player, raw_ram):
-        """Return one admitted contact or a stable fail-closed reason."""
-        if not isinstance(raw_ram, dict):
+    def _normalize_ram_contact_envelope(self, player, raw_ram):
+        """Validate one receipt without consulting mutable Bot progress."""
+        if (not isinstance(raw_ram, dict) or
+                set(raw_ram) != HUMAN_RAM_CONTACT_FIELDS):
             return None, "malformed_contact"
         try:
             seq = _exact_int(raw_ram.get("seq"), 1, 2147483647)
@@ -8387,46 +8485,52 @@ class BattleState:
             native_contact_time_us = _exact_int(
                 raw_ram.get("native_contact_time_us"), 0,
                 MAX_MOTION_TIME_US)
-            player_armor = float(raw_ram.get("contact_armor_player"))
-            bot_armor = float(raw_ram.get("contact_armor_bot"))
-            player_spall = float(raw_ram.get("contact_spall_player"))
-            player_bonus = float(raw_ram.get("contact_bonus_player"))
-            contact_normal_x = float(raw_ram.get("contact_normal_x"))
-            contact_normal_z = float(raw_ram.get("contact_normal_z"))
-            pitch = float(raw_ram.get("pitch", 0.0))
-            roll = float(raw_ram.get("roll", 0.0))
+            player_armor = _bounded_float(
+                raw_ram.get("contact_armor_player"), 0.0, 5000.0,
+                False)
+            bot_armor = _bounded_float(
+                raw_ram.get("contact_armor_bot"), 0.0, 5000.0, False)
+            player_spall = _bounded_float(
+                raw_ram.get("contact_spall_player"), 1.0, 1.5)
+            player_bonus = _bounded_float(
+                raw_ram.get("contact_bonus_player"), 0.0, 0.15)
+            contact_normal_x = _bounded_float(
+                raw_ram.get("contact_normal_x"), -1.0, 1.0)
+            contact_normal_z = _bounded_float(
+                raw_ram.get("contact_normal_z"), -1.0, 1.0)
+            center_x = _bounded_float(raw_ram.get("x"), -2000.0, 2000.0)
+            center_y = _bounded_float(raw_ram.get("y"), -1000.0, 1000.0)
+            center_z = _bounded_float(raw_ram.get("z"), -2000.0, 2000.0)
+            yaw = _bounded_float(
+                raw_ram.get("yaw"), -math.pi * 2.0, math.pi * 2.0)
+            pitch = _bounded_float(raw_ram.get("pitch", 0.0), -0.61, 0.61)
+            roll = _bounded_float(raw_ram.get("roll", 0.0), -0.61, 0.61)
+            hit_x = _bounded_float(
+                raw_ram.get("contact_x"), -2000.0, 2000.0)
+            hit_y = _bounded_float(
+                raw_ram.get("contact_y"), -1000.0, 1000.0)
+            hit_z = _bounded_float(
+                raw_ram.get("contact_z"), -2000.0, 2000.0)
+            velocities = {
+                name: _bounded_float(raw_ram.get(name), -200.0, 200.0)
+                for name in (
+                    "vx", "vy", "vz", "bot_vx", "bot_vy", "bot_vz")
+            }
         except (TypeError, ValueError, OverflowError):
             return None, "malformed_contact"
         contact_normal_length = math.hypot(
             contact_normal_x, contact_normal_z)
-        if (seq is None or bot_id not in self.bot_states or
-                revision is None or revision > self.bot_state_revision or
-                revision + 255 < self.bot_state_revision or
+        if (seq is None or bot_id is None or revision is None or
                 presentation_time_us is None or
-                presentation_time_us > self.bot_state_time_us or
                 native_contact_time_us is None or
                 abs(native_contact_time_us - presentation_time_us) >
                 int(HUMAN_POSE_HISTORY_SECONDS * 1000000.0) or
-                not math.isfinite(player_armor) or
-                not 0.0 < player_armor <= 5000.0 or
-                not math.isfinite(bot_armor) or
-                not 0.0 < bot_armor <= 5000.0 or
-                not math.isfinite(player_spall) or
-                not 1.0 <= player_spall <= 1.5 or
-                not math.isfinite(player_bonus) or
-                not 0.0 <= player_bonus <= 0.15 or
                 not math.isfinite(contact_normal_length) or
                 not 0.999 <= contact_normal_length <= 1.001 or
-                not math.isfinite(pitch) or not -0.61 <= pitch <= 0.61 or
-                not math.isfinite(roll) or not -0.61 <= roll <= 0.61 or
                 not isinstance(raw_ram.get("contact_screened_player"), bool) or
                 not isinstance(raw_ram.get("contact_screened_bot"), bool) or
                 raw_ram.get("contact_screened_player") or
-                raw_ram.get("contact_screened_bot") or
-                not _has_finite_fields(
-                    raw_ram, ("x", "y", "z", "yaw", "vx", "vy", "vz",
-                              "bot_vx", "bot_vy", "bot_vz",
-                              "contact_x", "contact_y", "contact_z"))):
+                raw_ram.get("contact_screened_bot")):
             return None, "invalid_contact_contract"
         profile = self.human_collision_profiles.get(player.player_id)
         if profile is None:
@@ -8434,18 +8538,12 @@ class BattleState:
         if abs(player_spall - float(
                 profile["ram_profile"]["spall_coefficient"])) > 0.0001:
             return None, "ram_profile_mismatch"
-        center_x = _finite_float(raw_ram.get("x"))
-        center_y = _finite_float(raw_ram.get("y"))
-        center_z = _finite_float(raw_ram.get("z"))
-        yaw = _finite_float(raw_ram.get("yaw"))
-        hit_x = _finite_float(raw_ram.get("contact_x"))
-        hit_y = _finite_float(raw_ram.get("contact_y"))
-        hit_z = _finite_float(raw_ram.get("contact_z"))
         if not tank_collision.body_contains_point({
                 "x": center_x, "y": center_y, "z": center_z,
                 "yaw": yaw, "pitch": pitch, "roll": roll,
                 "shape": profile["shape"],
-        }, (hit_x, hit_y, hit_z)):
+        }, (hit_x, hit_y, hit_z),
+                slop=tank_collision.RAM_CONTACT_POINT_SLOP):
             return None, "contact_outside_player_body"
         if (contact_normal_x * (center_x - hit_x) +
                 contact_normal_z * (center_z - hit_z)) <= 0.000001:
@@ -8456,9 +8554,9 @@ class BattleState:
             "bot_state_revision": revision,
             "presentation_time_us": presentation_time_us,
             "native_contact_time_us": native_contact_time_us,
-            "contact_x": round(_clamp(hit_x, -2000.0, 2000.0), 4),
-            "contact_y": round(_clamp(hit_y, -1000.0, 1000.0), 4),
-            "contact_z": round(_clamp(hit_z, -2000.0, 2000.0), 4),
+            "contact_x": round(hit_x, 4),
+            "contact_y": round(hit_y, 4),
+            "contact_z": round(hit_z, 4),
             "contact_normal_x": round(
                 contact_normal_x / contact_normal_length, 6),
             "contact_normal_z": round(
@@ -8469,28 +8567,33 @@ class BattleState:
             "contact_screened_bot": raw_ram["contact_screened_bot"],
             "contact_spall_player": round(player_spall, 4),
             "contact_bonus_player": round(player_bonus, 6),
-            "x": round(_clamp(_finite_float(
-                raw_ram.get("x")), -2000.0, 2000.0), 4),
-            "y": round(_clamp(_finite_float(
-                raw_ram.get("y")), -1000.0, 1000.0), 4),
-            "z": round(_clamp(_finite_float(
-                raw_ram.get("z")), -2000.0, 2000.0), 4),
-            "yaw": round(_finite_float(raw_ram.get("yaw")), 5),
+            "x": round(center_x, 4),
+            "y": round(center_y, 4),
+            "z": round(center_z, 4),
+            "yaw": round(yaw, 5),
             "pitch": round(pitch, 5),
             "roll": round(roll, 5),
-            "vx": round(_clamp(_finite_float(
-                raw_ram.get("vx")), -200.0, 200.0), 4),
-            "vy": round(_clamp(_finite_float(
-                raw_ram.get("vy")), -200.0, 200.0), 4),
-            "vz": round(_clamp(_finite_float(
-                raw_ram.get("vz")), -200.0, 200.0), 4),
-            "bot_vx": round(_clamp(_finite_float(
-                raw_ram.get("bot_vx")), -200.0, 200.0), 4),
-            "bot_vy": round(_clamp(_finite_float(
-                raw_ram.get("bot_vy")), -200.0, 200.0), 4),
-            "bot_vz": round(_clamp(_finite_float(
-                raw_ram.get("bot_vz")), -200.0, 200.0), 4),
+            "vx": round(velocities["vx"], 4),
+            "vy": round(velocities["vy"], 4),
+            "vz": round(velocities["vz"], 4),
+            "bot_vx": round(velocities["bot_vx"], 4),
+            "bot_vy": round(velocities["bot_vy"], 4),
+            "bot_vz": round(velocities["bot_vz"], 4),
         }, None
+
+    def _validate_ram_contact(self, player, raw_ram):
+        """Return one admitted contact or a stable fail-closed reason."""
+        contact, reason = self._normalize_ram_contact_envelope(
+            player, raw_ram)
+        if contact is None:
+            return None, reason
+        if (contact["bot_id"] not in self.bot_states or
+                contact["bot_state_revision"] > self.bot_state_revision or
+                contact["bot_state_revision"] + 255 <
+                self.bot_state_revision or
+                contact["presentation_time_us"] > self.bot_state_time_us):
+            return None, "invalid_contact_contract"
+        return contact, None
 
     @staticmethod
     def _validated_player_destructible_contact(raw_contact):
@@ -8498,19 +8601,23 @@ class BattleState:
         if (not isinstance(raw_contact, dict) or
                 set(raw_contact) != {
                     "seq", "x", "y", "z", "yaw", "speed", "dt",
-                    "token"} or
-                not _has_finite_fields(
-                    raw_contact, ("x", "y", "z", "yaw", "speed", "dt"))):
+                    "token"}):
             return None
         try:
             seq = _exact_int(raw_contact.get("seq"), 1, PROJECTILE_MAX_ID)
-            speed = _finite_float(raw_contact.get("speed"))
-            step = _finite_float(raw_contact.get("dt"))
+            x = _bounded_float(raw_contact.get("x"), -2000.0, 2000.0)
+            y = _bounded_float(raw_contact.get("y"), -1000.0, 1000.0)
+            z = _bounded_float(raw_contact.get("z"), -2000.0, 2000.0)
+            yaw = _bounded_float(
+                raw_contact.get("yaw"), -math.pi * 2.0, math.pi * 2.0)
+            speed = _bounded_float(
+                raw_contact.get("speed"), -200.0, 200.0)
+            step = _bounded_float(
+                raw_contact.get("dt"), 0.0, 0.1, False)
         except (TypeError, ValueError, OverflowError):
             return None
         raw_token = raw_contact.get("token")
-        if (seq is None or not 0.0 < step <= 0.1 or
-                not 0.001 <= abs(speed) <= 200.0 or
+        if (seq is None or not 0.001 <= abs(speed) or
                 not isinstance(raw_token, list) or
                 not 1 <= len(raw_token) <= 16):
             return None
@@ -8535,14 +8642,11 @@ class BattleState:
             row[0], row[1], -1 if row[2] is None else row[2]))
         return {
             "seq": seq,
-            "x": round(_clamp(_finite_float(
-                raw_contact.get("x")), -2000.0, 2000.0), 4),
-            "y": round(_clamp(_finite_float(
-                raw_contact.get("y")), -1000.0, 1000.0), 4),
-            "z": round(_clamp(_finite_float(
-                raw_contact.get("z")), -2000.0, 2000.0), 4),
-            "yaw": round(_finite_float(raw_contact.get("yaw")), 5),
-            "speed": round(_clamp(speed, -200.0, 200.0), 4),
+            "x": round(x, 4),
+            "y": round(y, 4),
+            "z": round(z, 4),
+            "yaw": round(yaw, 5),
+            "speed": round(speed, 4),
             "dt": round(step, 6),
             "token": [list(row) for row in ordered],
         }
@@ -8612,6 +8716,68 @@ class BattleState:
             player.pose_history.popleft()
         return True
 
+    def _modern_input_envelope_valid(self, player, message,
+                                     validate_contacts=False):
+        """Validate one input envelope without advancing any ledger."""
+        bounded_fields = {
+            "forward": (-1.0, 1.0),
+            "turn": (-1.0, 1.0),
+            "speed": (-200.0, 200.0),
+            "aim_yaw": (-math.pi * 2.0, math.pi * 2.0),
+            "gun_pitch": (-1.2, 1.2),
+            "x": (-2000.0, 2000.0),
+            "y": (-1000.0, 1000.0),
+            "z": (-2000.0, 2000.0),
+            "yaw": (-math.pi * 2.0, math.pi * 2.0),
+            "pitch": (-0.61, 0.61),
+            "roll": (-0.61, 0.61),
+        }
+        try:
+            _exact_int(message.get("round_id"), 1, PROJECTILE_MAX_ID)
+            for name, bounds in bounded_fields.items():
+                if name in message:
+                    _bounded_float(message[name], bounds[0], bounds[1])
+            if "pose_time_us" in message:
+                _exact_int(
+                    message["pose_time_us"], 0, MAX_MOTION_TIME_US)
+            if "fire_seq" in message:
+                _exact_int(message["fire_seq"], 0, PROJECTILE_MAX_ID)
+            if "input_seq" in message:
+                _exact_int(
+                    message["input_seq"], 1, PROJECTILE_MAX_ID)
+            elif HUMAN_RAM_TIMELINE_CAPABILITY in player.capabilities:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if ("siege_enabled" in message and
+                not isinstance(message["siege_enabled"], bool)):
+            return False
+        if not validate_contacts:
+            # Active frames retain the established per-row rejection path.
+            # A bad optional contact must not reject the ordered control frame
+            # and leave every subsequent input stuck behind a sequence gap.
+            return True
+        raw_ram_contacts = message.get("ram_contacts", [])
+        if (not isinstance(raw_ram_contacts, list) or
+                len(raw_ram_contacts) > 16):
+            return False
+        for raw_ram in raw_ram_contacts:
+            if self._normalize_ram_contact_envelope(
+                    player, raw_ram)[0] is None:
+                return False
+        if "ram_contact" in message and self._normalize_ram_contact_envelope(
+                player, message["ram_contact"])[0] is None:
+            return False
+        raw_destructible_contacts = message.get(
+            "destructible_contacts", [])
+        if (not isinstance(raw_destructible_contacts, list) or
+                len(raw_destructible_contacts) >
+                MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS):
+            return False
+        return all(
+            self._validated_player_destructible_contact(raw) is not None
+            for raw in raw_destructible_contacts)
+
     @staticmethod
     def _player_pose_for_destructible_contact(player, contact):
         """Bind a proposal only to an already admitted player input sample."""
@@ -8637,18 +8803,20 @@ class BattleState:
             player = self.players.get(player_id)
             if player is None or not player.connected:
                 return False
+            inactive_modern = False
             if self.client_build == CLIENT_BUILD_0922:
                 fields = set(message)
                 if (("type" in message and
                      message.get("type") != "input") or
                         not MODERN_INPUT_REQUIRED_FIELDS.issubset(fields) or
-                        fields - MODERN_INPUT_FIELDS or
-                        self.phase != "battle" or
-                        self.battle_result is not None or
-                        not player.participating or not player.alive):
+                        fields - MODERN_INPUT_FIELDS):
                     # Reject the whole transaction before sequence, gun,
                     # controls or pose state can advance.
                     return False
+                inactive_modern = bool(
+                    self.phase != "battle" or
+                    self.battle_result is not None or
+                    not player.participating or not player.alive)
             shell_selection = None
             gun_checkpoint = None
             has_next_shell = "next_shell_index" in message
@@ -8700,6 +8868,16 @@ class BattleState:
                         not -1.0 <= float(raw_up_cosine) <= 1.0):
                     return False
                 reported_up_cosine = float(raw_up_cosine)
+            if self.client_build == CLIENT_BUILD_0922:
+                if not self._modern_input_envelope_valid(
+                        player, message, validate_contacts=inactive_modern):
+                    return False
+                if inactive_modern:
+                    # A complete input frame may already be queued when death,
+                    # leave, or the round result overtakes it. Validate its
+                    # entire non-mutating envelope first, then fold it without
+                    # advancing sequence, pose, gun, or control state.
+                    return True
             if HUMAN_RAM_TIMELINE_CAPABILITY in player.capabilities:
                 accepted, duplicate = self._admit_player_input(
                     player, message)
@@ -11140,13 +11318,21 @@ class BattleState:
             self._tick_player_drowning(dt)
             self._tick_player_overturn(dt)
             self._expire_projectiles()
-            if self.battle_result is None:
+            # Observation and damage handlers update planner memory as their
+            # messages arrive. Only the full-roster synthesis is throttled;
+            # authoritative events and snapshots continue every tick below.
+            if (self.battle_result is None and
+                    self.tick >= self._next_bot_planner_tick):
                 self.bot_orders = self.bot_planner.build_orders(
                     self.bot_manifest, list(self.bot_states.values()),
                     [self._public_player(p, include_outfits=False)
                      for p in self.players.values()
                      if p.connected and p.participating],
                     time.monotonic(), self._bot_defense_context())
+                self._next_bot_planner_tick = (
+                    self.tick +
+                    (BOT_PLANNER_INTERVAL_TICKS
+                     if self.client_build == CLIENT_BUILD_0922 else 1))
             tick_server_time_ms = None
             if self.client_build == CLIENT_BUILD_0922:
                 # Freeze the one current clock sample shared by this tick's

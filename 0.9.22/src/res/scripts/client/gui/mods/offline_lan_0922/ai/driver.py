@@ -574,10 +574,10 @@ class LocalDriver(object):
 			# while the hull is still turning makes it circle at the foot of the
 			# climb and repeatedly invalidates the next terrain sample.
 			throttle = 0.0
-		elif abs(delta) > 1.35 and not avoiding:
-			# A route heading more than about 77 degrees off the bow is a pivot.
-			# Keep translating avoidance branches available for overlapping hulls,
-			# but align ordinary route followers before applying drive torque.
+		elif abs(delta) > math.pi * 0.5 and not avoiding:
+			# Only a target behind the hull needs a stationary pivot. Side and
+			# diagonal route corners retain forward progress while steering, which
+			# avoids long zero-throttle pauses on slow heavy tanks.
 			throttle = 0.0
 		return {
 			'throttle': throttle,

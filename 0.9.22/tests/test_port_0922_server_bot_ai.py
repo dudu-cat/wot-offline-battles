@@ -7,7 +7,16 @@ PORT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from server_bot_ai import BotPlanner, _order_signature  # noqa: E402
-from lan_battle_server import BattleState, Player  # noqa: E402
+from lan_battle_server import (  # noqa: E402
+    BOT_PLANNER_INTERVAL_TICKS,
+    CLIENT_BUILD_0922,
+    PREBATTLE_SECONDS,
+    SIMULATION_WORKER_AUTHORITY_ID,
+    TICK_HZ,
+    BattleState,
+    Player,
+    SimulationWorker,
+)
 from gui.mods.offline_lan_0922.bot_runtime import (  # noqa: E402
     _overlay_live_target_pose,
 )
@@ -94,6 +103,20 @@ def _capture_defense():
             '2': [{'id': '2:0', 'x': 123.5, 'y': 0.0, 'z': 456.25}],
         },
     }
+
+
+class _CountingPlanner(object):
+    def __init__(self, state):
+        self.state = state
+        self.build_ticks = []
+        self.reset_count = 0
+
+    def build_orders(self, *unused_args):
+        self.build_ticks.append(self.state.tick)
+        return {"revision": len(self.build_ticks), "orders": []}
+
+    def reset(self):
+        self.reset_count += 1
 
 
 class ServerBotTacticsTests(unittest.TestCase):
@@ -524,6 +547,108 @@ class ServerBotTacticsTests(unittest.TestCase):
 
         self.assertEqual([(11, 'player', 1, 175, 12.5)], received)
 
+    def test_global_planning_runs_at_one_hz_while_worker_snapshots_stay_30_hz(self):
+        state = BattleState()
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        planner = _CountingPlanner(state)
+        state.bot_planner = planner
+        snapshots = []
+        worker = SimulationWorker(None, ('test', 0))
+        worker.offer_reliable = (
+            lambda message: snapshots.append(message) or True)
+        worker.offer_snapshot = (
+            lambda message: snapshots.append(message) or True)
+        state.simulation_worker = worker
+
+        for unused in range(BOT_PLANNER_INTERVAL_TICKS + 1):
+            state.tick_once(1.0 / TICK_HZ)
+
+        self.assertEqual([1, 31], planner.build_ticks)
+        self.assertEqual(BOT_PLANNER_INTERVAL_TICKS + 1, state.tick)
+        self.assertEqual(
+            list(range(1, BOT_PLANNER_INTERVAL_TICKS + 2)),
+            [message['server_tick'] for message in snapshots])
+
+    def test_first_live_tick_replans_immediately_after_round_reset(self):
+        state = BattleState()
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        planner = _CountingPlanner(state)
+        state.bot_planner = planner
+
+        state.tick_once(1.0 / TICK_HZ)
+        for unused in range(BOT_PLANNER_INTERVAL_TICKS - 1):
+            state.tick_once(1.0 / TICK_HZ)
+        self.assertEqual([1], planner.build_ticks)
+
+        state._reset_round()
+        state.phase = 'battle'
+        state.tick_once(1.0 / TICK_HZ)
+
+        self.assertEqual(1, planner.reset_count)
+        self.assertEqual([1, 1], planner.build_ticks)
+
+    def test_observation_and_damage_memory_survive_skipped_plan_ticks(self):
+        state = BattleState()
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+        state.bot_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.bot_manifest_authority_id = SIMULATION_WORKER_AUTHORITY_ID
+        state.bot_manifest = list(self.manifest)
+        state.bot_states = {11: dict(self.states[0])}
+        target = Player(
+            2, None, ('test', 0), team=2, connected=True,
+            participating=True)
+        target.offer_reliable = lambda unused_message: True
+        target.offer_snapshot = lambda unused_message: True
+        state.players[2] = target
+        build_ticks = []
+        build_orders = state.bot_planner.build_orders
+
+        def record_build(*args, **kwargs):
+            build_ticks.append(state.tick)
+            return build_orders(*args, **kwargs)
+
+        state.bot_planner.build_orders = record_build
+        state.tick_once(1.0 / TICK_HZ)
+        relay = state.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'bot_observation', 'round_id': state.round_id,
+                'contacts': [{
+                    'observing_team': 1, 'target_kind': 'human',
+                    'target_id': 2, 'target_team': 2,
+                    'visible': True, 'fresh': True, 'time_left': 10.0,
+                    'visible_by_bot_ids': [11],
+                    'visible_by_player_ids': [],
+                    'shootable_by_bot_ids': [11],
+                    'x': 0.0, 'y': 0.0, 'z': 150.0,
+                    'health': 1000, 'max_health': 1000,
+                }],
+                'affordances': [],
+            })
+        state._record_damage(
+            ('player', 2), ('bot', 11), 75, {})
+
+        self.assertIsInstance(relay, dict)
+        self.assertIn(('human', 2), state.bot_planner._contacts[1])
+        self.assertEqual(
+            ('human', 2),
+            state.bot_planner._recent_hits[11]['attacker'])
+        for unused in range(BOT_PLANNER_INTERVAL_TICKS - 1):
+            state.tick_once(1.0 / TICK_HZ)
+        self.assertEqual([451], build_ticks)
+
+        state.tick_once(1.0 / TICK_HZ)
+
+        self.assertEqual([451, 481], build_ticks)
+        order = next(
+            order for order in state.bot_orders['orders']
+            if order['id'] == 11)
+        self.assertEqual(2, order['target_id'])
+
 
 class ServerBotArtilleryTests(unittest.TestCase):
     def test_spg_keeps_a_client_proved_target_beyond_direct_fire_range(self):
@@ -869,6 +994,43 @@ class ServerHumanRamNormalTests(unittest.TestCase):
         self.assertEqual((0.0, -1.0), (
             normalized['contact_normal_x'],
             normalized['contact_normal_z']))
+
+    def test_player_receipt_allows_one_frame_contact_point_pose_skew(self):
+        state = BattleState()
+        state.bot_states[11] = {'id': 11}
+        state.bot_state_revision = 1
+        state.bot_state_time_us = 123000
+        state.human_collision_profiles[1] = {
+            'shape': (1.5, 3.5, -0.8, 2.0),
+            'ram_profile': {
+                'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        }
+        player = Player(
+            1, object(), ('127.0.0.1', 1), team=1, slot=0)
+        raw = {
+            'seq': 1, 'bot_id': 11, 'bot_state_revision': 1,
+            'presentation_time_us': 123000,
+            'native_contact_time_us': 123000,
+            'contact_x': 0.0, 'contact_y': 0.0, 'contact_z': 4.0,
+            'contact_normal_x': 0.0, 'contact_normal_z': -1.0,
+            'contact_armor_player': 80.0, 'contact_armor_bot': 100.0,
+            'contact_spall_player': 1.0, 'contact_bonus_player': 0.0,
+            'contact_screened_player': False,
+            'contact_screened_bot': False,
+            'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+            'pitch': 0.0, 'roll': 0.0,
+            'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
+            'bot_vx': 0.0, 'bot_vy': 0.0, 'bot_vz': 0.0,
+        }
+
+        normalized, reason = state._validate_ram_contact(player, raw)
+        self.assertIsNone(reason)
+        self.assertIsNotNone(normalized)
+
+        remote = dict(raw, contact_z=4.5)
+        normalized, reason = state._validate_ram_contact(player, remote)
+        self.assertIsNone(normalized)
+        self.assertEqual('contact_outside_player_body', reason)
 
     def test_player_receipt_rejects_flipped_or_perpendicular_normal(self):
         state = BattleState()

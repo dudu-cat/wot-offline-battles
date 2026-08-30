@@ -67,6 +67,21 @@ def pitch_params(descriptor):
     }
 
 
+def absolute_pitch_limits(descriptor):
+    """Return the active gun's validated relative pitch envelope."""
+    gun = _field(descriptor, 'gun')
+    limits = _field(gun, 'pitchLimits')
+    absolute = _field(limits, 'absolute', limits)
+    try:
+        minimum = _finite(absolute[0], 'minimum gun pitch')
+        maximum = _finite(absolute[1], 'maximum gun pitch')
+    except (IndexError, KeyError, TypeError):
+        raise ValueError('gun pitch limits are unavailable')
+    if minimum > maximum:
+        raise ValueError('gun pitch limits are inverted')
+    return minimum, maximum
+
+
 def siege_switching(siege_state):
     return int(siege_state) in (SWITCHING_ON, SWITCHING_OFF)
 
@@ -132,6 +147,24 @@ def minimal_correction(total_pitch, gun_minimum, gun_maximum,
                  correction_maximum + 1.0e-9)
     return (max(correction_minimum, min(correction_maximum, required)),
             reachable)
+
+
+def world_target_correction(world_pitch, terrain_pitch,
+                            gun_minimum, gun_maximum,
+                            correction_minimum, correction_maximum):
+    """Resolve one world target against gun travel and hydraulic travel.
+
+    ``world_pitch`` and ``terrain_pitch`` use #1513's negative-up convention.
+    The result is the chassis correction nearest zero, so the gun consumes its
+    ordinary relative travel before the hydraulic suspension moves.
+    """
+    world_pitch = _finite(world_pitch, 'world target pitch')
+    terrain_pitch = _finite(terrain_pitch, 'terrain pitch')
+    relative_pitch = ((world_pitch - terrain_pitch + math.pi) %
+                      (2.0 * math.pi) - math.pi)
+    return minimal_correction(
+        relative_pitch, gun_minimum, gun_maximum,
+        correction_minimum, correction_maximum)
 
 
 def slew(current, desired, speed, elapsed):

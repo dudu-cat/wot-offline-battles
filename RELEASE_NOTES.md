@@ -12,6 +12,16 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   stalls, duplicate or reordered updates, queue pressure, and timing drift
   without unnecessarily ending the battle. Identity, round, roster, and
   message-shape boundaries remain enforced.
+- Projectile progress now converges each cumulative cursor independently, so
+  a delayed or skipped worker snapshot no longer rejects the whole active
+  projectile batch. Valid destruction receipts in a stale cursor are retained.
+- Current-round input, water, and destruction messages already queued when a
+  vehicle dies or a battle ends are accepted as terminal no-ops. One stale
+  player observation no longer discards unrelated live observations in the
+  same trusted-worker batch.
+- Native ramming receipts tolerate one bounded presentation-frame difference
+  between the collision callback and copied vehicle pose, while remote contact
+  points, invalid normals, identities, and physical values remain rejected.
 - Rapid-fire projectile, muzzle, impact, and terrain visuals are bounded and
   fail independently. Visual overload no longer interrupts authoritative
   shots, hits, damage, statistics, or results.
@@ -36,10 +46,32 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Bots align their hull before committing to a route, reducing base spinning
   and stop-start movement. Discovered artillery is now a priority target
   without making every bot focus the same vehicle.
+- Direct goals, A* fallbacks, path smoothing, and local steering now share the
+  same shallow-water policy. Bots prefer a dry route, use only an A*-selected
+  shallow crossing when unavoidable, and can still drive out after entering
+  water.
+- Heavy tanks keep moving through ordinary side turns and reserve stationary
+  pivots for targets behind the hull. Final Bot movement, tank pushes, and
+  rotation are constrained by the complete chassis at the official map edge.
+- Player driving, collision deflection, slope sliding, airborne carry, tank
+  pushes, and pivoting now use the same complete-chassis map-edge constraint.
+  A stale out-of-bounds pose can drive inward but cannot drift farther out.
 - The 0.9.22 bot roster now draws from 40 Chinese player names styled for the
   2017 client era.
 - Authoritative artillery stun is enabled and presented through the stock
   0.9.22 client interface.
+
+## Performance
+
+- Full-team tactical synthesis and expensive firing-lane and cover scans run
+  at 1 Hz. Ordinary target and ballistic solutions run at 10 Hz, local
+  route/contact decisions at their measured 6.7 Hz cadence, visibility reports
+  at 2.5 Hz, and spotting samples at 6 Hz. Motion, collision, gun movement,
+  burst fire, and client publication remain at 30 Hz for smooth presentation
+  and exact hits.
+- Repeated native muzzle reads and critical-module parsing are reused only
+  within their safe authority tick, reducing worker-side Python and native
+  boundary work without putting private cache state on the wire.
 
 ## Ammunition, vehicles, and the editor
 
@@ -47,8 +79,10 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   reloading. Magazine vehicles keep firing the current clip after selecting
   the next shell type, and Loader Intuition publishes the committed shell even
   if its HUD notification fails.
-- Swedish Siege mode now applies hydraulic hull aiming without calling an
-  unsafe native physics path, restoring aiming in engineering mode.
+- Swedish Siege mode now keeps the hydraulic hull, visible barrel, reticle,
+  and fired ray on one copied pose, uses the active gun's real pitch limits,
+  and recenters safely when leaving engineering mode without calling an unsafe
+  native physics path.
 - If a complete saved crew belongs to the wrong nation, the exact #1513
   attribute calculation retries once with that vehicle's default crew. Other
   vehicle-structure or native errors remain visible instead of being hidden.
@@ -65,7 +99,7 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 
 ## Credits
 
-Thanks to 秋风扫落叶 for the bot behavior review and improvement suggestions.
+Thanks to 秋风扫落叶 for the contributed bot behavior improvements and review.
 
 When reporting a reproducible problem, please include the launcher activity
 text, `server.log` beside the launcher, and the game's `python.log`, together

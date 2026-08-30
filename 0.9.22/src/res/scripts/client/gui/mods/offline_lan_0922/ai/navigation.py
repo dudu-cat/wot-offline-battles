@@ -329,6 +329,26 @@ class TerrainGrid(object):
 				return True
 		return False
 
+	def point_has_baked_hazard(self, point, hazard_mask):
+		"""Return whether one realised pose occupies a baked hazard cell."""
+		if not self.prebaked:
+			return False
+		index = self._baked_flat_index(self.cell_for(point))
+		return bool(index is not None and
+		            int(self._baked_hazards[index]) & int(hazard_mask))
+
+	def dry_segment_clear(self, start, end, now):
+		"""Prove one preferred direct segment without entering shallow water.
+
+		Shallow cells remain linked for the weighted A* fallback.  This predicate
+		is only for raw goals, smoothing and reactive shortcuts which have not
+		been selected by that planner.
+		"""
+		return (self.segment_penalty(start, end, now) <= 0.0 and
+		        not self.segment_has_baked_hazard(
+		            start, end, BAKED_SHALLOW_WATER) and
+		        self.segment_clear(start, end))
+
 	def path_has_penalty(self, path, now):
 		if not self._failed_edges:
 			return False
@@ -618,10 +638,7 @@ class TerrainGrid(object):
 				if y is None:
 					continue
 				candidate = (x, y, z)
-				if (self.segment_penalty(current, candidate, now) > 0.0 or
-						self.segment_has_baked_hazard(
-							current, candidate, BAKED_SHALLOW_WATER) or
-						not self.segment_clear(current, candidate)):
+				if not self.dry_segment_clear(current, candidate, now):
 					continue
 				cell = self.cell_for(candidate)
 				score = (_distance_2d(candidate, goal) + abs(offset) * 3.5 +
@@ -781,10 +798,8 @@ class TerrainGrid(object):
 						 path, index, furthest)) and
 						self.shortcut_preserves_climb_approach(
 						path, index, furthest) and
-						self.segment_penalty(path[index], path[furthest], now) <= 0.0 and
-						not self.segment_has_baked_hazard(
-							path[index], path[furthest], BAKED_SHALLOW_WATER) and
-						self.segment_clear(path[index], path[furthest])):
+						self.dry_segment_clear(
+							path[index], path[furthest], now)):
 					break
 				furthest -= 1
 			result.append(path[furthest])
@@ -907,6 +922,7 @@ class TerrainNavigator(object):
 		as steering intent for LocalDriver. The caller still probes every candidate
 		vehicle-width corridor and can only throttle into one that is locally safe.
 		"""
+		state.pop('controlled_shallow_target', None)
 		if allow_safe_local:
 			fallback = self.grid.safe_local_target(
 				current, goal, now, avoid_points,
@@ -1054,10 +1070,7 @@ class TerrainNavigator(object):
 		if search is None:
 			# Most annotated segments are already open roads. Avoid invoking A*
 			# when one continuous support/collision check proves the direct link.
-			if (self.grid.segment_penalty(start, goal, now) <= 0.0 and
-					not self.grid.segment_has_baked_hazard(
-						start, goal, BAKED_SHALLOW_WATER) and
-					self.grid.segment_clear(start, goal)):
+			if self.grid.dry_segment_clear(start, goal, now):
 				path = (tuple(start), tuple(goal))
 				self.paths[key] = path
 				self.path_times[key] = float(now)
@@ -1081,6 +1094,26 @@ class TerrainNavigator(object):
 		# a test double or an externally completed task.
 		self._finish_search(key, search, now)
 		return key, self.paths[key]
+
+	def _planned_next_segment_clear(self, current, path, index, now):
+		"""Keep an adjacent A* ford without inventing a shallow shortcut."""
+		if index + 1 >= len(path):
+			return False
+		target = path[index + 1]
+		if (not self.grid.live_shortcut_preserves_climb_approach(
+				current, path, index, index + 1) or
+				self.grid.segment_penalty(current, target, now) > 0.0 or
+				not self.grid.segment_clear(current, target)):
+			return False
+		if not self.grid.segment_has_baked_hazard(
+				current, target, BAKED_SHALLOW_WATER):
+			return True
+		# The offset from the realised hull pose may enter shallow water only
+		# when the adjacent edge selected by A* is itself the planned ford.
+		# Otherwise reaching one dry corner could skip the next dry corner and
+		# turn their diagonal into an unplanned water shortcut.
+		return self.grid.segment_has_baked_hazard(
+			path[index], target, BAKED_SHALLOW_WATER)
 
 	def next_target(self, bot_id, current, goal, path_key, now,
 			anchor=None, avoid_points=None):
@@ -1151,16 +1184,16 @@ class TerrainNavigator(object):
 		key, path = self._path(effective_key, plan_start, goal, now,
 		                       None)
 		if path is None:
-			if (self.grid.segment_penalty(current, goal, now) <= 0.0 and
-					self.grid.segment_clear(current, goal)):
+			if self.grid.dry_segment_clear(current, goal, now):
+				state.pop('controlled_shallow_target', None)
 				state['last_target'] = tuple(goal)
 				self._set_fallback_mode(bot_id, 'safe_direct')
 				return tuple(goal)
 			return self._fallback_target(
 				bot_id, current, goal, now, avoid_points, state, False)
 		if not path:
-			if (self.grid.segment_penalty(current, goal, now) <= 0.0 and
-					self.grid.segment_clear(current, goal)):
+			if self.grid.dry_segment_clear(current, goal, now):
+				state.pop('controlled_shallow_target', None)
 				state['last_target'] = tuple(goal)
 				self._set_fallback_mode(bot_id, 'safe_direct')
 				return tuple(goal)
@@ -1191,6 +1224,8 @@ class TerrainNavigator(object):
 			state['index'] = best_index
 		index = min(int(state.get('index', 0)), len(path) - 1)
 		if (self.grid.segment_penalty(current, path[index], now) > 0.0 or
+				self.grid.segment_has_baked_hazard(
+					current, path[index], BAKED_SHALLOW_WATER) or
 				not self.grid.segment_clear(current, path[index])):
 			join_key = ('join', bot_id, self.grid.cell_for(current)) + tuple(path_key)
 			key, joined_path = self._path(join_key, current, goal, now, avoid_points)
@@ -1212,18 +1247,16 @@ class TerrainNavigator(object):
 		reach_radius = min(10.0, max(1.5, self.grid.cell_size * 0.55))
 		while (index + 1 < len(path) and
 		       _distance_2d(current, path[index]) < reach_radius and
-		       self.grid.live_shortcut_preserves_climb_approach(
-			       current, path, index, index + 1) and
-		       self.grid.segment_penalty(current, path[index + 1], now) <= 0.0 and
-		       self.grid.segment_clear(current, path[index + 1])):
+		       self._planned_next_segment_clear(
+			       current, path, index, now)):
 			index += 1
 		# Look ahead only while every skipped piece is continuously supported.
 		lookahead = index
 		for candidate in range(index + 1, min(len(path), index + 3)):
 			if (self.grid.live_shortcut_preserves_climb_approach(
 					current, path, index, candidate) and
-					self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
-					self.grid.segment_clear(current, path[candidate])):
+					self.grid.dry_segment_clear(
+						current, path[candidate], now)):
 				lookahead = candidate
 			else:
 				break
@@ -1241,17 +1274,28 @@ class TerrainNavigator(object):
 				path = continued
 				state['path_key'] = next_key
 				next_index = 0
-				for candidate in range(1, min(len(path), 3)):
+				if (len(path) > 1 and
+						self._planned_next_segment_clear(
+							current, path, 0, now)):
+					next_index = 1
+				for candidate in range(2, min(len(path), 3)):
 					if (self.grid.live_shortcut_preserves_climb_approach(
 							current, path, 0, candidate) and
-							self.grid.segment_penalty(current, path[candidate], now) <= 0.0 and
-							self.grid.segment_clear(current, path[candidate])):
+							self.grid.dry_segment_clear(
+								current, path[candidate], now)):
 						next_index = candidate
 					else:
 						break
 				state['index'] = next_index
-				state['last_target'] = tuple(path[next_index])
-				return tuple(path[next_index])
+				selected = tuple(path[next_index])
+				state['last_target'] = selected
+				if self.grid.segment_has_baked_hazard(
+						current, selected, BAKED_SHALLOW_WATER):
+					state['controlled_shallow_target'] = selected
+				else:
+					state.pop('controlled_shallow_target', None)
+				self._set_fallback_mode(bot_id, None)
+				return selected
 			if continued is None:
 				return self._fallback_target(
 					bot_id, current, goal, now, avoid_points, state, False)
@@ -1266,8 +1310,33 @@ class TerrainNavigator(object):
 				bot_id, current, goal, now, avoid_points, state, True)
 		state['index'] = lookahead
 		state['last_target'] = selected
+		if self.grid.segment_has_baked_hazard(
+				current, selected, BAKED_SHALLOW_WATER):
+			state['controlled_shallow_target'] = selected
+		else:
+			state.pop('controlled_shallow_target', None)
 		self._set_fallback_mode(bot_id, None)
 		return selected
+
+	def controlled_shallow_step(self, bot_id, current, sample_yaw,
+			maximum_yaw_error=0.20):
+		"""Admit only the A*-selected heading into a passable shallow cell."""
+		state = self.bot_states.get(int(bot_id))
+		if state is None or self.fallback_modes.get(int(bot_id)) is not None:
+			return False
+		target = state.get('controlled_shallow_target')
+		if target is None:
+			return False
+		dx = float(target[0]) - float(current[0])
+		dz = float(target[2]) - float(current[2])
+		if abs(dx) + abs(dz) < 0.1:
+			return False
+		difference = float(sample_yaw) - math.atan2(dx, dz)
+		while difference > math.pi:
+			difference -= math.pi * 2.0
+		while difference < -math.pi:
+			difference += math.pi * 2.0
+		return abs(difference) <= max(0.0, float(maximum_yaw_error))
 
 	@staticmethod
 	def navigation_paused(current, requested_goal, selected_target,

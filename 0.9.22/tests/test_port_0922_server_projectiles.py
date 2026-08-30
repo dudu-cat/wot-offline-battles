@@ -290,6 +290,35 @@ def _destructible(chunk_id=7, item_index=3, **changes):
     return event
 
 
+def _player_ram_contact(seq=1, **changes):
+    contact = {
+        'seq': seq, 'bot_id': 30, 'bot_state_revision': 999,
+        'presentation_time_us': 500000,
+        'native_contact_time_us': 500000,
+        'contact_x': 0.0, 'contact_y': 0.0, 'contact_z': 3.0,
+        'contact_normal_x': 0.0, 'contact_normal_z': -1.0,
+        'contact_armor_player': 80.0, 'contact_armor_bot': 100.0,
+        'contact_screened_player': False,
+        'contact_screened_bot': False,
+        'contact_spall_player': 1.0, 'contact_bonus_player': 0.0,
+        'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+        'pitch': 0.0, 'roll': 0.0,
+        'vx': 0.0, 'vy': 0.0, 'vz': 10.0,
+        'bot_vx': 0.0, 'bot_vy': 0.0, 'bot_vz': 0.0,
+    }
+    contact.update(changes)
+    return contact
+
+
+def _player_destructible_contact(seq=1, **changes):
+    contact = {
+        'seq': seq, 'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
+        'speed': 5.0, 'dt': 0.03, 'token': [[7, 3, None]],
+    }
+    contact.update(changes)
+    return contact
+
+
 class ServerProjectileLedgerTests(unittest.TestCase):
     @staticmethod
     def _critical_record():
@@ -494,7 +523,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             player.input_seq, player.gun_checkpoint_seq,
             player.forward, player.turn))
 
-    def test_modern_input_rejects_inactive_player_atomically(self):
+    def test_modern_input_folds_inactive_player_frame_as_noop(self):
         for condition in ('waiting', 'loading', 'finished',
                           'nonparticipating', 'dead'):
             with self.subTest(condition=condition):
@@ -509,13 +538,191 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                 else:
                     player.alive = False
                     player.health = 0
-                self.assertFalse(state.update_input(1, {
-                    'type': 'input', 'round_id': state.round_id,
-                    'input_seq': 1, 'forward': 1.0, 'turn': 1.0,
-                }))
-                self.assertEqual((0, {}, 0.0, 0.0), (
+                state.human_collision_profiles[player.player_id] = {
+                    'shape': (1.5, 3.5, -0.8, 2.0),
+                    'ram_profile': {
+                        'spall_coefficient': 1.0,
+                        'ramming_bonus': 0.0,
+                    },
+                }
+                before = (
                     player.input_seq, dict(player.input_fingerprints),
-                    player.forward, player.turn))
+                    player.gun_checkpoint_seq, dict(player.gun_checkpoint),
+                    dict(player.gun_checkpoints),
+                    player.forward, player.turn, player.speed,
+                    player.aim_yaw, player.gun_pitch,
+                    player.x, player.y, player.z, player.yaw,
+                    player.pitch, player.roll, player.up_cosine,
+                    player.pose_time_us, tuple(player.pose_history),
+                    player.fire_seq, player.shell_index,
+                    player.next_shell_index, player.shell_change_pending,
+                    player.siege_state, player.siege_transition_ticks,
+                    player.ram_contact_seq, dict(player.ram_contacts),
+                    player.destructible_contact_seq,
+                    dict(player.destructible_contacts),
+                )
+                self.assertTrue(_update_player_input(
+                    state, 1, forward=1.0, turn=1.0, speed=25.0,
+                    aim_yaw=0.5, gun_pitch=0.1,
+                    x=2.0, y=3.0, z=4.0, yaw=0.2,
+                    pitch=0.1, roll=-0.1, up_cosine=0.75,
+                    fire_seq=7, shell_index=1, next_shell_index=1,
+                    shell_change_pending=False,
+                    siege_enabled=True,
+                    ram_contacts=[_player_ram_contact()],
+                    destructible_contacts=[
+                        _player_destructible_contact()],
+                ))
+                self.assertEqual(before, (
+                    player.input_seq, dict(player.input_fingerprints),
+                    player.gun_checkpoint_seq, dict(player.gun_checkpoint),
+                    dict(player.gun_checkpoints),
+                    player.forward, player.turn, player.speed,
+                    player.aim_yaw, player.gun_pitch,
+                    player.x, player.y, player.z, player.yaw,
+                    player.pitch, player.roll, player.up_cosine,
+                    player.pose_time_us, tuple(player.pose_history),
+                    player.fire_seq, player.shell_index,
+                    player.next_shell_index, player.shell_change_pending,
+                    player.siege_state, player.siege_transition_ticks,
+                    player.ram_contact_seq, dict(player.ram_contacts),
+                    player.destructible_contact_seq,
+                    dict(player.destructible_contacts),
+                ))
+
+                malformed = (
+                    ('round_id', float(state.round_id)),
+                    ('input_seq', True),
+                    ('forward', True), ('forward', 1e300),
+                    ('speed', 1e300), ('fire_seq', True),
+                    ('pose_time_us', 1.5), ('ram_contacts', [{}]),
+                    ('destructible_contacts', [{}]),
+                    ('ram_contacts', [dict(
+                        _player_ram_contact(), unexpected=True)]),
+                    ('ram_contacts', [
+                        _player_ram_contact(contact_x=True)]),
+                    ('destructible_contacts', [
+                        _player_destructible_contact(x=True)]),
+                    ('destructible_contacts', [
+                        _player_destructible_contact(x=2001.0)]),
+                )
+                for field, value in malformed:
+                    with self.subTest(condition=condition, field=field):
+                        self.assertFalse(_update_player_input(
+                            state, 1, **{field: value}))
+                        self.assertEqual(0, player.input_seq)
+                        self.assertEqual({}, player.input_fingerprints)
+                        self.assertEqual((0.0, 0.0), (
+                            player.forward, player.turn))
+
+    def test_active_input_contains_bad_contact_rows_without_sequence_gap(self):
+        state = _state(players=1)
+        player = state.players[1]
+        bad_ram = _player_ram_contact(contact_x=True)
+        bad_destructible = _player_destructible_contact(x=True)
+
+        self.assertTrue(_update_player_input(
+            state, 1, ram_contacts=[bad_ram],
+            destructible_contacts=[bad_destructible]))
+        self.assertEqual(1, player.input_seq)
+        self.assertEqual((1, 1), (
+            player.ram_contact_seq, player.ram_contact_resolved_seq))
+        self.assertIn(1, player.ram_contact_rejections)
+        self.assertEqual((1, 1), (
+            player.destructible_contact_seq,
+            player.destructible_contact_resolved_seq))
+        self.assertIn(1, player.destructible_contact_rejections)
+
+        self.assertTrue(_update_player_input(
+            state, 1, forward=1.0, ram_contacts=[bad_ram],
+            destructible_contacts=[bad_destructible]))
+        self.assertEqual(2, player.input_seq)
+        self.assertEqual(1.0, player.forward)
+
+    def test_player_environment_skips_overtaken_rows_and_keeps_live_rows(self):
+        state = _state(players=2)
+        dead = state.players[1]
+        live = state.players[2]
+        dead.alive = False
+        dead.health = 0
+
+        self.assertTrue(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'player_environment',
+                'round_id': state.round_id,
+                'authority_epoch': state.authority_epoch,
+                'sample_seq': 1,
+                'observations': [
+                    {'player_id': dead.player_id, 'input_seq': 0,
+                     'level': 2},
+                    {'player_id': live.player_id, 'input_seq': 0,
+                     'level': 1},
+                ],
+            }))
+
+        self.assertNotIn(dead.player_id, state.player_environment)
+        self.assertEqual(
+            1, state.player_environment[live.player_id]['level'])
+        self.assertEqual(1, state.player_environment_seq)
+
+        # Exact retries and a queued current-round sample overtaken by the
+        # terminal result are both successful no-ops.
+        snapshot = dict(state.player_environment)
+        self.assertTrue(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'player_environment',
+                'round_id': state.round_id,
+                'authority_epoch': state.authority_epoch,
+                'sample_seq': 1,
+                'observations': [],
+            }))
+        state.battle_result = {'winner': 2}
+        self.assertTrue(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'player_environment',
+                'round_id': state.round_id,
+                'authority_epoch': state.authority_epoch,
+                'sample_seq': 2,
+                'observations': [],
+            }))
+        self.assertEqual(snapshot, state.player_environment)
+
+    def test_player_environment_skips_departed_row_after_full_validation(self):
+        state = _state(players=2)
+        departed_id = 1
+        live = state.players[2]
+        state.remove_player(departed_id)
+        message = {
+            'type': 'player_environment',
+            'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+            'sample_seq': 1,
+            'observations': [
+                {'player_id': departed_id, 'input_seq': 0, 'level': 2},
+                {'player_id': live.player_id, 'input_seq': 0, 'level': 1},
+            ],
+        }
+
+        malformed = dict(message, observations=[
+            {'player_id': departed_id, 'input_seq': 0, 'level': 2,
+             'drowning_critical': True},
+            message['observations'][1],
+        ])
+        self.assertFalse(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, malformed))
+        duplicate = dict(message, observations=[
+            message['observations'][0], message['observations'][0],
+            message['observations'][1],
+        ])
+        self.assertFalse(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, duplicate))
+
+        self.assertTrue(state.update_player_environment(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertNotIn(departed_id, state.player_environment)
+        self.assertEqual(
+            1, state.player_environment[live.player_id]['level'])
+        self.assertEqual(1, state.player_environment_seq)
 
     def test_leave_filters_participant_and_dead_leave_has_no_death_event(self):
         state = _state(players=2)
@@ -1224,7 +1431,15 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertTrue(state.progress_projectiles(
             SIMULATION_WORKER_AUTHORITY_ID, {
                 'type': 'projectile_progress', 'round_id': 1,
-                'authority_epoch': 1, 'cursors': []}))
+                'authority_epoch': 1, 'cursors': [{
+                    'projectile_id': '1:p:1:1',
+                    'base_checked_ms': 0,
+                    'checked_through_ms': 0,
+                    'checked_distance': 0.0,
+                    'piercing_loss': 0.0,
+                    'penetration_factor': 1.0,
+                    'destructibles': [],
+                }]}))
         self.assertTrue(state.ricochet_projectile(
             SIMULATION_WORKER_AUTHORITY_ID, {
                 'round_id': 1, 'authority_epoch': 1}))
@@ -1559,14 +1774,66 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(20.0, record['checked_distance'])
         self.assertEqual(3.0, record['piercing_loss'])
         self.assertEqual(1.0, record['penetration_factor'])
-        stale = dict(cursor, checked_through_ms=201)
-        self.assertFalse(state.progress_projectiles(
+        stale = dict(
+            cursor, checked_through_ms=201,
+            checked_distance=19.0, piercing_loss=2.0)
+        self.assertTrue(state.progress_projectiles(
             SIMULATION_WORKER_AUTHORITY_ID,
             dict(message, cursors=[stale])))
+        self.assertEqual(201, record['checked_through_ms'])
+        self.assertEqual(20.0, record['checked_distance'])
+        self.assertEqual(3.0, record['piercing_loss'])
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, dict(message, cursors=[dict(
+                cursor, base_checked_ms=202, checked_through_ms=202)])))
+        self.assertEqual(202, record['checked_through_ms'])
+        self.assertEqual(20.0, record['checked_distance'])
+        self.assertEqual(3.0, record['piercing_loss'])
         self.assertFalse(state.progress_projectiles(
             SIMULATION_WORKER_AUTHORITY_ID, dict(message, cursors=[dict(
-                cursor, base_checked_ms=200, checked_through_ms=200,
+                cursor, base_checked_ms=202, checked_through_ms=202,
                 penetration_factor=0.999999)])))
+
+    def test_stale_progress_converges_without_poisoning_active_batch(self):
+        state = _state(players=3)
+        self.assertTrue(_launch_authority(state, _launch()))
+        self.assertTrue(_launch_authority(
+            state, _launch(shooter_id=2, shot_seq=1)))
+        first = {
+            'projectile_id': '1:p:1:1', 'base_checked_ms': 0,
+            'checked_through_ms': 200, 'checked_distance': 20.0,
+            'piercing_loss': 3.0, 'penetration_factor': 1.0,
+            'destructibles': [],
+        }
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'projectile_progress', 'round_id': 1,
+                'authority_epoch': 1, 'cursors': [first]}))
+        stale_with_receipt = dict(
+            first, checked_through_ms=150, checked_distance=15.0,
+            piercing_loss=1.0, destructibles=[_destructible()])
+        active = {
+            'projectile_id': '1:p:2:1', 'base_checked_ms': 0,
+            'checked_through_ms': 600, 'checked_distance': 60.0,
+            'piercing_loss': 4.0, 'penetration_factor': 1.0,
+            'destructibles': [],
+        }
+
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'projectile_progress', 'round_id': 1,
+                'authority_epoch': 1,
+                'cursors': [stale_with_receipt, active]}))
+
+        first_record = state.projectiles['1:p:1:1']
+        self.assertEqual(200, first_record['checked_through_ms'])
+        self.assertEqual(20.0, first_record['checked_distance'])
+        self.assertEqual(3.0, first_record['piercing_loss'])
+        active_record = state.projectiles['1:p:2:1']
+        self.assertEqual(600, active_record['checked_through_ms'])
+        self.assertEqual(60.0, active_record['checked_distance'])
+        self.assertEqual(4.0, active_record['piercing_loss'])
+        self.assertEqual(1, state.destructible_revision)
 
     def test_terminal_overtaking_exact_progress_retry_does_not_poison_batch(self):
         state = _state(players=3)
@@ -1799,6 +2066,85 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                          state.projectiles['1:p:1:1']['checked_through_ms'])
         self.assertEqual(0,
                          state.projectiles['1:p:2:1']['checked_through_ms'])
+
+    def test_terminal_round_folds_queued_destructible_as_noop(self):
+        state = _state()
+        message = {
+            'type': 'destructible', 'round_id': state.round_id,
+        }
+        message.update(_destructible())
+        state.battle_result = {'winner': 2}
+
+        self.assertTrue(state.report_destructible(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        self.assertEqual(0, state.destructible_revision)
+        self.assertEqual({}, state.destructibles)
+
+        invalid = dict(message, speed=float('nan'))
+        self.assertFalse(state.report_destructible(
+            SIMULATION_WORKER_AUTHORITY_ID, invalid))
+
+    def test_terminal_round_progress_validates_envelope_before_noop(self):
+        state = _state()
+        state.battle_result = {'winner': 2}
+        cursor = {
+            'projectile_id': '1:p:1:1',
+            # Terminal state makes these finite cursor values obsolete.
+            'base_checked_ms': -100,
+            'checked_through_ms': -50,
+            'checked_distance': -20.0,
+            'piercing_loss': -3.0,
+            'penetration_factor': 99.0,
+            'destructibles': [],
+        }
+        message = {
+            'type': 'projectile_progress',
+            'round_id': state.round_id,
+            'authority_epoch': state.authority_epoch,
+            'cursors': [cursor],
+        }
+
+        self.assertTrue(state.progress_projectiles(
+            SIMULATION_WORKER_AUTHORITY_ID, message))
+        invalid_messages = (
+            dict(message, round_id=state.round_id + 1),
+            dict(message, authority_epoch=state.authority_epoch + 1),
+            dict(message, type='not_projectile_progress'),
+            dict(message, unexpected=True),
+            dict((key, value) for key, value in message.items()
+                 if key != 'cursors'),
+            dict(message, cursors='not-a-list'),
+            dict(message, cursors=[]),
+            dict(message, cursors=[dict(cursor, projectile_id='')]),
+            dict(message, cursors=[dict(
+                (key, value) for key, value in cursor.items()
+                if key != 'checked_distance')]),
+            dict(message, cursors=[cursor, dict(cursor)]),
+            dict(message, cursors=[dict(cursor, destructibles='not-a-list')]),
+        )
+        for invalid in invalid_messages:
+            with self.subTest(invalid=invalid):
+                self.assertFalse(state.progress_projectiles(
+                    SIMULATION_WORKER_AUTHORITY_ID, invalid))
+
+    def test_prebattle_destructible_is_not_folded_as_terminal_noop(self):
+        for condition in ('loading', 'countdown'):
+            with self.subTest(condition=condition):
+                state = _state()
+                if condition == 'loading':
+                    state.phase = 'loading'
+                else:
+                    state.tick = int(round(
+                        PREBATTLE_SECONDS * TICK_HZ)) - 1
+                message = {
+                    'type': 'destructible', 'round_id': state.round_id,
+                }
+                message.update(_destructible())
+
+                self.assertFalse(state.report_destructible(
+                    SIMULATION_WORKER_AUTHORITY_ID, message))
+                self.assertEqual(0, state.destructible_revision)
+                self.assertEqual({}, state.destructibles)
 
     def test_resolve_destructibles_validate_before_any_terminal_change(self):
         state = _state()

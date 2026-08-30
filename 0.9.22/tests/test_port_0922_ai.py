@@ -1,4 +1,5 @@
 import copy
+import json
 import math
 import sys
 from pathlib import Path
@@ -523,6 +524,40 @@ class BotAiPortTests(unittest.TestCase):
             self.assertFalse(navigator.grid.segment_has_baked_hazard(
                 first, second, BAKED_SHALLOW_WATER))
 
+        selected = navigator.next_target(
+            7, start, goal, ('route', 1, 'dry-detour'), 1.1)
+
+        self.assertNotEqual(goal, selected)
+        self.assertFalse(navigator.grid.segment_has_baked_hazard(
+            start, selected, BAKED_SHALLOW_WATER))
+        self.assertFalse(navigator.controlled_shallow_step(
+            7, start, math.pi * 0.5))
+
+    def test_reached_dry_corner_does_not_authorize_offset_shallow_shortcut(self):
+        graph = self._baked_graph(4, 3)
+        graph['hazards'][5] = 4
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        current = (11.9, 0.0, 20.0)
+        first = (10.0, 0.0, 20.0)
+        corner = (14.0, 0.0, 20.0)
+        goal = (22.0, 0.0, 28.0)
+        path = (first, corner, goal)
+        navigator._path = lambda *unused: (('fixed-path',), path)
+
+        self.assertTrue(navigator.grid.segment_has_baked_hazard(
+            current, goal, BAKED_SHALLOW_WATER))
+        self.assertFalse(navigator.grid.segment_has_baked_hazard(
+            corner, goal, BAKED_SHALLOW_WATER))
+
+        selected = navigator.next_target(
+            7, current, goal, ('route', 1, 'dry-corners'), 1.0)
+
+        self.assertEqual(corner, selected)
+        self.assertFalse(navigator.controlled_shallow_step(
+            7, current, math.atan2(
+                goal[0] - current[0], goal[2] - current[2])))
+
     def test_prebaked_astar_prefers_dry_route_over_short_shallow_crossing(self):
         graph = self._baked_graph(5, 3)
         graph['hazards'] = [
@@ -562,9 +597,53 @@ class BotAiPortTests(unittest.TestCase):
         graph['hazards'] = [4, 0, 0]
         grid = TerrainGrid(lambda *unused: None, baked_graph=graph)
 
+        self.assertTrue(grid.point_has_baked_hazard(
+            (10.0, 0.0, 20.0), BAKED_SHALLOW_WATER))
         self.assertFalse(grid.segment_has_baked_hazard(
             (10.0, 0.0, 20.0), (18.0, 0.0, 20.0),
             BAKED_SHALLOW_WATER))
+
+    def test_pending_and_failed_searches_do_not_claim_shallow_direct_goal(self):
+        graph = self._baked_graph(3, 1)
+        graph['hazards'] = [0, 4, 0]
+        current = (10.0, 0.0, 20.0)
+        goal = (18.0, 0.0, 20.0)
+
+        for path_result in (None, ()):
+            navigator = TerrainNavigator(
+                lambda *unused: None, baked_graph=graph)
+            navigator._path = lambda *unused, result=path_result: (
+                ('search-result',), result)
+            navigator.grid.safe_local_target = lambda *unused: None
+
+            selected = navigator.next_target(
+                7, current, goal, ('route', 1, 'wet-shortcut'), 1.0)
+
+            with self.subTest(path_result=path_result):
+                self.assertEqual(goal, selected)
+                self.assertEqual('reactive', navigator.fallback_modes[7])
+                self.assertFalse(navigator.controlled_shallow_step(
+                    7, current, math.pi * 0.5))
+
+    def test_unavoidable_astar_shallow_edge_authorizes_only_planned_heading(self):
+        graph = self._baked_graph(3, 1)
+        graph['hazards'] = [0, 4, 0]
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        current = (10.0, 0.0, 20.0)
+        goal = (18.0, 0.0, 20.0)
+
+        navigator.next_target(
+            7, current, goal, ('route', 1, 'only-ford'), 1.0)
+        selected = navigator.next_target(
+            7, current, goal, ('route', 1, 'only-ford'), 1.1)
+
+        self.assertEqual((14.0, 0.0, 20.0), selected)
+        self.assertNotIn(7, navigator.fallback_modes)
+        self.assertTrue(navigator.controlled_shallow_step(
+            7, current, math.pi * 0.5))
+        self.assertFalse(navigator.controlled_shallow_step(
+            7, current, math.pi * 0.5 + 0.42))
 
     def test_navigation_housekeeping_runs_once_per_second(self):
         navigator = TerrainNavigator(lambda *unused: 0.0)
@@ -787,6 +866,31 @@ class BotAiPortTests(unittest.TestCase):
         self.assertIn(0.0, throttles)
         self.assertIn(1.0, throttles)
         self.assertGreater(abs(yaw), 2.5)
+
+    def test_prohorovka_west_ridge_corner_keeps_forward_progress(self):
+        driver = LocalDriver()
+        graph = json.loads(
+            (PORT_ROOT / 'navgraphs' / '05_prohorovka.json').read_text())
+        route = next(
+            route for route in graph['routes']['1']
+            if route['id'] == 'west_ridge')
+        corner_index = next(
+            index for index, point in enumerate(route['waypoints'])
+            if tuple(point[:2]) == (54.0, -442.0))
+        first, corner, target = route['waypoints'][corner_index - 1:
+                                                   corner_index + 2]
+        incoming_yaw = math.atan2(
+            float(corner[0]) - float(first[0]),
+            float(corner[1]) - float(first[1]))
+
+        order = driver.drive(
+            121, (corner[0], 0.0, corner[1]), incoming_yaw, 0.0, 0.1,
+            (target[0], 0.0, target[1]),
+            (), lambda unused_yaw: True)
+
+        self.assertEqual('drive', order['recovery_mode'])
+        self.assertEqual(1.0, order['throttle'])
+        self.assertGreater(abs(order['turn']), 0.9)
 
     def test_a_wedged_hull_still_reaches_recovery(self):
         driver = LocalDriver()

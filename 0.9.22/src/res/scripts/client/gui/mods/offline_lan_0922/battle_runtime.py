@@ -999,6 +999,7 @@ class _LANInputSender(object):
         self.turn = 0.0
         self.aim_yaw = 0.0
         self.gun_pitch = 0.0
+        self.aim_pitch = 0.0
         self.handbrake = False
 
     def align_aim(self, turret_yaw=0.0, gun_pitch=0.0):
@@ -1006,6 +1007,10 @@ class _LANInputSender(object):
         unused_position, vehicle_yaw = self.owner.local_pose()
         self.aim_yaw = float(vehicle_yaw) + float(turret_yaw)
         self.gun_pitch = float(gun_pitch)
+        self.aim_pitch = (
+            float(getattr(self.owner, '_local_pitch', 0.0)) +
+            float(getattr(self.owner, '_local_siege_aim_pitch', 0.0)) +
+            self.gun_pitch)
         return True
 
     def send_avatar_input(self, vehicle_id, kind, payload):
@@ -1035,6 +1040,11 @@ class _LANInputSender(object):
             gun_pitch = _number(payload.get('gun_pitch'))
             self.aim_yaw = vehicle_yaw + turret_yaw
             self.gun_pitch = gun_pitch
+            self.aim_pitch = (
+                float(getattr(self.owner, '_local_pitch', 0.0)) +
+                float(getattr(
+                    self.owner, '_local_siege_aim_pitch', 0.0)) +
+                gun_pitch)
             self.owner._echo_local_gun_angles(turret_yaw, gun_pitch)
             return self.send_current()
         if kind == 'shoot':
@@ -1066,6 +1076,7 @@ class _LANInputSender(object):
         # is up), so its geometric elevation must be inverted before it is
         # echoed through VehicleGunRotator or donated to the worker.
         self.gun_pitch = -math.atan2(dy, max(horizontal, 0.001))
+        self.aim_pitch = self.gun_pitch
 
     def send_current(self, siege_enabled=None):
         position, yaw = self.owner.local_pose()
@@ -1342,6 +1353,7 @@ class BattleRuntime(object):
         self._bots_ready_reported = False
         self._next_bot_create_time = 0.0
         self._arena_type = None
+        self._arena_bounds = None
         self._spawn_planner = None
         self._navigation_graph = None
         self._grounded_bot_ids = set()
@@ -1669,6 +1681,7 @@ class BattleRuntime(object):
             if arena_type is None:
                 raise RuntimeError('standard arena definition is unavailable')
             self._arena_type = arena_type
+            self._arena_bounds = self._arena_bounds_from_type(arena_type)
             graph_loader = getattr(
                 self._runtime, 'navigation_graph_loader',
                 prebaked_navigation.load_graph)
@@ -2075,6 +2088,35 @@ class BattleRuntime(object):
                     STANDARD_GAMEPLAY):
                 return arena_type
         return None
+
+    @staticmethod
+    def _arena_bounds_from_type(arena_type):
+        """Read #1513's official red-border rectangle once per battle."""
+        bounding_box = getattr(arena_type, 'boundingBox', None)
+        try:
+            bottom_left, upper_right = bounding_box[0], bounding_box[1]
+
+            def coordinates(point):
+                try:
+                    return float(point[0]), float(point[1])
+                except (AttributeError, IndexError, TypeError):
+                    return float(point.x), float(point.y)
+
+            minimum_x, minimum_z = coordinates(bottom_left)
+            maximum_x, maximum_z = coordinates(upper_right)
+            values = (minimum_x, minimum_z, maximum_x, maximum_z)
+            if (any(math.isnan(value) or math.isinf(value)
+                    for value in values) or
+                    minimum_x >= maximum_x or minimum_z >= maximum_z):
+                return None
+            return values
+        except (AttributeError, IndexError, TypeError, ValueError,
+                OverflowError):
+            # The pinned client always publishes this field. A malformed
+            # optional test/future arena must not turn map creation into a
+            # system-error draw merely because the extra safety rail cannot
+            # be installed.
+            return None
 
     def _configure_standard_space_visibility(self, space_id=None):
         """Best-effort maintenance of the mapped typed gameplay bit."""
@@ -4029,6 +4071,68 @@ class BattleRuntime(object):
         return prebaked_navigation.pose_is_safe(
             self._navigation_graph, position, shoulder_cells=0)
 
+    def _arena_pose_violations(self, entity, position, yaw):
+        """Return chassis-corner overflow past each official map edge."""
+        bounds = self._arena_bounds
+        if bounds is None:
+            return (0.0, 0.0, 0.0, 0.0)
+        half_width, half_length = self._collision_shape(
+            entity.typeDescriptor)[:2]
+        sine = abs(math.sin(float(yaw)))
+        cosine = abs(math.cos(float(yaw)))
+        # These are the axis projections of all four chassis OBB corners.
+        extent_x = cosine * half_width + sine * half_length
+        extent_z = sine * half_width + cosine * half_length
+        minimum_x = float(bounds[0]) + extent_x
+        minimum_z = float(bounds[1]) + extent_z
+        maximum_x = float(bounds[2]) - extent_x
+        maximum_z = float(bounds[3]) - extent_z
+        x, unused_y, z = _xyz(position)
+        return (
+            max(0.0, minimum_x - x),
+            max(0.0, x - maximum_x),
+            max(0.0, minimum_z - z),
+            max(0.0, z - maximum_z),
+        )
+
+    def _arena_pose_is_outside(self, entity, position, yaw):
+        return any(value > 0.00001 for value in
+                   self._arena_pose_violations(entity, position, yaw))
+
+    def _arena_motion_is_clear(self, entity, position, travel_yaw,
+                               speed, dt, hull_yaw=None):
+        """Keep every chassis corner inside, but let stale poses recover."""
+        if self._arena_bounds is None:
+            return True
+        if hull_yaw is None:
+            hull_yaw = travel_yaw
+        x, y, z = _xyz(position)
+        distance = float(speed) * max(0.0, float(dt))
+        candidate = (
+            x + math.sin(float(travel_yaw)) * distance,
+            y,
+            z + math.cos(float(travel_yaw)) * distance)
+        before = self._arena_pose_violations(
+            entity, position, hull_yaw)
+        after = self._arena_pose_violations(
+            entity, candidate, hull_yaw)
+        # A legal pose cannot cross the red line. If an old state is already
+        # outside, accept only axes that hold or reduce every edge overflow;
+        # this avoids a teleport while still allowing the player to drive in.
+        return all(after[index] <= before[index] + 0.00001
+                   for index in range(4))
+
+    def _arena_rotation_is_clear(self, entity, position, yaw,
+                                 candidate_yaw):
+        """Apply the same no-worsening rule when only the chassis turns."""
+        if self._arena_bounds is None:
+            return True
+        before = self._arena_pose_violations(entity, position, yaw)
+        after = self._arena_pose_violations(
+            entity, position, candidate_yaw)
+        return all(after[index] <= before[index] + 0.00001
+                   for index in range(4))
+
     def _direction_probe(self, position, yaw, speed=0.0,
                          descriptor=None, maximum_distance=None):
         """Copy the 0.8.2 dual-height, three-lane hull corridor probe."""
@@ -4775,8 +4879,8 @@ class BattleRuntime(object):
         # BigWorld uses row vectors. Exact #1513 Vehicle.getComponents()
         # relates body and chassis as body * inverse(ground). Strip the stale
         # client-only entity world pose with that same native relation, then
-        # apply it to the copied terrain pose. The filtered ground and
-        # stabilised providers retain their distinct stock camera roles.
+        # apply it to the copied terrain pose. The filtered ground retains
+        # its distinct stock camera role.
         inverse_ground = inverse_type(native_ground)
 
         aim_matrix = self._runtime.math.Matrix()
@@ -4792,7 +4896,15 @@ class BattleRuntime(object):
                 relative, self._local_siege_aim_world_matrix)
 
         self._local_siege_body_matrix = transplant(native_body)
-        self._local_siege_stabilised_matrix = transplant(native_stabilised)
+        # A fixed-turret #1513 gun derives its marker and current shot ray
+        # from ``filter.interpolateStabilisedMatrix()``, while the rendered
+        # barrel inherits ``compoundModel.matrix``.  A client-created local
+        # vehicle has no cell filter keeping those two native providers in
+        # lock-step.  Use the copied hydraulic body for both consumers so the
+        # visible barrel, client marker, server-marker echo and fire intent
+        # all share the same pose authority.
+        self._local_siege_stabilised_matrix = (
+            self._local_siege_body_matrix)
         self._local_siege_ground_matrix = transplant(
             native_ground_filtered)
         self._local_pose_matrix = self._matrix_product(self._local_matrix)
@@ -4821,8 +4933,7 @@ class BattleRuntime(object):
             raise RuntimeError('player hydraulic pose was not prepared')
         body = (self._local_siege_body_matrix
                 if enabled else self._local_matrix)
-        stabilised = (self._local_siege_stabilised_matrix
-                      if enabled else self._local_matrix)
+        stabilised = body
         ground = (self._local_siege_ground_matrix
                   if enabled else self._local_matrix)
         self._local_pose_matrix.a = body
@@ -4842,6 +4953,8 @@ class BattleRuntime(object):
         native object is not valid for a client-created local vehicle and can
         terminate #1513. The descriptor already exposes the same hydraulic
         limits, so apply the correction to the copied matrix provider instead.
+        Gun travel is resolved from the active descriptor; the current native
+        gun angle is deliberately not a second feedback authority.
         """
         matrix = self._local_siege_aim_matrix
         descriptor = getattr(entity, 'typeDescriptor', None)
@@ -4858,18 +4971,21 @@ class BattleRuntime(object):
             if params is None:
                 raise ValueError('hydraulic pitch parameters are unavailable')
             speed = params['speed']
+            if (not params['isAvailable'] or
+                    (active and not params['isEnabled'])):
+                raise ValueError('hydraulic pitch is not enabled')
             if active:
-                rotator = getattr(self._avatar, 'gunRotator', None)
-                if self._sender is None or rotator is None:
+                if self._sender is None:
                     raise ValueError('hydraulic aim source is unavailable')
-                desired_pitch = float(self._sender.gun_pitch)
-                gun_pitch = float(rotator.gunPitch)
-                total_pitch = ((
-                    desired_pitch - float(self._local_pitch) + math.pi) %
-                    (2.0 * math.pi) - math.pi)
-                desired, unused_reachable = hull_aiming.minimal_correction(
-                    total_pitch, gun_pitch, gun_pitch,
-                    params['minimum'], params['maximum'])
+                desired_pitch = float(getattr(
+                    self._sender, 'aim_pitch', self._sender.gun_pitch))
+                gun_minimum, gun_maximum = (
+                    hull_aiming.absolute_pitch_limits(descriptor))
+                desired, unused_reachable = (
+                    hull_aiming.world_target_correction(
+                        desired_pitch, float(self._local_pitch),
+                        gun_minimum, gun_maximum,
+                        params['minimum'], params['maximum']))
             self._local_siege_aim_pitch = hull_aiming.slew(
                 self._local_siege_aim_pitch, desired, speed, elapsed)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -12580,7 +12696,7 @@ class BattleRuntime(object):
         return pitch
 
     def _motion_is_clear(self, entity, position, yaw, speed, dt,
-                         allow_crush_drive=False):
+                         allow_crush_drive=False, hull_yaw=None):
         """Thin tuple-to-Vector adapter around the copied 0.8.2 probe."""
         if getattr(self, '_local_destructible_send_failed', False):
             return False
@@ -12588,6 +12704,11 @@ class BattleRuntime(object):
         self._local_motion_cap_crushed = False
         self._local_motion_kinds = '-'
         self._local_motion_status = 'clear'
+        if not self._arena_motion_is_clear(
+                entity, position, yaw, speed, dt, hull_yaw=hull_yaw):
+            self._local_motion_kinds = 'arena'
+            self._local_motion_status = 'hard'
+            return False
         kinetic_speed = None
         if allow_crush_drive:
             params = self._local_physics
@@ -13650,9 +13771,13 @@ class BattleRuntime(object):
             contact_speed = distance / max(float(dt), 1.0 / 120.0)
             candidate = (position[0] + move_x, position[1],
                          position[2] + move_z)
+            arena_recovery = self._arena_pose_is_outside(
+                entity, position, yaw)
             if (not self._motion_is_clear(
-                    entity, position, contact_yaw, contact_speed, dt) or
-                    not self._baked_pose_safe(candidate)):
+                    entity, position, contact_yaw, contact_speed, dt,
+                    hull_yaw=yaw) or
+                    (not self._baked_pose_safe(candidate) and
+                     not arena_recovery)):
                 push_x = 0.0
                 push_z = 0.0
             else:
@@ -14097,7 +14222,8 @@ class BattleRuntime(object):
                     lateral_x * lateral_x + lateral_z * lateral_z)
                 lateral_yaw = math.atan2(lateral_x, lateral_z)
                 if (entity is None or self._motion_is_clear(
-                        entity, position, lateral_yaw, lateral_speed, dt)):
+                        entity, position, lateral_yaw, lateral_speed, dt,
+                        hull_yaw=yaw)):
                     position = next_position
                 self._local_air_lateral = (
                     lateral_x * 0.995, lateral_z * 0.995)
@@ -14119,7 +14245,8 @@ class BattleRuntime(object):
         lateral_speed = abs(slide_dot) * self._local_slide_speed
         lateral_yaw = math.atan2(slide_x, slide_z)
         if (entity is not None and not self._motion_is_clear(
-                entity, position, lateral_yaw, lateral_speed, dt)):
+                entity, position, lateral_yaw, lateral_speed, dt,
+                hull_yaw=yaw)):
             if not self._local_motion_soft_block:
                 self._local_slide_speed = 0.0
                 self._local_air_lateral = (0.0, 0.0)
@@ -14406,7 +14533,7 @@ class BattleRuntime(object):
                             vehicle_physics.hard_contact_candidate_yaws(yaw):
                         if self._motion_is_clear(
                                 entity, position, slide_yaw,
-                                self._local_speed, dt):
+                                self._local_speed, dt, hull_yaw=yaw):
                             slide_speed, slide_x, slide_z = \
                                 vehicle_physics.hard_contact_step(
                                     self._local_speed, dt,
@@ -14441,11 +14568,21 @@ class BattleRuntime(object):
                 drive_intent=throttle)
             self._local_turn_speed *= critical_damage.stat_factor(
                 entity, 'traverse')
-        yaw += self._local_turn_speed * dt
-        while yaw > math.pi:
-            yaw -= 2.0 * math.pi
-        while yaw < -math.pi:
-            yaw += 2.0 * math.pi
+        candidate_yaw = yaw + self._local_turn_speed * dt
+        while candidate_yaw > math.pi:
+            candidate_yaw -= 2.0 * math.pi
+        while candidate_yaw < -math.pi:
+            candidate_yaw += 2.0 * math.pi
+        if self._arena_rotation_is_clear(
+                entity, position, yaw, candidate_yaw):
+            yaw = candidate_yaw
+        else:
+            # The rectangular red border behaves as a hard chassis contact:
+            # keep this tick's last legal pose and remove angular momentum.
+            self._local_turn_speed = 0.0
+            self._local_motion_kinds = 'arena'
+            self._local_motion_status = 'hard'
+            contact_path = contact_path or 'arena_turn'
         self._local_support_rise_blocked = False
         self._local_support_tick_pose = tick_pose
         try:
@@ -18436,6 +18573,7 @@ class BattleRuntime(object):
         self._round_finished_notified = False
         self._on_local_leave = None
         self._arena_type = None
+        self._arena_bounds = None
         self._spawn_planner = None
         self._navigation_graph = None
         self._grounded_bot_ids = set()

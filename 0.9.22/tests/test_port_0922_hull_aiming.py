@@ -12,6 +12,12 @@ from gui.mods.offline_lan_0922 import hull_aiming  # noqa: E402
 
 
 class HullAiming1513RulesTests(unittest.TestCase):
+    @staticmethod
+    def _descriptor(minimum=-4.0, maximum=2.0):
+        gun = {'pitchLimits': {'absolute': (
+            math.radians(minimum), math.radians(maximum))}}
+        return {'gun': gun}
+
     def test_static_yaw_uses_destroyed_movement_and_switching_gates(self):
         static = 0.0
         self.assertTrue(hull_aiming.static_yaw_locked(
@@ -61,6 +67,51 @@ class HullAiming1513RulesTests(unittest.TestCase):
             math.radians(14.1), math.radians(-20.0), 0.0,
             0.0, math.radians(14.0))
         self.assertFalse(reachable)
+
+    def test_active_descriptor_exposes_relative_gun_pitch_limits(self):
+        minimum, maximum = hull_aiming.absolute_pitch_limits(
+            self._descriptor())
+
+        self.assertAlmostEqual(math.radians(-4.0), minimum)
+        self.assertAlmostEqual(math.radians(2.0), maximum)
+
+    def test_flat_target_uses_gun_travel_before_hydraulic_travel(self):
+        minimum, maximum = hull_aiming.absolute_pitch_limits(
+            self._descriptor())
+
+        correction, reachable = hull_aiming.world_target_correction(
+            math.radians(-3.0), 0.0, minimum, maximum,
+            math.radians(-11.0), math.radians(11.0))
+
+        self.assertTrue(reachable)
+        self.assertEqual(0.0, correction)
+
+    def test_slope_is_removed_before_combined_pitch_is_resolved(self):
+        minimum, maximum = hull_aiming.absolute_pitch_limits(
+            self._descriptor())
+
+        correction, reachable = hull_aiming.world_target_correction(
+            math.radians(-10.0), math.radians(5.0), minimum, maximum,
+            math.radians(-11.0), math.radians(11.0))
+
+        self.assertTrue(reachable)
+        self.assertAlmostEqual(math.radians(-11.0), correction)
+
+    def test_combined_pitch_edge_clamps_and_reports_reachability(self):
+        minimum, maximum = hull_aiming.absolute_pitch_limits(
+            self._descriptor())
+
+        edge, edge_ok = hull_aiming.world_target_correction(
+            math.radians(-15.0), 0.0, minimum, maximum,
+            math.radians(-11.0), math.radians(11.0))
+        beyond, beyond_ok = hull_aiming.world_target_correction(
+            math.radians(-15.1), 0.0, minimum, maximum,
+            math.radians(-11.0), math.radians(11.0))
+
+        self.assertTrue(edge_ok)
+        self.assertAlmostEqual(math.radians(-11.0), edge)
+        self.assertFalse(beyond_ok)
+        self.assertAlmostEqual(math.radians(-11.0), beyond)
 
     def test_slew_uses_descriptor_radians_per_second(self):
         self.assertAlmostEqual(

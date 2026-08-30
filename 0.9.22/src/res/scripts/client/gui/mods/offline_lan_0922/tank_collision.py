@@ -27,6 +27,11 @@ import math
 
 DEFAULT_SHAPE = (1.5, 3.5, -0.8, 2.0)
 POSITION_SLOP = 0.01
+# A native collision callback and the copied authority pose can straddle one
+# presentation frame.  Keep contact receipts inside a bounded one-frame body
+# envelope instead of requiring the callback point to match the copied OBB to
+# the centimetre.
+RAM_CONTACT_POINT_SLOP = 0.75
 POSITION_PERCENT = 0.95
 _SHAPE_CACHE = {}
 SPATIAL_CELL_SIZE = 24.0

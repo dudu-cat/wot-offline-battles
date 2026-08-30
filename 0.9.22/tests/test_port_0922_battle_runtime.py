@@ -4942,7 +4942,39 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertNotIn(
             'allow_crush_drive',
             battle._motion_is_clear.call_args.kwargs)
+        self.assertEqual(
+            0.0, battle._motion_is_clear.call_args.kwargs['hull_yaw'])
         battle._baked_pose_safe.assert_called_once()
+
+    def test_tank_contact_can_push_a_stale_outside_pose_back_in(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._arena_bounds = (-300.0, -300.0, 300.0, 300.0)
+        battle._local_physics = {'mass': 25000.0}
+        battle._contact_tanks = mock.Mock(return_value=[])
+        battle._poll_local_ram_contact_episodes = mock.Mock()
+        battle._baked_pose_safe = mock.Mock(return_value=False)
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        contact = {
+            'cooldowns': {}, 'contacts': frozenset(),
+            'delta_velocity': (0.0, 0.0), 'correction': (-0.2, 0.0),
+        }
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'tank_collision.resolve_tank', return_value=contact), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'world_collision.check_horizontal_collision',
+                    return_value='clear'):
+            position = battle._resolve_local_tank_contacts(
+                entity, (301.0, 0.0, 0.0), 0.0, 0.1)
+
+        self.assertAlmostEqual(300.8, position[0])
+        self.assertFalse(battle._baked_pose_safe(position))
 
     def test_local_bot_ram_receipt_preserves_pre_separation_pose(self):
         runtime = _runtime()
@@ -7072,6 +7104,62 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
 
         self.assertIs(arena, battle._standard_arena('31_airfield'))
+
+    def test_player_arena_boundary_uses_official_box_and_chassis_corners(self):
+        battle = BattleRuntime(_runtime())
+        arena = types.SimpleNamespace(boundingBox=(
+            _Vector(-300.0, -300.0), _Vector(300.0, 300.0)))
+        battle._arena_bounds = battle._arena_bounds_from_type(arena)
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+        position = (296.49, 7.0, -20.0)
+
+        self.assertEqual(
+            (-300.0, -300.0, 300.0, 300.0), battle._arena_bounds)
+        # At pi/2 the 3.5 m chassis half-length reaches the east edge.
+        self.assertFalse(battle._arena_motion_is_clear(
+            entity, position, math.pi * 0.5, 1.0, 0.1))
+        self.assertTrue(battle._arena_motion_is_clear(
+            entity, position, 0.0, 1.0, 0.1,
+            hull_yaw=math.pi * 0.5))
+        self.assertFalse(battle._arena_rotation_is_clear(
+            entity, position, math.pi * 0.5, 1.2))
+
+        # An already stale pose can move or drift inward without a teleport,
+        # but it cannot increase its overflow past the same official edge.
+        outside = (301.0, 100.0, -20.0)
+        self.assertTrue(battle._arena_motion_is_clear(
+            entity, outside, -math.pi * 0.5, 1.0, 0.1,
+            hull_yaw=math.pi * 0.5))
+        self.assertFalse(battle._arena_motion_is_clear(
+            entity, outside, math.pi * 0.5, 1.0, 0.1,
+            hull_yaw=math.pi * 0.5))
+        self.assertTrue(battle._arena_rotation_is_clear(
+            entity, outside, math.pi * 0.5, 0.0))
+
+    def test_player_arena_boundary_blocks_before_native_world_probe(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._arena_bounds = (-300.0, -300.0, 300.0, 300.0)
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'world_collision.check_horizontal_collision',
+                return_value='clear') as world_probe:
+            self.assertFalse(battle._motion_is_clear(
+                entity, (296.49, 7.0, 0.0), math.pi * 0.5,
+                1.0, 0.1))
+            self.assertEqual('hard', battle._local_motion_status)
+            self.assertEqual('arena', battle._local_motion_kinds)
+            world_probe.assert_not_called()
+
+            self.assertTrue(battle._motion_is_clear(
+                entity, (296.49, 7.0, 0.0), 0.0, 1.0, 0.1,
+                hull_yaw=math.pi * 0.5))
+            world_probe.assert_called_once()
 
     def test_supported_map_installs_catalog_before_native_destructible_reset(self):
         runtime = _runtime()
@@ -11757,6 +11845,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
                 },
             },
         }
+        descriptor.gun.pitchLimits = {'absolute': (-0.07, 0.035)}
         entity = _Vehicle(
             10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
             {'health': 500})
@@ -11775,12 +11864,13 @@ class BattleRuntimeContractTests(unittest.TestCase):
         runtime.bigworld.entities[10] = entity
         battle._server = types.SimpleNamespace(vehicle_id=10)
         battle._sender = types.SimpleNamespace(
-            forward=0.0, turn=0.0, aim_yaw=0.0, gun_pitch=-0.25,
+            forward=0.0, turn=0.0, aim_yaw=0.0, gun_pitch=0.03,
+            aim_pitch=-0.25,
             handbrake=False, send_current=mock.Mock(return_value=True))
         battle._local_position = (2.0, 3.0, 4.0)
-        battle._local_pitch = -0.03
+        battle._local_pitch = 0.05
         battle._local_descriptor = descriptor
-        battle._avatar.gunRotator.gunPitch = -0.07
+        battle._avatar.gunRotator.gunPitch = 0.03
         battle._attach_local_presentation()
 
         self.assertIs(entity.model.matrix, battle._local_pose_matrix)
@@ -11792,6 +11882,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             battle._local_siege_aim_world_matrix,
             battle._local_siege_body_matrix.b)
+        self.assertIs(
+            battle._local_siege_body_matrix,
+            battle._local_siege_stabilised_matrix)
         self.assertIs(
             battle._local_siege_aim_matrix,
             battle._local_siege_aim_world_matrix.a)
@@ -11805,7 +11898,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             battle._local_siege_body_matrix,
             battle._local_pose_matrix.a)
         self.assertIs(
-            battle._local_siege_stabilised_matrix,
+            battle._local_siege_body_matrix,
             battle._local_stabilised_matrix.a)
         self.assertIs(
             battle._local_siege_ground_matrix,
@@ -11814,17 +11907,21 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(-0.1, battle._local_siege_aim_pitch)
         self.assertAlmostEqual(-0.1, battle._local_siege_aim_matrix.pitch)
         entity.siegeState = 3
+        descriptor.type.hullAimingParams['pitch']['isEnabled'] = False
         self.assertTrue(battle._select_local_siege_pose(entity, True))
         self.assertIs(
             battle._local_siege_body_matrix,
             battle._local_pose_matrix.a)
         self.assertFalse(battle._update_local_hull_aiming(entity, 1.0))
         self.assertAlmostEqual(0.0, battle._local_siege_aim_pitch)
+        self.assertAlmostEqual(0.0, battle._local_siege_aim_matrix.pitch)
         entity.filter.getVehiclePhysics.assert_not_called()
 
         self.assertTrue(battle._select_local_siege_pose(entity, False))
         self.assertIs(
             battle._local_matrix, battle._local_pose_matrix.a)
+        self.assertIs(
+            battle._local_matrix, battle._local_stabilised_matrix.a)
 
     def test_local_siege_waits_for_native_vehicle_enter_to_finish(self):
         runtime = _runtime()
@@ -12902,9 +12999,57 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [0.0, 0.55, -0.55],
             [call.args[2] for call in battle._motion_is_clear.call_args_list])
+        self.assertNotIn(
+            'hull_yaw', battle._motion_is_clear.call_args_list[0].kwargs)
+        self.assertTrue(all(
+            call.kwargs['hull_yaw'] == 0.0 for call in
+            battle._motion_is_clear.call_args_list[1:]))
         self.assertEqual(
             vehicle_physics.HARD_CONTACT_GRIND_TICKS,
             battle._local_grind)
+
+    def test_player_pivot_cannot_swing_chassis_corners_past_arena_edge(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(296.49, 0.0, 0.0), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=-1.0, handbrake=False,
+            send_current=mock.Mock(return_value=True))
+        battle._arena_bounds = (-300.0, -300.0, 300.0, 300.0)
+        battle._local_position = (296.49, 0.0, 0.0)
+        battle._local_yaw = math.pi * 0.5
+        battle._local_descriptor = entity.typeDescriptor
+        battle._attach_local_presentation()
+        battle._smoothed_drive_pitch = mock.Mock(return_value=0.0)
+        battle._update_vertical_motion = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+        battle._ground_pitch = mock.Mock(return_value=0.0)
+        battle._apply_slope_slide = mock.Mock(
+            side_effect=lambda position, unused_yaw, unused_dt,
+            unused_entity=None: position)
+        battle._resolve_local_tank_contacts = mock.Mock(
+            side_effect=lambda unused_entity, position, unused_yaw,
+            unused_dt: position)
+
+        with mock.patch(
+                'gui.mods.offline_lan_0922.battle_runtime.'
+                'vehicle_physics.longitudinal_step', return_value=0.0), \
+                mock.patch(
+                    'gui.mods.offline_lan_0922.battle_runtime.'
+                    'vehicle_physics.traverse_step', return_value=-3.7):
+            battle._drive_local(0.1)
+
+        self.assertEqual(math.pi * 0.5, battle._local_yaw)
+        self.assertEqual(0.0, battle._local_turn_speed)
+        self.assertEqual((296.49, 0.0, 0.0), battle._local_position)
+        self.assertEqual('arena', battle._local_motion_kinds)
 
     def test_ground_probe_hands_the_broken_skin_filter_to_the_engine(self):
         runtime = _runtime()
@@ -15229,6 +15374,25 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(0.0, battle._local_slide_speed)
         self.assertEqual((1.99, -0.995), battle._local_air_lateral)
 
+    def test_airborne_lateral_carry_cannot_cross_the_arena_edge(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._arena_bounds = (-300.0, -300.0, 300.0, 300.0)
+        battle._local_airborne = True
+        battle._local_slide_speed = 4.0
+        battle._local_air_lateral = (2.0, 0.0)
+        entity = _Vehicle(
+            10, _Descriptor(), _Vector(), (0, 0, 0), {'health': 500})
+
+        position = battle._apply_slope_slide(
+            (298.49, 10.0, 0.0), 0.0, 0.1, entity)
+
+        self.assertEqual((298.49, 10.0, 0.0), position)
+        self.assertEqual(0.0, battle._local_slide_speed)
+        self.assertEqual((1.99, 0.0), battle._local_air_lateral)
+        self.assertEqual('arena', battle._local_motion_kinds)
+
     def test_cross_slope_slide_carries_off_a_cliff_with_ground_plane(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -15303,6 +15467,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertNotIn(
             'allow_crush_drive',
             battle._motion_is_clear.call_args.kwargs)
+        self.assertEqual(
+            0.0, battle._motion_is_clear.call_args.kwargs['hull_yaw'])
         unused_entity, unused_position, slide_yaw, slide_speed, step = (
             battle._motion_is_clear.call_args[0])
         self.assertAlmostEqual(math.pi * 0.5, slide_yaw)
@@ -15422,12 +15588,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(math.atan2(10.0, 20.0), sender.aim_yaw)
         self.assertAlmostEqual(-math.atan2(2.0, math.sqrt(500.0)),
                                sender.gun_pitch)
+        self.assertAlmostEqual(sender.gun_pitch, sender.aim_pitch)
         owner._echo_local_gun_angles.assert_called_once_with()
 
         sender.send_avatar_input(1, 'stop_tracking', {
             'turret_yaw': 0.25, 'gun_pitch': -0.1})
         self.assertAlmostEqual(0.75, sender.aim_yaw)
         self.assertAlmostEqual(-0.1, sender.gun_pitch)
+        self.assertAlmostEqual(-0.1, sender.aim_pitch)
         self.assertEqual(
             [mock.call(), mock.call(0.25, -0.1)],
             owner._echo_local_gun_angles.call_args_list)
@@ -17195,6 +17363,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._local_yaw = 0.4
         battle._avatar.gunRotator.turretYaw = 0.15
         battle._avatar.gunRotator.gunPitch = -0.08
+        battle._sender.aim_pitch = -0.25
         battle._records = {
             'player:1': {'engine_id': 10, 'local': True}}
 
@@ -17223,6 +17392,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(-0.08, current_input[1][3])
         self.assertAlmostEqual(0.55, battle._sender.aim_yaw)
         self.assertAlmostEqual(-0.08, battle._sender.gun_pitch)
+        self.assertAlmostEqual(-0.25, battle._sender.aim_pitch)
         battle._show_shot({
             'attacker': 1, 'shooter_kind': 'player', 'shooter_id': 1,
             'fire_intent_seq': 1, 'fire_input_seq': 1,

@@ -11,7 +11,7 @@ from gui.mods.offline_lan_0922.ai import maps as tactical_maps
 from gui.mods.offline_lan_0922.ai import driver as ai_driver
 from gui.mods.offline_lan_0922.ai import planner as ai_planner
 from gui.mods.offline_lan_0922.ai.navigation import (
-    BAKED_FATAL_HAZARDS, TerrainNavigator)
+    BAKED_FATAL_HAZARDS, BAKED_SHALLOW_WATER, TerrainNavigator)
 from gui.mods.offline_lan_0922 import critical_damage
 from gui.mods.offline_lan_0922 import ballistics
 from gui.mods.offline_lan_0922 import burst_mechanics
@@ -32,6 +32,8 @@ from gui.mods.offline_lan_0922 import vehicle_physics
 
 OBSERVATION_SECONDS = 0.40
 PUBLICATION_SECONDS = 1.0 / 30.0
+LOCAL_ACTION_SECONDS = 0.10
+TACTICAL_REFRESH_SECONDS = 1.0
 # Eight protocol-maximum exact paths can share only two of the four native
 # rays while strategic work is pending.  Give both the initial intent and each
 # stale moving-target reproof their own queue-sized lifetime.
@@ -50,33 +52,32 @@ HUMAN_TARGET_ID_BASE = 1000000
 # invalidates the pair immediately below.
 VISIBILITY_SAMPLE_SECONDS = 1.0 / 6.0
 SHOT_LANE_SECONDS = 0.20
-# Spread full-roster tactical refreshes across the complete observation
-# window.  A selected target still goes through the independent 0.20-second
-# final-fire gate above, so this only flattens the server-planning snapshot.
-SHOT_LANE_REFRESH_SECONDS = OBSERVATION_SECONDS
+# Spread full-roster tactical refreshes across one second independently from
+# the 0.40-second spotting publication. A selected target still goes through
+# the independent 0.20-second final-fire gate above, so a cached tactical lane
+# can never authorize an unsafe shot.
+SHOT_LANE_REFRESH_SECONDS = TACTICAL_REFRESH_SECONDS
 SHOT_LANE_PHASES = 29
 # Sixty-four exact static rays finish all 435 protocol-maximum pairs inside a
-# 0.40-second window at 24 FPS while removing the old 110-ray render-thread
-# spike.  If a slower renderer misses that envelope, delay the complete
-# observation instead of publishing a partial shooter list.
+# one-second tactical window at 24 FPS while removing the old 110-ray
+# render-thread spike. Spotting publication never waits for this advisory
+# shooter list; missing or expired pairs publish as not shootable.
 MAX_SHOT_LANE_PAIRS_PER_FRAME = 64
-# The server never assigns a visible target beyond 560 metres.  The pinned
-# #1513 catalogue tops out at 79 km/h; including the copied 1.05 downhill
-# overspeed, two vehicles close less than 22 metres across one 0.40-second
-# observation plus a 24 Hz render frame and 30 Hz publication frame.  Keep a
-# conservative 25-metre margin, but do not spend a native collision ray on a
-# pair which cannot enter the server envelope in that time.
+# The server never assigns a visible target beyond 560 metres. Keep a
+# conservative 25-metre broad-phase margin for the advisory roster scan; the
+# selected target's independent 0.20-second final-fire check does not use this
+# stale tactical result as launch authorization.
 SHOT_LANE_QUERY_DISTANCE = 585.0
 # Artillery is reported shootable only after the authority has completed a
 # pitch-valid curved-world probe.  Keep its query envelope at map scale without
 # making every ordinary tank spend native rays beyond the server's 560 m lease.
 SPG_SHOT_LANE_QUERY_DISTANCE = 2500.0
-# Cover fans remain phased through the first half of the observation window.
-# Lane refreshes span the full window, but their global per-frame cap above and
-# the existing one-cover-job limit keep the overlap bounded.
-COVER_JOB_WINDOW_SECONDS = OBSERVATION_SECONDS * 0.5
+# Cover fans share the one-second global-tactics cadence but remain phased
+# through its first half. Visibility reports continue independently.
+COVER_REFRESH_SECONDS = TACTICAL_REFRESH_SECONDS
+COVER_JOB_WINDOW_SECONDS = COVER_REFRESH_SECONDS * 0.5
 PROBE_KINDS = ('visibility', 'lane', 'cover', 'ground', 'motion')
-DECISION_SECONDS = 0.0975
+DECISION_SECONDS = 0.150
 # Distance tiers for planner and suspension sampling.  Physical integration is
 # globally capped by PUBLICATION_SECONDS; MatrixAnimation interpolates the
 # accepted poses, so a second per-bot integration throttle would only create
@@ -96,7 +97,8 @@ DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
 # three-lane corridor.  A cached sample may only be reused while the hull stays
 # well inside the 2.2 m outer lanes.  The time bound also limits maximum copied
-# travel to 35 m/s * 0.0975 s = 3.4125 m before a mandatory new native probe.
+# travel to 35 m/s * 0.150 s = 5.25 m; the tighter 3.5 m spatial containment
+# below still forces a new native probe before that full interval at top speed.
 MOTION_PROBE_SECONDS = DECISION_SECONDS
 MOTION_PROBE_LATERAL_BUDGET = 1.0
 MOTION_PROBE_FORWARD_BUDGET = 3.5
@@ -535,8 +537,10 @@ def _shot_ballistics(descriptor, shell_index):
     return speed, gravity, maximum
 
 
-def _critical_parts(state):
-    critical = state.get('critical')
+_CRITICAL_PARTS_TICK_CACHE = '_critical_parts_tick_cache'
+
+
+def _parse_critical_parts(critical):
     if not isinstance(critical, dict):
         return {}, set(), set(), set()
     devices = {}
@@ -552,6 +556,34 @@ def _critical_parts(state):
     yellow.difference_update(destroyed)
     crew_ko = set(str(name) for name in (critical.get('crew_ko') or ()))
     return devices, destroyed, crew_ko, yellow
+
+
+def _critical_parts(state):
+    critical = state.get('critical')
+    cached = state.get(_CRITICAL_PARTS_TICK_CACHE)
+    if (isinstance(cached, tuple) and len(cached) == 2 and
+            cached[0] is critical):
+        return cached[1]
+    return _parse_critical_parts(critical)
+
+
+def _cache_critical_parts_for_tick(state):
+    """Parse one stable post-repair payload for the current Bot tick."""
+    critical = state.get('critical')
+    parts = _parse_critical_parts(critical)
+    state[_CRITICAL_PARTS_TICK_CACHE] = (critical, parts)
+    return parts
+
+
+def _clear_critical_parts_tick_cache(state):
+    state.pop(_CRITICAL_PARTS_TICK_CACHE, None)
+
+
+def _copy_runtime_state(state):
+    """Copy authority state without the private one-tick parse cache."""
+    copied = dict(state)
+    copied.pop(_CRITICAL_PARTS_TICK_CACHE, None)
+    return copied
 
 
 def _critical_factor(state, descriptor, stat):
@@ -1792,6 +1824,7 @@ class BotRuntime(object):
         self._pending_launch_by_bot = {}
         self._artillery_intents = {}
         self._artillery_reproofs = {}
+        self._ballistic_solution_cache = {}
         self._friendly_repositions = {}
         self._shot_los_cache = {}
         self._shot_los_deadlines = {}
@@ -1825,6 +1858,8 @@ class BotRuntime(object):
         self._server_order_tokens = {}
         self._order_revision = -1
         self._next_observation = 0.0
+        self._next_shot_lane_refresh = 0.0
+        self._next_cover_refresh = 0.0
         self._next_publication = 0.0
         self._pending_ram_reports = []
         self._cover_cursor = 0
@@ -2493,6 +2528,7 @@ class BotRuntime(object):
             self._pending_launch_keys = {}
             self._pending_launch_by_bot = {}
             self._clear_artillery_intents()
+            self._ballistic_solution_cache = {}
             self._friendly_repositions = {}
             self._shot_los_cache = {}
             self._shot_los_deadlines = {}
@@ -2527,6 +2563,8 @@ class BotRuntime(object):
             self._server_order_tokens = {}
             self._order_revision = -1
             self._next_observation = 0.0
+            self._next_shot_lane_refresh = 0.0
+            self._next_cover_refresh = 0.0
             self._next_publication = 0.0
             self._pending_ram_reports = []
             self._pending_launches = []
@@ -2548,6 +2586,7 @@ class BotRuntime(object):
         if message.get('battle_result') is not None:
             self.finished = True
             self._clear_artillery_intents()
+            self._ballistic_solution_cache = {}
             self._friendly_repositions = {}
         previous_authority = self.authority_id
         self.authority_id = message.get('bot_authority_id')
@@ -2559,6 +2598,7 @@ class BotRuntime(object):
         if previous_authority != self.authority_id:
             self._sample_time_us = 0
             self._clear_artillery_intents()
+            self._ballistic_solution_cache = {}
             self._friendly_repositions = {}
             self._visibility_cache = {}
             self._team_visibility_cache = {}
@@ -2587,6 +2627,9 @@ class BotRuntime(object):
             self._ram_contacts = frozenset()
             self._cover_queue = []
             self._cover_results = []
+            self._next_observation = 0.0
+            self._next_shot_lane_refresh = 0.0
+            self._next_cover_refresh = 0.0
             self._next_publication = 0.0
             if self.is_authority():
                 self._manifest_sent = False
@@ -2941,7 +2984,7 @@ class BotRuntime(object):
         sync = self._combat_sync_state(state)
         if server_tick is not None and server_tick < sync['server_tick']:
             return False
-        candidate = dict(state)
+        candidate = _copy_runtime_state(state)
         candidate['health'] = max(0, min(
             int(_number(raw.get('health'), state['health'])),
             int(state['max_health'])))
@@ -3219,6 +3262,9 @@ class BotRuntime(object):
 
     def _advance_bot_critical(self, state, step, now, record_step=True,
                               advance_fire=True, equipment_effects=None):
+        # Repair, consumables and fire may replace the canonical payload. Never
+        # carry a parsed view across that mutation boundary.
+        _clear_critical_parts_tick_cache(state)
         payload = state.get('critical')
         if ((not isinstance(payload, dict) or not payload) and
                 not self._bot_stunned(state)):
@@ -4615,7 +4661,8 @@ class BotRuntime(object):
         return 2
 
     def _planner_corridor_clear(self, position, yaw, speed,
-                                wet_escape=False):
+                                wet_escape=False, allow_shallow=False,
+                                hazard_only=False):
         """Rank one candidate through the validated baked static corridor.
 
         ``True`` admits a planner candidate and ``False`` rejects a known fatal
@@ -4654,9 +4701,13 @@ class BotRuntime(object):
                 _number(position[1]),
                 _number(position[2]) + cosine * distance,
             )
-            if grid.segment_has_baked_hazard(
-                    position, end, BAKED_FATAL_HAZARDS):
+            hazard_mask = BAKED_FATAL_HAZARDS
+            if not allow_shallow:
+                hazard_mask |= BAKED_SHALLOW_WATER
+            if grid.segment_has_baked_hazard(position, end, hazard_mask):
                 return False
+            if hazard_only:
+                return True
             if grid.segment_clear(position, end):
                 return True
             # A coarse baked corridor can reject a valid short turn on uneven
@@ -4931,10 +4982,15 @@ class BotRuntime(object):
 
     def _guard_realised_pose(self, state, tick_pose, tick_was_safe,
                              attempted_yaw):
-        """Cancel only this tick's newly unsafe motion; never rewind history."""
-        if (not tick_was_safe or
-                prebaked_navigation.pose_is_safe(
-                    self.baked_graph, _position(state), shoulder_cells=0)):
+        """Reject a new hazard or outward map-edge drift after all motion."""
+        realised_pose = _position(state)
+        moved_farther_outside = not self._baked_pose_progress_clear(
+            state, tick_pose, state.get('yaw'),
+            realised_pose, state.get('yaw'))
+        if (not moved_farther_outside and
+                (not tick_was_safe or
+                 prebaked_navigation.pose_is_safe(
+                     self.baked_graph, realised_pose, shoulder_cells=0))):
             return False
         state['x'], state['y'], state['z'] = tick_pose
         state['speed'] = 0.0
@@ -4947,9 +5003,65 @@ class BotRuntime(object):
         self._invalidate_realised_motion(state['id'], attempted_yaw)
         return True
 
+    def _baked_boundary_overflow(self, state, position, yaw):
+        """Return per-edge chassis overflow past the authored rectangle.
+
+        Arena bounds constrain the complete vehicle, not only its centre.
+        Projecting the exact Bot collision dimensions here keeps this final
+        authority guard consistent with the local player's boundary gate.
+        """
+        graph = self.baked_graph
+        if not isinstance(graph, dict):
+            return None
+        try:
+            bounds = tuple(float(value) for value in graph['bounds'])
+            if len(bounds) != 4:
+                return None
+            minimum_x, minimum_z, maximum_x, maximum_z = bounds
+            x = float(position[0])
+            z = float(position[2])
+            hull_yaw = float(yaw)
+            half_length = max(0.5, float(state.get('half_length', 3.5)))
+            half_width = max(0.3, float(state.get('half_width', 1.7)))
+            values = bounds + (x, z, hull_yaw, half_length, half_width)
+            if (minimum_x >= maximum_x or minimum_z >= maximum_z or
+                    any(math.isnan(value) or math.isinf(value)
+                        for value in values)):
+                return None
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+            return None
+        sine = abs(math.sin(hull_yaw))
+        cosine = abs(math.cos(hull_yaw))
+        extent_x = cosine * half_width + sine * half_length
+        extent_z = sine * half_width + cosine * half_length
+        return (
+            max(0.0, minimum_x + extent_x - x),
+            max(0.0, x + extent_x - maximum_x),
+            max(0.0, minimum_z + extent_z - z),
+            max(0.0, z + extent_z - maximum_z),
+        )
+
+    def _baked_pose_progress_clear(self, state, before_position, before_yaw,
+                                   after_position, after_yaw):
+        """Allow a legal pose or recovery that worsens no boundary edge."""
+        before = self._baked_boundary_overflow(
+            state, before_position, before_yaw)
+        after = self._baked_boundary_overflow(
+            state, after_position, after_yaw)
+        if before is None or after is None:
+            return True
+        return all(after[index] <= before[index] + 1.0e-6
+                   for index in range(4))
+
     def _navigation_target(self, bot_id, position, goal, strategic, state):
-        if self.navigator is None or _distance(position, goal) <= 15.0:
+        if self.navigator is None:
             return goal
+        if _distance(position, goal) <= 15.0:
+            grid = getattr(self.navigator, 'grid', None)
+            direct = getattr(grid, 'dry_segment_clear', None)
+            if callable(direct) and direct(
+                    position, goal, state.get('now', 0.0)):
+                return goal
         mode = strategic.get('combat_mode', 'route')
         route_index = int(_number(strategic.get('route_index'), 0))
         if mode == 'base_defense':
@@ -5364,8 +5476,9 @@ class BotRuntime(object):
 
     @staticmethod
     def _native_ram_hit_supported(body, hit):
-        """Require the native contact point to lie on the frozen OBB body."""
-        return tank_collision.body_contains_point(body, hit)
+        """Contain one frame of native/copy pose skew inside the frozen OBB."""
+        return tank_collision.body_contains_point(
+            body, hit, slop=tank_collision.RAM_CONTACT_POINT_SLOP)
 
     def _ram_reports(self, state, events, human_ram_receipt=None):
         reports = []
@@ -5606,6 +5719,8 @@ class BotRuntime(object):
                             'y': _number(historical.get('y')),
                             'z': _number(historical.get('z')),
                             'yaw': bot_yaw,
+                            'pitch': _number(historical.get('pitch')),
+                            'roll': _number(historical.get('roll')),
                             'mass': _number(
                                 historical.get('mass'), 25000.0),
                             'shape': historical.get('collision_shape'),
@@ -5942,7 +6057,7 @@ class BotRuntime(object):
             direction[1], max(1.0e-12, horizontal))
         try:
             raw = self.direct_launch_origin_probe(
-                dict(state), descriptor, int(shell_index),
+                _copy_runtime_state(state), descriptor, int(shell_index),
                 int(state.get('fire_seq', 0)) + 1,
                 shot_yaw, shot_pitch, 0.0)
             origin = tuple(float(value) for value in raw)
@@ -6180,6 +6295,11 @@ class BotRuntime(object):
         return {
             'aim_position': aim_position, 'yaw': yaw, 'pitch': pitch,
             'flight_time': flight_time, 'arc': 'low',
+            # Gun aiming immediately follows this solve in the same authority
+            # tick, before hydraulic, turret or barrel state advances. Reuse
+            # the exact frozen muzzle instead of crossing the native
+            # HP_gunFire boundary a second time for the identical pose.
+            '_origin': start,
         }
 
     @staticmethod
@@ -6425,14 +6545,14 @@ class BotRuntime(object):
                 return None
             if self._probe_clock is None:
                 value = self.ballistic_solution_probe(
-                    dict(state), (dict(target)
+                    _copy_runtime_state(state), (dict(target)
                                   if target is not None else None),
                     descriptor, int(shell_index), _number(now))
             else:
                 probe_started = self._probe_started()
                 try:
                     value = self.ballistic_solution_probe(
-                        dict(state), (dict(target)
+                        _copy_runtime_state(state), (dict(target)
                                       if target is not None else None),
                         descriptor, int(shell_index), _number(now))
                 finally:
@@ -6460,6 +6580,41 @@ class BotRuntime(object):
         return self._local_ballistic_solution(
             state, target, descriptor, shell_index)
 
+    @staticmethod
+    def _ballistic_solution_signature(
+            state, target, descriptor, shell_index):
+        target = target if isinstance(target, dict) else {}
+        return (
+            str(target.get('kind') or ''),
+            target.get('network_id', target.get('id')),
+            bool(target.get('alive', True)),
+            int(shell_index), id(descriptor),
+            int(state.get('siege_state', siege_mechanics.DISABLED)),
+            int(state.get('fire_seq', 0)),
+        )
+
+    def _cadenced_ballistic_solution(
+            self, state, target, descriptor, shell_index, now, force=False):
+        """Refresh target geometry at 10 Hz while presentation stays 30 Hz."""
+        bot_id = int(state['id'])
+        signature = self._ballistic_solution_signature(
+            state, target, descriptor, shell_index)
+        cached = self._ballistic_solution_cache.get(bot_id)
+        fresh = bool(
+            force or cached is None or cached[0] != signature or
+            _number(now) + 1.0e-9 >= cached[1])
+        if fresh:
+            solution = self._ballistic_solution(
+                state, target, descriptor, shell_index, now)
+            self._ballistic_solution_cache[bot_id] = (
+                signature,
+                _cache_deadline(
+                    now, bot_id, LOCAL_ACTION_SECONDS, 13,
+                    cached is None),
+                solution)
+            return solution, True
+        return cached[2], False
+
     def _update_gun_aim(self, state, command, target, step):
         """Slew the rendered turret and barrel through the 0.8.2 limits."""
         descriptor = self._descriptors.get(state['id'], {})
@@ -6482,8 +6637,11 @@ class BotRuntime(object):
                     ballistic_solution.get('aim_position'), fallback)
             else:
                 aim_position = _point(command.get('aim_position'), fallback)
-            origin = self._exact_shot_origin(
-                state, descriptor, state.get('shell_index', 0))
+            origin = (ballistic_solution.get('_origin')
+                      if isinstance(ballistic_solution, dict) else None)
+            if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
+                origin = self._exact_shot_origin(
+                    state, descriptor, state.get('shell_index', 0))
             if origin is None:
                 state['gun_aligned'] = False
                 return _number(state.get('aim_yaw')), 0.0
@@ -6653,9 +6811,9 @@ class BotRuntime(object):
         """Serialise one lightweight record per canonical team target.
 
         Lane checks remain in the per-bot loop so their cache and native-probe
-        side effects keep the same order.  Serialisation happens only after the
-        complete lane set is ready; the last target snapshot and visibility OR
-        match the previous overwrite-on-each-observer implementation.
+        side effects keep the same order. The tactical lane cache is advisory
+        and refreshes independently; the last target snapshot and visibility
+        OR remain complete on every latency-sensitive observation.
         """
         packed = []
         for key in sorted(aggregate):
@@ -6862,13 +7020,15 @@ class BotRuntime(object):
         flight_time = intent['solution']['flight_time']
         if self._probe_clock is None:
             value = self.artillery_launch_probe(
-                dict(state), dict(target), descriptor, int(shell_index),
+                _copy_runtime_state(state), dict(target), descriptor,
+                int(shell_index),
                 fire_seq, shot_yaw, shot_pitch, flight_time, _number(now))
         else:
             probe_started = self._probe_started()
             try:
                 value = self.artillery_launch_probe(
-                    dict(state), dict(target), descriptor, int(shell_index),
+                    _copy_runtime_state(state), dict(target), descriptor,
+                    int(shell_index),
                     fire_seq, shot_yaw, shot_pitch, flight_time,
                     _number(now))
             finally:
@@ -6939,13 +7099,15 @@ class BotRuntime(object):
         try:
             if self._probe_clock is None:
                 raw_origin = self.direct_launch_origin_probe(
-                    dict(state), descriptor, int(shell_index), fire_seq,
+                    _copy_runtime_state(state), descriptor, int(shell_index),
+                    fire_seq,
                     shot_yaw, shot_pitch, flight_time)
             else:
                 probe_started = self._probe_started()
                 try:
                     raw_origin = self.direct_launch_origin_probe(
-                        dict(state), descriptor, int(shell_index), fire_seq,
+                        _copy_runtime_state(state), descriptor,
+                        int(shell_index), fire_seq,
                         shot_yaw, shot_pitch, flight_time)
                 finally:
                     self._probe_finished(1, probe_started)
@@ -7441,21 +7603,22 @@ class BotRuntime(object):
         live_players = None
         live_probe_targets = {}
         processed_bot_ids = set()
-        # Cover geometry is sampled on the render thread.  A batch selected by
-        # one observation is phased through the following observation window,
-        # so a later observation is not formed until all of its cover results
-        # are ready.  Supported render rates have ample room for three jobs;
-        # unusually low rates delay the observation instead of publishing a
-        # partial batch or running several native probes on one frame.
+        # Spotting is latency-sensitive presentation state. Full-roster firing
+        # lanes and cover fans only guide the one-hertz server planner, so they
+        # run on independent clocks and can never delay this observation.
         observation_due = now >= self._next_observation
-        collect_observation = (
-            publish and observation_due and not self._cover_queue)
+        collect_observation = publish and observation_due
+        shot_lane_refresh_time = self._next_shot_lane_refresh
+        shot_lane_refresh_due = now >= shot_lane_refresh_time
         refresh_shot_lanes = (
             not self._cover_queue and
-            (observation_due or
-             (self._next_observation > 0.0 and
+            (shot_lane_refresh_due or
+             (shot_lane_refresh_time > 0.0 and
               now + SHOT_LANE_REFRESH_SECONDS + 1e-9 >=
-              self._next_observation)))
+              shot_lane_refresh_time)))
+        collect_cover_jobs = bool(
+            publish and not self._cover_queue and
+            now >= self._next_cover_refresh)
         shot_lane_budget = [MAX_SHOT_LANE_PAIRS_PER_FRAME]
         shot_lanes_ready = True
         neighbours = list(neighbours or []) + self._player_neighbours(players)
@@ -7472,7 +7635,7 @@ class BotRuntime(object):
         # simulation slice. Share them across all observers, but never across
         # slices where motion or equipment state may change.
         visibility_tick = {}
-        if collect_observation:
+        if collect_observation or refresh_shot_lanes:
             self._append_human_observations(
                 players, now, observation_entries, team_visibility,
                 visibility_tick)
@@ -7505,6 +7668,10 @@ class BotRuntime(object):
             if not state['alive']:
                 self._cancel_active_burst(state)
                 continue
+            # Drowning and overturn are the last critical-state writers before
+            # this Bot's ordinary decision/aim/fire work. Parse once only for
+            # that stable portion of this authority tick.
+            _cache_critical_parts_for_tick(state)
             tick_siege_yaw = _number(state.get('yaw'))
             siege_motion_locked = int(state.get(
                 'siege_state', siege_mechanics.DISABLED)) in (
@@ -7542,11 +7709,23 @@ class BotRuntime(object):
                         self._descriptors.get(state['id']))
                 return planner_probe_samples[key]
 
+            grid = getattr(self.navigator, 'grid', None)
+            point_hazard = getattr(grid, 'point_has_baked_hazard', None)
+            baked_shallow_escape = bool(
+                callable(point_hazard) and point_hazard(
+                    position, BAKED_SHALLOW_WATER))
+            controlled_shallow = getattr(
+                self.navigator, 'controlled_shallow_step', None)
+
             def sample_clear(sample_yaw):
                 advisory = self._planner_corridor_clear(
                     position, sample_yaw, state.get('speed', 0.0),
-                    _number(state.get('_water_depth'), -1.0) >
-                    BOT_WATER_AVOID_DEPTH)
+                    wet_escape=(baked_shallow_escape or
+                                _number(state.get('_water_depth'), -1.0) >
+                                BOT_WATER_AVOID_DEPTH),
+                    allow_shallow=(callable(controlled_shallow) and
+                                   controlled_shallow(
+                                       state['id'], position, sample_yaw)))
                 if advisory is not None:
                     return bool(advisory)
                 sample = planner_sample_direction(sample_yaw)
@@ -7648,15 +7827,19 @@ class BotRuntime(object):
             if live_players is None:
                 live_players = self._index_live_players(players)
             refresh_all_targets = bool(
-                collect_observation or refresh_shot_lanes)
-            active_contacts = contacts if refresh_all_targets else ()
+                collect_observation or refresh_shot_lanes or
+                collect_cover_jobs)
+            active_contacts = (
+                contacts if (collect_observation or refresh_shot_lanes)
+                else ())
             live_targets = None
             if refresh_all_targets:
                 live_targets = self._refresh_target_poses(
                     targets, live_players=live_players,
                     probe_targets=live_probe_targets,
                     processed_bot_ids=processed_bot_ids)
-            lane_source = dict(state) if active_contacts else None
+            lane_source = (_copy_runtime_state(state)
+                           if active_contacts else None)
             for cached_target in active_contacts:
                 observed_target = live_targets.get(
                     cached_target.get('id'), cached_target)
@@ -8030,12 +8213,49 @@ class BotRuntime(object):
                         params, self._turn_speeds.get(state['id'], 0.0),
                         turn, _number(state.get('speed')), step,
                         drive_intent=throttle))
+                old_hull_yaw = _number(state.get('yaw'))
+                candidate_hull_yaw = old_hull_yaw + turn_speed * step
+                while candidate_hull_yaw > math.pi:
+                    candidate_hull_yaw -= math.pi * 2.0
+                while candidate_hull_yaw < -math.pi:
+                    candidate_hull_yaw += math.pi * 2.0
+                if not self._baked_pose_progress_clear(
+                        state, position, old_hull_yaw,
+                        position, candidate_hull_yaw):
+                    # Turning is a pose change even without translation. Keep
+                    # the prior legal OBB until the hull first moves far enough
+                    # inward to rotate without crossing the official red line.
+                    turn_speed = 0.0
+                    candidate_hull_yaw = old_hull_yaw
+                    state['rotation_dir'] = 0
                 self._turn_speeds[state['id']] = turn_speed
-                state['yaw'] += turn_speed * step
-                while state['yaw'] > math.pi:
-                    state['yaw'] -= math.pi * 2.0
-                while state['yaw'] < -math.pi:
-                    state['yaw'] += math.pi * 2.0
+                state['yaw'] = candidate_hull_yaw
+                committed_travel_yaw = (
+                    candidate_hull_yaw if travel_sign > 0.0 else
+                    candidate_hull_yaw + math.pi)
+                attempted_yaws[state['id']] = committed_travel_yaw
+                committed_corridor = self._planner_corridor_clear(
+                    position, committed_travel_yaw,
+                    state.get('speed', 0.0),
+                    wet_escape=(baked_shallow_escape or
+                                _number(state.get('_water_depth'), -1.0) >
+                                BOT_WATER_AVOID_DEPTH),
+                    allow_shallow=(callable(controlled_shallow) and
+                                   controlled_shallow(
+                                       state['id'], position,
+                                       committed_travel_yaw)),
+                    hazard_only=True)
+                if committed_corridor is False:
+                    # Copied physics integrates the post-turn hull yaw, while
+                    # the native motion receipt above proves the pre-turn
+                    # corridor. Never let that difference enter an unplanned
+                    # shallow-water cell; rotating toward a dry escape remains
+                    # allowed and the next decision can choose a new route.
+                    path_clear = False
+                    throttle = 0.0
+                    state['movement_dir'] = 0
+                    self._invalidate_realised_motion(
+                        state['id'], committed_travel_yaw)
                 previous_speed = _number(state.get('speed'))
                 speed = (0.0 if siege_motion_locked else
                     vehicle_physics.longitudinal_step(
@@ -8131,8 +8351,12 @@ class BotRuntime(object):
                         self._hard_contact_grinds[bot_id] = max(
                             0, self._hard_contact_grinds.get(bot_id, 0) - 1)
             ammo_state.publish(state)
-            ballistic_solution = self._ballistic_solution(
-                state, target, descriptor, state['shell_index'], now)
+            ballistic_solution, local_action_fresh = \
+                self._cadenced_ballistic_solution(
+                    state, target, descriptor, state['shell_index'], now,
+                    force=(burst_state.active or
+                           pending_intent is not None or
+                           pending_reproof is not None))
             command['_ballistic_solution'] = ballistic_solution
             previous_turret_yaw = _number(state.get('turret_yaw'))
             unused_desired_yaw, unused_horizontal = self._update_gun_aim(
@@ -8160,7 +8384,8 @@ class BotRuntime(object):
             in_range = (target is not None and target_distance > 1.0 and
                         ballistic_solution is not None and
                         (fire_range <= 0.0 or target_distance < fire_range))
-            if (publish and command['fire_allowed'] and target is not None and
+            if (publish and local_action_fresh and
+                    command['fire_allowed'] and target is not None and
                     in_range and
                     not state.get('_drowning', False) and
                     not state.get('_overturned', False) and
@@ -8237,7 +8462,7 @@ class BotRuntime(object):
                         # again after its normal safe-driver motion completes.
                         self._cancel_artillery_intent(state['id'])
             mode = command.get('combat_mode')
-            if (collect_observation and
+            if (collect_cover_jobs and
                     target is not None and target.get('visible') and
                     callable(self.cover_probe) and
                     (mode in ('take_cover', 'cover_hold', 'cover_peek',
@@ -8246,8 +8471,10 @@ class BotRuntime(object):
                      (command.get('fire_allowed') and mode in (
                          'engage', 'advance_contact', 'jiggle_forward',
                          'jiggle_back')))):
-                cover_jobs.append((state['id'], dict(state), dict(target),
+                cover_jobs.append((state['id'], _copy_runtime_state(state),
+                                   dict(target),
                                    command.get('move_position', position)))
+            _clear_critical_parts_tick_cache(state)
             processed_bot_ids.add(int(state['id']))
         # A static firing lane is only meaningful after at least one member of
         # the observing team has spotted the target.  The server ignores the
@@ -8262,39 +8489,39 @@ class BotRuntime(object):
                 continue
             if refresh_shot_lanes:
                 if (self._shot_los_deadlines.get(lane_key) !=
-                        self._next_observation):
+                        shot_lane_refresh_time):
                     self._refresh_shot_clear(
                         lane_source, observed_target, now,
-                        self._next_observation, shot_lane_budget,
+                        shot_lane_refresh_time, shot_lane_budget,
                         lane_key=lane_key,
                         distance_cache=lane_distance)
                 if (self._shot_los_deadlines.get(lane_key) !=
-                        self._next_observation):
+                        shot_lane_refresh_time):
                     shot_lanes_ready = False
-            if (collect_observation and
-                    self._shot_los_deadlines.get(lane_key) ==
-                    self._next_observation):
-                # ``_refresh_shot_clear`` already proved this pair inside the
-                # tactical observation window.  Re-entering ``_shot_clear``
-                # here applies the independent 0.20-second final-fire expiry;
-                # at 24 FPS those rechecks consume the whole 64-ray budget
-                # before the last 115 roster pairs can ever be sampled.  The
-                # observation owns the completed deadline and its cached
-                # verdict; only an actual fire attempt uses the shorter gate.
+            if collect_observation:
+                # Report the latest bounded tactical sample without waiting
+                # for the current one-second roster refresh. Missing or old
+                # samples mean "not shootable"; the independent 0.20-second
+                # final-fire gate remains the only launch authorization.
                 lane_sample = self._shot_los_cache.get(lane_key)
-                if lane_sample is None:
-                    shot_lanes_ready = False
-                elif lane_sample[1]:
+                if (lane_sample is not None and
+                        now - lane_sample[0] <=
+                        SHOT_LANE_REFRESH_SECONDS +
+                        PUBLICATION_SECONDS + 1e-9 and lane_sample[1]):
                     observation_entries[key][1].add(
                         int(lane_source['id']))
-        if collect_observation and not shot_lanes_ready:
-            collect_observation = False
+        if (shot_lane_refresh_due and refresh_shot_lanes and
+                shot_lanes_ready):
+            self._next_shot_lane_refresh = (
+                _number(now) + SHOT_LANE_REFRESH_SECONDS)
         completed_affordances = ()
         if collect_observation:
             completed_affordances = tuple(self._cover_results)
             self._cover_results = []
         cover_jobs.sort(key=lambda value: value[0])
-        if collect_observation and cover_jobs:
+        if collect_cover_jobs:
+            self._next_cover_refresh = _number(now) + COVER_REFRESH_SECONDS
+        if collect_cover_jobs and cover_jobs:
             cursor = self._cover_cursor % len(cover_jobs)
             ordered = cover_jobs[cursor:] + cover_jobs[:cursor]
             count = min(COVER_JOBS_PER_OBSERVATION, len(ordered))
@@ -8426,4 +8653,5 @@ class BotRuntime(object):
         """
         if not self.is_authority() or self.adapter is None or self.finished:
             return ()
-        return tuple(dict(state) for state in self._ordered_states())
+        return tuple(_copy_runtime_state(state)
+                     for state in self._ordered_states())

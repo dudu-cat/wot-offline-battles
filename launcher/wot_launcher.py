@@ -621,7 +621,7 @@ class LauncherWindow(object):
             relief="flat", borderwidth=0, highlightthickness=0)
         self.author_entry.grid(row=5, column=0, sticky="we", pady=(8, 0))
         self.qq_group_text = tk.StringVar(value=(
-            "个人QQ：692827763  坦克世界QQ群：1108778562"))
+            "坦克世界QQ群：1108778562、302519768"))
         self.qq_group_entry = tk.Entry(
             frame, textvariable=self.qq_group_text, state="readonly",
             relief="flat", borderwidth=0, highlightthickness=0)
