@@ -21,6 +21,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Fallen-tree foliage refreshes now stop before querying unloaded chunks or
   animator bodies that have already disappeared, closing a hidden-worker
   native crash path during chunk streaming.
+- Track repair reports now converge when a repair kit or server-side repair
+  has already advanced the canonical module state, instead of leaving the
+  client in an endless repair-progress retry.
 - The launcher and bundled map-data loaders accept structurally compatible
   deployed 0.9.22 data and recover when optional version metadata is missing
   or unreadable.
@@ -46,6 +49,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   if its HUD notification fails.
 - Swedish Siege mode now applies hydraulic hull aiming without calling an
   unsafe native physics path, restoring aiming in engineering mode.
+- If a complete saved crew belongs to the wrong nation, the exact #1513
+  attribute calculation retries once with that vehicle's default crew. Other
+  vehicle-structure or native errors remain visible instead of being hidden.
 - The vehicle editor restores hidden-but-playable vehicles, accepts decimal
   values for editable numeric fields stored as integers, labels elevation,
   depression, gun elevation speed, and turret traverse speed correctly, and
