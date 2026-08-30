@@ -567,6 +567,18 @@ class LocalDriver(object):
 		# while braking a recovery or sliding downhill; steering remains forward.
 		avoiding = abs(_angle_delta(chosen_yaw, desired_yaw)) > 0.05
 		throttle = 1.0
+		climb_grade = ((float(target[1]) - float(position[1])) /
+		               max(0.1, target_distance))
+		if climb_grade > 0.10 and abs(delta) > 0.30 and not avoiding:
+			# Enter steep route edges square to the slope. Applying full drive
+			# while the hull is still turning makes it circle at the foot of the
+			# climb and repeatedly invalidates the next terrain sample.
+			throttle = 0.0
+		elif abs(delta) > 1.35 and not avoiding:
+			# A route heading more than about 77 degrees off the bow is a pivot.
+			# Keep translating avoidance branches available for overlapping hulls,
+			# but align ordinary route followers before applying drive torque.
+			throttle = 0.0
 		return {
 			'throttle': throttle,
 			'turn': turn,

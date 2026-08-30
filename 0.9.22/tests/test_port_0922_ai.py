@@ -732,10 +732,9 @@ class BotAiPortTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, state['last_step'])
         self.assertAlmostEqual(1.0, state['clock'])
 
-    def test_large_route_turn_keeps_driving_and_never_reverses(self):
-        # A target far behind the bow keeps forward drive while steering. Slow
-        # traverse vehicles must not spend several seconds stopped at every
-        # large route turn or reinterpret that turn as a stuck recovery.
+    def test_large_route_turn_pivots_before_driving_and_never_reverses(self):
+        # A target far behind the bow commands a stationary pivot. Rotation is
+        # progress, so the driver must not reinterpret it as a stuck recovery.
         driver = LocalDriver()
         yaw = 0.0
         modes = set()
@@ -750,7 +749,8 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertNotIn('reverse_turn', modes)
         self.assertNotIn('pivot_recovery', modes)
-        self.assertEqual({1.0}, throttles)
+        self.assertIn(0.0, throttles)
+        self.assertIn(1.0, throttles)
         self.assertGreater(abs(yaw), 2.5)
 
     def test_a_wedged_hull_still_reaches_recovery(self):
@@ -881,7 +881,7 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertLess(escaped[0] * escaped[1], 0.0)
 
-    def test_uphill_route_turn_keeps_drive_torque(self):
+    def test_uphill_route_turn_aligns_before_drive_torque(self):
         driver = LocalDriver()
         uphill = driver.drive(
             120, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
@@ -890,7 +890,7 @@ class BotAiPortTests(unittest.TestCase):
             121, (0.0, 0.0, 0.0), 0.0, 0.0, 0.1,
             (20.0, 0.0, 20.0), (), lambda unused_yaw: True)
 
-        self.assertEqual(1.0, uphill['throttle'])
+        self.assertEqual(0.0, uphill['throttle'])
         self.assertGreater(abs(uphill['turn']), 0.9)
         self.assertEqual(1.0, flat['throttle'])
 
