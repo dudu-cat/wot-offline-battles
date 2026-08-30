@@ -64,6 +64,17 @@ mods\configs\offline_lan_0922\garage_state.json, so the garage survives a
 restart. Crew skills, optional devices and consumables move the same values the
 garage parameters panel shows, and the battle uses those values.
 
+The Launcher's Tools tab can also edit vehicle data directly. A vehicle data
+profile is a named set of Packed XML field changes (health, damage,
+penetration, armour, speeds, reload and more) made in the Launcher's editor; it
+never changes scripts.pkg. In single player the selected profile is active only
+for that session and removed when the game closes. In a LAN room the host's
+profile is pinned for the whole room: the server shares the modified package
+members with every joining Launcher, which installs the same temporary overlay
+before the game starts, so the host client, the hidden worker and every joiner
+run identical modified vehicle data. A room whose profile changed after it
+started must be restarted first.
+
 Requirements
 ------------
 

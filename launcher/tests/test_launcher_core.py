@@ -1,4 +1,6 @@
 import ast
+import base64
+import hashlib
 import io
 import json
 import os
@@ -182,13 +184,14 @@ class SessionPlanTest(unittest.TestCase):
         self.assertEqual(11, session["team2_size"])
         self.assertEqual(2, session["preferred_team"])
 
-    def test_modified_profile_is_refused_for_lan(self):
-        for status, mode in ((self._status(), core.MODE_JOIN),):
-            with self.assertRaisesRegex(
-                    core.LauncherError, "limited to 0.9.22 single player"):
-                core.plan_session(
-                    status, mode, "10.0.0.5" if mode == core.MODE_JOIN else "",
-                    vehicle_profile="Fast MS-1")
+    def test_vehicle_profile_is_planned_for_online_mode(self):
+        # The room host may pin a vehicle profile for an Online battle; the
+        # launcher verifies it against the room data at start time.
+        session = core.plan_session(
+            self._status(), core.MODE_JOIN, "10.0.0.5",
+            vehicle_profile="Fast MS-1")
+        self.assertEqual("Fast MS-1", session["vehicle_profile"])
+        self.assertEqual(core.MODE_JOIN, session["mode"])
 
     def test_0_9_22_team_size_must_be_between_one_and_fifteen(self):
         for value in ("", "four", 0, 16, 1.5, True):
@@ -1425,6 +1428,10 @@ class PayloadStagingTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(
             self.target, "0.9.22", "server", "offline_rewards.py")))
 
+    def test_the_0_9_22_server_stages_its_vehicle_overlay_store(self):
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.target, "0.9.22", "server", "vehicle_overlay_store.py")))
+
     def test_the_navigation_graphs_stay_out_of_the_bundle(self):
         self.assertFalse(any(
             os.path.sep + "navgraphs" + os.path.sep in path
@@ -2102,6 +2109,223 @@ class LauncherSettingsTest(unittest.TestCase):
 
     def test_missing_settings_are_empty(self):
         self.assertEqual(core.load_settings("/nonexistent/launcher.json"), {})
+
+
+class VehicleOverlayFetchTest(unittest.TestCase):
+    """core.fetch_vehicle_overlay speaks the launcher probe + overlay exchange."""
+
+    MEMBER = "scripts/item_defs/vehicles/ussr/R11_MS-1.xml"
+    MEMBER_DATA = b"member-data"
+
+    @staticmethod
+    def _manifest():
+        return {
+            "schema": 1,
+            "targetVersion": "0.9.22.0.1",
+            "targetBuild": "1513",
+            "sourcePackage": "res/packages/scripts.pkg",
+            "createdAt": "2026-08-23T12:00:00Z",
+            "updatedAt": "2026-08-23T12:00:00Z",
+            "activeProfile": "Fast MS-1",
+            "members": [{
+                "sourceMember": VehicleOverlayFetchTest.MEMBER,
+                "sourcePackage": "res/packages/scripts.pkg",
+                "overlayRelativePath": VehicleOverlayFetchTest.MEMBER,
+                "overlaySha256": hashlib.sha256(
+                    VehicleOverlayFetchTest.MEMBER_DATA).hexdigest(),
+                "edits": [{
+                    "fieldPath": "speedLimits/forward",
+                    "originalPackedType": "integer",
+                    "originalValue": 32,
+                    "replacementValue": 40,
+                }],
+            }],
+        }
+
+    @staticmethod
+    def _manifest_with_member_count(count):
+        manifest = VehicleOverlayFetchTest._manifest()
+        manifest["members"] = []
+        checksum = hashlib.sha256(
+            VehicleOverlayFetchTest.MEMBER_DATA).hexdigest()
+        for index in range(count):
+            member = (
+                "scripts/item_defs/vehicles/ussr/Capacity_%04d.xml" %
+                index)
+            manifest["members"].append({
+                "sourceMember": member,
+                "sourcePackage": "res/packages/scripts.pkg",
+                "overlayRelativePath": member,
+                "overlaySha256": checksum,
+                "edits": [{
+                    "fieldPath": "speedLimits/forward",
+                    "originalPackedType": "integer",
+                    "originalValue": 32,
+                    "replacementValue": 40,
+                }],
+            })
+        return manifest
+
+    class _OverlayConnection(object):
+        def __init__(self, manifest=None, present=True, capability=True,
+                     member_reply=None):
+            self.manifest = manifest
+            self.present = present
+            self.capability = capability
+            self.member_reply = member_reply
+            self.reply = b""
+            self.sent = []
+            self.closed = False
+
+        def settimeout(self, unused):
+            pass
+
+        def sendall(self, payload):
+            message = json.loads(payload.decode("utf-8"))
+            self.sent.append(message)
+            message_type = message.get("type")
+            if message_type == "hello":
+                reply = {
+                    "type": "welcome",
+                    "protocol": 5,
+                    "client_build": "wot-0.9.22.0.1-cn-1513",
+                    "capabilities": message.get("capabilities", []),
+                    "server_capabilities": (
+                        ["vehicle_overlay_v1"] if self.capability else []),
+                }
+            elif message_type == "vehicle_overlay_query":
+                if not self.present:
+                    reply = {
+                        "type": "vehicle_overlay_manifest",
+                        "present": False,
+                        "digest": "",
+                        "profile": "",
+                        "manifest": None,
+                        "members": [],
+                    }
+                else:
+                    digest = hashlib.sha256(json.dumps(
+                        self.manifest, sort_keys=True).encode("utf-8"))
+                    reply = {
+                        "type": "vehicle_overlay_manifest",
+                        "present": True,
+                        "digest": digest.hexdigest(),
+                        "profile": "Fast MS-1",
+                        "manifest": self.manifest,
+                        "members": [{
+                            "sourceMember": entry["sourceMember"],
+                            "overlaySha256": entry["overlaySha256"],
+                            "size": len(VehicleOverlayFetchTest.MEMBER_DATA),
+                        } for entry in self.manifest["members"]],
+                    }
+            elif message_type == "vehicle_overlay_member":
+                reply = self.member_reply
+                if reply is None:
+                    reply = {
+                        "type": "vehicle_overlay_member_data",
+                        "sourceMember": message["sourceMember"],
+                        "size": len(VehicleOverlayFetchTest.MEMBER_DATA),
+                        "sha256": hashlib.sha256(
+                            VehicleOverlayFetchTest.MEMBER_DATA).hexdigest(),
+                        "data_b64": base64.b64encode(
+                            VehicleOverlayFetchTest.MEMBER_DATA).decode(
+                            "ascii"),
+                    }
+            else:
+                reply = {"type": "error", "code": "unexpected"}
+            self.reply = (json.dumps(reply) + "\n").encode("utf-8")
+
+        def recv(self, unused):
+            reply, self.reply = self.reply, b""
+            return reply
+
+        def close(self):
+            self.closed = True
+
+    def _fetch(self, **kwargs):
+        connection = self._OverlayConnection(**kwargs)
+        result = core.fetch_vehicle_overlay(
+            "127.0.0.1", 28782, connect=lambda address, timeout: connection)
+        return result, connection
+
+    def test_fetch_returns_the_host_overlay(self):
+        result, connection = self._fetch(manifest=self._manifest())
+
+        self.assertTrue(result["supported"])
+        self.assertTrue(result["present"])
+        self.assertEqual("Fast MS-1", result["profile"])
+        self.assertEqual(64, len(result["digest"]))
+        self.assertEqual(
+            {self.MEMBER: self.MEMBER_DATA}, result["payload"])
+        self.assertEqual(self.MEMBER, result["manifest"]["members"][0][
+            "sourceMember"])
+        self.assertEqual(
+            ["hello", "vehicle_overlay_query", "vehicle_overlay_member"],
+            [message["type"] for message in connection.sent])
+        self.assertTrue(connection.closed)
+
+    def test_fetch_accepts_max_members_above_the_old_manifest_line_cap(self):
+        manifest = self._manifest_with_member_count(
+            core.MAX_OVERLAY_MEMBERS)
+        encoded = json.dumps({
+            "type": "vehicle_overlay_manifest",
+            "present": True,
+            "digest": "0" * 64,
+            "profile": "Capacity",
+            "manifest": manifest,
+            "members": manifest["members"],
+        }).encode("utf-8")
+
+        result, unused_connection = self._fetch(manifest=manifest)
+
+        self.assertGreater(len(encoded), 256 * 1024)
+        self.assertEqual(core.MAX_OVERLAY_MEMBERS, len(result["payload"]))
+
+    def test_fetch_rejects_one_member_over_the_supported_count(self):
+        manifest = self._manifest_with_member_count(
+            core.MAX_OVERLAY_MEMBERS + 1)
+
+        with self.assertRaisesRegex(
+                core.LauncherError, "more than 1024 members"):
+            self._fetch(manifest=manifest)
+
+    def test_fetch_reports_a_server_without_the_capability(self):
+        result, connection = self._fetch(
+            manifest=self._manifest(), capability=False)
+
+        self.assertFalse(result["supported"])
+        self.assertEqual(
+            ["hello"], [message["type"] for message in connection.sent])
+
+    def test_fetch_reports_a_room_without_an_overlay(self):
+        result, connection = self._fetch(manifest=None, present=False)
+
+        self.assertTrue(result["supported"])
+        self.assertFalse(result["present"])
+        self.assertEqual("", result["digest"])
+        self.assertEqual({}, result["payload"])
+
+    def test_fetch_rejects_corrupt_member_data(self):
+        reply = {
+            "type": "vehicle_overlay_member_data",
+            "sourceMember": self.MEMBER,
+            "size": 4,
+            "sha256": "0" * 64,
+            "data_b64": "not base64!",
+        }
+        with self.assertRaises(core.LauncherError):
+            self._fetch(manifest=self._manifest(), member_reply=reply)
+
+    def test_fetch_rejects_a_member_reply_for_another_member(self):
+        reply = {
+            "type": "vehicle_overlay_member_data",
+            "sourceMember": "scripts/item_defs/vehicles/ussr/R12_Test.xml",
+            "size": 4,
+            "sha256": "0" * 64,
+            "data_b64": "bWVtYmVy",
+        }
+        with self.assertRaises(core.LauncherError):
+            self._fetch(manifest=self._manifest(), member_reply=reply)
 
 
 if __name__ == "__main__":

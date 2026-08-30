@@ -40,6 +40,17 @@ modules and three consumables, and every item costs nothing. Change modules,
 optional devices, consumables, shells, camouflage and crew skills; the garage
 is saved after each change and the battle uses what you fitted.
 
+The Tools tab also edits vehicle data directly. A vehicle data profile is a
+named set of Packed XML field changes (health, damage, penetration, armour,
+speeds, reload and other values) made in the editor window; it never changes
+scripts.pkg. In single player the selected profile is activated only for that
+session and removed again when the game closes. When you start a LAN room on
+the Online tab, the selected profile is pinned for the whole room: the room
+server shares the modified package members with every player who joins, their
+launcher installs the same temporary overlay before the game starts, and
+original vehicle data is restored after the session. A room whose profile was
+changed after it was started must be restarted before Start game accepts it.
+
 For the exact 0.9.22 client, Repair startup validates the mod configuration
 and reinstalls the package while retaining the saved endpoint, garage,
 vehicle-data overrides, account progress, battle results and isolated client

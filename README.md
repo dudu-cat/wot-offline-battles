@@ -50,6 +50,17 @@ The 0.9.22 client gets a working offline garage:
   range, concealment, reload, aim time, dispersion, traverse, engine power,
   terrain resistance and repair speed.
 
+The launcher's Tools tab can also edit vehicle data directly. A vehicle data
+profile is a named set of Packed XML field changes (health, damage,
+penetration, armour, speeds, reload and more) made in the launcher's editor;
+it never changes `scripts.pkg`. In single player the selected profile is
+activated only for that session and removed when the game closes. In a LAN
+room the host's profile is pinned for the whole room: the room server shares
+the modified package members with every joining launcher, which installs the
+same temporary overlay before the game starts, so every client (host, hidden
+simulation worker and joiners) runs identical modified vehicle data. A room
+whose profile changed after it started must be restarted first.
+
 ## What is in the battle
 
 - 15-versus-15 spawning, countdown, capture, elimination and timeout, then a
