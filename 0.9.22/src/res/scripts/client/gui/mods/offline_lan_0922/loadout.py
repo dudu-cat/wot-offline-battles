@@ -178,6 +178,26 @@ def _update_native_attribute_factors_with_split(
     }
 
 
+def _is_wrong_tankman_nation(error):
+    """Whether #1513 rejected an otherwise complete garage crew."""
+    try:
+        return str(error).startswith('wrong tankman nation:')
+    except Exception:
+        return False
+
+
+def _native_attribute_factors(
+        utils, descriptor, compact_descrs, equipments, activity_flags,
+        is_fire, aspects, qualifier_type, crew_class, qualifiers_class):
+    """Build one fresh factor dictionary for a native crew attempt."""
+    factors = utils.makeDefaultVehicleAttributeFactors()
+    _update_native_attribute_factors_with_split(
+        descriptor, list(compact_descrs), equipments, factors,
+        activity_flags, bool(is_fire), aspects, qualifier_type, crew_class,
+        qualifiers_class)
+    return factors
+
+
 def attribute_factors(
         descriptor, crew=None, equipments=(), activity_flags=None,
         is_fire=False):
@@ -198,7 +218,9 @@ def attribute_factors(
     compact_descrs = crew_compact_descrs(crew)
     try:
         roles = descriptor.type.crewRoles
-        if len(compact_descrs) != len(roles):
+        has_complete_crew = len(compact_descrs) == len(roles)
+        uses_existing_crew = bool(compact_descrs) and has_complete_crew
+        if not has_complete_crew:
             compact_descrs = utils.generateDefaultCrew(
                 descriptor.type, tankmen.MAX_SKILL_LEVEL)
         flags = ([True] * len(compact_descrs) if activity_flags is None else
@@ -212,11 +234,19 @@ def attribute_factors(
             artefact = _artefact(equipment, vehicles_module)
             if artefact is not None:
                 mounted.append(artefact)
-        factors = utils.makeDefaultVehicleAttributeFactors()
-        _update_native_attribute_factors_with_split(
-            descriptor, list(compact_descrs), mounted, factors, flags,
-            bool(is_fire), aspects, qualifier_type, crew_class,
-            qualifiers_class)
+        try:
+            factors = _native_attribute_factors(
+                utils, descriptor, compact_descrs, mounted, flags, is_fire,
+                aspects, qualifier_type, crew_class, qualifiers_class)
+        except Exception as error:
+            if (not uses_existing_crew or
+                    not _is_wrong_tankman_nation(error)):
+                raise
+            default_crew = utils.generateDefaultCrew(
+                descriptor.type, tankmen.MAX_SKILL_LEVEL)
+            factors = _native_attribute_factors(
+                utils, descriptor, default_crew, mounted, flags, is_fire,
+                aspects, qualifier_type, crew_class, qualifiers_class)
     except Exception as error:
         sys.stdout.write(
             '[Offline LAN 0.9.22] vehicle attribute factors unavailable: '

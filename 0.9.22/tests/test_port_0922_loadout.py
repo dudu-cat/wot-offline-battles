@@ -370,6 +370,68 @@ class ClientFactorTests(unittest.TestCase):
                                 'gunAimingTimeFactor': 0.89}
         return descriptor
 
+    def _native_factor_modules(self):
+        utils = types.SimpleNamespace(
+            generateDefaultCrew=mock.Mock(return_value=('default',)),
+            makeDefaultVehicleAttributeFactors=mock.Mock(
+                side_effect=lambda: {}))
+        modules = (
+            utils, types.SimpleNamespace(MAX_SKILL_LEVEL=100), object(),
+            types.SimpleNamespace(DEFAULT=0, WHEN_STILL=1), object(),
+            object(), object())
+        return utils, modules
+
+    def test_wrong_nation_crew_retries_once_with_the_default_crew(self):
+        calls = []
+
+        def update(unused_descriptor, compact_descrs, unused_equipments,
+                   unused_factors, unused_flags, unused_is_fire,
+                   unused_aspects, unused_qualifier_type,
+                   unused_crew_class, unused_qualifiers_class):
+            calls.append(tuple(compact_descrs))
+            if compact_descrs == ['foreign']:
+                raise Exception('wrong tankman nation: foreign, vehicle')
+
+        utils, modules = self._native_factor_modules()
+        descriptor = types.SimpleNamespace(
+            type=types.SimpleNamespace(crewRoles=(('commander',),)),
+            optionalDevices=[])
+        crew = (types.SimpleNamespace(strCD='foreign'),)
+
+        with mock.patch.object(loadout, '_client_modules',
+                               return_value=modules), \
+                mock.patch.object(
+                    loadout, '_update_native_attribute_factors_with_split',
+                    side_effect=update):
+            factors = loadout.attribute_factors(descriptor, crew=crew)
+
+        self.assertEqual([('foreign',), ('default',)], calls)
+        utils.generateDefaultCrew.assert_called_once_with(
+            descriptor.type, 100)
+        self.assertEqual(2, utils.makeDefaultVehicleAttributeFactors.call_count)
+        self.assertEqual((0, 1), factors['_aspects'])
+
+    def test_non_crew_native_error_does_not_use_the_default_crew(self):
+        def update(*unused_args):
+            raise Exception('missing vehicle structure')
+
+        utils, modules = self._native_factor_modules()
+        descriptor = types.SimpleNamespace(
+            type=types.SimpleNamespace(crewRoles=(('commander',),)),
+            optionalDevices=[])
+        crew = (types.SimpleNamespace(strCD='valid'),)
+
+        with mock.patch.object(loadout, '_client_modules',
+                               return_value=modules), \
+                mock.patch.object(
+                    loadout, '_update_native_attribute_factors_with_split',
+                    side_effect=update), \
+                mock.patch.object(loadout.sys.stdout, 'write'):
+            factors = loadout.attribute_factors(descriptor, crew=crew)
+
+        self.assertIsNone(factors)
+        utils.generateDefaultCrew.assert_not_called()
+
     def test_every_gun_multiplier_comes_from_the_factor_dictionary(self):
         values = loadout.modifiers(
             self._gun_descriptor(), factors=self.FACTORS)
