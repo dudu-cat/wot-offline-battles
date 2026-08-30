@@ -708,15 +708,17 @@ def minidump_evidence(session, role):
         stream.close()
 
 
-def _visible_client_exit_tail(session):
+def _client_exit_tail(session, role):
+    if role not in DUMP_ROLES:
+        return None
     sources = session.get("sources")
     if not isinstance(sources, dict):
         return None
-    source = sources.get(ROLE_VISIBLE_CLIENT)
+    source = sources.get(role)
     if not isinstance(source, dict):
         return None
     try:
-        opened = _open_valid_source(session, ROLE_VISIBLE_CLIENT, source)
+        opened = _open_valid_source(session, role, source)
     except Exception:
         return None
     if opened is None:
@@ -740,16 +742,17 @@ def _visible_client_exit_tail(session):
         stream.close()
 
 
-def visible_client_exit_evidence(session):
-    """Classify the visible client's current-session shutdown evidence."""
-    if not isinstance(session, dict) or not _is_latest(session):
+def client_exit_evidence(session, role):
+    """Classify one current-session game client's shutdown evidence."""
+    if (not isinstance(session, dict) or not _is_latest(session) or
+            role not in DUMP_ROLES):
         return VISIBLE_CLIENT_EXIT_UNKNOWN
-    dump_evidence = minidump_evidence(session, ROLE_VISIBLE_CLIENT)
+    dump_evidence = minidump_evidence(session, role)
     if dump_evidence == MINIDUMP_EVIDENCE_EXCEPTION:
         return VISIBLE_CLIENT_EXIT_EXCEPTION
     if dump_evidence == MINIDUMP_EVIDENCE_UNKNOWN:
         return VISIBLE_CLIENT_EXIT_UNKNOWN
-    exit_tail = _visible_client_exit_tail(session)
+    exit_tail = _client_exit_tail(session, role)
     if exit_tail == "clean-shutdown":
         return VISIBLE_CLIENT_EXIT_CLEAN
     if (exit_tail == "lobby-restored" and
@@ -760,9 +763,19 @@ def visible_client_exit_evidence(session):
     return VISIBLE_CLIENT_EXIT_UNKNOWN
 
 
+def client_exited_cleanly(session, role):
+    """Return whether one current-session game client exited normally."""
+    return client_exit_evidence(session, role) == VISIBLE_CLIENT_EXIT_CLEAN
+
+
+def visible_client_exit_evidence(session):
+    """Classify the visible client's current-session shutdown evidence."""
+    return client_exit_evidence(session, ROLE_VISIBLE_CLIENT)
+
+
 def visible_client_exited_cleanly(session):
     """Return whether current-session evidence proves a clean client exit."""
-    return visible_client_exit_evidence(session) == VISIBLE_CLIENT_EXIT_CLEAN
+    return client_exited_cleanly(session, ROLE_VISIBLE_CLIENT)
 
 
 def _open_valid_dump(session, role):

@@ -168,16 +168,33 @@ class WorkerStarterTests(unittest.TestCase):
         self.assertIn('OFFLINE_LAN_0922_WORKER_INTERNAL_READY_MARKER', source)
         self.assertIn('OFFLINE_LAN_0922_PLAYER_READY_MARKER', source)
 
-    def test_starter_failure_log_preserves_the_root_procdump_error(self):
+    def test_starter_status_log_preserves_the_root_procdump_error(self):
         source = SOURCE.read_text(encoding='utf-8')
         log = source.split(
-            'static void log_failure', 1)[1].split(
+            'static void log_status', 1)[1].split(
                 'static void clear_failure_log', 1)[0]
 
         self.assertIn('FILE_APPEND_DATA', log)
         self.assertIn('OPEN_ALWAYS', log)
         self.assertIn('FILE_SHARE_READ | FILE_SHARE_WRITE', log)
         self.assertNotIn('CREATE_ALWAYS', log)
+
+    def test_starter_distinguishes_child_exits_from_win32_failures(self):
+        source = SOURCE.read_text(encoding='utf-8')
+        status_log = source.split(
+            'static void log_status', 1)[1].split(
+                'static void clear_failure_log', 1)[0]
+        main = source.split('int WINAPI wWinMain', 1)[1]
+
+        self.assertIn('"stage=%s %s=%lu\\r\\n"', status_log)
+        self.assertIn(
+            'log_status(stage, "win32_error", error_code);', status_log)
+        self.assertIn(
+            'log_status(stage, "exit_code", exit_code);', status_log)
+        self.assertIn('log_process_exit(', main)
+        self.assertIn('"worker_process_exit", child_exit_code', main)
+        self.assertNotIn(
+            'log_failure("worker_process_exit", child_exit_code)', main)
 
     def test_starter_bounds_procdump_completion_and_cancels_on_timeout(self):
         source = SOURCE.read_text(encoding='utf-8')

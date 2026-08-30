@@ -205,6 +205,60 @@ class ErrorReportTest(unittest.TestCase):
         self.assertFalse(
             error_reports.visible_client_exited_cleanly(session))
 
+    def test_worker_termination_dump_after_lobby_restore_is_normal(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True,
+            session_id=self.SESSION_1, started_at="start")
+        worker = self._game_log(error_reports.ROLE_HIDDEN_WORKER)
+        self._write(
+            worker,
+            b"2026-08-27 09:13:46.798: INFO: [Offline LAN 0.9.22] "
+            b"deferred lobby Account restored\r\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_HIDDEN_WORKER), self._minidump(7))
+
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_CLEAN,
+            error_reports.client_exit_evidence(
+                session, error_reports.ROLE_HIDDEN_WORKER))
+        self.assertTrue(error_reports.client_exited_cleanly(
+            session, error_reports.ROLE_HIDDEN_WORKER))
+
+    def test_worker_termination_without_teardown_is_unexpected(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True,
+            session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_HIDDEN_WORKER),
+            b"battle still live when worker output stopped\r\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_HIDDEN_WORKER), self._minidump(7))
+
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_TERMINATED,
+            error_reports.client_exit_evidence(
+                session, error_reports.ROLE_HIDDEN_WORKER))
+        self.assertFalse(error_reports.client_exited_cleanly(
+            session, error_reports.ROLE_HIDDEN_WORKER))
+
+    def test_worker_exception_overrides_a_lobby_restore(self):
+        session = error_reports.begin_session(
+            self.game, needs_worker=True,
+            session_id=self.SESSION_1, started_at="start")
+        self._write(
+            self._game_log(error_reports.ROLE_HIDDEN_WORKER),
+            b"2026-08-27 09:13:46.798: INFO: [Offline LAN 0.9.22] "
+            b"deferred lobby Account restored\r\n")
+        self._write(error_reports.session_dump_path(
+            session, error_reports.ROLE_HIDDEN_WORKER), self._minidump(6))
+
+        self.assertEqual(
+            error_reports.VISIBLE_CLIENT_EXIT_EXCEPTION,
+            error_reports.client_exit_evidence(
+                session, error_reports.ROLE_HIDDEN_WORKER))
+        self.assertFalse(error_reports.client_exited_cleanly(
+            session, error_reports.ROLE_HIDDEN_WORKER))
+
     def test_exception_stream_overrides_a_clean_exit_log_trailer(self):
         session = error_reports.begin_session(
             self.game, session_id=self.SESSION_1, started_at="start")

@@ -1529,7 +1529,7 @@ class WindowTest(unittest.TestCase):
         previous_marker_token = core.worker_ready_marker_token(
             self.settings_dir)
         with open(core.worker_failure_log(self.settings_dir), "w") as stream:
-            stream.write("stage=worker_exited_before_ready win32_error=7\n")
+            stream.write("stage=worker_exited_before_ready exit_code=7\n")
         worker = _Process(exit_code=23)
         with mock.patch(
                 "core.wait_for_worker_ready", return_value=False) as wait, \
@@ -1626,6 +1626,42 @@ class WindowTest(unittest.TestCase):
             self.assertEqual(23, self.window._stop_worker())
 
         self.assertFalse(worker.terminated)
+        self.assertIn(
+            wot_launcher.error_reports.ROLE_HIDDEN_WORKER,
+            self.window._observed_crash_roles)
+
+    def test_clean_worker_termination_is_not_a_crash(self):
+        worker = _Process(exit_code=3, pid=42)
+        self.window._worker = worker
+        self.window._worker_starter_root = self.settings_dir
+
+        with mock.patch.object(
+                wot_launcher.error_reports, "minidump_evidence",
+                return_value=(
+                    wot_launcher.error_reports.MINIDUMP_EVIDENCE_TERMINATION)), \
+                mock.patch.object(
+                    wot_launcher.error_reports, "client_exited_cleanly",
+                    return_value=True) as clean_exit:
+            self.assertEqual(3, self.window._stop_worker())
+
+        clean_exit.assert_called_once_with(
+            self.window._active_report_session,
+            wot_launcher.error_reports.ROLE_HIDDEN_WORKER)
+        self.assertNotIn(
+            wot_launcher.error_reports.ROLE_HIDDEN_WORKER,
+            self.window._observed_crash_roles)
+
+    def test_worker_exception_dump_is_a_crash_even_with_zero_exit(self):
+        worker = _Process(exit_code=0, pid=42)
+        self.window._worker = worker
+        self.window._worker_starter_root = self.settings_dir
+
+        with mock.patch.object(
+                wot_launcher.error_reports, "minidump_evidence",
+                return_value=(
+                    wot_launcher.error_reports.MINIDUMP_EVIDENCE_EXCEPTION)):
+            self.assertEqual(0, self.window._stop_worker())
+
         self.assertIn(
             wot_launcher.error_reports.ROLE_HIDDEN_WORKER,
             self.window._observed_crash_roles)
@@ -1825,6 +1861,39 @@ class WindowTest(unittest.TestCase):
         log.assert_called_once_with(self.settings_dir)
         self.assertNotIn("The game stopped with exit code 1", self._log_text())
         self.assertIn("worker stopped with exit code 9", self._log_text())
+
+    def test_clean_worker_authority_exit_is_not_reported_as_failure(self):
+        game = _Process(exit_code=None)
+        worker = _Process(exit_code=3)
+        self.window._worker = worker
+        with mock.patch(
+                "wot_launcher.subprocess.Popen", return_value=game), \
+                mock.patch(
+                    "core.wait_for_paired_player_exit",
+                    return_value=(1, True)), \
+                mock.patch.object(
+                    wot_launcher.error_reports, "minidump_evidence",
+                    return_value=(wot_launcher.error_reports.
+                                  MINIDUMP_EVIDENCE_TERMINATION)), \
+                mock.patch.object(
+                    wot_launcher.error_reports, "client_exited_cleanly",
+                    return_value=True), \
+                mock.patch.object(
+                    wot_launcher.error_reports,
+                    "visible_client_exit_evidence",
+                    return_value=(wot_launcher.error_reports.
+                                  VISIBLE_CLIENT_EXIT_TERMINATED)), \
+                mock.patch.object(self.window, "_log_worker_failure") as log:
+            self.assertFalse(self.window._run_game(
+                self.settings_dir, core.PORT_0_9_22, core.LOCAL_HOST,
+                core.DEFAULT_SERVER_PORT, paired_worker=True))
+
+        self.assertFalse(self.window._worker_exited_unexpectedly)
+        self.assertNotIn(
+            wot_launcher.error_reports.ROLE_HIDDEN_WORKER,
+            self.window._observed_crash_roles)
+        log.assert_not_called()
+        self.assertIn("worker exited normally with code 3", self._log_text())
 
     def test_worker_exit_does_not_hide_a_real_visible_exception_stream(self):
         game = _Process(exit_code=None)

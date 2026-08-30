@@ -1182,18 +1182,28 @@ class LauncherWindow(object):
         return self._remember_process_exit(exit_code, role)
 
     def _remember_process_exit(self, exit_code, role):
-        if (exit_code in (None, 0) or
-                role in self._forced_stop_roles):
+        if exit_code is None:
             return exit_code
-        clean_visible_exit = False
-        if role == error_reports.ROLE_VISIBLE_CLIENT:
-            try:
-                clean_visible_exit = (
-                    error_reports.visible_client_exited_cleanly(
-                        self._active_report_session))
-            except Exception:
-                clean_visible_exit = False
-        if not clean_visible_exit:
+        try:
+            dump_evidence = error_reports.minidump_evidence(
+                self._active_report_session, role)
+        except Exception:
+            dump_evidence = error_reports.MINIDUMP_EVIDENCE_UNKNOWN
+        if dump_evidence == error_reports.MINIDUMP_EVIDENCE_EXCEPTION:
+            self._observed_crash_roles.add(role)
+            return exit_code
+        if role in self._forced_stop_roles or exit_code == 0:
+            return exit_code
+        try:
+            if role == error_reports.ROLE_VISIBLE_CLIENT:
+                clean_exit = error_reports.visible_client_exited_cleanly(
+                    self._active_report_session)
+            else:
+                clean_exit = error_reports.client_exited_cleanly(
+                    self._active_report_session, role)
+        except Exception:
+            clean_exit = False
+        if not clean_exit:
             self._observed_crash_roles.add(role)
         return exit_code
 
@@ -1773,12 +1783,7 @@ class LauncherWindow(object):
             if needs_worker and self._worker is not None:
                 self._observe_process_exit(
                     self._worker, error_reports.ROLE_HIDDEN_WORKER)
-            worker_exit_code = self._stop_worker()
-            if (needs_worker and worker_exit_code not in (None, 0) and
-                    error_reports.ROLE_HIDDEN_WORKER not in
-                    self._forced_stop_roles):
-                self._observed_crash_roles.add(
-                    error_reports.ROLE_HIDDEN_WORKER)
+            self._stop_worker()
             if (self._worker_exited_unexpectedly or
                     error_reports.ROLE_HIDDEN_WORKER in
                     self._observed_crash_roles):
@@ -2105,11 +2110,8 @@ class LauncherWindow(object):
                 except OSError:
                     pass
             return None
-        if (exit_code not in (None, 0) and
-                error_reports.ROLE_HIDDEN_WORKER not in
-                self._forced_stop_roles):
-            self._observed_crash_roles.add(
-                error_reports.ROLE_HIDDEN_WORKER)
+        self._remember_process_exit(
+            exit_code, error_reports.ROLE_HIDDEN_WORKER)
         if stopped and exit_code not in (None, 0):
             return exit_code
         return None
@@ -2162,9 +2164,12 @@ class LauncherWindow(object):
             paired_worker and not self._stop_requested and
             (closed_for_required_process or worker_exit is not None))
         if worker_authority_failed:
-            self._worker_exited_unexpectedly = True
-            self._observed_crash_roles.add(
-                error_reports.ROLE_HIDDEN_WORKER)
+            self._remember_process_exit(
+                worker_exit, error_reports.ROLE_HIDDEN_WORKER)
+            self._worker_exited_unexpectedly = bool(
+                worker_exit is None or
+                error_reports.ROLE_HIDDEN_WORKER in
+                self._observed_crash_roles)
         authority_closed_visible = (
             closed_for_required_process or worker_authority_failed)
         if authority_closed_visible:
@@ -2190,17 +2195,22 @@ class LauncherWindow(object):
             self._log("The game stopped with exit code %s." % exit_code)
         if paired_worker:
             if worker_exit is not None and not self._stop_requested:
-                self._log(
-                    "The hidden simulation worker stopped with exit code "
-                    "%s; the game was closed." % worker_exit)
-                self._log_worker_failure(game_root)
-                if (self._server is not None and
-                        not self._server_persistent):
-                    # The server has already fenced the worker and queued the
-                    # terminal roster/result. Give its async outboxes a short
-                    # bounded chance to hand those frames to remote peers
-                    # before session cleanup terminates the local server.
-                    time.sleep(core.WORKER_FAILURE_DRAIN_SECONDS_0922)
+                if self._worker_exited_unexpectedly:
+                    self._log(
+                        "The hidden simulation worker stopped with exit code "
+                        "%s; the game was closed." % worker_exit)
+                    self._log_worker_failure(game_root)
+                    if (self._server is not None and
+                            not self._server_persistent):
+                        # The server has already fenced the worker and queued
+                        # the terminal roster/result. Give its async outboxes a
+                        # short bounded chance to hand those frames to remote
+                        # peers before cleanup terminates the local server.
+                        time.sleep(core.WORKER_FAILURE_DRAIN_SECONDS_0922)
+                else:
+                    self._log(
+                        "The hidden simulation worker exited normally with "
+                        "code %s." % worker_exit)
             self._log("The game closed.")
             return crashed
         if port_version == core.PORT_0_9_22:

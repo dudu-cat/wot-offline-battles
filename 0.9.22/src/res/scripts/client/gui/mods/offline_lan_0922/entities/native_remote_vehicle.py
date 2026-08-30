@@ -565,7 +565,10 @@ class _NativeRemoteState(object):
                 # after every relink without touching marker registration.
                 set_draw_visibility(self.entity, bool(getattr(
                     self.entity, '_offlineNativeDrawVisible', True)))
-                self.entity.targetCaps = ([1] if bool(getattr(
+                is_alive = getattr(self.entity, 'isAlive', None)
+                alive = (bool(is_alive()) if callable(is_alive)
+                         else bool(is_alive))
+                self.entity.targetCaps = ([1] if alive and bool(getattr(
                     self.entity, '_spot_visible', True)) else [])
 
         changed = getattr(appearance, 'onModelChanged', None)

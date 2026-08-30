@@ -7435,47 +7435,6 @@ class BattleRuntime(object):
         record['state'] = state
         return self._apply_vehicle_statistics(record, state)
 
-    def _defer_blind_frag(self, target_key, target_record, attacker_record):
-        """Hide one local frag until the destroyed enemy becomes team-known."""
-        pending = attacker_record.setdefault('_blind_frag_targets', set())
-        if target_key in pending:
-            return False
-        pending.add(target_key)
-        target_record['_blind_frag_attacker'] = (
-            '%s:%s' % (attacker_record.get('kind'),
-                       attacker_record.get('network_id')))
-        target_record['_blind_frag_target'] = target_key
-        return True
-
-    def _reveal_blind_frag(self, target_record):
-        attacker_key = target_record.pop('_blind_frag_attacker', None)
-        target_key = target_record.pop('_blind_frag_target', None)
-        if attacker_key is None or target_key is None:
-            return False
-        attacker = self._records.get(attacker_key)
-        if attacker is None:
-            return False
-        pending = attacker.get('_blind_frag_targets')
-        if not isinstance(pending, set):
-            return False
-        pending.discard(target_key)
-        if not pending:
-            attacker.pop('_blind_frag_targets', None)
-        return self._apply_vehicle_statistics(
-            attacker, attacker.get('state') or {})
-
-    def _flush_blind_frags(self):
-        changed = False
-        for record in tuple(self._records.values()):
-            if record.get('_blind_frag_targets'):
-                record.pop('_blind_frag_targets', None)
-                changed = self._apply_vehicle_statistics(
-                    record, record.get('state') or {}) or changed
-        for record in tuple(self._records.values()):
-            record.pop('_blind_frag_attacker', None)
-            record.pop('_blind_frag_target', None)
-        return changed
-
     def _record_position(self, record):
         if record.get('local'):
             return tuple(self._local_position)
@@ -8013,10 +7972,6 @@ class BattleRuntime(object):
         dead_target = (
             _number(state.get('health', 0.0)) <= 0.0 or
             not bool(state.get('alive', True)))
-        if (blind_local_attack and dead_target and
-                attacker_record is not None):
-            self._defer_blind_frag(
-                target_key, record, attacker_record)
         if (entity is not None and attacker is not None and
                 not record.get('local')):
             entity.last_killer_id = int(attacker_id or 0)
@@ -8050,7 +8005,8 @@ class BattleRuntime(object):
             record, state, attacker_id, death_reason,
             force_cause=force_health_cause,
             attack_reason_id=(0 if attack_reason is None else attack_reason),
-            suppress_combat_presentation=blind_local_attack)
+            suppress_combat_presentation=(
+                blind_local_attack and not dead_target))
         if not update_state:
             record['state'] = latest_state
         return True
@@ -8159,13 +8115,11 @@ class BattleRuntime(object):
             frags = int(state.get('frags', 0))
         except (TypeError, ValueError):
             frags = 0
-        hidden_frags = len(record.get('_blind_frag_targets') or ())
-        presented_frags = frags - hidden_frags
         changed = False
-        if record.get('presented_frags') != presented_frags:
+        if record.get('presented_frags') != frags:
             self._binding.arena_vehicle_statistics(
-                record['engine_id'], presented_frags)
-            record['presented_frags'] = presented_frags
+                record['engine_id'], frags)
+            record['presented_frags'] = frags
             changed = True
         team_killer = bool(state.get('team_killer', False))
         if team_killer and not record.get('presented_team_killer'):
@@ -8514,7 +8468,6 @@ class BattleRuntime(object):
         if (self._round_finished_notified or self._avatar is None or
                 self.state != 'running'):
             return False
-        self._flush_blind_frags()
         finish_reason = getattr(self._runtime.constants, 'FINISH_REASON', None)
         if finish_reason is None:
             raise RuntimeError('FINISH_REASON is unavailable')
@@ -16089,10 +16042,10 @@ class BattleRuntime(object):
                                     marker_visible=None):
         """Apply independent model and team-knowledge presentation gates.
 
-        A destroyed vehicle keeps its model drawn as cover once the spotting
-        gate closes, which is what retail does with a wreck.
+        A destroyed vehicle is a world object, not a spotting target. Its
+        wreck remains enabled for the stock renderer in every camera mode;
+        native distance and frustum culling still own whether it is drawn.
         """
-        previously_spotted = self._combat_target_is_spotted(record)
         visible = bool(visible)
         if marker_visible is None:
             marker_visible = record.pop(
@@ -16100,8 +16053,6 @@ class BattleRuntime(object):
         marker_visible = bool(marker_visible)
         record['spot_visible'] = visible
         record['spot_marker_visible'] = marker_visible
-        if marker_visible:
-            self._reveal_blind_frag(record)
         if not record.get('presentation') or not record.get('ready'):
             return visible
         vehicle = self._remote_factory.get(record['engine_id'])
@@ -16109,17 +16060,13 @@ class BattleRuntime(object):
             raise RuntimeError('spotted remote vehicle has no model')
         vehicle._spot_visible = visible
         alive = self._record_alive(record, vehicle)
-        if not alive and previously_spotted:
-            record['wreck_known'] = True
-        wreck_known = bool(record.get(
-            'wreck_known', record.get('spot_marker_visible', visible)))
-        draw_vehicle = visible or (not alive and wreck_known)
+        draw_vehicle = visible or not alive
         signature = (visible, marker_visible, draw_vehicle, alive)
         if signature != record.get('_spot_presentation_signature'):
             if record.get('native_remote'):
                 vehicle._offlineNativeDrawVisible = draw_vehicle
                 set_draw_visibility(vehicle, draw_vehicle)
-                vehicle.targetCaps = [1] if visible else []
+                vehicle.targetCaps = [1] if visible and alive else []
             else:
                 vehicle.appearance.changeVisibility(draw_vehicle)
             if draw_vehicle:
@@ -16265,9 +16212,6 @@ class BattleRuntime(object):
         model_visible, marker_visible = self._spot_presentation_visibility(
             entity, remembered,
             was_model_visible=bool(record.get('spot_visible', False)))
-        if (not self._record_alive(record, entity) and
-                self._combat_target_is_spotted(record)):
-            record['wreck_known'] = True
         # A number of engine-free harnesses replace the historic two-argument
         # method.  Store the marker edge first so those focused harnesses stay
         # useful while production consumes both states below.
@@ -16986,12 +16930,50 @@ class BattleRuntime(object):
                 vehicle._offlineNativeMarkerVisible = False
         return True
 
+    def _finalize_dead_remote_wreck(self, record, entity):
+        """Expose one finalized corpse without re-entering spotting.
+
+        Native model replacement may finish after the health callback. Store
+        the desired draw state on the entity first so the model-changed hook
+        applies the same visible wreck state when that late callback arrives.
+        """
+        record.pop('wreck_known', None)
+        record.pop('deferred_health_presentation', None)
+        factory = self._remote_factory
+        if factory is None:
+            return False
+        getter = getattr(factory, 'get', None)
+        if not callable(getter):
+            return False
+        vehicle = getter(record['engine_id']) or entity
+        if vehicle is None:
+            return False
+        if record.get('native_remote'):
+            vehicle._offlineNativeDrawVisible = True
+            vehicle.targetCaps = []
+        if getattr(vehicle, 'model', None) is None:
+            record.pop('_spot_presentation_signature', None)
+            return False
+        try:
+            return self._set_record_spot_visibility(
+                record, bool(record.get('spot_visible', False)),
+                bool(record.get(
+                    'spot_marker_visible',
+                    record.get('spot_visible', False))))
+        except Exception as error:
+            # The durable death is already committed. A model/marker failure
+            # may degrade one presentation edge, but must never abort a round.
+            record.pop('_spot_presentation_signature', None)
+            self._warn_optional_failure(
+                'dead wreck presentation', error, disable=False)
+            return False
+
     def _apply_health(self, record, state, attacker_id=0, reason_id=None,
                       force_cause=False, attack_reason_id=None,
                       suppress_combat_presentation=False):
         if 'health' not in state:
             return
-        suppress_combat_presentation = bool(
+        requested_presentation_suppression = bool(
             suppress_combat_presentation and not record.get('local'))
         health = max(0, int(state.get('health', 0)))
         if reason_id is None:
@@ -17008,6 +16990,10 @@ class BattleRuntime(object):
         crew_active = bool(state.get('alive', health > 0)) and health > 0
         dead = health <= 0 or not crew_active
         crew_knockout = health > 0 and not crew_active
+        # Blind non-lethal hits stay private, but death is public authority:
+        # native shutdown, the wreck, the kill and statistics form one edge.
+        suppress_combat_presentation = bool(
+            requested_presentation_suppression and not dead)
         # ``attacker_id`` and ``attack_reason_id`` are one-shot presentation
         # causes, not snapshot state.  Ordered combat events force their
         # native notification; a following cause-free snapshot must not look
@@ -17016,6 +17002,15 @@ class BattleRuntime(object):
             health, display_health, crew_active, int(reason_id))
         previous_signature = self._last_health.get(engine_id)
         durable_changed = previous_signature != signature
+        previous_dead = bool(
+            previous_signature is not None and
+            (previous_signature[0] <= 0 or not previous_signature[2]))
+        if previous_dead and dead:
+            # Replayed combat events and late snapshots may repeat a terminal
+            # state. Keep the durable signature current without replaying
+            # native death callbacks, effects, markers or kill notifications.
+            self._last_health[engine_id] = signature
+            return
         if not durable_changed and not force_cause:
             return
         entity = self._server_entity(engine_id)
@@ -17023,9 +17018,6 @@ class BattleRuntime(object):
             return
         self._last_health[engine_id] = signature
         previous = getattr(entity, 'health', health)
-        previous_dead = bool(
-            previous_signature is not None and
-            (previous_signature[0] <= 0 or not previous_signature[2]))
         if (dead and not previous_dead and
                 self._outlined_engine_id == engine_id):
             # Exact #1513's native onHealthChanged/set_isCrewActive death
@@ -17165,9 +17157,6 @@ class BattleRuntime(object):
                 engine_id, display_health, int(reason_id),
                 crew_active, False)
         if not previous_dead and dead:
-            record['wreck_known'] = bool(
-                not suppress_combat_presentation and
-                self._combat_target_is_spotted(record))
             if not suppress_combat_presentation:
                 if not publish_local_kill:
                     killed = getattr(self._binding, 'arena_vehicle_killed', None)
@@ -17175,9 +17164,14 @@ class BattleRuntime(object):
                         killed(engine_id, int(attacker_id), int(reason_id))
                 if not record.get('local'):
                     self._fallback_postmortem_viewpoint(engine_id)
-        if (record.get('presentation') and self._remote_factory is not None and
-                not self._record_alive(record, entity)):
-            self._remote_factory.request_wreck(engine_id)
+        if (not previous_dead and dead and record.get('presentation') and
+                self._remote_factory is not None):
+            try:
+                self._remote_factory.request_wreck(engine_id)
+            except Exception as error:
+                self._warn_optional_failure(
+                    'dead wreck replacement', error, disable=False)
+            self._finalize_dead_remote_wreck(record, entity)
 
     def _destroy_entity(self, event):
         record = self._records.get(event.get('entity'))

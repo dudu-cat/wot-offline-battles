@@ -86,7 +86,7 @@ typedef struct PlayerProcessTracker {
 } PlayerProcessTracker;
 
 
-static void log_failure(const char *stage, DWORD error_code)
+static void log_status(const char *stage, const char *field, DWORD value)
 {
 	WCHAR log_path[MAX_PATH];
 	char message[256];
@@ -104,13 +104,25 @@ static void log_failure(const char *stage, DWORD error_code)
 		return;
 	}
 	if (FAILED(StringCchPrintfA(message, 256,
-			"stage=%s win32_error=%lu\r\n", stage,
-			(unsigned long)error_code))) {
+			"stage=%s %s=%lu\r\n", stage, field,
+			(unsigned long)value))) {
 		CloseHandle(file);
 		return;
 	}
 	WriteFile(file, message, (DWORD)lstrlenA(message), &written, 0);
 	CloseHandle(file);
+}
+
+
+static void log_failure(const char *stage, DWORD error_code)
+{
+	log_status(stage, "win32_error", error_code);
+}
+
+
+static void log_process_exit(const char *stage, DWORD exit_code)
+{
+	log_status(stage, "exit_code", exit_code);
 }
 
 
@@ -445,13 +457,18 @@ static HANDLE start_procdump_configured(HANDLE target_process,
 	while (elapsed <= PROCDUMP_ATTACH_TIMEOUT_MS) {
 		wait_state = WaitForSingleObject(process.hProcess, 0);
 		if (wait_state != WAIT_TIMEOUT) {
-			exit_code = ERROR_PROCESS_ABORTED;
 			if (wait_state == WAIT_FAILED) {
-				exit_code = GetLastError();
+				log_failure(
+					"WaitForSingleObject(procdump attach)",
+					GetLastError());
 			} else if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
-				exit_code = GetLastError();
+				log_failure(
+					"GetExitCodeProcess(procdump attach)",
+					GetLastError());
+			} else {
+				log_process_exit(
+					"procdump_exited_before_attach", exit_code);
 			}
-			log_failure("procdump_exited_before_attach", exit_code);
 			CloseHandle(process.hProcess);
 			return 0;
 		}
@@ -657,6 +674,7 @@ static int wait_for_worker_ready(HANDLE worker_process, HANDLE stop_event)
 {
 	DWORD elapsed = 0;
 	DWORD marker_attributes;
+	DWORD worker_exit_code;
 	DWORD worker_state;
 	while (elapsed <= WORKER_READY_TIMEOUT_MS) {
 		if (stop_event != 0 &&
@@ -665,9 +683,19 @@ static int wait_for_worker_ready(HANDLE worker_process, HANDLE stop_event)
 		}
 		worker_state = WaitForSingleObject(worker_process, 0);
 		if (worker_state != WAIT_TIMEOUT) {
-			log_failure("worker_exited_before_ready",
-				worker_state == WAIT_FAILED ? GetLastError() :
-				ERROR_PROCESS_ABORTED);
+			if (worker_state == WAIT_FAILED) {
+				log_failure(
+					"WaitForSingleObject(worker before ready)",
+					GetLastError());
+			} else if (!GetExitCodeProcess(
+					worker_process, &worker_exit_code)) {
+				log_failure(
+					"GetExitCodeProcess(worker before ready)",
+					GetLastError());
+			} else {
+				log_process_exit(
+					"worker_exited_before_ready", worker_exit_code);
+			}
 			return 0;
 		}
 		marker_attributes = GetFileAttributesW(g_internal_ready_marker);
@@ -678,9 +706,19 @@ static int wait_for_worker_ready(HANDLE worker_process, HANDLE stop_event)
 			if (worker_state == WAIT_TIMEOUT) {
 				return 1;
 			}
-			log_failure("worker_exited_after_ready",
-				worker_state == WAIT_FAILED ? GetLastError() :
-				ERROR_PROCESS_ABORTED);
+			if (worker_state == WAIT_FAILED) {
+				log_failure(
+					"WaitForSingleObject(worker after ready)",
+					GetLastError());
+			} else if (!GetExitCodeProcess(
+					worker_process, &worker_exit_code)) {
+				log_failure(
+					"GetExitCodeProcess(worker after ready)",
+					GetLastError());
+			} else {
+				log_process_exit(
+					"worker_exited_after_ready", worker_exit_code);
+			}
 			return 0;
 		}
 		if (elapsed == WORKER_READY_TIMEOUT_MS) {
@@ -1466,11 +1504,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 					process.hProcess, 0) == WAIT_OBJECT_0 &&
 					GetExitCodeProcess(
 						process.hProcess, &child_exit_code)) {
-				if (child_exit_code != 0) {
-					log_failure(
-						"worker_process_exit_before_ready",
-						child_exit_code);
-				}
+				log_process_exit(
+					"worker_process_exit_before_ready",
+					child_exit_code);
 				worker_crashed = child_exit_code != 0;
 				result = (int)child_exit_code;
 			} else {
@@ -1496,6 +1532,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 					ERROR_PROCESS_ABORTED);
 				result = 23;
 			} else {
+				log_process_exit(
+					"worker_post_attach_exit", child_exit_code);
 				worker_crashed = child_exit_code != 0;
 				result = (int)child_exit_code;
 			}
@@ -1519,6 +1557,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 					child_exit_code = 13;
 					log_failure(
 						"GetExitCodeProcess", GetLastError());
+				} else {
+					log_process_exit(
+						"worker_process_exit", child_exit_code);
 				}
 				worker_crashed = child_exit_code != 0;
 				result = (int)child_exit_code;
@@ -1542,8 +1583,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous_instance,
 			if (!GetExitCodeProcess(process.hProcess, &child_exit_code)) {
 				child_exit_code = 13;
 				log_failure("GetExitCodeProcess", GetLastError());
-			} else if (child_exit_code != 0) {
-				log_failure("worker_process_exit", child_exit_code);
+			} else {
+				log_process_exit("worker_process_exit", child_exit_code);
 			}
 			worker_crashed = child_exit_code != 0;
 			result = (int)child_exit_code;

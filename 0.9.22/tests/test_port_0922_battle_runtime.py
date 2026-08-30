@@ -2389,6 +2389,20 @@ class NativeRemoteVehicleFactoryTests(unittest.TestCase):
         self.assertFalse(vehicle.model.visible)
         self.assertEqual([], vehicle.targetCaps)
 
+        # A late stock wreck-model relink must preserve world visibility while
+        # never turning the dead vehicle back into a spotting-gated target.
+        vehicle.health = 0
+        vehicle.isCrewActive = False
+        vehicle._offlineNativeDrawVisible = True
+        vehicle._spot_visible = True
+        vehicle.model = _Model()
+        vehicle.appearance.compoundModel = vehicle.model
+        for handler in tuple(vehicle.appearance.onModelChanged.handlers):
+            handler()
+        self.assertIs(provider, vehicle.model.matrix)
+        self.assertTrue(vehicle.model.visible)
+        self.assertEqual([], vehicle.targetCaps)
+
         self.assertTrue(factory.set_entity_interpolate_motion(
             vehicle_id, True))
         self.assertIsNotNone(state.animation)
@@ -9990,7 +10004,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             self.assertEqual(expected, (effect.args[1], effect.args[2]))
 
     def test_an_unspotted_target_discloses_no_shot_feedback(self):
-        """Pierce, block, critical and kill stay silent until spotted."""
+        """Impact and damage feedback stay silent until the target is seen."""
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
@@ -10051,7 +10065,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             value['eventType']
             for value in battle._avatar.battle_events[0]])
 
-    def test_a_blind_kill_applies_authority_without_client_disclosure(self):
+    def test_a_blind_kill_atomically_publishes_death_and_wreck(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
@@ -10062,7 +10076,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
                             {'health': 500})
         target = _Vehicle(11, _Descriptor(), _Vector(0, 0, 10),
                           (0, 0, 0), {'health': 500})
-        target.model.visible = False
+        target.show(False)
+        target.appearance.changeVisibility(False)
+        target.onHealthChanged = mock.Mock(wraps=target.onHealthChanged)
         runtime.bigworld.entities.update({10: attacker, 11: target})
         target_record = {
             'engine_id': 11, 'local': False, 'kind': 'bot',
@@ -10091,22 +10107,32 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'shot_result': 2, 'damage': 500}
 
         with mock.patch.object(
-                critical_damage, 'apply_death', return_value=None):
+                critical_damage, 'apply_death',
+                return_value=None) as apply_death:
+            self.assertTrue(battle._apply_combat_event(event))
+            # An ordered replay must not repeat native death/effect callbacks.
             self.assertTrue(battle._apply_combat_event(event))
 
         self.assertEqual(0, target.health)
         self.assertEqual(0, target_record['state']['health'])
-        self.assertFalse(target_record['wreck_known'])
-        self.assertTrue(target_record['deferred_health_presentation'])
-        self.assertFalse(hasattr(target, 'health_change'))
+        self.assertNotIn('wreck_known', target_record)
+        self.assertNotIn('deferred_health_presentation', target_record)
+        self.assertEqual((0, 10, 0), target.health_change)
+        self.assertEqual(1, target.onHealthChanged.call_count)
+        apply_death.assert_called_once_with(target, 'shot')
         self.assertFalse(battle._set_record_spot_visibility(
             target_record, False, False))
-        self.assertFalse(target.model.visible)
+        self.assertTrue(target.model.visible)
+        self.assertTrue(target.draw_pass_visible)
+        self.assertTrue(target._offlineNativeDrawVisible)
+        self.assertEqual([], target.targetCaps)
         request_wreck.assert_called_once_with(11)
-        battle._avatar.guiSessionProvider.setVehicleHealth.assert_not_called()
+        battle._avatar.guiSessionProvider.setVehicleHealth.\
+            assert_called_once_with(False, 11, 0, 10, 0)
         battle._avatar.guiSessionProvider.shared.feedback.\
             setVehicleState.assert_not_called()
-        battle._binding.arena_vehicle_killed.assert_not_called()
+        battle._binding.arena_vehicle_killed.assert_called_once_with(
+            11, 10, 0)
         battle._avatar.terrainEffects.addNew.assert_not_called()
         self.assertEqual([], battle._avatar.shot_results)
         self.assertEqual([], battle._avatar.battle_events)
@@ -10114,11 +10140,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         statistics = {
             'kind': 'vehicle_statistics', 'actor_kind': 'player',
             'actor_id': 1, 'frags': 1, 'team_killer': False}
+        self.assertTrue(battle._apply_vehicle_statistics_event(statistics))
         self.assertFalse(battle._apply_vehicle_statistics_event(statistics))
-        battle._binding.arena_vehicle_statistics.assert_not_called()
-
-        self.assertTrue(battle._set_record_spot_visibility(
-            target_record, True, True))
         battle._binding.arena_vehicle_statistics.assert_called_once_with(
             10, 1)
 
@@ -15967,7 +15990,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertTrue(battle._update_spotting(20.9))
         self.assertEqual(1, len(battle._avatar.battle_events))
 
-    def test_destroyed_enemy_stays_drawn_as_cover_after_the_spot_expires(self):
+    def test_destroyed_enemy_wreck_does_not_require_spot_history(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.client = _Client()
@@ -15988,7 +16011,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             _Vector(100.0, 0.0, 0.0), (0.0, 0.0, 0.0),
             types.SimpleNamespace(Vector3=_Vector, Matrix=_Matrix))
         enemy.model = _Model()
-        enemy.model.visible = True
+        enemy.model.visible = False
         enemy.appearance.attach(enemy.model)
         enemy.isStarted = True
         enemy.inWorld = True
@@ -15999,7 +16022,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'engine_id': 1000, 'kind': 'bot', 'network_id': 17,
             'ready': True, 'local': False, 'presentation': True,
             'tombstone': False, 'arena_added': True,
-            'visual_started': True, 'spot_visible': True,
+            'visual_started': True, 'spot_visible': False,
             'spot_until': 0.0, 'spot_next': 0.0,
             'state': {'team': 2, 'health': 0, 'alive': False}}}
 
@@ -16010,7 +16033,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             1000, False)
         self.assertTrue(enemy.model.visible)
 
-    def test_full_state_update_does_not_hide_a_known_enemy_wreck(self):
+    def test_full_state_update_does_not_hide_an_enemy_wreck(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
@@ -16027,7 +16050,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'presentation_initialized': True, 'native_remote': True,
             'arena_added': True, 'visual_started': False,
             'spot_visible': False, 'spot_marker_visible': False,
-            'wreck_known': True,
             '_spot_presentation_signature': (False, False, True, False),
             'state': {'team': 2, 'health': 0, 'alive': False}}
 
