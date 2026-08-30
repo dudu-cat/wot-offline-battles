@@ -12,6 +12,11 @@ from gui.mods.offline_lan_0922.account_rpc import commands
 from gui.mods.offline_lan_0922.account_rpc import data
 from gui.mods.offline_lan_0922.account_rpc import garage
 
+try:
+    _NATIVE_LONG = long
+except NameError:
+    _NATIVE_LONG = int
+
 
 class Result(object):
     def __init__(self, result_id, error='', stream=None, ext=None,
@@ -263,13 +268,30 @@ def _server_stats(context, args):
     return Result(commands.RES_SUCCESS, before_response=publish_stats)
 
 
-def _wrap_shop_item_prices(value, factory=None):
+def _native_price_value(value, integer_factory=None):
+    """Give #1513's native price formatter real Python 2 ``long`` values."""
+    integer_factory = integer_factory or _NATIVE_LONG
+    if isinstance(value, dict):
+        return dict((currency, integer_factory(amount))
+                    for currency, amount in value.items())
+    if isinstance(value, tuple):
+        return tuple(_native_price_value(part, integer_factory)
+                     if isinstance(part, (dict, tuple)) else part
+                     for part in value)
+    return value
+
+
+def _wrap_shop_item_prices(value, factory=None, integer_factory=None):
     """Convert wire mappings to #1513's dual-purpose ItemsPrices object."""
     if factory is None:
         from items import ItemsPrices
         factory = ItemsPrices
     current = value['items']['itemPrices']
     defaults = value['defaults']['items']['itemPrices']
+    current = dict((compact_descr, _native_price_value(
+        price, integer_factory)) for compact_descr, price in current.items())
+    defaults = dict((compact_descr, _native_price_value(
+        price, integer_factory)) for compact_descr, price in defaults.items())
     value['items']['itemPrices'] = factory(current)
     value['defaults']['items']['itemPrices'] = factory(defaults)
     return value

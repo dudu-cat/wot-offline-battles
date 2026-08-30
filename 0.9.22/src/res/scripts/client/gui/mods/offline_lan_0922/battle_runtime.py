@@ -45,7 +45,7 @@ from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
     ballistics, combat_rules, critical_damage, descriptor_donation,
     destructibles_compat, effective_params, equipment_mechanics, gun_mechanics,
-    lan_client as lan_protocol,
+    hull_aiming, lan_client as lan_protocol,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
     prebaked_navigation, native_mapping_mask, shot_geometry, spotting,
     tank_collision,
@@ -1271,6 +1271,9 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_aim_matrix = None
+        self._local_siege_aim_world_matrix = None
+        self._local_siege_aim_pitch = 0.0
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
@@ -1524,6 +1527,9 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_aim_matrix = None
+        self._local_siege_aim_world_matrix = None
+        self._local_siege_aim_pitch = 0.0
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
@@ -4773,9 +4779,17 @@ class BattleRuntime(object):
         # stabilised providers retain their distinct stock camera roles.
         inverse_ground = inverse_type(native_ground)
 
+        aim_matrix = self._runtime.math.Matrix()
+        aim_matrix.setIdentity()
+        self._local_siege_aim_matrix = aim_matrix
+        self._local_siege_aim_world_matrix = self._matrix_product(
+            aim_matrix, self._local_matrix)
+        self._local_siege_aim_pitch = 0.0
+
         def transplant(source):
             relative = self._matrix_product(source, inverse_ground)
-            return self._matrix_product(relative, self._local_matrix)
+            return self._matrix_product(
+                relative, self._local_siege_aim_world_matrix)
 
         self._local_siege_body_matrix = transplant(native_body)
         self._local_siege_stabilised_matrix = transplant(native_stabilised)
@@ -4820,6 +4834,51 @@ class BattleRuntime(object):
             raise RuntimeError('#1513 hydraulic pose selector was rejected')
         self._refresh_local_stabilised_snapshot()
         return True
+
+    def _update_local_hull_aiming(self, entity, elapsed):
+        """Pitch the copied Siege pose without entering native physics.
+
+        Alpha 6 called ``WGVehicleFilter.getVehiclePhysics()`` here. That
+        native object is not valid for a client-created local vehicle and can
+        terminate #1513. The descriptor already exposes the same hydraulic
+        limits, so apply the correction to the copied matrix provider instead.
+        """
+        matrix = self._local_siege_aim_matrix
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        if matrix is None or not bool(
+                getattr(descriptor, 'hasSiegeMode', False)):
+            return False
+        states = self._runtime.constants.VEHICLE_SIEGE_STATE
+        siege_state = getattr(entity, 'siegeState', states.DISABLED)
+        desired = 0.0
+        speed = 0.0
+        active = siege_state == states.ENABLED
+        try:
+            params = hull_aiming.pitch_params(descriptor)
+            if params is None:
+                raise ValueError('hydraulic pitch parameters are unavailable')
+            speed = params['speed']
+            if active:
+                rotator = getattr(self._avatar, 'gunRotator', None)
+                if self._sender is None or rotator is None:
+                    raise ValueError('hydraulic aim source is unavailable')
+                desired_pitch = float(self._sender.gun_pitch)
+                gun_pitch = float(rotator.gunPitch)
+                total_pitch = ((
+                    desired_pitch - float(self._local_pitch) + math.pi) %
+                    (2.0 * math.pi) - math.pi)
+                desired, unused_reachable = hull_aiming.minimal_correction(
+                    total_pitch, gun_pitch, gun_pitch,
+                    params['minimum'], params['maximum'])
+            self._local_siege_aim_pitch = hull_aiming.slew(
+                self._local_siege_aim_pitch, desired, speed, elapsed)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            # A malformed or stale descriptor degrades to the flat copied
+            # pose. It must not terminate a round or call unsafe native state.
+            self._local_siege_aim_pitch = 0.0
+            active = False
+        matrix.setRotateYPR((0.0, self._local_siege_aim_pitch, 0.0))
+        return active
 
     def _prepare_local_presentation(self, entity):
         """Publish one canonical pose before stock local-vehicle startup."""
@@ -4929,6 +4988,7 @@ class BattleRuntime(object):
         self._local_matrix.setRotateYPR((
             self._local_yaw, self._local_pitch, self._local_roll))
         self._local_matrix.translation = position
+        self._update_local_hull_aiming(entity, dt)
         self._refresh_local_stabilised_snapshot()
         # Exact #1513's CompoundAppearance.__linkCompound rebinds
         # ``compoundModel.matrix`` from Vehicle.matrix after every model
@@ -5063,6 +5123,9 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_aim_matrix = None
+        self._local_siege_aim_world_matrix = None
+        self._local_siege_aim_pitch = 0.0
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None
@@ -5997,7 +6060,16 @@ class BattleRuntime(object):
         status = getattr(status_group, 'LOADER_INTUITION_WAS_USED', None)
         if status is None:
             return False
-        callback(self._server.vehicle_id, status, 0, ())
+        try:
+            # #1513 indexes floatArgs[0] before it dispatches this status.
+            callback(self._server.vehicle_id, status, 0, (0.0,))
+        except Exception as error:
+            # The shell transaction is authoritative. A stock presentation
+            # failure must not strand the new round behind a failed HUD call.
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] loader intuition notification '
+                'failed: %s\n' % error)
+            return False
         return True
 
     def _reload_partial_clip_now(self, state):
@@ -6036,10 +6108,10 @@ class BattleRuntime(object):
         changed = state.sync_shell_index(index, instant=instant)
         if not changed:
             return False
-        if instant:
-            self._present_loader_intuition()
         self._publish_loaded_shell_change(
             state, previous_reload, previous_duration)
+        if instant:
+            self._present_loader_intuition()
         return True
 
     def change_vehicle_setting(self, code, value):
@@ -16054,6 +16126,8 @@ class BattleRuntime(object):
             self._local_physics = vehicle_physics.derive_params(
                 entity.typeDescriptor,
                 self._local_factors(entity.typeDescriptor))
+        if record.get('local') and self._local_matrix is not None:
+            self._update_local_hull_aiming(entity, 0.0)
         return True
 
     def _apply_record_pose(self, record, pose):
@@ -18276,6 +18350,9 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_aim_matrix = None
+        self._local_siege_aim_world_matrix = None
+        self._local_siege_aim_pitch = 0.0
         self._local_model = None
         self._local_native_matrix = None
         self._local_native_stabilised_matrix = None

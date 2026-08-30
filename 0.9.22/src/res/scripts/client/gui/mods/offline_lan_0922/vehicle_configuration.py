@@ -2,18 +2,18 @@
 
 
 NON_STANDARD_BATTLE_TAGS = frozenset((
-    'event_battles', 'premiumIGR', 'observer', 'secret'))
+    'event_battles', 'premiumIGR', 'observer', 'unrecoverable'))
 NON_STANDARD_BATTLE_NAMES = frozenset(('usa:T23',))
 
 
 def is_standard_battle_vehicle(vehicle_type):
     """Return whether #1513 exposes this type to ordinary tank battles.
 
-    The stock catalogue also contains observer, event, IGR and environment
-    helper entities.  Some of them can be constructed in the garage but omit
-    resources required by ``Vehicle.prerequisites``; ``Env_Artillery`` is one
-    example whose shell has no renderable projectile.  Use the stock tags,
-    not per-vehicle patches, at every catalogue boundary.
+    The stock catalogue also contains observer, event, IGR and unrecoverable
+    environment helper entities.  Some of them can be constructed in the
+    garage but omit resources required by ``Vehicle.prerequisites``;
+    ``Env_Artillery`` is one example whose shell has no renderable projectile.
+    ``secret`` alone is only a catalogue-visibility tag and remains playable.
     """
     name = str(getattr(vehicle_type, 'name', '') or '')
     tags = set(getattr(vehicle_type, 'tags', ()) or ())

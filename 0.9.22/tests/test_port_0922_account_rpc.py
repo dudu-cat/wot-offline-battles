@@ -18,6 +18,7 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.account_rpc import commands
 from gui.mods.offline_lan_0922.account_rpc import data as account_data
+from gui.mods.offline_lan_0922.account_rpc import requests as account_requests
 from gui.mods.offline_lan_0922 import compat as compatibility
 from gui.mods.offline_lan_0922.account_rpc.server import FakeServer
 from gui.mods.offline_lan_0922.account_rpc.state import AccountState
@@ -135,6 +136,10 @@ class _ItemsPrices(dict):
         return self[compact_descr]
 
 
+class _NativeLong(int):
+    pass
+
+
 class AccountRpcTests(unittest.TestCase):
     def setUp(self):
         self.pending = []
@@ -148,6 +153,30 @@ class AccountRpcTests(unittest.TestCase):
         delay, callback = self.pending.pop(0)
         self.assertEqual(0.0, delay)
         callback()
+
+    def test_shop_item_prices_are_normalized_for_native_long_formatter(self):
+        value = {
+            'items': {'itemPrices': {
+                101: {'credits': 0},
+                102: ({'gold': 25}, {'gold': 30}),
+            }},
+            'defaults': {'items': {'itemPrices': {
+                101: {'credits': 0},
+            }}},
+        }
+
+        wrapped = account_requests._wrap_shop_item_prices(
+            value, _ItemsPrices, _NativeLong)
+
+        self.assertIsInstance(
+            wrapped['items']['itemPrices'][101]['credits'], _NativeLong)
+        self.assertIsInstance(
+            wrapped['items']['itemPrices'][102][0]['gold'], _NativeLong)
+        self.assertIsInstance(
+            wrapped['items']['itemPrices'][102][1]['gold'], _NativeLong)
+        self.assertIsInstance(
+            wrapped['defaults']['items']['itemPrices'][101]['credits'],
+            _NativeLong)
 
     def test_exact_registered_handler_is_asynchronous(self):
         self.server.doCmdInt3(31, commands.CMD_REQ_SERVER_STATS, 0, 0, 0)

@@ -112,6 +112,7 @@ class VehicleOverlayTest(unittest.TestCase):
             (b"turrets0", element([
                 (b"T-18_mod", element([
                     (b"weight", scalar(packed.TYPE_INTEGER, 700)),
+                    (b"rotationSpeed", scalar(packed.TYPE_INTEGER, 44)),
                     (b"circularVisionRadius", scalar(
                         packed.TYPE_INTEGER, 320)),
                     (b"armor", element([
@@ -222,11 +223,12 @@ class VehicleOverlayTest(unittest.TestCase):
                 (b"tags", scalar(packed.TYPE_STRING, b"lightTank")),
             ])),
             (b"R12_Test", element([
-                (b"tags", scalar(packed.TYPE_STRING, b"lightTank")),
+                (b"tags", scalar(
+                    packed.TYPE_STRING, b"secret lightTank")),
             ])),
             (b"Observer", element([
                 (b"tags", scalar(
-                    packed.TYPE_STRING, b"secret lightTank")),
+                    packed.TYPE_STRING, b"secret observer lightTank")),
             ])),
         ])
         return {
@@ -427,6 +429,7 @@ class VehicleOverlayTest(unittest.TestCase):
             "chassis/T-18Bis/terrainResistance": "Chassis",
             "chassis/T-18Bis/rotationSpeed": "Chassis",
             "turrets0/T-18_mod/circularVisionRadius": "Turret",
+            "turrets0/T-18_mod/rotationSpeed": "Turret",
             "shared/Gun-A/clip/count": "Gun",
             "shared/Gun-A/clip/rate": "Gun",
             "shared/Gun-A/shotDispersionRadius": "Gun",
@@ -451,6 +454,18 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertIn(
             "Hull traverse speed",
             records["chassis/T-18Bis/rotationSpeed"]["fieldLabel"])
+        self.assertIn(
+            "Turret traverse speed",
+            records["turrets0/T-18_mod/rotationSpeed"]["fieldLabel"])
+        self.assertIn(
+            "Gun elevation speed",
+            records["shared/Gun-A/rotationSpeed"]["fieldLabel"])
+        self.assertIn(
+            "Elevation curve",
+            records["shared/Gun-A/pitchLimits/minPitch"]["fieldLabel"])
+        self.assertIn(
+            "Depression curve",
+            records["shared/Gun-A/pitchLimits/maxPitch"]["fieldLabel"])
         self.assertIn(
             "shorter reload",
             records["shared/Gun-A/clip/rate"]["fieldLabel"])
@@ -507,12 +522,24 @@ class VehicleOverlayTest(unittest.TestCase):
                     self.game, self.VEHICLE,
                     "chassis/T-18Bis/terrainResistance", replacement,
                     is_running=lambda: False)
-        with self.assertRaisesRegex(
-                vehicle_overlays.VehicleOverlayError, "integer"):
-            vehicle_overlays.apply_vehicle_edit(
-                self.game, self.VEHICLE,
-                "chassis/T-18Bis/rotationSpeed", "40.5",
-                is_running=lambda: False)
+        decimal_result = vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE,
+            "chassis/T-18Bis/rotationSpeed", "40.5",
+            is_running=lambda: False)
+        decimal_rotation = vehicle_overlays._find_value(
+            self._root(self.VEHICLE),
+            "chassis/T-18Bis/rotationSpeed")
+        self.assertEqual(packed.TYPE_STRING, decimal_rotation.value_type)
+        self.assertEqual(b"40.5", decimal_rotation.value)
+        self.assertEqual("40.5", decimal_result["currentValue"])
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.GUNS, "shared/Gun-A/reloadTime", "3",
+            is_running=lambda: False)
+        rebuilt_rotation = vehicle_overlays._find_value(
+            self._root(self.VEHICLE),
+            "chassis/T-18Bis/rotationSpeed")
+        self.assertEqual(packed.TYPE_STRING, rebuilt_rotation.value_type)
+        self.assertEqual(b"40.5", rebuilt_rotation.value)
         with self.assertRaisesRegex(
                 vehicle_overlays.VehicleOverlayError, "burst/count"):
             vehicle_overlays.apply_vehicle_edit(
@@ -962,7 +989,6 @@ class VehicleOverlayTest(unittest.TestCase):
     def test_parser_and_storage_constraints_fail_before_writing(self):
         refused = (
             (self.VEHICLE, "speedLimits/forward", "0"),
-            (self.VEHICLE, "speedLimits/forward", "1.5"),
             (self.GUNS, "shared/Gun-A/reloadTime", "nan"),
             (self.GUNS, "shared/Gun-A/reloadTime", "inf"),
             (self.GUNS, "shared/Gun-A/maxAmmo", str(1 << 63)),
@@ -1162,7 +1188,7 @@ class VehicleOverlayTest(unittest.TestCase):
         with open(other, "rb") as stream:
             self.assertEqual(b"keep", stream.read())
 
-    def test_restore_refuses_to_delete_an_externally_changed_owned_member(self):
+    def test_restore_removes_a_manifest_owned_drifted_materialization(self):
         vehicle_overlays.apply_vehicle_edit(
             self.game, self.VEHICLE, "speedLimits/forward", "40",
             is_running=lambda: False)
@@ -1170,14 +1196,52 @@ class VehicleOverlayTest(unittest.TestCase):
             "/".join((vehicle_overlays.OVERLAY_ROOT, self.VEHICLE)),
             b"changed externally")
 
-        with self.assertRaisesRegex(
-                vehicle_overlays.VehicleOverlayError, "another tool"):
-            vehicle_overlays.restore_vehicle_defaults(
-                self.game, is_running=lambda: False)
+        self.assertEqual(1, vehicle_overlays.restore_vehicle_defaults(
+            self.game, is_running=lambda: False))
 
-        self.assertTrue(os.path.exists(self._overlay(self.VEHICLE)))
-        self.assertTrue(os.path.exists(
+        self.assertFalse(os.path.exists(self._overlay(self.VEHICLE)))
+        self.assertFalse(os.path.exists(
             vehicle_overlays.manifest_path(self.game)))
+
+    def test_apply_rebuilds_a_manifest_owned_drifted_materialization(self):
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE, "speedLimits/forward", "40",
+            is_running=lambda: False)
+        self._write(
+            "/".join((vehicle_overlays.OVERLAY_ROOT, self.VEHICLE)),
+            b"changed externally")
+
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE, "speedLimits/backward", "12",
+            is_running=lambda: False)
+
+        self.assertEqual(
+            40, self._value(self.VEHICLE, "speedLimits/forward"))
+        self.assertEqual(
+            12, self._value(self.VEHICLE, "speedLimits/backward"))
+
+    def test_apply_normalizes_stale_manifest_target_metadata(self):
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE, "speedLimits/forward", "40",
+            is_running=lambda: False)
+        path = vehicle_overlays.manifest_path(self.game)
+        with open(path, "rb") as stream:
+            manifest = json.load(stream)
+        manifest["targetVersion"] = "0.9.22.legacy"
+        manifest["targetBuild"] = "older"
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(manifest, stream)
+
+        vehicle_overlays.apply_vehicle_edit(
+            self.game, self.VEHICLE, "speedLimits/backward", "12",
+            is_running=lambda: False)
+
+        with open(path, "rb") as stream:
+            normalized = json.load(stream)
+        self.assertEqual(
+            vehicle_overlays.TARGET_VERSION, normalized["targetVersion"])
+        self.assertEqual(
+            vehicle_overlays.TARGET_BUILD, normalized["targetBuild"])
 
     def test_invalid_manifest_fails_closed(self):
         self._write(
@@ -1191,21 +1255,22 @@ class VehicleOverlayTest(unittest.TestCase):
                 self.game, self.VEHICLE, "speedLimits/forward", "40",
                 is_running=lambda: False)
 
-    def test_manifest_values_cannot_change_the_recorded_packed_type(self):
+    def test_integer_required_manifest_value_cannot_become_text(self):
         vehicle_overlays.apply_vehicle_edit(
-            self.game, self.VEHICLE, "speedLimits/forward", "40",
+            self.game, self.GUNS, "shared/Gun-A/maxAmmo", "46",
             is_running=lambda: False)
         path = vehicle_overlays.manifest_path(self.game)
         with open(path, "rb") as stream:
             manifest = json.load(stream)
-        manifest["members"][0]["edits"][0]["replacementValue"] = "41"
+        manifest["members"][0]["edits"][0]["replacementValue"] = "47"
         with open(path, "w", encoding="utf-8") as stream:
             json.dump(manifest, stream)
 
         with self.assertRaisesRegex(
-                vehicle_overlays.VehicleOverlayError, "keep integer values"):
+                vehicle_overlays.VehicleOverlayError,
+                "invalid replacement value"):
             vehicle_overlays.apply_vehicle_edit(
-                self.game, self.VEHICLE, "speedLimits/backward", "12",
+                self.game, self.GUNS, "shared/Gun-A/reloadTime", "3",
                 is_running=lambda: False)
 
     def test_changed_original_package_contract_refuses_a_saved_edit(self):

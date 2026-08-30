@@ -92,6 +92,8 @@ _FIELD_CHINESE = {
     "Repair threshold": "修复阈值", "Power": "功率",
     "Traverse speed": "旋转速度", "Gun elevation limits": "火炮俯仰范围",
     "Hull traverse speed (deg/s)": "车体转向速度（度/秒）",
+    "Gun elevation speed (deg/s)": "火炮俯仰速度（度/秒）",
+    "Turret traverse speed (deg/s)": "炮塔水平转速（度/秒）",
     "Ground resistance (hard, medium, soft; lower is better)":
         "履带地形阻力（硬地 / 中地 / 软地，越低越好）",
     "Depression curve": "俯角曲线", "Elevation curve": "仰角曲线",

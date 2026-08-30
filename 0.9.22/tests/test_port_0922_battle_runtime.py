@@ -6445,6 +6445,31 @@ class BattleRuntimeContractTests(unittest.TestCase):
         state.commit_fire()
         self.assertEqual(1, state.shot_index)
 
+    def test_next_shell_preselection_preserves_remaining_magazine_rounds(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        descriptor = _two_shell_descriptor()
+        descriptor.gun.clip = (3, 1.0)
+        state = gun_mechanics.GunState(
+            descriptor, ammo_layout={101: 20, 102: 10})
+        state.reload_time = 0.0
+        state.clip = 2
+        battle._gun_state = state
+        battle._sender = types.SimpleNamespace(
+            send_current=mock.Mock(return_value=True))
+        battle._publish_ammo_state = mock.Mock()
+        battle._publish_reload_event = mock.Mock()
+
+        self.assertTrue(battle.change_vehicle_setting(
+            runtime.constants.VEHICLE_SETTING.NEXT_SHELLS, 102))
+
+        self.assertEqual(0, state.shot_index)
+        self.assertEqual(1, state.pending_index)
+        self.assertEqual(2, state.clip)
+        self.assertEqual(0.0, state.reload_time)
+        battle._publish_ammo_state.assert_not_called()
+        battle._publish_reload_event.assert_not_called()
+
     def test_current_shell_setting_reloads_the_new_shell_at_once(self):
         battle, state, settings = self._shell_change_battle()
         battle.change_vehicle_setting(settings.NEXT_SHELLS, 102)
@@ -6698,8 +6723,57 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(1, state.clip)
         status = battle._runtime.constants.VEHICLE_MISC_STATUS
         self.assertEqual(
-            [(10, status.LOADER_INTUITION_WAS_USED, 0, ())],
+            [(10, status.LOADER_INTUITION_WAS_USED, 0, (0.0,))],
             battle._avatar.misc_statuses)
+
+    def test_two_loader_intuition_switches_leave_hud_and_ammo_consistent(self):
+        battle, state, settings = self._shell_change_battle()
+        battle._avatar = _runtime().bigworld.avatar
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._roll_loader_intuition = lambda: True
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 101))
+
+        self.assertEqual(0, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual(1, state.clip)
+        self.assertEqual(2, battle._publish_ammo_state.call_count)
+        self.assertEqual(2, battle._publish_reload_event.call_count)
+        self.assertEqual(2, battle._sender.send_current.call_count)
+        status = battle._runtime.constants.VEHICLE_MISC_STATUS
+        self.assertEqual([
+            (10, status.LOADER_INTUITION_WAS_USED, 0, (0.0,)),
+            (10, status.LOADER_INTUITION_WAS_USED, 0, (0.0,)),
+        ], battle._avatar.misc_statuses)
+
+    def test_loader_intuition_notification_failure_keeps_committed_shell(self):
+        battle, state, settings = self._shell_change_battle()
+        battle._avatar = types.SimpleNamespace(
+            updateVehicleMiscStatus=mock.Mock(
+                side_effect=IndexError('tuple index out of range')))
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._roll_loader_intuition = lambda: True
+
+        self.assertTrue(
+            battle.change_vehicle_setting(settings.CURRENT_SHELLS, 102))
+
+        self.assertEqual(1, state.shot_index)
+        self.assertIsNone(state.pending_index)
+        self.assertEqual(0.0, state.reload_time)
+        self.assertEqual(1, state.clip)
+        battle._publish_ammo_state.assert_called_once_with(state, force=True)
+        battle._publish_reload_event.assert_called_once_with(
+            0.0, state.reload_duration, force=True)
+        battle._sender.send_current.assert_called_once_with()
+        battle._avatar.updateVehicleMiscStatus.assert_called_once_with(
+            10,
+            battle._runtime.constants.VEHICLE_MISC_STATUS.
+            LOADER_INTUITION_WAS_USED,
+            0, (0.0,))
 
     def test_an_unfinished_intuition_perk_never_rolls(self):
         battle, unused_state, unused_settings = self._shell_change_battle()
@@ -11622,13 +11696,25 @@ class BattleRuntimeContractTests(unittest.TestCase):
             entity.filter.notifyInputKeysDown.assert_called_with(0, 0)
             entity.filter.getVehiclePhysics.assert_not_called()
 
-    def test_enabled_siege_transplants_native_hydraulic_pose_without_physics_sync(self):
+    def test_enabled_siege_aims_copied_hydraulic_pose_without_native_physics(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
         battle.client = _Client()
         battle._avatar = runtime.bigworld.avatar
         descriptor = _Descriptor('sweden:S11_Strv_103B')
         descriptor.hasSiegeMode = True
+        descriptor.type.hullAimingParams = {
+            'pitch': {
+                'isAvailable': True,
+                'isEnabled': True,
+                'wheelCorrectionCenterZ': 0.0,
+                'wheelsCorrectionSpeed': 0.1,
+                'wheelsCorrectionAngles': {
+                    'pitchMin': -0.2,
+                    'pitchMax': 0.2,
+                },
+            },
+        }
         entity = _Vehicle(
             10, descriptor, _Vector(2, 3, 4), (0, 0, 0),
             {'health': 500})
@@ -11662,7 +11748,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(native_body, body_relative.a)
         self.assertIs(native_ground, body_relative.b.source)
         self.assertIs(
-            battle._local_matrix, battle._local_siege_body_matrix.b)
+            battle._local_siege_aim_world_matrix,
+            battle._local_siege_body_matrix.b)
+        self.assertIs(
+            battle._local_siege_aim_matrix,
+            battle._local_siege_aim_world_matrix.a)
+        self.assertIs(
+            battle._local_matrix,
+            battle._local_siege_aim_world_matrix.b)
 
         entity.siegeState = 2
         self.assertTrue(battle._select_local_siege_pose(entity, True))
@@ -11675,11 +11768,16 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             battle._local_siege_ground_matrix,
             battle._local_steady_rotation_matrix.a)
+        self.assertTrue(battle._update_local_hull_aiming(entity, 1.0))
+        self.assertAlmostEqual(-0.1, battle._local_siege_aim_pitch)
+        self.assertAlmostEqual(-0.1, battle._local_siege_aim_matrix.pitch)
         entity.siegeState = 3
         self.assertTrue(battle._select_local_siege_pose(entity, True))
         self.assertIs(
             battle._local_siege_body_matrix,
             battle._local_pose_matrix.a)
+        self.assertFalse(battle._update_local_hull_aiming(entity, 1.0))
+        self.assertAlmostEqual(0.0, battle._local_siege_aim_pitch)
         entity.filter.getVehiclePhysics.assert_not_called()
 
         self.assertTrue(battle._select_local_siege_pose(entity, False))

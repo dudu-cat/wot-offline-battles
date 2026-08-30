@@ -150,6 +150,9 @@ class BotLineupIntegrationTests(unittest.TestCase):
             5: types.SimpleNamespace(
                 name='ussr:Observer', level=1,
                 tags=('lightTank', 'observer')),
+            6: types.SimpleNamespace(
+                name='ussr:R99_SecretTank', level=8,
+                tags=('mediumTank', 'secret')),
         }
         runtime = types.SimpleNamespace(
             nations=types.SimpleNamespace(
@@ -158,12 +161,14 @@ class BotLineupIntegrationTests(unittest.TestCase):
                 getList=lambda unused_nation_id: entries)))
 
         self.assertEqual(
-            ['ussr:R11_MS-1'],
+            ['ussr:R11_MS-1', 'ussr:R99_SecretTank'],
             [row['name'] for row in
              descriptor_donation.vehicle_catalog(runtime)])
-        for entry in list(entries.values())[1:]:
+        for entry in list(entries.values())[1:5]:
             self.assertFalse(
                 vehicle_configuration.is_standard_battle_vehicle(entry))
+        self.assertTrue(vehicle_configuration.is_standard_battle_vehicle(
+            entries[6]))
 
     def test_missing_exact_vehicle_is_rejected_by_hidden_worker(self):
         lineup = [{

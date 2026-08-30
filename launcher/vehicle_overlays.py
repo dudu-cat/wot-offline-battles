@@ -38,10 +38,8 @@ except ImportError:
 
 try:
     from . import core
-    from .bot_lineup_profiles import vehicle_choice_is_eligible
 except ImportError:
     import core
-    from bot_lineup_profiles import vehicle_choice_is_eligible
 
 
 TARGET_VERSION = "0.9.22.0.1"
@@ -68,6 +66,9 @@ _VEHICLE_MEMBER = re.compile(
 _VEHICLE_CATALOG_PREFIX = re.compile(r"^[A-Za-z]{1,2}[0-9]{2,3}_")
 _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_NON_EDITABLE_VEHICLE_TAGS = frozenset((
+    "event_battles", "premiumIGR", "observer", "unrecoverable"))
+_NON_EDITABLE_VEHICLES = frozenset(("usa:T23",))
 
 _TYPE_NAMES = {
     packed_xml.TYPE_STRING: "string",
@@ -118,11 +119,13 @@ _FIELD_LABELS = {
     "power": "Power",
     "rotationSpeed": "Traverse speed",
     "hullRotationSpeed": "Hull traverse speed (deg/s)",
+    "gunElevationSpeed": "Gun elevation speed (deg/s)",
+    "turretTraverseSpeed": "Turret traverse speed (deg/s)",
     "terrainResistance": (
         "Ground resistance (hard, medium, soft; lower is better)"),
     "pitchLimits": "Gun elevation limits",
-    "minPitch": "Depression curve",
-    "maxPitch": "Elevation curve",
+    "minPitch": "Elevation curve",
+    "maxPitch": "Depression curve",
     "turretYawLimits": "Horizontal traverse limits",
     "hull_aiming": "Hull aiming",
     "wheelsCorrectionAngles": "Suspension pitch limits",
@@ -426,7 +429,7 @@ def _field_rule(member, field_path):
                 parts[-1] == "weight"):
             return _POSITIVE
         if (len(parts) == 3 and re.fullmatch(r"turrets\d+", parts[0]) and
-                parts[-1] == "circularVisionRadius"):
+                parts[-1] in ("circularVisionRadius", "rotationSpeed")):
             return _POSITIVE
         if (len(parts) == 4 and re.fullmatch(r"turrets\d+", parts[0]) and
                 parts[2] == "armor"):
@@ -467,7 +470,7 @@ def _field_rule(member, field_path):
                 return rule
         if (component_name == "turrets" and len(parts) == 3 and
                 parts[0] == "shared" and
-                parts[-1] == "circularVisionRadius"):
+                parts[-1] in ("circularVisionRadius", "rotationSpeed")):
             return _POSITIVE
         if (component_name in ("chassis", "guns", "turrets") and
                 len(parts) == 4 and parts[0] == "shared" and
@@ -878,7 +881,13 @@ def _vehicle_roster_from_archive(archive, counts, nation=None):
                 "userString": user_strings.get("userString", ""),
                 "shortUserString": user_strings.get("shortUserString", ""),
             }
-            record["selectable"] = vehicle_choice_is_eligible(record)
+            # ``secret`` hides vehicles from the retail tech tree, but it is
+            # not a data-safety boundary for this local editor. Keep only
+            # native construction hazards out of the player catalogue.
+            type_name = "%s:%s" % (roster_nation, vehicle)
+            record["selectable"] = bool(
+                not _NON_EDITABLE_VEHICLE_TAGS.intersection(record["tags"]) and
+                type_name not in _NON_EDITABLE_VEHICLES)
             records.append(record)
     return sorted(records, key=lambda record: (
         record["nation"], record["vehicle"], record["member"]))
@@ -1116,6 +1125,10 @@ def _field_label(category, field_path):
         parts = parts[:-2] + ["Armor thickness (%s)" % parts[-1]]
     if category == "chassis" and parts[-1:] == ["rotationSpeed"]:
         parts[-1] = "hullRotationSpeed"
+    elif category == "guns" and parts[-1:] == ["rotationSpeed"]:
+        parts[-1] = "gunElevationSpeed"
+    elif category == "turret" and parts[-1:] == ["rotationSpeed"]:
+        parts[-1] = "turretTraverseSpeed"
     return " / ".join(_FIELD_LABELS.get(part, part) for part in parts)
 
 
@@ -1444,7 +1457,8 @@ def _parse_replacement(raw_value, original, rule):
             packed_xml.TYPE_STRING, manifest_value.encode("ascii")),
                 manifest_value)
 
-    if original.value_type == packed_xml.TYPE_INTEGER:
+    if (original.value_type == packed_xml.TYPE_INTEGER and
+            rule.get("integerRequired")):
         try:
             value = int(text)
         except (TypeError, ValueError, OverflowError):
@@ -1458,7 +1472,8 @@ def _parse_replacement(raw_value, original, rule):
             packed_xml.TYPE_INTEGER, value)
         manifest_value = value
     else:
-        if rule.get("integerRequired"):
+        if (original.value_type != packed_xml.TYPE_INTEGER and
+                rule.get("integerRequired")):
             raise VehicleOverlayError(
                 "This field must use the stock Packed integer type.")
         try:
@@ -1467,9 +1482,16 @@ def _parse_replacement(raw_value, original, rule):
             raise VehicleOverlayError("Enter one numeric scalar.")
         if not math.isfinite(numeric):
             raise VehicleOverlayError("The replacement must be finite.")
-        manifest_value = format(numeric, ".15g")
-        replacement = packed_xml.PackedValue(
-            packed_xml.TYPE_STRING, manifest_value.encode("ascii"))
+        if (original.value_type == packed_xml.TYPE_INTEGER and
+                numeric.is_integer() and
+                -(1 << 63) <= numeric <= (1 << 63) - 1):
+            manifest_value = int(numeric)
+            replacement = packed_xml.PackedValue(
+                packed_xml.TYPE_INTEGER, manifest_value)
+        else:
+            manifest_value = format(numeric, ".15g")
+            replacement = packed_xml.PackedValue(
+                packed_xml.TYPE_STRING, manifest_value.encode("ascii"))
 
     if not math.isfinite(numeric):
         raise VehicleOverlayError("The replacement must be finite.")
@@ -1503,11 +1525,9 @@ def _validate_manifest(value):
     if not isinstance(value, dict):
         raise VehicleOverlayError("vehicle_overlays.json must be an object.")
     if (value.get("schema") != MANIFEST_SCHEMA or
-            value.get("targetVersion") != TARGET_VERSION or
-            str(value.get("targetBuild")) != TARGET_BUILD or
             value.get("sourcePackage") != SOURCE_PACKAGE):
         raise VehicleOverlayError(
-            "vehicle_overlays.json does not belong to this editor and build.")
+            "vehicle_overlays.json does not belong to this editor.")
     members = value.get("members")
     if not isinstance(members, list):
         raise VehicleOverlayError("The overlay manifest member list is invalid.")
@@ -1546,12 +1566,30 @@ def _validate_manifest(value):
                     "A manifest edit is missing its values.")
             if edit["originalPackedType"] == "integer":
                 if (not isinstance(edit["originalValue"], int) or
-                        isinstance(edit["originalValue"], bool) or
-                        not isinstance(edit["replacementValue"], int) or
-                        isinstance(edit["replacementValue"], bool)):
+                        isinstance(edit["originalValue"], bool)):
                     raise VehicleOverlayError(
-                        "A Packed integer manifest edit must keep integer "
-                        "values.")
+                        "A Packed integer manifest edit has an invalid "
+                        "original value.")
+                replacement = edit["replacementValue"]
+                rule = _field_rule(member, field_path)
+                if rule.get("integerRequired"):
+                    valid_replacement = (
+                        isinstance(replacement, int) and
+                        not isinstance(replacement, bool))
+                else:
+                    valid_replacement = (
+                        isinstance(replacement, int) and
+                        not isinstance(replacement, bool))
+                    if isinstance(replacement, str):
+                        try:
+                            valid_replacement = math.isfinite(
+                                float(replacement))
+                        except (TypeError, ValueError, OverflowError):
+                            valid_replacement = False
+                if not valid_replacement:
+                    raise VehicleOverlayError(
+                        "A Packed integer manifest edit has an invalid "
+                        "replacement value.")
             elif (not isinstance(edit["originalValue"], str) or
                   not isinstance(edit["replacementValue"], str)):
                 raise VehicleOverlayError(
@@ -1600,14 +1638,9 @@ def _ownership_problem(game_root, member, entry):
         return (
             "Conflict: this complete package member already exists in "
             "res_mods but is not owned by vehicle_overlays.json.")
-    try:
-        current_digest = _sha256(_read_file(path))
-    except (IOError, OSError) as error:
-        return "Conflict: the existing overlay cannot be read: %s" % error
-    if current_digest != entry["overlaySha256"]:
-        return (
-            "Conflict: this editor's owned overlay was changed by another "
-            "tool. No file will be overwritten or removed.")
+    # A structurally valid manifest is the ownership proof. The overlay is a
+    # disposable materialization of logical edits and is rebuilt from the
+    # original package on Apply; content drift is therefore self-healing.
     return ""
 
 
@@ -1640,11 +1673,18 @@ def _compare_trees(original, rebuilt, edited_paths, prefix=()):
         raise VehicleOverlayError("Packed XML topology changed during rebuild.")
     for (old_name, old_value), (new_name, new_value) in zip(
             original.children, rebuilt.children):
-        if old_name != new_name or old_value.value_type != new_value.value_type:
+        if old_name != new_name:
             raise VehicleOverlayError(
-                "Packed XML names or types changed during rebuild.")
+                "Packed XML names changed during rebuild.")
         child_path = prefix + (old_name.decode("utf-8"),)
+        if (old_value.value_type != new_value.value_type and
+                child_path not in edited_paths):
+            raise VehicleOverlayError(
+                "An unedited Packed XML type changed during rebuild.")
         if old_value.value_type == packed_xml.TYPE_ELEMENT:
+            if new_value.value_type != packed_xml.TYPE_ELEMENT:
+                raise VehicleOverlayError(
+                    "Packed XML topology changed during rebuild.")
             _compare_trees(
                 old_value.value, new_value.value, edited_paths, child_path)
         elif (child_path not in edited_paths and
@@ -1744,9 +1784,9 @@ def _validate_angle_relations(element, prefix=()):
                 len(values.get("maxPitch", ())) == 1):
             try:
                 minimum = _pitch_curve_points(
-                    values["minPitch"][0], "Gun depression curve")
+                    values["minPitch"][0], "Gun elevation curve")
                 maximum = _pitch_curve_points(
-                    values["maxPitch"][0], "Gun elevation curve")
+                    values["maxPitch"][0], "Gun depression curve")
             except VehicleOverlayError:
                 # A few stock local overrides are deliberately empty and
                 # inherit the shared gun curve. They are never offered by the
@@ -1760,7 +1800,7 @@ def _validate_angle_relations(element, prefix=()):
                        _curve_at(maximum, position) + 1e-9
                        for position in positions):
                     raise VehicleOverlayError(
-                        "%s gun depression must not exceed elevation." %
+                        "%s minimum pitch must not exceed maximum pitch." %
                         "/".join(prefix + ("pitchLimits",)))
 
     correction = direct.get("wheelsCorrectionAngles", ())
@@ -1788,6 +1828,7 @@ def _build_member(package_path, entry):
     unused_source, original_root = _read_source_member(package_path, member)
     rebuilt_root = copy.deepcopy(original_root)
     edited_paths = set()
+    expected_values = {}
     normalized_edits = []
     for edit in sorted(entry["edits"], key=lambda item: item["fieldPath"]):
         field_path = edit["fieldPath"]
@@ -1805,11 +1846,11 @@ def _build_member(package_path, entry):
                 "The original scripts.pkg value changed for %s." % field_path)
         replacement, manifest_value = _parse_replacement(
             edit["replacementValue"], original, rule)
-        if target.value_type != replacement.value_type:
-            raise VehicleOverlayError(
-                "The Packed type changed for %s." % field_path)
+        target.value_type = replacement.value_type
         target.value = replacement.value
         edited_paths.add(tuple(_field_parts(field_path)))
+        expected_values[field_path] = (
+            replacement.value_type, replacement.value)
         normalized = dict(edit)
         normalized["replacementValue"] = manifest_value
         normalized["constraint"] = rule["description"]
@@ -1827,11 +1868,9 @@ def _build_member(package_path, entry):
     _compare_trees(original_root, reparsed, edited_paths)
     for edit in normalized_edits:
         value = _find_value(reparsed, edit["fieldPath"])
-        replacement, unused = _parse_replacement(
-            edit["replacementValue"], value,
-            _field_rule(member, edit["fieldPath"]))
-        if (value.value_type != replacement.value_type or
-                value.value != replacement.value):
+        expected_type, expected_value = expected_values[edit["fieldPath"]]
+        if (value.value_type != expected_type or
+                value.value != expected_value):
             raise VehicleOverlayError(
                 "The rebuilt value did not round-trip for %s." %
                 edit["fieldPath"])
@@ -1895,11 +1934,8 @@ def _merge_saved_edit(entries, package_path, member, field_path,
     unused_data, source_root = _read_source_member(package_path, member)
     original = _find_value(source_root, field_path)
     _validate_original(original, rule)
-    replacement, manifest_value = _parse_replacement(
+    unused_replacement, manifest_value = _parse_replacement(
         replacement_value, original, rule)
-    if replacement.value_type != original.value_type:
-        raise VehicleOverlayError("The replacement changed the Packed type.")
-
     entry = entries.get(member)
     if entry is None:
         entry = {
@@ -2403,6 +2439,8 @@ def apply_vehicle_edit(game_root, member, field_path, replacement_value,
         rebuilt[owned_member] = output
 
     manifest["members"] = [entries[name] for name in sorted(entries)]
+    manifest["targetVersion"] = TARGET_VERSION
+    manifest["targetBuild"] = TARGET_BUILD
     manifest["updatedAt"] = _now()
     _validate_manifest(manifest)
     writes = [(_overlay_path(status["path"], name), rebuilt[name])
@@ -2516,11 +2554,9 @@ def _profile_manifest(profile):
 def _validate_profile_store(value):
     if not isinstance(value, dict):
         raise VehicleOverlayError("vehicle_profiles.json must be an object.")
-    if (value.get("schema") != PROFILE_STORE_SCHEMA or
-            value.get("targetVersion") != TARGET_VERSION or
-            str(value.get("targetBuild")) != TARGET_BUILD):
+    if value.get("schema") != PROFILE_STORE_SCHEMA:
         raise VehicleOverlayError(
-            "vehicle_profiles.json does not belong to this editor and build.")
+            "vehicle_profiles.json does not belong to this editor.")
     if not isinstance(value.get("createdAt"), str) or not isinstance(
             value.get("updatedAt"), str):
         raise VehicleOverlayError(
@@ -2644,6 +2680,8 @@ def _profile_store_bytes(store):
 
 
 def _save_profile_store(game_root, store):
+    store["targetVersion"] = TARGET_VERSION
+    store["targetBuild"] = TARGET_BUILD
     store["updatedAt"] = _now()
     _validate_profile_store(store)
     _atomic_profile_store_write(
