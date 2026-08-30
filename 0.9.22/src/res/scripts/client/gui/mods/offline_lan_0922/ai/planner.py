@@ -17,6 +17,7 @@ from gui.mods.offline_lan_0922.ai import maps as bot_ai_maps
 
 CONTACT_MEMORY_SECONDS = 7.0
 TARGET_HYSTERESIS_BONUS = 18.0
+DISCOVERED_ARTILLERY_PRIORITY_BONUS = 48.0
 LOCAL_FORCE_RADIUS = 185.0
 BATTLE_TIER_RADIUS = 1
 MATCH_CLASSES = ('heavyTank', 'mediumTank', 'AT-SPG', 'lightTank', 'SPG')
@@ -1089,6 +1090,11 @@ class BattleDirector(object):
 				score += TARGET_HYSTERESIS_BONUS
 			if contact.get('class_tag') in ('lightTank', 'SPG'):
 				score += 4.0 * personality['initiative']
+			if visible and contact.get('class_tag') == 'SPG':
+				# A discovered battery is a high-value target, but the normal
+				# shootability and focus reservations above still prevent blind
+				# pursuit or the whole team dog-piling one artillery vehicle.
+				score += DISCOVERED_ARTILLERY_PRIORITY_BONUS
 			if score > best_score:
 				best_score = score
 				best = contact

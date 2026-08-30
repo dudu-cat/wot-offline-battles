@@ -432,6 +432,38 @@ class BotAiPortTests(unittest.TestCase):
         self.assertNotIn('jiggle_back', modes)
         self.assertEqual({None}, throttle_values)
 
+    def test_discovered_artillery_has_priority_over_a_soft_regular_target(self):
+        director = BattleDirector('04_himmelsdorf', 46)
+        profile = self._strategy_profile('mediumTank', 18.0, 85.0)
+        director.register_profile(401, 1, profile, 'Hunter')
+        director.update_contact(
+            1, 402, 2, (0.0, 0.0, 100.0), 10, 1000,
+            'heavyTank', True, 1.0, shootable_by_ids=(401,))
+        director.update_contact(
+            1, 403, 2, (0.0, 0.0, 130.0), 500, 500,
+            'SPG', True, 1.0, shootable_by_ids=(401,))
+
+        order = director.order_for(
+            401, (0.0, 0.0, 0.0), 0.0, 1000, 1000, 1.0)
+
+        self.assertEqual(403, order['target_id'])
+
+    def test_unspotted_artillery_does_not_override_a_visible_target(self):
+        director = BattleDirector('04_himmelsdorf', 47)
+        profile = self._strategy_profile('mediumTank', 18.0, 85.0)
+        director.register_profile(401, 1, profile, 'Hunter')
+        director.update_contact(
+            1, 402, 2, (0.0, 0.0, 100.0), 800, 1000,
+            'heavyTank', True, 1.0, shootable_by_ids=(401,))
+        director.update_contact(
+            1, 403, 2, (0.0, 0.0, 130.0), 500, 500,
+            'SPG', False, 1.0, shootable_by_ids=(401,))
+
+        order = director.order_for(
+            401, (0.0, 0.0, 0.0), 0.0, 1000, 1000, 1.0)
+
+        self.assertEqual(402, order['target_id'])
+
     def test_navigation_accepts_caller_probes(self):
         grid = TerrainGrid(lambda x, z, hint_y: 0.0,
                            bounds=(-50, -50, 50, 50))
