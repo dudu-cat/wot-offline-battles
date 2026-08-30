@@ -20,4 +20,4 @@ launcher/dist/
 deliverables/
 
 # The developer-supplied client package a source checkout reads.
-client/
+/client/
