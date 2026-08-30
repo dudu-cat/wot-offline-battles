@@ -394,6 +394,102 @@ class ServerCaptureTests(unittest.TestCase):
         self.assertEqual(3, state.rules_state['bases']['1']['points'])
         self.assertEqual({'human:2': 3}, state.capture_contributors[1])
 
+    def test_stale_track_repair_converges_to_canonical_equipment_repair(self):
+        state = self._state()
+        player = _player(2, 2, 0.0, 0.0)
+        player.critical = {
+            'devices': [{
+                'name': 'leftTrackHealth', 'hp': 20.0, 'max_hp': 100.0,
+                'state': 'destroyed',
+            }],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        state.players[2] = player
+
+        def report(seq, hp, phase='destroyed', round_id=None,
+                   name='leftTrackHealth'):
+            return {
+                'type': 'track_repair',
+                'round_id': state.round_id if round_id is None else round_id,
+                'critical_base_revision': 0, 'repair_seq': seq,
+                'tracks': [{
+                    'name': name, 'hp': hp, 'max_hp': 100.0,
+                    'state': phase,
+                }],
+            }
+
+        self.assertTrue(state.report_track_repair(2, report(1, 30.0)))
+        repaired = {
+            'devices': [{
+                'name': 'leftTrackHealth', 'hp': 70.0, 'max_hp': 100.0,
+                'state': 'critical',
+            }],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        state._commit_player_critical_progress(player, repaired)
+        revision = player.critical_revision
+
+        self.assertTrue(state.report_track_repair(2, report(2, 40.0)))
+        self.assertEqual(2, player.critical_ack_seq)
+        self.assertGreater(player.critical_revision, revision)
+        self.assertEqual(repaired, player.critical)
+        published = state._public_player(player, include_outfits=False)
+        self.assertEqual(2, published['critical_ack_seq'])
+        self.assertEqual(repaired, published['critical'])
+
+        # Exact retries and older accepted checkpoints are harmless no-ops;
+        # same-sequence mutations and invalid identity/shape still fail closed.
+        revision = player.critical_revision
+        self.assertTrue(state.report_track_repair(2, report(2, 40.0)))
+        self.assertTrue(state.report_track_repair(2, report(1, 30.0)))
+        self.assertEqual(revision, player.critical_revision)
+        self.assertFalse(state.report_track_repair(2, report(2, 41.0)))
+        self.assertFalse(state.report_track_repair(
+            2, report(3, 50.0, round_id=state.round_id + 1)))
+        self.assertFalse(state.report_track_repair(
+            2, report(3, 50.0, name='engineHealth')))
+        self.assertFalse(state.report_track_repair(
+            2, report(3, 50.0, name='rightTrackHealth')))
+
+    def test_track_repair_merges_progress_beside_converged_track(self):
+        state = self._state()
+        player = _player(2, 2, 0.0, 0.0)
+        player.critical = {
+            'devices': [
+                {'name': 'leftTrackHealth', 'hp': 70.0,
+                 'max_hp': 100.0, 'state': 'critical'},
+                {'name': 'rightTrackHealth', 'hp': 20.0,
+                 'max_hp': 100.0, 'state': 'destroyed'},
+            ],
+            'destroyed': ['rightTrackHealth'], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        state.players[2] = player
+
+        def report(right_hp):
+            return {
+                'type': 'track_repair', 'round_id': state.round_id,
+                'critical_base_revision': 0, 'repair_seq': 1,
+                'tracks': [
+                    {'name': 'leftTrackHealth', 'hp': 40.0,
+                     'max_hp': 100.0, 'state': 'destroyed'},
+                    {'name': 'rightTrackHealth', 'hp': right_hp,
+                     'max_hp': 100.0, 'state': 'destroyed'},
+                ],
+            }
+
+        self.assertFalse(state.report_track_repair(2, report(20.0)))
+        self.assertEqual(0, player.critical_ack_seq)
+        self.assertTrue(state.report_track_repair(2, report(30.0)))
+        devices = {row['name']: row for row in player.critical['devices']}
+        self.assertEqual('critical', devices['leftTrackHealth']['state'])
+        self.assertEqual(70.0, devices['leftTrackHealth']['hp'])
+        self.assertEqual('destroyed', devices['rightTrackHealth']['state'])
+        self.assertEqual(30.0, devices['rightTrackHealth']['hp'])
+        self.assertEqual(1, player.critical_ack_seq)
+
 
 if __name__ == '__main__':
     unittest.main()

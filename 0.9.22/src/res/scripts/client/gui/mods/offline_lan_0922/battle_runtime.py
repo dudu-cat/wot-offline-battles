@@ -8086,7 +8086,8 @@ class BattleRuntime(object):
         critical = event.get('critical')
         if isinstance(critical, dict):
             canonical = self._critical_state(critical)
-            should_apply = self._reconcile_critical_authority(record, event)
+            should_apply = self._reconcile_critical_authority(
+                record, event, canonical)
             if (entity is not None and should_apply and
                     canonical != record.get('critical_state')):
                 events = critical_damage.apply_payload(entity, critical)
@@ -8154,7 +8155,7 @@ class BattleRuntime(object):
         values['critical_delta'] = critical_delta
         return values
 
-    def _reconcile_critical_authority(self, record, source):
+    def _reconcile_critical_authority(self, record, source, canonical=None):
         if record.get('kind') != 'player':
             return True
         required = ('critical_revision', 'critical_base_revision',
@@ -8172,8 +8173,27 @@ class BattleRuntime(object):
         record['critical_base_revision'] = base_revision
         record['critical_ack_seq'] = ack_seq
         if record.get('local'):
-            self.acknowledge_local_damage_report(
+            pending = self._local_damage_report
+            acknowledged = self.acknowledge_local_damage_report(
                 base_revision, ack_seq, revision)
+            if (acknowledged and self._local_critical_owned and
+                    isinstance(pending, dict) and
+                    isinstance(canonical, dict)):
+                pending_tracks = set(
+                    str(row.get('name'))
+                    for row in pending.get('tracks') or ()
+                    if isinstance(row, dict))
+                canonical_states = {
+                    str(row.get('name')): str(row.get('state'))
+                    for row in canonical.get('devices') or ()
+                    if isinstance(row, dict)}
+                destroyed = set(
+                    str(name) for name in canonical.get('destroyed') or ())
+                if (pending_tracks and all(
+                        canonical_states.get(name) in ('normal', 'critical')
+                        and name not in destroyed
+                        for name in pending_tracks)):
+                    self._local_critical_owned = False
             if (self._local_critical_owned and
                     base_revision == self._local_critical_base_revision):
                 return False
@@ -8185,7 +8205,7 @@ class BattleRuntime(object):
             return False
         if authority is not None:
             should_apply = self._reconcile_critical_authority(
-                record, authority)
+                record, authority, canonical)
             if not should_apply:
                 if record.get('local') and record.get('critical_state'):
                     state = dict(record.get('state') or {})

@@ -9291,7 +9291,7 @@ class BattleState:
         }, True
 
     def report_track_repair(self, player_id, message):
-        """CAS one owner-timed destroyed-track repair into canonical state."""
+        """CAS one owner-timed repair or acknowledge canonical convergence."""
         with self.lock:
             player = self.players.get(player_id)
             if (self.client_build != CLIENT_BUILD_0922 or
@@ -9316,10 +9316,6 @@ class BattleState:
             fingerprint = tuple(
                 (row["name"], row["hp"], row["max_hp"], row["state"])
                 for row in rows)
-            if repair_seq <= player.critical_ack_seq:
-                return (player.track_repair_fingerprints.get(repair_seq) ==
-                        fingerprint)
-
             current = (player.critical
                        if isinstance(player.critical, dict) else {})
             devices = [dict(record)
@@ -9330,19 +9326,29 @@ class BattleState:
                 for index, record in enumerate(devices)
                 if record.get("name") is not None
             }
+            if any(row["name"] not in by_name for row in rows):
+                return False
+            if repair_seq <= player.critical_ack_seq:
+                accepted = player.track_repair_fingerprints.get(repair_seq)
+                return accepted is None or accepted == fingerprint
+
             destroyed = set(current.get("destroyed") or ())
             events = []
             improved = False
+            converged = set()
             for row in rows:
-                pair = by_name.get(row["name"])
-                if pair is None:
-                    return False
-                index, previous = pair
+                index, previous = by_name[row["name"]]
                 old_hp = _finite_float(previous.get("hp"), -1.0)
                 old_maximum = _finite_float(
                     previous.get("max_hp"), -1.0)
+                if old_hp < 0.0 or old_maximum <= 0.0:
+                    return False
+                if (previous.get("state") in ("normal", "critical") and
+                        row["name"] not in destroyed):
+                    converged.add(row["name"])
+                    continue
                 if (previous.get("state") != "destroyed" or
-                        row["name"] not in destroyed or old_hp < 0.0 or
+                        row["name"] not in destroyed or
                         abs(old_maximum - row["max_hp"]) > 0.001 or
                         row["hp"] + 0.001 < old_hp):
                     return False
@@ -9359,12 +9365,15 @@ class BattleState:
                         "state": "critical",
                         "cause": "repair",
                     })
-            if not improved:
+            if not improved and len(converged) != len(rows):
                 return False
-            candidate = dict(current)
-            candidate["devices"] = devices
-            candidate["destroyed"] = sorted(destroyed)
-            candidate["events"] = events
+            if not improved:
+                candidate = current
+            else:
+                candidate = dict(current)
+                candidate["devices"] = devices
+                candidate["destroyed"] = sorted(destroyed)
+                candidate["events"] = events
             try:
                 candidate = _critical_payload(candidate)
             except ValueError:

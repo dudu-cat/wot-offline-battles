@@ -9453,6 +9453,48 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIsNone(battle._local_damage_report)
         self.assertTrue(battle._local_critical_owned)
 
+    def test_local_repair_ack_applies_newer_canonical_completion(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        entity = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        runtime.bigworld.entities[10] = entity
+        live = {
+            'devices': [{'name': 'leftTrackHealth', 'hp': 35.0,
+                         'max_hp': 100.0, 'state': 'destroyed'}],
+            'destroyed': ['leftTrackHealth'], 'crew_ko': [],
+            'fire': False, 'ammo_rack_death': False, 'events': []}
+        canonical = {
+            'devices': [{'name': 'leftTrackHealth', 'hp': 70.0,
+                         'max_hp': 100.0, 'state': 'critical'}],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': []}
+        entity.devices_hp = {'leftTrackHealth': 35.0}
+        entity._destroyed_devices = set(['leftTrackHealth'])
+        record = {
+            'engine_id': 10, 'state': {
+                'health': 500, 'alive': True, 'critical': live},
+            'critical_state': live, 'critical_revision': 0,
+            'kind': 'player', 'network_id': 1, 'local': True}
+        battle._present_critical = mock.Mock(return_value=True)
+        battle._local_critical_owned = True
+        battle._local_critical_base_revision = 0
+        battle._local_critical_next_seq = 1
+        battle._local_damage_report = {
+            'tracks': [dict(live['devices'][0])],
+            'critical_base_revision': 0,
+            'critical_seq': 1}
+
+        self.assertTrue(battle._apply_critical_state(record, canonical, {
+            'critical_revision': 1, 'critical_base_revision': 0,
+            'critical_ack_seq': 1}))
+
+        self.assertIsNone(battle._local_damage_report)
+        self.assertFalse(battle._local_critical_owned)
+        self.assertEqual(70.0, entity.devices_hp['leftTrackHealth'])
+        self.assertEqual(canonical, record['state']['critical'])
+
     def test_duplicate_ordered_event_is_presented_once(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
