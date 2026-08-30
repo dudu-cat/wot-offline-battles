@@ -17572,21 +17572,6 @@ class BattleRuntime(object):
                 retain_wreck()
             return
         entity.health = native_health
-        publish_local_kill = bool(
-            not previous_dead and dead and
-            not suppress_combat_presentation and
-            not record.get('local') and
-            int(attacker_id or 0) > 0 and
-            int(attacker_id) == int(
-                getattr(self._avatar, 'playerVehicleID', 0) or 0))
-        if publish_local_kill:
-            # ``VEHICLE_KILLED`` synchronously refreshes the marker's dead
-            # state.  Publish that state before the health update which the
-            # marker classifies as FROM_PLAYER, otherwise the terminal refresh
-            # replaces the local-kill colour with the generic enemy one.
-            killed = getattr(self._binding, 'arena_vehicle_killed', None)
-            if callable(killed):
-                killed(engine_id, int(attacker_id), int(reason_id))
         health_changed = getattr(entity, 'onHealthChanged', None)
         if (not suppress_combat_presentation and
                 callable(health_changed)):
@@ -17599,8 +17584,19 @@ class BattleRuntime(object):
             notifier = getattr(entity, 'set_health', None)
             if callable(notifier):
                 notifier(previous)
+        previous_crew_active = getattr(entity, 'isCrewActive', crew_active)
+        entity.isCrewActive = crew_active
+        if (previous_crew_active != crew_active and
+                (not suppress_combat_presentation or
+                 not record.get('native_remote'))):
+            crew_notifier = getattr(entity, 'set_isCrewActive', None)
+            if callable(crew_notifier):
+                crew_notifier(previous_crew_active)
         if (record.get('presentation') and
                 not suppress_combat_presentation):
+            # Exact #1513's ``set_isCrewActive`` republishes remote health
+            # without an attacker.  Keep the causal update last so a local
+            # hit or kill remains classified as FROM_PLAYER.
             provider = getattr(self._avatar, 'guiSessionProvider', None)
             present_health = getattr(provider, 'setVehicleHealth', None)
             if not callable(present_health):
@@ -17615,14 +17611,6 @@ class BattleRuntime(object):
             # target is spotted later.  Until then, no floating damage text is
             # allowed to disclose the blind hit.
             record['deferred_health_presentation'] = True
-        previous_crew_active = getattr(entity, 'isCrewActive', crew_active)
-        entity.isCrewActive = crew_active
-        if (previous_crew_active != crew_active and
-                (not suppress_combat_presentation or
-                 not record.get('native_remote'))):
-            crew_notifier = getattr(entity, 'set_isCrewActive', None)
-            if callable(crew_notifier):
-                crew_notifier(previous_crew_active)
         # Vehicle.onHealthChanged and Vehicle.set_isCrewActive both reach
         # __onVehicleDeath from the synced entity properties, after the health
         # presentation.
@@ -17646,10 +17634,9 @@ class BattleRuntime(object):
                 crew_active, False)
         if not previous_dead and dead:
             if not suppress_combat_presentation:
-                if not publish_local_kill:
-                    killed = getattr(self._binding, 'arena_vehicle_killed', None)
-                    if callable(killed):
-                        killed(engine_id, int(attacker_id), int(reason_id))
+                killed = getattr(self._binding, 'arena_vehicle_killed', None)
+                if callable(killed):
+                    killed(engine_id, int(attacker_id), int(reason_id))
                 if not record.get('local'):
                     self._fallback_postmortem_viewpoint(engine_id)
         if (not previous_dead and dead and record.get('presentation') and

@@ -19987,8 +19987,68 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._binding.arena_vehicle_killed.assert_called_once_with(
             11, 10, 3)
         self.assertEqual([
-            ('killed', (11, 10, 3)),
             ('health', (False, 11, 0, 10, 0)),
+            ('killed', (11, 10, 3)),
+        ], presentation_order)
+
+    def test_local_kill_cause_survives_native_crew_deactivation(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._binding = mock.Mock()
+        battle._avatar.playerVehicleID = 10
+        target = _Vehicle(
+            11, _Descriptor(), _Vector(0, 0, 1), (0, 0, 0),
+            {'health': 500})
+        runtime.bigworld.entities[11] = target
+        record = {
+            'engine_id': 11,
+            'state': {'health': 500, 'alive': True, 'team': 2},
+            'kind': 'bot', 'network_id': 2, 'local': False,
+            'presentation': True, 'native_remote': True,
+        }
+        battle._records = {'bot:2': record}
+        battle._last_health[11] = (500, 500, True, 0)
+        presentation_order = []
+        present_health = battle._avatar.guiSessionProvider.setVehicleHealth
+        present_health.side_effect = lambda *args: presentation_order.append(
+            ('health', args))
+        battle._binding.arena_vehicle_killed.side_effect = (
+            lambda *args: presentation_order.append(('killed', args)))
+
+        def native_health_changed(health, attacker_id, reason_id):
+            target.health_change = (health, attacker_id, reason_id)
+            present_health(
+                False, target.id, health, attacker_id, reason_id)
+
+        def native_crew_changed(previous):
+            target.previous_crew_active = previous
+            # Exact #1513 Vehicle.set_isCrewActive calls this feedback path
+            # with the default attacker and attack reason.
+            present_health(False, target.id, target.health, 0, 0)
+
+        target.onHealthChanged = native_health_changed
+        target.set_isCrewActive = native_crew_changed
+        battle._fallback_postmortem_viewpoint = mock.Mock()
+
+        with mock.patch.object(
+                critical_damage, 'apply_death', return_value=None):
+            battle._apply_health(
+                record, {
+                    'health': 0, 'display_health': 0, 'alive': False,
+                    'death_reason': 0,
+                }, attacker_id=10, reason_id=0, force_cause=True)
+
+        self.assertEqual([
+            mock.call(False, 11, 0, 10, 0),
+            mock.call(False, 11, 0, 0, 0),
+            mock.call(False, 11, 0, 10, 0),
+        ], present_health.call_args_list)
+        self.assertEqual([
+            ('health', (False, 11, 0, 10, 0)),
+            ('health', (False, 11, 0, 0, 0)),
+            ('health', (False, 11, 0, 10, 0)),
+            ('killed', (11, 10, 0)),
         ], presentation_order)
 
     def test_server_owned_frag_and_team_killer_updates_use_native_arena(self):
