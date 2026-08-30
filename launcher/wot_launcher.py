@@ -1843,6 +1843,12 @@ class LauncherWindow(object):
                               "started." % (host, port))
                     return
                 else:
+                    if session["client"] == core.PORT_0_9_22:
+                        self._log(
+                            "%s:%d did not answer the compatible 0.9.22 "
+                            "protocol. The game was not started." %
+                            (host, port))
+                        return
                     self._log("Warning: %s:%d did not answer. Start the game "
                               "anyway and click the battle button when the "
                               "host is ready." % (host, port))

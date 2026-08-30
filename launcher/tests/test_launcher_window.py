@@ -2337,6 +2337,38 @@ class WindowTest(unittest.TestCase):
         run_game.assert_not_called()
         self.assertIn("not the server for this client", self._log_text())
 
+    def test_0922_join_waits_for_a_compatible_server_before_starting(self):
+        session = {
+            "client": core.PORT_0_9_22,
+            "host": "10.0.0.5",
+            "tcp_port": 28782,
+            "needs_server": False,
+            "mode": core.MODE_JOIN,
+        }
+        with mock.patch("core.install_client_mod", return_value=[]), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.prepare_vehicle_profile",
+                    return_value={"profile": None, "installedMembers": 0,
+                                  "removedMembers": 0}), \
+                mock.patch(
+                    "wot_launcher.vehicle_overlays.ensure_original_vehicle_data",
+                    return_value=0), \
+                mock.patch(
+                    "core.ensure_0_9_22_preferences_isolation",
+                    return_value="preferences isolated"), \
+                mock.patch("core.write_settings", return_value=[]), \
+                mock.patch("core.listener_status",
+                           return_value=core.LISTENER_FREE), \
+                mock.patch("core.fetch_vehicle_overlay") as fetch_overlay, \
+                mock.patch.object(self.window, "_run_game") as run_game:
+            self.window._run_session(self.settings_dir, session, "Peng")
+
+        fetch_overlay.assert_not_called()
+        run_game.assert_not_called()
+        self.assertIn(
+            "did not answer the compatible 0.9.22 protocol",
+            self._log_text())
+
     def test_closing_the_window_saves_the_settings(self):
         self.window.player_name.set("Peng")
         self.window._on_close()
