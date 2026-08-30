@@ -169,6 +169,15 @@ BOT_CALLSIGNS = (
     "Orion", "Otter", "Panda", "Quartz", "Raven", "Rook", "Saber", "Scout",
     "Shark", "Sparrow", "Talon", "Tiger", "Viper", "Wolf", "Yak", "Zephyr",
 )
+BOT_CALLSIGNS_0922 = (
+    "暗夜猎手", "百步穿杨", "北方孤狼", "不服来战", "苍穹之刃", "乘风破浪",
+    "赤色彗星", "此路不通", "刀锋战士", "东风破", "风卷残云", "风云再起",
+    "钢铁洪流", "孤胆英雄", "黑色闪电", "横扫千军", "火力全开", "极速狂飙",
+    "剑指苍穹", "决战到底", "雷霆万钧", "亮剑", "龙行天下", "落叶随风",
+    "逆风飞翔", "怒海狂涛", "千里走单骑", "秋名山车神", "热血战魂",
+    "神出鬼没", "铁甲雄风", "铁骑纵横", "无敌小坦克", "西北狼", "逍遥浪子",
+    "一炮入魂", "一骑当千", "勇往直前", "战场幽灵", "追风少年",
+)
 ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
     "bot_observation", "bot_hit_report", "bot_human_hit", "bot_ram_report",
@@ -2070,12 +2079,16 @@ class BattleState:
         occupied_slots = set(occupied_slots or ())
         roster = []
         used = set()
+        callsigns = (BOT_CALLSIGNS_0922
+                     if self.client_build == CLIENT_BUILD_0922
+                     else BOT_CALLSIGNS)
         for team in (1, 2):
             for slot in range(self.team_sizes[team]):
                 if (team, slot) in occupied_slots:
                     continue
                 while True:
-                    name = "%s-%02d" % (random.choice(BOT_CALLSIGNS), random.randint(10, 99))
+                    name = "%s-%02d" % (
+                        random.choice(callsigns), random.randint(10, 99))
                     if name.lower() not in used:
                         used.add(name.lower())
                         break

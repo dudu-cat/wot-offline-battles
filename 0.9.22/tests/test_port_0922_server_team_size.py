@@ -8,7 +8,8 @@ SERVER_ROOT = Path(__file__).resolve().parents[1] / 'server'
 sys.path.insert(0, str(SERVER_ROOT))
 
 from lan_battle_server import (  # noqa: E402
-    BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    BattleState, BOT_CALLSIGNS_0922, CLIENT_BUILD_0922,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, PROJECTILE_CAPABILITY,
     MODERN_VISIBLE_MESSAGE_TYPES, PLAYER_ENVIRONMENT_CAPABILITY,
     EFFECTIVE_PARAMS_CAPABILITY,
@@ -72,6 +73,19 @@ def _attach_worker(state):
 
 
 class ServerTeamSizeTests(unittest.TestCase):
+    def test_0922_bot_callsigns_use_period_appropriate_chinese_names(self):
+        self.assertGreaterEqual(len(BOT_CALLSIGNS_0922), 30)
+        self.assertTrue(all(any(ord(char) > 127 for char in name)
+                            for name in BOT_CALLSIGNS_0922))
+
+        state = BattleState(team_size=4)
+        state.client_build = CLIENT_BUILD_0922
+        roster = state._new_bot_roster()
+
+        self.assertEqual(8, len(roster))
+        self.assertTrue(all(any(ord(char) > 127 for char in bot['name'])
+                            for bot in roster))
+
     def test_visible_clients_may_send_team_size_requests(self):
         self.assertIn('set_team_size', MODERN_VISIBLE_MESSAGE_TYPES)
 
