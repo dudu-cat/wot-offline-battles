@@ -18,6 +18,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Clean victories, draws, garage returns, and intentional worker shutdowns are
   no longer reported as crashes, while genuine client failures still produce
   diagnostic reports.
+- Fallen-tree foliage refreshes now stop before querying unloaded chunks or
+  animator bodies that have already disappeared, closing a hidden-worker
+  native crash path during chunk streaming.
 - The launcher and bundled map-data loaders accept structurally compatible
   deployed 0.9.22 data and recover when optional version metadata is missing
   or unreadable.
