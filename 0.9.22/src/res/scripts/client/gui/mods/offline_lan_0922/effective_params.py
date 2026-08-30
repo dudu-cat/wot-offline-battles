@@ -19,6 +19,10 @@ from gui.mods.offline_lan_0922 import equipment_mechanics
 
 SCHEMA_VERSION = 1
 CAPABILITY = 'effective_params_v1'
+# Vehicle XML stores these values in 32-bit-era numeric fields.  Keep one
+# generous finite wire bound so trusted editor values are preserved without
+# admitting infinities or arithmetic-scale payloads.
+MAX_CRITICAL_DEVICE_HP = 1000000000.0
 
 _LOADOUT_FLOATS = (
     'crew_level', 'commander_level', 'effective_crew_level',
@@ -308,7 +312,14 @@ def _canonical_source_shot(value):
     maximum = _number(value.get('maxDistance'), 0.000001, 10000.0)
     piercing = _tuple(value.get('piercingPower'), 2, 0.0, 10000.0)
     caliber = _number(shell.get('caliber'), 0.000001, 1000.0)
-    damage = _tuple(shell.get('damage'), 2, 0.0, 10000.0)
+    raw_damage = shell.get('damage')
+    damage = None
+    if isinstance(raw_damage, (list, tuple)) and len(raw_damage) == 2:
+        hull_damage = _number(raw_damage[0], 0.0, 10000.0)
+        device_damage = _number(
+            raw_damage[1], 0.0, MAX_CRITICAL_DEVICE_HP)
+        if hull_damage is not None and device_damage is not None:
+            damage = [hull_damage, device_damage]
     radius = _number(shell.get('explosionRadius'), 0.0, 100.0)
     he_factors = None
     if _SOURCE_SHELL_HE_FACTOR_KEYS.issubset(set(shell)):
@@ -414,8 +425,10 @@ def _canonical_critical(value):
         if not _mapping(entry, _CRITICAL_DEVICE_KEYS):
             return None
         name = entry.get('name')
-        maximum = _number(entry.get('max_hp'), 1.0, 100000.0)
-        regen = _number(entry.get('regen_hp'), 0.0, 100000.0)
+        maximum = _number(
+            entry.get('max_hp'), 1.0, MAX_CRITICAL_DEVICE_HP)
+        regen = _number(
+            entry.get('regen_hp'), 0.0, MAX_CRITICAL_DEVICE_HP)
         if (not isinstance(name, string_types) or
                 name not in _CRITICAL_DEVICE_NAMES or name in seen or
                 maximum is None or regen is None or regen > maximum):

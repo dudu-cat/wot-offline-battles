@@ -24,6 +24,7 @@ from lan_battle_server import (  # noqa: E402
     Player, SimulationWorker, SIMULATION_WORKER_AUTHORITY_ID,
     SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
     SIEGE_SWITCHING_ON, SIEGE_VEHICLE_PARAMS, TICK_HZ,
+    _critical_damage_delta, _critical_payload, _projectile_source_shot,
 )
 from gui.mods.offline_lan_0922 import vehicle_physics
 from effective_params_fixture import effective_params
@@ -1271,6 +1272,33 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             message = json.loads(json.dumps(valid))
             mutate(message['source_shot'])
             self.assertTrue(_launch_authority(state, message))
+
+    def test_large_finite_module_values_survive_server_validation(self):
+        amount = 500000000.0
+        shot = _source_shot(
+            100.0, 9.81, 1000.0, damage=(390.0, amount))
+        critical = {
+            'devices': [{
+                'name': 'ammoBayHealth', 'hp': amount,
+                'max_hp': amount, 'state': 'normal',
+            }],
+            'destroyed': [], 'crew_ko': [], 'fire': False,
+            'ammo_rack_death': False, 'events': [],
+        }
+        delta = {
+            'devices': [{
+                'name': 'ammoBayHealth', 'hp_loss': amount,
+            }],
+            'crew_ko': [], 'ignite': False,
+        }
+
+        self.assertEqual(
+            amount,
+            _projectile_source_shot(shot)['shell']['damage'][1])
+        self.assertEqual(amount, _critical_payload(
+            critical)['devices'][0]['max_hp'])
+        self.assertEqual(
+            amount, _critical_damage_delta(delta)['devices'][0]['hp_loss'])
 
     def test_he_factors_survive_server_ledger_and_snapshot(self):
         state = _state()

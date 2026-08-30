@@ -85,6 +85,7 @@ MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS = 16
 MAX_PLAYER_DESTRUCTIBLE_REJECTIONS = 16
 MAX_PLAYER_INPUT_FINGERPRINTS = 128
 MAX_PLAYER_EQUIPMENT_FINGERPRINTS = 64
+MAX_CRITICAL_DEVICE_HP = effective_params_wire.MAX_CRITICAL_DEVICE_HP
 HUMAN_POSE_HISTORY_SECONDS = 1.5
 HUMAN_RAM_MAX_SUBSTEP_US = 100000
 HUMAN_POSE_CLOCK_LEEWAY_US = 250000
@@ -759,7 +760,8 @@ def _projectile_source_shot(value):
             "damage": [
                 round(_bounded_float(
                     damage[0], 0.000001, 10000.0), 6),
-                round(_bounded_float(damage[1], 0.0, 10000.0), 6),
+                round(_bounded_float(
+                    damage[1], 0.0, MAX_CRITICAL_DEVICE_HP), 6),
             ],
             "explosionRadius": round(_bounded_float(
                 shell.get("explosionRadius"), 0.0,
@@ -983,9 +985,12 @@ def _critical_payload(value):
                 state not in CRITICAL_STATES or
                 not _has_finite_fields(record, ("hp", "max_hp"))):
             raise ValueError("invalid critical device")
-        hp = _clamp(_finite_float(record.get("hp")), 0.0, 10000.0)
+        hp = _clamp(
+            _finite_float(record.get("hp")), 0.0,
+            MAX_CRITICAL_DEVICE_HP)
         maximum = _clamp(
-            _finite_float(record.get("max_hp")), 1.0, 10000.0)
+            _finite_float(record.get("max_hp")), 1.0,
+            MAX_CRITICAL_DEVICE_HP)
         devices.append({"name": name, "hp": round(min(hp, maximum), 3),
                         "max_hp": round(maximum, 3), "state": state})
         seen.add(name)
@@ -1079,7 +1084,7 @@ def _critical_damage_delta(value):
                 not _has_finite_fields(raw, ("hp_loss",))):
             raise ValueError("invalid critical device delta")
         hp_loss = _finite_float(raw.get("hp_loss"), -1.0)
-        if hp_loss <= 0.0 or hp_loss > 10000.0:
+        if hp_loss <= 0.0 or hp_loss > MAX_CRITICAL_DEVICE_HP:
             raise ValueError("invalid critical device HP loss")
         seen.add(name)
         devices.append({"name": name, "hp_loss": round(hp_loss, 3)})

@@ -200,6 +200,29 @@ class EffectiveParamsContractTests(unittest.TestCase):
         source['loadout']['reload_factor'] = 99.0
         self.assertEqual(0.96, result['loadout']['reload_factor'])
 
+    def test_snapshot_preserves_large_finite_module_values(self):
+        source = effective_params()
+        source['critical']['devices'][0].update({
+            'max_hp': 500000000.0,
+            'regen_hp': 250000000.0,
+        })
+        source['gun']['shots'][0]['source_shot']['shell']['damage'][1] = \
+            750000000.0
+
+        result = contract.canonical(source)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            500000000.0, result['critical']['devices'][0]['max_hp'])
+        self.assertEqual(
+            750000000.0,
+            result['gun']['shots'][0]['source_shot']['shell']['damage'][1])
+
+        over_limit = effective_params()
+        over_limit['critical']['devices'][0]['max_hp'] = \
+            contract.MAX_CRITICAL_DEVICE_HP + 1.0
+        self.assertIsNone(contract.canonical(over_limit))
+
     def test_snapshot_preserves_complete_he_shell_factors(self):
         source = effective_params()
         shell = source['gun']['shots'][0]['source_shot']['shell']

@@ -75,6 +75,7 @@ MAX_PLAYER_DISPERSION_ANGLE = 0.5
 MAX_PLAYER_CLIP_SIZE = 255
 MAX_PLAYER_RELOAD_SECONDS = 3600.0
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
+MAX_CRITICAL_DEVICE_HP = effective_params_wire.MAX_CRITICAL_DEVICE_HP
 CRITICAL_DELTA_DEVICE_NAMES = frozenset((
     'engineHealth', 'ammoBayHealth', 'fuelTankHealth', 'radioHealth',
     'leftTrackHealth', 'rightTrackHealth', 'gunHealth',
@@ -780,7 +781,8 @@ def _strict_projectile_source_shot(value):
         shell.get('caliber'), 0.000001, 1000.0)
     damage = [
         _projectile_float_range(damage[0], 0.000001, 10000.0),
-        _projectile_float_range(damage[1], 0.0, 10000.0),
+        _projectile_float_range(
+            damage[1], 0.0, MAX_CRITICAL_DEVICE_HP),
     ]
     radius = _projectile_float_range(
         shell.get('explosionRadius'), 0.0,
@@ -944,7 +946,8 @@ def _strict_critical_delta(value):
         if not isinstance(raw, dict) or set(raw) != {'name', 'hp_loss'}:
             return None
         name = _safe_text(raw.get('name'), '', 40)
-        hp_loss = _projectile_float_range(raw.get('hp_loss'), 0.0, 10000.0)
+        hp_loss = _projectile_float_range(
+            raw.get('hp_loss'), 0.0, MAX_CRITICAL_DEVICE_HP)
         if (name not in CRITICAL_DELTA_DEVICE_NAMES or name in seen or
                 hp_loss is None or hp_loss <= 0.0):
             return None

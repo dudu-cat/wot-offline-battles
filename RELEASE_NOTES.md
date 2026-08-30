@@ -52,6 +52,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - If a complete saved crew belongs to the wrong nation, the exact #1513
   attribute calculation retries once with that vehicle's default crew. Other
   vehicle-structure or native errors remain visible instead of being hidden.
+- Large finite edited module-health and module-damage values now remain intact
+  across the client, worker, and server instead of being rejected or truncated
+  before the normal fire and ammunition-rack laws can run.
 - The vehicle editor restores hidden-but-playable vehicles, accepts decimal
   values for editable numeric fields stored as integers, labels elevation,
   depression, gun elevation speed, and turret traverse speed correctly, and

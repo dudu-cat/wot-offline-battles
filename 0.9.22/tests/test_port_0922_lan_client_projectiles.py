@@ -534,6 +534,23 @@ class ProjectileWireTests(unittest.TestCase):
         self.assertEqual(1.4, shell['explosionDamageAbsorptionFactor'])
         self.assertEqual(0.2, shell['explosionEdgeDamageFactor'])
 
+    def test_large_finite_module_damage_survives_client_wires(self):
+        amount = 500000000.0
+        frozen = source_shot(
+            math.sqrt(11300.0), 9.81, 720.0,
+            damage=(390.0, amount))
+
+        parsed = module._strict_projectile_source_shot(frozen)
+        delta = module._strict_critical_delta({
+            'devices': [{
+                'name': 'ammoBayHealth', 'hp_loss': amount,
+            }],
+            'crew_ko': [], 'ignite': False,
+        })
+
+        self.assertEqual(amount, parsed['shell']['damage'][1])
+        self.assertEqual(amount, delta['devices'][0]['hp_loss'])
+
     def test_send_fire_never_falls_back_to_instant_input(self):
         client = self.active_client()
         self.assertIsNone(client.send_fire(shell_index=1))
