@@ -44,6 +44,13 @@ _SERVER_SETTINGS = {
     # predefined-host list directly indexes the fourth roaming-host list.
     'roaming': (0, 0, [], []),
     'wallet': (1, 1),
+    # The #1513 Vehicle entity ignores stunInfo and emits one warning per
+    # vehicle when this server-owned feature is absent or disabled.  The
+    # offline battle authority already publishes canonical SPG stun state.
+    'spgRedesignFeatures': {
+        'stunEnabled': True,
+        'markTargetAreaEnabled': False,
+    },
     # ClientRanked indexes this setting directly even when ranked battles are
     # disabled.  Presence, rather than truthiness, is the native contract.
     'ranked_config': {'isEnabled': False},

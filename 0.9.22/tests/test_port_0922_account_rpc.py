@@ -897,6 +897,15 @@ class AccountRpcTests(unittest.TestCase):
         self.assertFalse(
             compatibility._SERVER_SETTINGS['isTutorialEnabled'])
 
+    def test_spg_stun_feature_matches_authoritative_battle_state(self):
+        features = compatibility._SERVER_SETTINGS[
+            'spgRedesignFeatures']
+
+        self.assertEqual({
+            'stunEnabled': True,
+            'markTargetAreaEnabled': False,
+        }, features)
+
     def test_dossier_stream_matches_native_two_tuple_consumer(self):
         self.server.doCmdInt3(36, commands.CMD_SYNC_DOSSIERS, 4, 0, 0)
         self._run()

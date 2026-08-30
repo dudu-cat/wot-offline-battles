@@ -11684,8 +11684,9 @@ class ClientHandler(socketserver.BaseRequestHandler):
             if (not accepted and
                     server.state.phase in ("loading", "battle") and
                     server.state.battle_result is None):
-                # Identity and lineage conflicts are not recoverable from a
-                # later checkpoint on the same transport.
+                # Round and authority conflicts cannot be reconciled on this
+                # transport. Publication-local identity/lineage mismatches
+                # retain the last-good checkpoint and may recover next tick.
                 server.state.remove_simulation_worker(
                     worker, reject_code or "bot_state_rejected")
                 return "close"
