@@ -214,6 +214,10 @@ class FoliageBaker0922Tests(unittest.TestCase):
             shutil.copy2(DATA_ROOT / 'manifest.json', manifest_path)
             shutil.copy2(DATA_ROOT / '06_ensk.json',
                          target / '06_ensk.json')
+            data_path = target / '06_ensk.json'
+            data = json.loads(data_path.read_text())
+            data['game_version'] = 'locally-repacked-client'
+            data_path.write_text(json.dumps(data))
 
             loaded = prebaked_foliage.load_foliage(
                 '06_ensk', base_dir=directory)
@@ -223,12 +227,12 @@ class FoliageBaker0922Tests(unittest.TestCase):
             selected = next(
                 record for record in manifest['maps']
                 if record['map'] == '06_ensk')
-            selected['sha256'] = ''
+            selected['sha256'] = 'stale build metadata'
+            manifest['game_version'] = 'locally-repacked-client'
             manifest_path.write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(
-                    ValueError, 'manifest record is invalid'):
-                prebaked_foliage.load_foliage(
-                    '06_ensk', base_dir=directory)
+            loaded = prebaked_foliage.load_foliage(
+                '06_ensk', base_dir=directory)
+            self.assertEqual('06_ensk', loaded.map_name)
 
     def test_runtime_loader_rejects_shared_standing_foliage_reference(self):
         data = {

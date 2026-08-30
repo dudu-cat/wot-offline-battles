@@ -114,8 +114,6 @@ def validate_graph(graph, map_name):
 		raise ValueError('unsupported navigation graph version')
 	if version != FORMAT_VERSION:
 		raise ValueError('unsupported navigation graph version')
-	if str(graph.get('game_version', '')) != GAME_VERSION:
-		raise ValueError('navigation graph belongs to a different client version')
 	if short_map_name(graph.get('map')) != map_name:
 		raise ValueError('navigation graph map does not match the battle')
 	try:

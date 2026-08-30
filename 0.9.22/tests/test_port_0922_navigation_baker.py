@@ -247,6 +247,15 @@ class CompiledSpace0922Test(unittest.TestCase):
             shutil.copy2(
                 ROOT / '0.9.22' / 'navgraphs' / 'manifest.json',
                 manifest_path)
+            manifest = json.loads(manifest_path.read_text())
+            manifest['game_version'] = 'locally-repacked-client'
+            next(record for record in manifest['maps']
+                 if record['map'] == '06_ensk')['sha256'] = 'stale metadata'
+            manifest_path.write_text(json.dumps(manifest))
+            graph_path = directory / graph.name
+            graph_value = json.loads(graph_path.read_text())
+            graph_value['game_version'] = 'locally-repacked-client'
+            graph_path.write_text(json.dumps(graph_value))
             package_names = ('gui', 'gui.mods',
                              'gui.mods.offline_lan_0922')
             config_name = 'gui.mods.offline_lan_0922.config'

@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """Load the exact #1513 destructible contact catalog beside config.json."""
 
-import hashlib
 import json
 import math
 import os
 
 from gui.mods.offline_lan_0922.navigation_graph_schema import (
-	GAME_VERSION, SUPPORTED_MAPS, short_map_name,
+	SUPPORTED_MAPS, short_map_name,
 )
 from gui.mods.offline_lan_0922.prebaked_navigation import mod_dir
 
@@ -25,20 +24,6 @@ try:
 	_INTEGER_TYPES = (int, long)
 except NameError:
 	_INTEGER_TYPES = (int,)
-
-
-def _sha256(path):
-	digest = hashlib.sha256()
-	handle = open(path, 'rb')
-	try:
-		while True:
-			block = handle.read(1024 * 1024)
-			if not block:
-				break
-			digest.update(block)
-	finally:
-		handle.close()
-	return digest.hexdigest()
 
 
 def _manifest_entry(directory, map_name):
@@ -60,8 +45,7 @@ def _manifest_entry(directory, map_name):
 	if (not isinstance(manifest, dict) or
 			manifest.get('format') != MANIFEST_FORMAT or
 			version != FORMAT_VERSION or
-			locator_quantization != 1000 or
-			str(manifest.get('game_version', '')) != GAME_VERSION):
+			locator_quantization != 1000):
 		raise ValueError('destructible catalog manifest is incompatible')
 	records = manifest.get('maps')
 	if not isinstance(records, list):
@@ -81,9 +65,7 @@ def _manifest_entry(directory, map_name):
 			'destructible catalog manifest has no record for this map')
 	name = short_map_name(selected.get('map'))
 	filename = str(selected.get('file') or '')
-	digest = str(selected.get('sha256') or '')
-	if (name not in SUPPORTED_MAPS or filename != name + '.json' or
-			len(digest) != 64):
+	if name not in SUPPORTED_MAPS or filename != name + '.json':
 		raise ValueError(
 			'destructible catalog manifest record is invalid')
 	if not os.path.isfile(os.path.join(directory, filename)):
@@ -124,9 +106,6 @@ def _validate(data, map_name):
 		raise ValueError('unsupported destructible catalog format')
 	if int(data.get('version', -1)) != FORMAT_VERSION:
 		raise ValueError('unsupported destructible catalog version')
-	if str(data.get('game_version', '')) != GAME_VERSION:
-		raise ValueError(
-			'destructible catalog belongs to a different client version')
 	if short_map_name(data.get('map')) != map_name:
 		raise ValueError('destructible catalog map does not match the battle')
 	resources = data.get('resources')

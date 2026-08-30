@@ -642,7 +642,6 @@ class BotAiPortTests(unittest.TestCase):
         cases = {
             'format': lambda value: value.update(format='wrong'),
             'version': lambda value: value.update(version=1),
-            'game_version': lambda value: value.update(game_version='wrong'),
             'map': lambda value: value.update(map='02_malinovka'),
             'grid_array': lambda value: value.update(hazards=(0,)),
             'team_routes': lambda value: value['routes'].update({'2': ()}),
@@ -659,6 +658,10 @@ class BotAiPortTests(unittest.TestCase):
                 mutate(invalid)
                 with self.assertRaises(ValueError):
                     prebaked_navigation._validate(invalid, '01_karelia')
+
+        graph['game_version'] = 'locally-repacked-client'
+        self.assertIs(graph, prebaked_navigation._validate(
+            graph, '01_karelia'))
 
     def test_baked_routes_keep_validated_team_endpoints_unchanged(self):
         team_one = ((-2.0, -350.0, False),

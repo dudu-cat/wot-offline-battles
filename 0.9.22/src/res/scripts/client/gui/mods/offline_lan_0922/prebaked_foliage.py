@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """Load versioned #1513 foliage volumes shipped beside config.json."""
 
-import hashlib
 import json
 import math
 import os
 
 from gui.mods.offline_lan_0922.foliage import FoliageMap
 from gui.mods.offline_lan_0922.navigation_graph_schema import (
-	GAME_VERSION, SUPPORTED_MAPS, short_map_name,
+	SUPPORTED_MAPS, short_map_name,
 )
 from gui.mods.offline_lan_0922.prebaked_navigation import mod_dir
 
@@ -22,20 +21,6 @@ except NameError:
 	_INTEGER_TYPES = (int,)
 
 
-def _sha256(path):
-	digest = hashlib.sha256()
-	handle = open(path, 'rb')
-	try:
-		while True:
-			block = handle.read(1024 * 1024)
-			if not block:
-				break
-			digest.update(block)
-	finally:
-		handle.close()
-	return digest.hexdigest()
-
-
 def _manifest_entry(directory, map_name):
 	path = os.path.join(directory, 'manifest.json')
 	if not os.path.isfile(path):
@@ -47,8 +32,7 @@ def _manifest_entry(directory, map_name):
 		handle.close()
 	if (not isinstance(manifest, dict) or
 			manifest.get('format') != MANIFEST_FORMAT or
-			int(manifest.get('version', -1)) != FORMAT_VERSION or
-			str(manifest.get('game_version', '')) != GAME_VERSION):
+			int(manifest.get('version', -1)) != FORMAT_VERSION):
 		raise ValueError('foliage manifest is incompatible')
 	records = manifest.get('maps')
 	if not isinstance(records, list):
@@ -65,9 +49,7 @@ def _manifest_entry(directory, map_name):
 		raise ValueError('foliage manifest has no record for this map')
 	name = short_map_name(selected.get('map'))
 	filename = str(selected.get('file') or '')
-	digest = str(selected.get('sha256') or '')
-	if (name not in SUPPORTED_MAPS or filename != name + '.json' or
-			len(digest) != 64):
+	if name not in SUPPORTED_MAPS or filename != name + '.json':
 		raise ValueError('foliage manifest record is invalid')
 	if not os.path.isfile(os.path.join(directory, filename)):
 		raise ValueError('foliage data is unavailable')
@@ -81,8 +63,6 @@ def _validate(data, map_name):
 		raise ValueError('unsupported foliage format')
 	if int(data.get('version', -1)) != FORMAT_VERSION:
 		raise ValueError('unsupported foliage version')
-	if str(data.get('game_version', '')) != GAME_VERSION:
-		raise ValueError('foliage belongs to a different client version')
 	if short_map_name(data.get('map')) != map_name:
 		raise ValueError('foliage map does not match the battle')
 	if float(data.get('cell_size', 0.0)) <= 0.0:

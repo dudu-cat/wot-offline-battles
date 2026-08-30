@@ -2,12 +2,11 @@
 """Load versioned navigation graphs shipped with the offline-battle mod."""
 
 import json
-import hashlib
 import os
 
 from gui.mods.offline_lan_0922.config import CONFIG_PATH
 from gui.mods.offline_lan_0922.navigation_graph_schema import (
-	FORMAT_NAME, FORMAT_VERSION, GAME_VERSION, MANIFEST_FORMAT,
+	FORMAT_NAME, FORMAT_VERSION, MANIFEST_FORMAT,
 	SUPPORTED_MAPS, short_map_name, validate_graph,
 )
 
@@ -31,20 +30,6 @@ def _validate(graph, map_name):
 	return validate_graph(graph, map_name)
 
 
-def _sha256(path):
-	digest = hashlib.sha256()
-	handle = open(path, 'rb')
-	try:
-		while True:
-			block = handle.read(1024 * 1024)
-			if not block:
-				break
-			digest.update(block)
-	finally:
-		handle.close()
-	return digest.hexdigest()
-
-
 def _manifest_entry(directory, map_name):
 	"""Validate and return only this map's manifest record.
 
@@ -62,8 +47,7 @@ def _manifest_entry(directory, map_name):
 		handle.close()
 	if (not isinstance(manifest, dict) or
 			manifest.get('format') != MANIFEST_FORMAT or
-			int(manifest.get('version', -1)) != FORMAT_VERSION or
-			str(manifest.get('game_version', '')) != GAME_VERSION):
+			int(manifest.get('version', -1)) != FORMAT_VERSION):
 		raise ValueError('navigation manifest is incompatible')
 	records = manifest.get('maps')
 	if not isinstance(records, list):
@@ -80,8 +64,7 @@ def _manifest_entry(directory, map_name):
 		raise ValueError('navigation manifest has no record for this map')
 	name = _short_map_name(selected.get('map'))
 	filename = str(selected.get('file') or '')
-	if (name not in SUPPORTED_MAPS or filename != name + '.json' or
-			len(str(selected.get('sha256') or '')) != 64):
+	if name not in SUPPORTED_MAPS or filename != name + '.json':
 		raise ValueError('navigation manifest record is invalid')
 	if not os.path.isfile(os.path.join(directory, filename)):
 		raise ValueError('navigation graph is unavailable')

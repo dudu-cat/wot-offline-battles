@@ -50,8 +50,7 @@ COMMON_GAME_ROOTS = (
 SERVE_FLAG = "--serve"
 
 _VERSION_PATTERN = re.compile(r"v\.(\d+(?:\.\d+)+)(?:\s+#(\d+))?")
-_PINNED_0_9_22_VERSION = "0.9.22.0.1"
-_PINNED_0_9_22_BUILD = "1513"
+_SUPPORTED_0_9_22_PREFIX = (0, 9, 22)
 
 _MOD_MARKERS = {
     PORT_0_8_2: os.path.join(
@@ -286,8 +285,11 @@ def read_client_version(game_root):
 def port_for_version(version, build=None):
     if not version:
         return None
-    if (version == _PINNED_0_9_22_VERSION and
-            str(build or "") == _PINNED_0_9_22_BUILD):
+    try:
+        parts = tuple(int(part) for part in str(version).split(".")[:3])
+    except (TypeError, ValueError):
+        return None
+    if parts == _SUPPORTED_0_9_22_PREFIX:
         return PORT_0_9_22
     return None
 
@@ -315,9 +317,10 @@ def inspect_game_root(game_root):
     game_root = os.path.abspath(game_root or "")
     identity = read_client_identity(game_root)
     version, build = identity if identity is not None else (None, None)
-    port_version = (port_for_version(version, build)
-                    if identity is not None else None)
     installed = installed_port(game_root)
+    port_version = (port_for_version(version, build)
+                    if identity is not None else
+                    (installed if installed == PORT_0_9_22 else None))
     return {
         "path": game_root,
         "has_executable": os.path.isfile(game_executable(game_root)),
@@ -848,17 +851,22 @@ def client_archive(port_version, base_dir=None):
     return path if os.path.isfile(path) else None
 
 
-def _payload_identity(path):
-    import hashlib
+def _payload_release(path, port_version):
+    """Return a stable package label without hashing the trusted payload."""
+    import zipfile
 
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+    with zipfile.ZipFile(path, "r") as archive:
+        packages = sorted(
+            os.path.basename(name) for name in archive.namelist()
+            if name.lower().endswith(".wotmod") and
+            "org.peng.offline_lan_0922" in os.path.basename(name))
+    if packages:
+        return "%s:%s" % (port_version, ",".join(packages))
+    stat_result = os.stat(path)
+    modified_ns = getattr(
+        stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1000000000))
+    return "%s:%s:%d:%d" % (
+        port_version, os.path.basename(path), stat_result.st_size, modified_ns)
 
 
 def install_marker_path(game_root, port_version):
@@ -867,9 +875,9 @@ def install_marker_path(game_root, port_version):
                           [INSTALL_MARKER_NAME]))
 
 
-def installed_identity(game_root, port_version):
+def installed_release(game_root, port_version):
     marker = _read_json(install_marker_path(game_root, port_version))
-    return (marker or {}).get("payload")
+    return (marker or {}).get("release")
 
 
 def _inside(root, path):
@@ -1133,12 +1141,12 @@ def install_client_mod(game_root, port_version, base_dir=None, force=False):
         raise LauncherError(
             "This launcher carries no %s mod files." % port_version)
     try:
-        identity = _payload_identity(archive_path)
-    except (IOError, OSError) as error:
+        release = _payload_release(archive_path, port_version)
+    except (IOError, OSError, ValueError, zipfile.BadZipFile) as error:
         raise LauncherError(
             "The bundled %s mod cannot be read: %s" %
             (port_version, error))
-    if (not force and installed_identity(game_root, port_version) == identity
+    if (not force and installed_release(game_root, port_version) == release
             and _installation_complete(game_root, port_version, layout)):
         return ["The %s mod is already up to date." % port_version]
     transaction_root = None
@@ -1170,7 +1178,7 @@ def install_client_mod(game_root, port_version, base_dir=None, force=False):
         actions.append("Installed %d %s mod paths" % (written, port_version))
         try:
             _write_json(install_marker_path(game_root, port_version),
-                        {"payload": identity})
+                        {"release": release})
         except (IOError, OSError):
             actions.append(
                 "The mod was installed, but its update marker could not be saved.")

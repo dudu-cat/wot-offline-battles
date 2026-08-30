@@ -80,15 +80,15 @@ class GameRootTest(unittest.TestCase):
                          ("0.9.22.0.1", "1513"))
         self.assertEqual(core.detect_port(self.root), core.PORT_0_9_22)
 
-    def test_another_0_9_22_build_is_not_treated_as_the_pinned_client(self):
+    def test_another_0_9_22_build_uses_the_compatible_port(self):
         self._write("version.xml", "<version> v.0.9.22.0.1 #0789 </version>")
         self._write(
             "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.7.wotmod")
-        self.assertIsNone(core.detect_port(self.root))
+        self.assertEqual(core.PORT_0_9_22, core.detect_port(self.root))
 
-    def test_another_0_9_22_patch_is_not_treated_as_the_pinned_client(self):
+    def test_another_0_9_22_patch_uses_the_compatible_port(self):
         self._write("version.xml", "<version> v.0.9.22.1 #1513 </version>")
-        self.assertIsNone(core.detect_port(self.root))
+        self.assertEqual(core.PORT_0_9_22, core.detect_port(self.root))
 
     def test_installed_mod_does_not_identify_a_client_without_version_xml(self):
         self._write(os.path.join(
@@ -106,20 +106,24 @@ class GameRootTest(unittest.TestCase):
             "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.7.wotmod")
         self.assertIsNone(core.detect_port(self.root))
 
-    def test_an_installed_0_9_22_package_is_not_a_version_fallback(self):
+    def test_an_installed_0_9_22_package_is_a_trusted_version_fallback(self):
         self._write(
             "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.7.wotmod")
         self.assertIsNone(core.detect_port(self.root))
-        self.assertIsNone(core.inspect_game_root(self.root)["client"])
+        status = core.inspect_game_root(self.root)
+        self.assertEqual(core.PORT_0_9_22, status["client"])
+        self.assertTrue(status["mod_installed"])
 
-    def test_an_unparseable_version_file_fails_closed(self):
+    def test_an_installed_package_recovers_an_unparseable_version_file(self):
         self._write(
             "version.xml",
             "<broken><version>v.0.9.22.0.1 #1513</version>")
         self._write(
             "mods/0.9.22.0.1/org.peng.offline_lan_0922_0.6.0-alpha.7.wotmod")
         self.assertIsNone(core.detect_port(self.root))
-        self.assertIsNone(core.inspect_game_root(self.root)["client"])
+        status = core.inspect_game_root(self.root)
+        self.assertEqual(core.PORT_0_9_22, status["client"])
+        self.assertTrue(status["mod_installed"])
 
     def test_an_empty_stock_mod_directory_is_not_an_install_marker(self):
         os.makedirs(os.path.join(self.root, "mods", "0.9.22.0.1"))

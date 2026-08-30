@@ -646,13 +646,23 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
                 for filename in ('manifest.json', '06_ensk.json'):
                     path = DATA_ROOT / filename
                     (target / filename).write_bytes(path.read_bytes())
+                manifest_path = target / 'manifest.json'
+                manifest = json.loads(manifest_path.read_text())
+                manifest['game_version'] = 'locally-repacked-client'
+                next(record for record in manifest['maps']
+                     if record['map'] == '06_ensk')['sha256'] = \
+                    'stale metadata'
+                manifest_path.write_text(json.dumps(manifest))
+                catalog_path = target / '06_ensk.json'
+                catalog = json.loads(catalog_path.read_text())
+                catalog['game_version'] = 'locally-repacked-client'
+                catalog_path.write_text(json.dumps(catalog))
                 loaded = loader.load_catalog('spaces/06_ensk')
                 self.assertEqual('06_ensk', loaded['map'])
                 self.assertIn(
                     'content/GatesAndFences/gaf011_Fence/normal/lod0/'
                     'gaf011_FenceTile1.model', loaded['resources'])
 
-                manifest_path = target / 'manifest.json'
                 original_manifest = json.loads(manifest_path.read_text())
                 manifest = copy.deepcopy(original_manifest)
                 selected = next(
