@@ -334,6 +334,7 @@ class LauncherWindow(object):
         self._room_worker = None
         self._room_worker_starter_root = None
         self._room_worker_stop_lock = threading.Lock()
+        self._room_vehicle_overlay_root = None
         self._game = None
         self._game_starter_root = None
         self._busy = False
@@ -1276,11 +1277,12 @@ class LauncherWindow(object):
                         self._log(
                             "Could not close the started process: %s" % error)
         self._stop_worker()
-        if stop_persistent_server:
-            self._stop_worker(room_owned=True)
         if force_cleanup:
             core.kill_game()
-        self._stop_server(force=stop_persistent_server)
+        if stop_persistent_server:
+            self._stop_lan_room()
+        else:
+            self._stop_server()
         return True
 
     def _request_starter_stop(self, process, game_root):
@@ -1625,6 +1627,7 @@ class LauncherWindow(object):
                     # The room pins one vehicle-data overlay for its whole
                     # lifetime: the hidden worker reads it at startup and the
                     # server serves it to joiners.
+                    self._room_vehicle_overlay_root = status["path"]
                     prepared = vehicle_overlays.prepare_vehicle_profile(
                         status["path"], profile_name)
                     if prepared["profile"] is None:
@@ -1652,10 +1655,11 @@ class LauncherWindow(object):
                         status["path"], core.LOCAL_HOST,
                         core.DEFAULT_SERVER_PORT, room_owned=True):
                     self.root.after(0, self._use_local_server_address)
-                elif started:
-                    self._log(
-                        "The LAN room was not opened because its hidden "
-                        "simulation worker is unavailable.")
+                else:
+                    if started:
+                        self._log(
+                            "The LAN room was not opened because its hidden "
+                            "simulation worker is unavailable.")
                     self._stop_lan_room()
             except core.LauncherError as error:
                 self._stop_lan_room()
@@ -1875,24 +1879,7 @@ class LauncherWindow(object):
             self._stop_server()
             if session.get("client") == core.PORT_0_9_22:
                 if not owned_room:
-                    try:
-                        if not core.wait_for_game_shutdown():
-                            self._log(
-                                "A World of Tanks process did not finish "
-                                "closing; vehicle cleanup will retry at the "
-                                "next launcher start.")
-                        else:
-                            removed = (
-                                vehicle_overlays.
-                                ensure_original_vehicle_data(game_root))
-                            if removed:
-                                self._log(
-                                    "Removed the temporary vehicle profile; "
-                                    "original vehicle data is active again.")
-                    except vehicle_overlays.VehicleOverlayError as error:
-                        self._log(
-                            "Could not restore original vehicle data: %s" %
-                            error)
+                    self._restore_original_vehicle_data(game_root)
             report_finalized = False
             if report_session is not None and self._crash_capture_enabled:
                 try:
@@ -2420,9 +2407,32 @@ class LauncherWindow(object):
         self.root.after(0, self._update_action_controls)
         return server is not None
 
+    def _restore_original_vehicle_data(self, game_root):
+        try:
+            if not core.wait_for_game_shutdown():
+                self._log(
+                    "A World of Tanks process did not finish closing; "
+                    "vehicle cleanup will retry at the next launcher start.")
+                return False
+            removed = vehicle_overlays.ensure_original_vehicle_data(game_root)
+            if removed:
+                self._log(
+                    "Removed the temporary vehicle profile; original "
+                    "vehicle data is active again.")
+            return True
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log(
+                "Could not restore original vehicle data: %s" % error)
+            return False
+
     def _stop_lan_room(self):
+        game_root = self._room_vehicle_overlay_root
         self._stop_worker(room_owned=True)
-        return self._stop_server(force=True)
+        stopped = self._stop_server(force=True)
+        if (game_root is not None and
+                self._restore_original_vehicle_data(game_root)):
+            self._room_vehicle_overlay_root = None
+        return stopped
 
     def _on_close(self):
         if self._maintenance_busy:
