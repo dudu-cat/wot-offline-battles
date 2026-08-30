@@ -115,7 +115,8 @@
       "tankmanCost",
       "freeXPConversion",
       "freeXPToTManXPRate",
-      "paidRemovalCost"
+      "paidRemovalCost",
+      "paidDeluxeRemovalCost"
     ],
     "itemsDirectKeys": [
       "itemPrices",
@@ -165,7 +166,7 @@
       "classChangeRoleLoss",
       "isPremium"
     ],
-    "currencyMappings": ["paidRemovalCost"],
+    "currencyMappings": ["paidRemovalCost", "paidDeluxeRemovalCost"],
     "refSystem": {
       "directKeys": [
         "periods",

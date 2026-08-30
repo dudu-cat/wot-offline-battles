@@ -566,10 +566,17 @@ class AccountRpcTests(unittest.TestCase):
         for cost in shop['tankmanCost']:
             self.assertEqual(
                 set(shop_contract['tankmanCostDirectKeys']), set(cost))
-        for key in shop_contract['currencyMappings']:
+        currency_mappings = {
+            'paidRemovalCost': {'gold': 0},
+            'paidDeluxeRemovalCost': {'crystal': 0},
+        }
+        self.assertEqual(
+            set(currency_mappings), set(shop_contract['currencyMappings']))
+        for key, expected in currency_mappings.items():
             self.assertIsInstance(shop[key], dict)
-            self.assertEqual(0, shop[key].get('gold'))
+            self.assertEqual(expected, shop[key])
             self.assertIsInstance(shop['defaults'][key], dict)
+            self.assertEqual(expected, shop['defaults'][key])
         ref_contract = shop_contract['refSystem']
         ref_system = shop['refSystem']
         self.assertEqual(set(ref_contract['directKeys']), set(ref_system))

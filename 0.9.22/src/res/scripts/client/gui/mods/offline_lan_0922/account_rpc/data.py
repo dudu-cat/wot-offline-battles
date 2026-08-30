@@ -493,6 +493,9 @@ def shop(revision=0, selected_vehicle=None):
             'freeXPToTManXPRate': 10,
             'goodies': dict(empty_goodies),
             'paidRemovalCost': {'gold': 0},
+            # #1513 OptionalDevice.getRemovalPrice uses a separate Money
+            # value for optional devices tagged ``deluxe``.
+            'paidDeluxeRemovalCost': {'crystal': 0},
         },
         'goodies': dict(empty_goodies),
         # Exact #1513 consumers fall back to the final price entry and the
@@ -545,6 +548,10 @@ def shop(revision=0, selected_vehicle=None):
         },
         # ShopRequester calls .get(Currency.GOLD) on this value.
         'paidRemovalCost': {'gold': 0},
+        # Deluxe optional devices do not use paidRemovalCost.  Publish their
+        # exact #1513 shop field so the requester does not use its retail
+        # crystal-price fallback.
+        'paidDeluxeRemovalCost': {'crystal': 0},
         'dailyXPFactor': 1,
         'changeRoleCost': 0,
         'freeXPToTManXPRate': 10,
