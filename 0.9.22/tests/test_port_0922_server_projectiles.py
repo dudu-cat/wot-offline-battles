@@ -1480,6 +1480,33 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             [state.projectiles['1:b:16:%s' % shot_seq][
                 'launch_server_time_ms'] for shot_seq in (1, 2, 3)])
 
+    def test_bot_launch_without_edge_converges_only_when_already_stale(self):
+        state = _state()
+        _attach_worker_authority(state)
+        state.bot_states[16] = {
+            'id': 16, 'team': 2, 'alive': True, 'fire_seq': 3,
+            'shell_index': 0, 'health': 1000, 'max_health': 1000,
+            'vehicle': 'ussr:R11_MS-1',
+            'x': 20.0, 'y': 0.0, 'z': 0.0,
+        }
+
+        self.assertTrue(_launch_authority(state, _launch(
+            shooter_id=16, shooter_kind='bot', shot_seq=3,
+            origin=[20.0, 1.0, 0.0], launch_time_us=300000)))
+        self.assertNotIn('1:b:16:3', state.projectiles)
+
+        self.assertFalse(_launch_authority(state, _launch(
+            shooter_id=16, shooter_kind='bot', shot_seq=4,
+            origin=[20.0, 1.0, 0.0], launch_time_us=400000)))
+        self.assertEqual('launch_edge_pending',
+                         state.last_projectile_launch_reject_code)
+
+        state.bot_states[16]['alive'] = False
+        state.bot_states[16]['health'] = 0
+        self.assertTrue(_launch_authority(state, _launch(
+            shooter_id=16, shooter_kind='bot', shot_seq=4,
+            origin=[20.0, 1.0, 0.0], launch_time_us=400000)))
+
     def test_progress_uses_batch_cas_epoch_and_exact_retry(self):
         state = _state()
         self.assertTrue(_launch_authority(state, _launch()))
@@ -1540,8 +1567,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             'destructibles': [],
         }
         late = dict(
-            retired, checked_through_ms=101,
-            checked_distance=10.1)
+            retired, checked_through_ms=999999,
+            checked_distance=999999.0, piercing_loss=-1.0,
+            penetration_factor=999.0)
 
         self.assertTrue(state.progress_projectiles(
             SIMULATION_WORKER_AUTHORITY_ID, {

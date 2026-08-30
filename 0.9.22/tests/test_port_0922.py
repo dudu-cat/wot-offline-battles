@@ -5324,22 +5324,36 @@ class LANClientTests(unittest.TestCase):
         self.assertFalse(client.running)
         self.assertEqual('protocol mismatch', client.last_error)
 
-    def test_client_build_mismatch_stops_before_accepting_welcome(self):
+    def test_welcome_negotiates_protocol_and_build_labels_by_capability(self):
         module, client, _, _ = self._client()
         client.running = True
         client._handle_message({
-            'type': 'welcome', 'protocol': module.PROTOCOL_VERSION,
-            'client_build': 'wot-0.8.2',
+            'type': 'welcome', 'protocol': module.PROTOCOL_VERSION + 1,
+            'client_build': 'launcher-local-server',
+            'capabilities': list(module.CLIENT_CAPABILITIES),
+            'server_capabilities': [
+                module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                module.RICOCHET_CONTINUATION_CAPABILITY,
+                module.PROJECTILE_HIT_VEHICLE_CAPABILITY,
+                module.RAM_CONTACT_LEDGER_CAPABILITY,
+                module.HUMAN_RAM_TIMELINE_CAPABILITY,
+                module.PLAYER_FIRE_INTENT_CAPABILITY,
+                module.PLAYER_ENVIRONMENT_CAPABILITY,
+                module.EFFECTIVE_PARAMS_CAPABILITY,
+            ],
+            'authority_epoch': 1,
             'player_id': 7, 'host_player_id': 7, 'name': 'Player',
             'vehicle': 'ussr:MS-1', 'max_health': 100,
             'team': 1, 'slot': 0, 'round_id': 1,
             'state_revision': 1,
             'phase': 'waiting', 'map': '01_karelia',
-            'spawn': {'x': 0, 'y': 0, 'z': 0},
+            'spawn': {'x': 0, 'y': 0, 'z': 0, 'yaw': 0},
+            'effective_params': effective_params(),
         })
-        self.assertFalse(client.running)
-        self.assertFalse(client.ready)
-        self.assertEqual('client build mismatch', client.last_error)
+        self.assertTrue(client.running)
+        self.assertTrue(client.ready)
+        self.assertTrue(client._schema_negotiated)
+        self.assertIsNone(client.last_error)
 
     def test_round_barriers_drop_stale_snapshot_and_clear_terminal_cache(self):
         _, client, events, _ = self._client()

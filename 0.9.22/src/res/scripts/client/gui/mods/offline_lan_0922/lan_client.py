@@ -1459,6 +1459,7 @@ class LANClient(object):
         self.server_time_ms = None
         self.capabilities = []
         self.server_capabilities = []
+        self._schema_negotiated = False
         self.last_snapshot = None
         self.last_error = None
         self.rtt_ms = None
@@ -1514,6 +1515,7 @@ class LANClient(object):
             self.phase = 'connecting'
             self.capabilities = []
             self.server_capabilities = []
+            self._schema_negotiated = False
             self.authority_epoch = None
             self.server_time_ms = None
             self.rtt_ms = None
@@ -3119,8 +3121,7 @@ class LANClient(object):
                 if generation != self._transport_generation:
                     break
                 if not chunk:
-                    self._record_transport_error(
-                        'server closed the connection', generation, sock)
+                    self._record_peer_close(generation, sock)
                     break
                 received_time = _monotonic_time()
                 try:
@@ -3151,7 +3152,9 @@ class LANClient(object):
                         break
                     self._queue_message(message, generation)
         except Exception as error:
-            self._record_transport_error(error, generation)
+            if not (isinstance(error, socket.error) and
+                    self._transport_close_expected(generation, sock)):
+                self._record_transport_error(error, generation, sock)
         finally:
             wake_sender = False
             with self._outbound_lock:
@@ -3245,6 +3248,23 @@ class LANClient(object):
                 return False
             self.last_error = str(error)
         return True
+
+    def _transport_close_expected(self, generation, sock=None):
+        """Return whether EOF/reset belongs to an intentional lifecycle end."""
+        with self._outbound_lock:
+            return bool(
+                generation != self._transport_generation or
+                self._stopping or not self.running or
+                (sock is not None and self.sock is not sock) or
+                self.phase == 'disconnected' or
+                self.combat_phase == 'finished')
+
+    def _record_peer_close(self, generation, sock=None):
+        """Record unexpected EOF while keeping a completed battle quiet."""
+        if self._transport_close_expected(generation, sock):
+            return False
+        return self._record_transport_error(
+            'server closed the connection', generation, sock)
 
     def _abort_outbound(self, error, generation):
         with self._outbound_lock:
@@ -3375,45 +3395,64 @@ class LANClient(object):
                     not self._outbound_accepting or self._stopping or
                     not self.running or not self.connected):
                 return False
-            previous = (self._outbound_queue[-1]
-                        if self._outbound_queue else None)
-            previous_message = previous[1] if previous is not None else None
-            replace_tail = bool(
-                isinstance(message, _PreencodedOutbound) and
-                message.coalesce_key is not None and
-                isinstance(previous_message, _PreencodedOutbound) and
-                previous_message.coalesce_key == message.coalesce_key)
+            replacement_index = None
+            if (isinstance(message, _PreencodedOutbound) and
+                    message.coalesce_key is not None):
+                for index in range(len(self._outbound_queue) - 1, -1, -1):
+                    queued = self._outbound_queue[index][1]
+                    if isinstance(queued, _PreencodedOutbound):
+                        if queued.coalesce_key == message.coalesce_key:
+                            replacement_index = index
+                        # A different canonical Bot checkpoint is a state
+                        # edge.  Never move a later state back across it.
+                        break
+            previous = (self._outbound_queue[replacement_index]
+                        if replacement_index is not None else None)
             replacement_bytes = (
                 self._outbound_bytes - previous[2] + encoded_size
-                if replace_tail else self._outbound_bytes + encoded_size)
-            if (replace_tail and
-                    replacement_bytes <= MAX_OUTBOUND_BYTES):
+                if previous is not None else
+                self._outbound_bytes + encoded_size)
+            if (previous is not None and
+                    replacement_bytes <= max(
+                        MAX_OUTBOUND_BYTES, self._outbound_bytes)):
                 # A worker Bot publication is a full canonical checkpoint.
-                # When no discrete combat/ammo/equipment edge changed and no
-                # ordered message was queued between two checkpoints, only
-                # the newest unsent pose/timer sample has observable value.
-                # Replacing it here prevents a slightly slower local server
-                # from accumulating stale 30 Hz poses indefinitely while all
-                # fire, damage, ammunition and protocol barriers remain FIFO.
-                self._outbound_seq += 1
-                self._outbound_queue[-1] = (
-                    self._outbound_seq, message, encoded_size)
+                # Its key retains every combat/ammo/equipment edge, so an
+                # equivalent newer pose/timer sample supersedes the older one
+                # even when independent FIFO messages were queued between
+                # them.  Those discrete messages remain in their exact slots.
+                self._outbound_queue[replacement_index] = (
+                    previous[0], message, encoded_size)
                 self._outbound_bytes = replacement_bytes
-            elif (len(self._outbound_queue) >= MAX_OUTBOUND_MESSAGES or
-                    self._outbound_bytes + encoded_size >
-                    MAX_OUTBOUND_BYTES):
-                overflow = True
             else:
-                self._outbound_seq += 1
-                self._outbound_queue.append((
-                    self._outbound_seq, message, encoded_size))
-                self._outbound_bytes += encoded_size
+                checkpoint = bool(
+                    isinstance(message, _PreencodedOutbound) and
+                    message.coalesce_key is not None)
+                preserve_discrete = bool(
+                    not checkpoint and
+                    self._outbound_discrete_headroom_enabled(message))
+                message_limit = MAX_OUTBOUND_MESSAGES * (
+                    2 if preserve_discrete else 1)
+                byte_limit = MAX_OUTBOUND_BYTES * (
+                    2 if preserve_discrete else 1)
+                if (len(self._outbound_queue) >= message_limit or
+                        self._outbound_bytes + encoded_size > byte_limit):
+                    overflow = True
+                else:
+                    self._outbound_seq += 1
+                    self._outbound_queue.append((
+                        self._outbound_seq, message, encoded_size))
+                    self._outbound_bytes += encoded_size
         if overflow:
-            self._abort_outbound('LAN outbound queue exceeded limit',
-                                 generation)
+            # Queue pressure is backpressure, not transport corruption.  Keep
+            # every already accepted FIFO event and let the caller retry or
+            # supersede this checkpoint after the sender drains capacity.
             return False
         self._outbound_event.set()
         return True
+
+    def _outbound_discrete_headroom_enabled(self, unused_message):
+        """Ordinary player input keeps the original exact queue boundary."""
+        return False
 
     def _send_preencoded_trusted(self, message, coalesce_key=None):
         """Encode one trusted canonical message directly into queue bytes.
@@ -3658,15 +3697,19 @@ class LANClient(object):
             return
         protocol = message.get('protocol')
         if protocol is not None or kind in SERVER_STATE_TYPES:
-            try:
-                matches_protocol = int(protocol) == PROTOCOL_VERSION
-            except (TypeError, ValueError):
-                matches_protocol = False
+            parsed_protocol = _exact_int(protocol)
+            if kind == 'welcome' or self._schema_negotiated:
+                # Welcome carries the full capability contract below.  A
+                # positive version marker is enough to negotiate that known
+                # JSON schema; the exact build/version label is informational.
+                matches_protocol = bool(
+                    parsed_protocol is not None and parsed_protocol > 0)
+            else:
+                matches_protocol = parsed_protocol == PROTOCOL_VERSION
             if not matches_protocol:
-                if (protocol is None and
-                        kind in RECOVERABLE_RUNTIME_TYPES and
+                if (kind in RECOVERABLE_RUNTIME_TYPES and
                         self._ignore_runtime_payload(
-                            kind, 'missing_protocol', message)):
+                            kind, 'invalid_protocol', message)):
                     return
                 self.last_error = 'protocol mismatch'
                 self.stop()
@@ -3696,10 +3739,6 @@ class LANClient(object):
             if not atomic_runtime:
                 self.server_time_ms = server_time_ms
         if kind == 'welcome':
-            if _safe_text(message.get('client_build'), '') != CLIENT_BUILD:
-                self.last_error = 'client build mismatch'
-                self.stop()
-                return
             capabilities = _strict_capabilities(message.get('capabilities'))
             server_capabilities = _strict_capabilities(
                 message.get('server_capabilities', []))
@@ -3805,6 +3844,7 @@ class LANClient(object):
             self.authority_epoch = authority_epoch
             self.capabilities = capabilities
             self.server_capabilities = server_capabilities
+            self._schema_negotiated = True
             self.server_time_ms = welcome_server_time
         elif kind == 'battle_receipt':
             if (not _valid_battle_receipt(message) or

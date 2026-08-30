@@ -738,8 +738,8 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(90000, server.motion_time_offset_us)
 
         # An instantaneous source leap beyond real elapsed time plus one
-        # maximum integration step is rejected without poisoning the accepted
-        # origins. A later normal sample can therefore recover immediately.
+        # maximum integration step drops the atomic state but re-anchors the
+        # trusted source clock. A later normal sample can recover immediately.
         now[0] = 100.500
         oversized = self._publication(server, 9.0)
         oversized['sample_time_us'] = 1000000
@@ -749,18 +749,18 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual('sample_time_rate',
                          server.last_bot_state_reject_code)
         self.assertEqual(580000, server.bot_state_time_us)
-        self.assertEqual(420000, server.bot_source_time_us)
-        self.assertEqual(490000, server.bot_source_receipt_time_us)
+        self.assertEqual(1000000, server.bot_source_time_us)
+        self.assertEqual(500000, server.bot_source_receipt_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
         now[0] = 100.530
         recovered = self._publication(server, 2.6)
-        recovered['sample_time_us'] = 460000
-        recovered['source_batch_horizon_us'] = 460000
+        recovered['sample_time_us'] = 1040000
+        recovered['source_batch_horizon_us'] = 1040000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, recovered))
         self.assertEqual(620000, server.bot_state_time_us)
-        self.assertEqual(460000, server.bot_source_time_us)
+        self.assertEqual(1040000, server.bot_source_time_us)
         self.assertEqual(530000, server.bot_source_receipt_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
@@ -769,13 +769,27 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         server.remove_player(1)
         self.assertEqual(
             SIMULATION_WORKER_AUTHORITY_ID, server.bot_authority_id)
-        self.assertEqual(460000, server.bot_source_time_us)
+        self.assertEqual(1040000, server.bot_source_time_us)
         self.assertEqual(530000, server.bot_source_receipt_time_us)
         self.assertEqual(90000, server.motion_time_offset_us)
 
         server._reset_round()
         self.assertIsNone(server.bot_source_receipt_time_us)
         self.assertEqual(0, server.motion_time_offset_us)
+
+    def test_bot_state_after_battle_result_is_an_idempotent_noop(self):
+        server, unused_worker, unused_authority_socket = self._server()
+        revision = server.bot_state_revision
+        states = dict((bot_id, dict(state))
+                      for bot_id, state in server.bot_states.items())
+        server.battle_result = {'winner': 1, 'reason': 'all_destroyed'}
+
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._publication(server, 99.0)))
+        self.assertEqual(revision, server.bot_state_revision)
+        self.assertEqual(states, server.bot_states)
+        self.assertEqual('', server.last_bot_state_reject_code)
 
     def test_revision_advances_inside_one_coarse_clock_quantum(self):
         now = [100.0]
@@ -1105,13 +1119,31 @@ class ServerBotObservationRelayTests(unittest.TestCase):
 
         self.assertIs(True, relay)
 
-    def test_nonparticipating_human_is_not_an_observation_target(self):
+    def test_retired_observation_targets_are_quiet_noops(self):
         server, unused_authority_socket, unused_guest_socket = self._server()
         server.players[2].participating = False
 
-        self.assertFalse(server.update_bot_observation(
+        self.assertTrue(server.update_bot_observation(
             SIMULATION_WORKER_AUTHORITY_ID,
             self._message(server.round_id, target_id=2)))
+        self.assertFalse(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id, target_id=999)))
+
+    def test_dead_target_and_observer_rows_are_quiet_noops(self):
+        server, unused_authority_socket, unused_guest_socket = self._server()
+        server.players[2].alive = False
+        self.assertTrue(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id, target_id=2)))
+
+        server.players[2].alive = True
+        server.bot_states[11]['alive'] = False
+        server.bot_states[11]['health'] = 0
+        self.assertTrue(server.update_bot_observation(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            self._message(server.round_id, target_id=2)))
+        self.assertEqual(frozenset(), server.bot_spotted[11])
 
 
 class BotRuntimeTests(unittest.TestCase):

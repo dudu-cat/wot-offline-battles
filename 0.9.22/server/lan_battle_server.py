@@ -274,10 +274,24 @@ MAX_MOTION_TIME_US = 10000000000000000
 MAX_BOT_SAMPLE_LEAD_US = 200000
 SIMULATION_WORKER_CAPABILITY = "simulation_worker_v1"
 SIMULATION_WORKER_ROLE = "simulation_worker"
+MODERN_CLIENT_REQUIRED_CAPABILITIES = (
+    PROJECTILE_CAPABILITY,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    RAM_CONTACT_LEDGER_CAPABILITY,
+    HUMAN_RAM_TIMELINE_CAPABILITY,
+    PLAYER_FIRE_INTENT_CAPABILITY,
+    PLAYER_ENVIRONMENT_CAPABILITY,
+    EFFECTIVE_PARAMS_CAPABILITY,
+    RICOCHET_CONTINUATION_CAPABILITY,
+)
+SIMULATION_WORKER_REQUIRED_CAPABILITIES = (
+    MODERN_CLIENT_REQUIRED_CAPABILITIES +
+    (SIMULATION_WORKER_CAPABILITY,))
 # Negative ids are never legal player or bot ids.  Keep the external native
 # worker distinct from the in-process server authority, whose wire id is zero.
 SIMULATION_WORKER_AUTHORITY_ID = -1
 SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS = 5.0
+SIMULATION_WORKER_LOADING_TIMEOUT_SECONDS = 30.0
 SIMULATION_WORKER_ADVANCEMENT_TYPES = frozenset((
     "simulation_progress", "bot_state", "bot_observation",
     "bot_hit_report", "bot_human_hit", "bot_ram_report", "rules_state",
@@ -285,6 +299,9 @@ SIMULATION_WORKER_ADVANCEMENT_TYPES = frozenset((
     "projectile_ricochet", "projectile_resolve", "fire_intent_result",
     "player_destructible_contact_result",
     "player_environment",
+))
+FATAL_BOT_STATE_REJECT_CODES = frozenset((
+    "round", "authority", "manifest_authority", "manifest_missing",
 ))
 AUTHORITY_DESCRIPTOR_TIMEOUT_SECONDS = 30.0
 AUTHORITY_DESTRUCTIBLE_TIMEOUT_SECONDS = 120.0
@@ -391,6 +408,43 @@ def _server_log_limited(key, message, interval=5.0):
     _SERVER_LOG_LAST[key] = now
     _server_log(message)
     return True
+
+
+def _valid_capability_subset(value, required):
+    """Validate a bounded capability list containing the understood subset."""
+    return bool(
+        isinstance(value, list) and
+        len(value) <= 32 and
+        all(isinstance(item, str) and item and len(item) <= 64
+            for item in value) and
+        len(set(value)) == len(value) and
+        all(item in value for item in required))
+
+
+def _compatible_hello_protocol(value, capabilities):
+    """Negotiate newer/older JSON peers by capability, not version equality."""
+    if isinstance(value, bool):
+        return False
+    try:
+        protocol = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if protocol == PROTOCOL_VERSION:
+        return True
+    return bool(
+        protocol > 0 and
+        _valid_capability_subset(
+            capabilities, MODERN_CLIENT_REQUIRED_CAPABILITIES))
+
+
+def _peer_closed_socket(error):
+    """Classify ordinary peer shutdown/reset separately from server faults."""
+    code = getattr(error, "errno", None)
+    if code is None:
+        args = getattr(error, "args", ())
+        if args and isinstance(args[0], int):
+            code = args[0]
+    return code in frozenset((32, 54, 104, 107, 10053, 10054, 10058))
 
 
 def _bot_combat_log_message(event, players, bot_states):
@@ -2147,10 +2201,24 @@ class BattleState:
                 return None, "battle_in_progress"
             if hello.get("role", "player") != "player":
                 return None, "unsupported_role"
-            client_build = hello.get("client_build", CLIENT_BUILD_082)
-            if (not isinstance(client_build, str) or
-                    client_build not in CLIENT_MAP_POOLS):
+            declared_client_build = hello.get(
+                "client_build", CLIENT_BUILD_082)
+            if (not isinstance(declared_client_build, str) or
+                    not declared_client_build or
+                    len(declared_client_build) > 128):
                 return None, "unsupported_client_build"
+            raw_capabilities = hello.get("capabilities", ())
+            modern_capabilities = _valid_capability_subset(
+                raw_capabilities, MODERN_CLIENT_REQUIRED_CAPABILITIES)
+            # The build label is diagnostic only for capability-complete
+            # #1513 peers.  Keep the known 0.8.2 path for truly legacy hellos,
+            # then normalize every negotiated modern peer to the server's
+            # internal build family so later room logic remains unchanged.
+            client_build = (
+                CLIENT_BUILD_082
+                if (declared_client_build == CLIENT_BUILD_082 and
+                    not modern_capabilities)
+                else CLIENT_BUILD_0922)
             try:
                 requested_team = _requested_team(
                     hello.get("requested_team"))
@@ -2158,25 +2226,9 @@ class BattleState:
                 return None, "invalid_team"
             capabilities = ()
             if client_build == CLIENT_BUILD_0922:
-                raw_capabilities = hello.get("capabilities", ())
-                if (not isinstance(raw_capabilities, list) or
-                        len(raw_capabilities) > 32 or
-                        any(not isinstance(value, str) or not value or
-                            len(value) > 64
-                            for value in raw_capabilities) or
-                        len(set(raw_capabilities)) != len(raw_capabilities)):
+                if not modern_capabilities:
                     return None, "unsupported_capabilities"
                 capabilities = tuple(raw_capabilities)
-                if (PROJECTILE_CAPABILITY not in capabilities or
-                        DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in
-                        capabilities or
-                        RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
-                        HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
-                        PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
-                        PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
-                        EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
-                        RICOCHET_CONTINUATION_CAPABILITY not in capabilities):
-                    return None, "unsupported_capabilities"
                 account_key = hello.get("account_key")
                 if account_key is None:
                     # Protocol-v5 clients released before durable receipts did
@@ -2400,27 +2452,18 @@ class BattleState:
             if (self.simulation_worker is not None and
                     self.simulation_worker.connected):
                 return None, "worker_already_connected"
-            client_build = hello.get("client_build")
-            if client_build != CLIENT_BUILD_0922:
+            declared_client_build = hello.get("client_build")
+            if (not isinstance(declared_client_build, str) or
+                    not declared_client_build or
+                    len(declared_client_build) > 128):
                 return None, "unsupported_client_build"
             raw_capabilities = hello.get("capabilities", ())
-            if (not isinstance(raw_capabilities, list) or
-                    len(raw_capabilities) > 32 or
-                    any(not isinstance(value, str) or not value or
-                        len(value) > 64 for value in raw_capabilities) or
-                    len(set(raw_capabilities)) != len(raw_capabilities)):
+            if not _valid_capability_subset(
+                    raw_capabilities,
+                    SIMULATION_WORKER_REQUIRED_CAPABILITIES):
                 return None, "unsupported_capabilities"
             capabilities = tuple(raw_capabilities)
-            if (PROJECTILE_CAPABILITY not in capabilities or
-                    DESTRUCTIBLE_CATALOG_V5_CAPABILITY not in capabilities or
-                    SIMULATION_WORKER_CAPABILITY not in capabilities or
-                    RAM_CONTACT_LEDGER_CAPABILITY not in capabilities or
-                    HUMAN_RAM_TIMELINE_CAPABILITY not in capabilities or
-                    PLAYER_FIRE_INTENT_CAPABILITY not in capabilities or
-                    PLAYER_ENVIRONMENT_CAPABILITY not in capabilities or
-                    EFFECTIVE_PARAMS_CAPABILITY not in capabilities or
-                    RICOCHET_CONTINUATION_CAPABILITY not in capabilities):
-                return None, "unsupported_capabilities"
+            client_build = CLIENT_BUILD_0922
             if (self.client_build is not None and
                     self.client_build != client_build):
                 return None, "incompatible_client_build"
@@ -4071,9 +4114,12 @@ class BattleState:
         """Accept authority observations; never derive contacts from snapshots."""
         with self.lock:
             if (not self._message_round_matches(message) or
-                    not self._combat_accepting() or
                     player_id != self.bot_authority_id or
                     player_id != self.bot_manifest_authority_id):
+                return False
+            if self.battle_result is not None:
+                return True
+            if not self._combat_accepting():
                 return False
             if (not isinstance(message.get("contacts"), (list, tuple)) or
                     ("affordances" in message and
@@ -4095,6 +4141,7 @@ class BattleState:
             direct_player_spots = dict(
                 (reporter_id, set()) for reporter_id in known_players)
             human_visible = set()
+            stale_observation = False
             if self.client_build != CLIENT_BUILD_0922:
                 for reporter_id, targets in self.player_spotted.items():
                     reporter = self.players.get(reporter_id)
@@ -4137,12 +4184,27 @@ class BattleState:
                     return False
                 target_kind = contact.get("target_kind")
                 target = known_targets.get((target_kind, target_id))
-                if (target is None or
+                if target is None:
+                    known_retired = bool(
+                        (target_kind == "human" and
+                         target_id in self.players) or
+                        (target_kind == "bot" and
+                         (target_id in self.bot_states or any(
+                             int(entry.get("id", 0)) == target_id
+                             for entry in self.bot_manifest))))
+                    if known_retired:
+                        stale_observation = True
+                        continue
+                    return False
+                if not bool(target.get("alive", True)):
+                    stale_observation = True
+                    continue
+                if (target_kind not in ("human", "bot") or
                         int(target.get("team", 0)) == observing_team or
-                        target_team != int(target.get("team", 0)) or
-                        not bool(target.get("alive", True))):
+                        target_team != int(target.get("team", 0))):
                     return False
                 bot_observer_ids = []
+                stale_contact = False
                 for raw_bot_id in contact.get("visible_by_bot_ids"):
                     try:
                         bot_id = _exact_int(
@@ -4150,7 +4212,11 @@ class BattleState:
                     except ValueError:
                         return False
                     bot = known_bots.get(bot_id)
-                    if (bot is None or not bot.get("alive") or
+                    if bot is not None and not bot.get("alive"):
+                        stale_observation = True
+                        stale_contact = True
+                        continue
+                    if (bot is None or
                             int(bot.get("team", 0)) != observing_team or
                             bot_id in bot_observer_ids):
                         return False
@@ -4166,6 +4232,10 @@ class BattleState:
                     except ValueError:
                         return False
                     observer = known_players.get(observer_id)
+                    if observer is not None and not observer.alive:
+                        stale_observation = True
+                        stale_contact = True
+                        continue
                     if (observer is None or
                             int(observer.team) != observing_team or
                             observer_id in observer_ids):
@@ -4182,13 +4252,19 @@ class BattleState:
                     except ValueError:
                         return False
                     bot = known_bots.get(bot_id)
-                    if (bot is None or not bot.get("alive") or
+                    if bot is not None and not bot.get("alive"):
+                        stale_observation = True
+                        stale_contact = True
+                        continue
+                    if (bot is None or
                             int(bot.get("team", 0)) != observing_team or
                             bot_id in shooter_ids):
                         return False
                     shooter_ids.append(bot_id)
                 contact["shootable_by_bot_ids"] = sorted(shooter_ids)
                 fresh = bool(bot_observer_ids or observer_ids)
+                if stale_contact and not fresh:
+                    continue
                 if (contact["fresh"] != fresh or
                         contact["visible"] != (time_left > 0.0) or
                         (fresh and not contact["visible"]) or
@@ -4241,7 +4317,7 @@ class BattleState:
             # false rejection logs.
             return bool(
                 accepted_contacts > 0 or accepted_affordances > 0 or
-                valid_hidden)
+                valid_hidden or stale_observation)
 
     def _replace_bot_spotted(self, direct_spots):
         """Commit one complete validated Bot direct-spot batch."""
@@ -4920,13 +4996,15 @@ class BattleState:
                     "round=%s server_round=%s" % (
                         message.get("round_id") if isinstance(message, dict)
                         else None, self.round_id))
+            if self.battle_result is not None:
+                # A checkpoint encoded before the terminal result can still be
+                # waiting in the worker's reliable queue.  The result is
+                # canonical, so converge that tail packet as a quiet no-op.
+                return True
             if not self._combat_accepting():
                 return self._set_protocol_reject(
                     "bot_state", "combat_closed",
                     "phase=%s tick=%s" % (self.phase, self.tick))
-            if self.battle_result is not None:
-                return self._set_protocol_reject(
-                    "bot_state", "battle_finished", "battle_result=set")
             if player_id != self.bot_authority_id:
                 return self._set_protocol_reject(
                     "bot_state", "authority",
@@ -4993,6 +5071,18 @@ class BattleState:
                     if source_delta_us > (
                             receipt_elapsed_us +
                             MAX_BOT_SAMPLE_LEAD_US):
+                        # Retain the last-good Bot checkpoint, but advance the
+                        # trusted worker clock origin.  Otherwise every later
+                        # normal sample remains ahead after one render stall or
+                        # coalesced outbound backlog.
+                        self.bot_source_time_us = source_time_us
+                        self.bot_source_receipt_time_us = (
+                            received_raw_motion_time_us)
+                        self.bot_source_batch_horizon_us = (
+                            source_batch_horizon_us)
+                        self.bot_launch_clock_offset_us = (
+                            self._server_time_ms() * 1000 -
+                            source_batch_horizon_us)
                         return self._set_protocol_reject(
                             "bot_state", "sample_time_rate",
                             ("sample_delta=%s receipt_elapsed=%s "
@@ -6203,15 +6293,29 @@ class BattleState:
                         "burst_count": 1,
                         "shell_index": shell_index,
                     }
-                if (shooter is None or not shooter.get("alive") or
-                        expected_edge is None or
-                        any(pending_bot == shooter_id and
-                            pending_seq < shot_seq
-                            for pending_bot, pending_seq in
-                            self.bot_pending_projectile_launches)):
+                if shooter is None:
+                    return self._set_protocol_reject(
+                        reject_kind, "identity", "bot shooter is unknown")
+                if not shooter.get("alive"):
+                    # Death can overtake a launch already queued by the
+                    # worker.  No live edge remains to admit.
+                    return True
+                if expected_edge is None:
+                    if shot_seq <= int(shooter.get("fire_seq", 0)):
+                        # The canonical state already crossed this edge, but
+                        # its pending metadata was consumed or retired before
+                        # this retry arrived.
+                        return True
+                    return self._set_protocol_reject(
+                        reject_kind, "launch_edge_pending",
+                        "bot projectile is waiting for its launch edge")
+                if any(pending_bot == shooter_id and
+                       pending_seq < shot_seq
+                       for pending_bot, pending_seq in
+                       self.bot_pending_projectile_launches):
                     return self._set_protocol_reject(
                         reject_kind, "order",
-                        "bot projectile has no next launch edge")
+                        "bot projectile launch edge is out of order")
                 launch_clock_offset_us = expected_edge.get(
                     "launch_clock_offset_us", self.bot_launch_clock_offset_us)
                 if launch_clock_offset_us is None:
@@ -6354,7 +6458,7 @@ class BattleState:
         }
 
     def _validate_retired_projectile_cursor(self, raw, projectile_id):
-        """Validate wire safety for a cursor overtaken by its terminal."""
+        """Validate only the envelope of a cursor overtaken by its terminal."""
         allowed = {
             "projectile_id", "base_checked_ms", "checked_through_ms",
             "checked_distance", "piercing_loss", "penetration_factor",
@@ -6364,17 +6468,9 @@ class BattleState:
             raise ValueError("invalid retired cursor shape")
         if raw.get("projectile_id") != projectile_id:
             raise ValueError("invalid retired projectile id")
-        base_checked_ms = _exact_int(
-            raw.get("base_checked_ms"), 0, PROJECTILE_MAX_LIFETIME_MS)
-        _exact_int(
-            raw.get("checked_through_ms"), base_checked_ms,
-            PROJECTILE_MAX_LIFETIME_MS)
-        _bounded_float(
-            raw.get("checked_distance"), 0.0,
-            PROJECTILE_MAX_DISTANCE + PROJECTILE_TOLERANCE)
-        _bounded_float(raw.get("piercing_loss"), 0.0, 100000.0)
-        _bounded_float(raw.get("penetration_factor"), 0.0, 100.0)
-        self._normalize_projectile_destructibles(raw.get("destructibles"))
+        # Message-level byte and finite-value checks have already run.  Once
+        # the terminal is canonical, the queued cursor's exact time, distance
+        # and receipts are obsolete and cannot affect server state.
 
     def progress_projectiles(self, player_id, message):
         """Advance an authority-owned batch with cursor compare-and-swap."""
@@ -11563,7 +11659,22 @@ class ClientHandler(socketserver.BaseRequestHandler):
         elif message_type == "bot_state":
             accepted = server.state.update_bot_states(
                 authority_id, message)
-            if server.state.should_log_protocol_reject(
+            reject_code = server.state.last_bot_state_reject_code
+            if (not accepted and
+                    reject_code not in FATAL_BOT_STATE_REJECT_CODES):
+                # State publications are atomic.  A timing, precision or
+                # model-contract mismatch can safely retain the last-good
+                # checkpoint while the local trusted worker sends its next
+                # full publication.  Treat the soft drop as liveness so a
+                # persistent diagnostic never turns into a forced draw.
+                if server.state.should_log_protocol_reject(
+                        "bot_state", accepted):
+                    _server_log(
+                        "BOT STATE dropped authority=%d code=%s reason=%s" % (
+                            authority_id, reject_code,
+                            server.state.last_bot_state_reject))
+                accepted = True
+            elif server.state.should_log_protocol_reject(
                     "bot_state", accepted):
                 _server_log(
                     "BOT STATE rejected authority=%d code=%s reason=%s" % (
@@ -11573,15 +11684,10 @@ class ClientHandler(socketserver.BaseRequestHandler):
             if (not accepted and
                     server.state.phase in ("loading", "battle") and
                     server.state.battle_result is None):
-                # A bot publication is one atomic canonical batch.  Keeping
-                # the previous snapshot after rejecting it leaves every Bot
-                # frozen while the worker advances beyond the server's
-                # lineage.  Fence the producer and use the existing explicit
-                # infrastructure-failure result instead.  A late publication
-                # after a terminal result is harmless cleanup traffic and
-                # must not turn the completed round into a worker failure.
+                # Identity and lineage conflicts are not recoverable from a
+                # later checkpoint on the same transport.
                 server.state.remove_simulation_worker(
-                    worker, "bot_state_rejected")
+                    worker, reject_code or "bot_state_rejected")
                 return "close"
         elif message_type == "bot_observation":
             relay = server.state.update_bot_observation(
@@ -11635,14 +11741,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
             "projectile_launch", "projectile_progress",
             "projectile_ricochet", "projectile_resolve")
         if message_type in projectile_commands:
-            if server.state.should_log_protocol_reject(
-                    message_type, accepted):
+            reject_code = getattr(
+                server.state, "last_%s_reject_code" % message_type,
+                "unknown")
+            if (reject_code != "launch_edge_pending" and
+                    server.state.should_log_protocol_reject(
+                        message_type, accepted)):
                 _server_log(
                     "WORKER COMMAND rejected type=%s code=%s reason=%s" % (
                         message_type,
-                        getattr(server.state,
-                                "last_%s_reject_code" % message_type,
-                                "unknown"),
+                        reject_code,
                         getattr(server.state,
                                 "last_%s_reject" % message_type,
                                 "unknown")))
@@ -11728,9 +11836,13 @@ class ClientHandler(socketserver.BaseRequestHandler):
                              SIMULATION_WORKER_ADVANCEMENT_TYPES)):
                         last_activity = time.monotonic()
                 now = time.monotonic()
+                liveness_timeout = (
+                    SIMULATION_WORKER_LOADING_TIMEOUT_SECONDS
+                    if current_key is not None and
+                    current_key[1] == "loading" else
+                    SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS)
                 if (current_key is not None and
-                        now - last_activity >=
-                        SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS):
+                        now - last_activity >= liveness_timeout):
                     _server_log(
                         "WORKER TIMEOUT round=%d phase=%s idle=%.2fs" % (
                             current_key[0], current_key[1],
@@ -11770,13 +11882,10 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 buffer += chunk
             line, _, buffer = buffer.partition(b"\n")
             hello = json.loads(line.decode("utf-8"))
-            try:
-                hello_protocol = (int(hello.get("protocol", -1))
-                                  if isinstance(hello, dict) else -1)
-            except (TypeError, ValueError):
-                hello_protocol = -1
             if (not isinstance(hello, dict) or hello.get("type") != "hello" or
-                    hello_protocol != PROTOCOL_VERSION):
+                    not _compatible_hello_protocol(
+                        hello.get("protocol"),
+                        hello.get("capabilities", ()))):
                 self._send_raw(conn, {"type": "error", "code": "protocol", "message": "protocol mismatch"})
                 _server_log("Rejected %s:%d: protocol mismatch" % self.client_address)
                 return
@@ -11784,26 +11893,13 @@ class ClientHandler(socketserver.BaseRequestHandler):
             if role == "probe":
                 client_build = hello.get("client_build")
                 raw_capabilities = hello.get("capabilities", ())
-                required_capabilities = (
-                    PROJECTILE_CAPABILITY,
-                    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
-                    RAM_CONTACT_LEDGER_CAPABILITY,
-                    HUMAN_RAM_TIMELINE_CAPABILITY,
-                    PLAYER_FIRE_INTENT_CAPABILITY,
-                    PLAYER_ENVIRONMENT_CAPABILITY,
-                    EFFECTIVE_PARAMS_CAPABILITY,
-                    RICOCHET_CONTINUATION_CAPABILITY,
-                )
-                valid_capabilities = (
-                    isinstance(raw_capabilities, list) and
-                    len(raw_capabilities) <= 32 and
-                    all(isinstance(value, str) and value and
-                        len(value) <= 64 for value in raw_capabilities) and
-                    len(set(raw_capabilities)) == len(raw_capabilities) and
-                    all(value in raw_capabilities
-                        for value in required_capabilities))
-                if (client_build != CLIENT_BUILD_0922 or
-                        not valid_capabilities):
+                valid_client_build = bool(
+                    isinstance(client_build, str) and client_build and
+                    len(client_build) <= 128)
+                if (not valid_client_build or
+                        not _valid_capability_subset(
+                            raw_capabilities,
+                            MODERN_CLIENT_REQUIRED_CAPABILITIES)):
                     self._send_raw(conn, {
                         "type": "error",
                         "code": "unsupported_capabilities",
@@ -11816,7 +11912,8 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     "type": "welcome",
                     "protocol": PROTOCOL_VERSION,
                     "client_build": CLIENT_BUILD_0922,
-                    "capabilities": list(required_capabilities),
+                    "capabilities": list(
+                        MODERN_CLIENT_REQUIRED_CAPABILITIES),
                     "server_capabilities": list(SERVER_CAPABILITIES),
                 })
                 _server_log("PROBE OK %s:%d" % self.client_address)
@@ -12243,7 +12340,13 @@ class ClientHandler(socketserver.BaseRequestHandler):
         except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
             _server_log("Invalid message from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
         except (ConnectionError, OSError) as error:
-            _server_log("Connection error from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
+            if _peer_closed_socket(error):
+                _server_log_limited(
+                    "peer-close:%s:%s" % self.client_address,
+                    "Connection closed by %s:%d" % self.client_address)
+            else:
+                _server_log("Connection error from %s:%d: %s" % (
+                    self.client_address[0], self.client_address[1], error))
         finally:
             if player is not None:
                 removed, reset = server.state.remove_player(

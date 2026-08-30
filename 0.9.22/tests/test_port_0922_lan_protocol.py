@@ -860,15 +860,28 @@ class LanProtocolTests(unittest.TestCase):
         self.assertEqual(
             1, self.client._runtime_drop_diagnostics['snapshot'][1])
 
-    def test_explicit_runtime_protocol_conflict_remains_fatal(self):
+    def test_negotiated_runtime_protocol_label_is_informational(self):
         self.client.running = True
+        self.client._schema_negotiated = True
         self.client._handle_message({
             'type': 'events', 'protocol': 4, 'round_id': 7,
             'server_tick': 1, 'events': [],
         })
 
-        self.assertFalse(self.client.running)
-        self.assertEqual('protocol mismatch', self.client.last_error)
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+
+    def test_invalid_runtime_protocol_marker_soft_drops_one_message(self):
+        self.client.running = True
+        self.client._schema_negotiated = True
+        self.client._handle_message({
+            'type': 'events', 'protocol': 'invalid', 'round_id': 7,
+            'server_tick': 1, 'events': [],
+        })
+
+        self.assertTrue(self.client.running)
+        self.assertIsNone(self.client.last_error)
+        self.assertIn('events', self.client._runtime_drop_diagnostics)
 
     def test_snapshot_missing_bot_combat_contract_keeps_last_good_state(self):
         self.client.running = True

@@ -193,6 +193,16 @@ def _wait_until(predicate, timeout=2.0):
 
 
 class SimulationWorkerStateTests(unittest.TestCase):
+    def test_worker_loading_timeout_has_separate_startup_grace(self):
+        self.assertGreater(
+            server_module.SIMULATION_WORKER_LOADING_TIMEOUT_SECONDS,
+            server_module.SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS)
+
+    def test_peer_reset_is_classified_as_close_not_server_fault(self):
+        self.assertTrue(server_module._peer_closed_socket(OSError(10054, 'x')))
+        self.assertTrue(server_module._peer_closed_socket(OSError(54, 'x')))
+        self.assertFalse(server_module._peer_closed_socket(OSError(13, 'x')))
+
     def test_worker_join_requires_ricochet_capability(self):
         state = BattleState(map_name='01_karelia')
         hello = _worker_hello()
@@ -203,6 +213,24 @@ class SimulationWorkerStateTests(unittest.TestCase):
 
         self.assertIsNone(worker)
         self.assertEqual('unsupported_capabilities', error)
+
+    def test_build_labels_are_normalized_after_capability_negotiation(self):
+        state = BattleState(map_name='01_karelia')
+        worker_hello = _worker_hello()
+        worker_hello['client_build'] = 'launcher-local-worker'
+
+        worker, worker_error = state.add_simulation_worker(
+            _Connection(), ('127.0.0.1', 1000), worker_hello)
+        player_hello = _player_hello()
+        player_hello['client_build'] = 'launcher-local-player'
+        player, player_error = state.add_player(
+            _Connection(), ('127.0.0.1', 1001), player_hello)
+
+        self.assertIsNotNone(worker)
+        self.assertIsNone(worker_error)
+        self.assertIsNotNone(player)
+        self.assertIsNone(player_error)
+        self.assertEqual(CLIENT_BUILD_0922, state.client_build)
 
     def test_modern_player_join_requires_exact_max_health_before_mutation(self):
         invalid_values = (
@@ -1032,6 +1060,45 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             self.state.tick, int(round(PREBATTLE_SECONDS * TICK_HZ)))
         return manifest
 
+    def test_handler_negotiates_probe_worker_and_player_handshakes(self):
+        incompatible = self._connect()
+        incompatible.send({
+            'type': 'hello', 'role': 'probe', 'protocol': 6,
+            'client_build': 'launcher-local-probe', 'capabilities': [],
+        })
+        self.assertEqual(
+            'protocol', incompatible.receive_until('error')['code'])
+
+        probe = self._connect()
+        probe_hello = _player_hello('Probe')
+        probe_hello.update({
+            'role': 'probe', 'protocol': 6,
+            'client_build': 'launcher-local-probe',
+        })
+        probe.send(probe_hello)
+        probe_welcome = probe.receive_until('welcome')
+
+        worker = self._connect()
+        worker_hello = _worker_hello()
+        worker_hello.update({
+            'protocol': 6, 'client_build': 'launcher-local-worker'})
+        worker.send(worker_hello)
+        worker_welcome = worker.receive_until('welcome')
+
+        player = self._connect()
+        player_hello = _player_hello()
+        player_hello.update({
+            'protocol': 6, 'client_build': 'launcher-local-player'})
+        player.send(player_hello)
+        player_welcome = player.receive_until('welcome')
+
+        for welcome in (probe_welcome, worker_welcome, player_welcome):
+            self.assertEqual(5, welcome['protocol'])
+            self.assertEqual(CLIENT_BUILD_0922, welcome['client_build'])
+        self.assertEqual(
+            SIMULATION_WORKER_AUTHORITY_ID, worker_welcome['worker_id'])
+        self.assertEqual(1, player_welcome['player_id'])
+
     def test_handler_worker_disconnect_never_promotes_visible_client(self):
         worker = self._connect()
         worker.send(_worker_hello())
@@ -1212,10 +1279,46 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             event.get('reason') == 'worker_disconnected'
             for event in events['events']))
 
+    def test_recoverable_bot_state_rejection_keeps_worker_and_round(self):
+        worker = self._connect()
+        worker.send(_worker_hello())
+        worker.receive_until('welcome')
+        player = self._connect()
+        player.send(_player_hello())
+        player.receive_until('welcome')
+        manifest = self._enter_worker_countdown(worker, player)
+        self.state.tick = int(round(PREBATTLE_SECONDS * TICK_HZ))
+
+        publication = _bot_publication(manifest)
+        worker.send({
+            'type': 'bot_state', 'round_id': self.state.round_id,
+            'bots': publication,
+        })
+        worker.send({'type': 'ping', 'seq': 1})
+        worker.receive_until('pong')
+        _wait_until(lambda: self.state.bot_state_revision == 1)
+
+        rejected = _bot_publication(manifest, x_offset=99.0)
+        rejected[0]['combat_seq'] = 2
+        worker.send({
+            'type': 'bot_state', 'round_id': self.state.round_id,
+            'bots': rejected,
+        })
+        worker.send({'type': 'ping', 'seq': 2})
+        self.assertEqual(2, worker.receive_until('pong')['seq'])
+
+        self.assertIsNotNone(self.state.simulation_worker)
+        self.assertIsNone(self.state.battle_result)
+        self.assertEqual(1, self.state.bot_state_revision)
+        self.assertEqual('combat_contract',
+                         self.state.last_bot_state_reject_code)
+        self.assertNotEqual(99.0 + manifest[0]['x'],
+                            self.state.bot_states[manifest[0]['id']]['x'])
+
     def test_silent_open_worker_timeout_terminates_round(self):
         with mock.patch.object(
                 server_module,
-                'SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS', 0.1):
+                'SIMULATION_WORKER_LOADING_TIMEOUT_SECONDS', 0.1):
             worker = self._connect()
             worker.send(_worker_hello())
             worker.receive_until('welcome')
@@ -1256,7 +1359,7 @@ class SimulationWorkerSocketTests(unittest.TestCase):
     def test_loading_worker_ping_refreshes_liveness(self):
         with mock.patch.object(
                 server_module,
-                'SIMULATION_WORKER_LIVENESS_TIMEOUT_SECONDS', 0.35):
+                'SIMULATION_WORKER_LOADING_TIMEOUT_SECONDS', 0.35):
             worker = self._connect()
             worker.send(_worker_hello())
             worker.receive_until('welcome')

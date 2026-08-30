@@ -360,6 +360,8 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         second['x'] = 8.0
         second['yaw'] = 0.7
         second['reload_time'] = 0.05
+        second['combat_fire_elapsed'] = 0.03
+        second['combat_fire_timer'] = 0.07
 
         self.assertTrue(client.send_projected_bot_state(
             [first], sample_time_us=40000,
@@ -380,7 +382,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual(8.0, wire['bots'][0]['x'])
         self.assertEqual(0.05, wire['bots'][0]['reload_time'])
 
-    def test_worker_keeps_discrete_bot_edges_and_ordered_messages_fifo(self):
+    def test_worker_coalesces_across_queue_without_dropping_discrete_message(self):
         client = self._active_client()
         first = _projected_bot_state()
         fired = json.loads(json.dumps(first))
@@ -403,14 +405,19 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             [later], sample_time_us=120000,
             source_batch_horizon_us=120000))
 
-        self.assertEqual(4, len(client._outbound_queue))
+        self.assertEqual(3, len(client._outbound_queue))
         self.assertEqual([
-            'bot_state', 'bot_state', 'projectile_launch', 'bot_state',
+            'bot_state', 'bot_state', 'projectile_launch',
         ], [
             (json.loads(item[1].payload.decode('utf-8'))['type']
              if isinstance(item[1], lan_client_module._PreencodedOutbound)
              else item[1]['type'])
             for item in client._outbound_queue])
+        wires = [
+            json.loads(item[1].payload.decode('utf-8'))
+            for item in client._outbound_queue
+            if isinstance(item[1], lan_client_module._PreencodedOutbound)]
+        self.assertEqual(9.0, wires[-1]['bots'][0]['x'])
 
     def test_worker_never_coalesces_damage_or_combat_sequence_edges(self):
         client = self._active_client()
@@ -435,6 +442,24 @@ class AuthorityWorkerClientTests(unittest.TestCase):
             wire['bots'][0]['health'] for wire in wires])
         self.assertEqual([2, 3], [
             wire['bots'][0]['combat_seq'] for wire in wires])
+
+    def test_worker_never_coalesces_back_across_a_state_edge(self):
+        client = self._active_client()
+        first = _projected_bot_state()
+        edge = json.loads(json.dumps(first))
+        edge['fire_seq'] += 1
+        edge['ammo_remaining'][0] -= 1
+        reverted_key = json.loads(json.dumps(first))
+        reverted_key['x'] = 12.0
+
+        self.assertTrue(client.send_projected_bot_state([first]))
+        self.assertTrue(client.send_projected_bot_state([edge]))
+        self.assertTrue(client._send({'type': 'projectile_launch'}))
+        self.assertTrue(client.send_projected_bot_state([reverted_key]))
+
+        self.assertEqual(4, len(client._outbound_queue))
+        self.assertEqual('projectile_launch',
+                         client._outbound_queue[2][1]['type'])
 
     def test_worker_normal_30hz_pose_backlog_stays_bounded(self):
         client = self._active_client()
@@ -464,7 +489,7 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         self.assertEqual(600 * 33333, wire['sample_time_us'])
         self.assertEqual(0.599, wire['bots'][0]['x'])
 
-    def test_worker_bot_state_uses_common_fail_closed_queue_limit(self):
+    def test_worker_bot_state_queue_pressure_keeps_transport_and_fifo(self):
         client = self._active_client()
         sock = client.sock
         original_limit = lan_client_module.MAX_OUTBOUND_MESSAGES
@@ -477,12 +502,31 @@ class AuthorityWorkerClientTests(unittest.TestCase):
         finally:
             lan_client_module.MAX_OUTBOUND_MESSAGES = original_limit
 
-        self.assertFalse(client.running)
-        self.assertFalse(client.connected)
-        self.assertTrue(sock.closed)
-        self.assertEqual([], client._outbound_queue)
-        self.assertEqual('LAN outbound queue exceeded limit',
-                         client.last_error)
+        self.assertTrue(client.running)
+        self.assertTrue(client.connected)
+        self.assertFalse(sock.closed)
+        self.assertEqual(1, len(client._outbound_queue))
+        self.assertIsNone(client.last_error)
+
+    def test_worker_queue_reserves_bounded_headroom_for_discrete_edges(self):
+        client = self._active_client()
+        original_limit = lan_client_module.MAX_OUTBOUND_MESSAGES
+        lan_client_module.MAX_OUTBOUND_MESSAGES = 1
+        try:
+            self.assertTrue(client.send_projected_bot_state([
+                _projected_bot_state(11)]))
+            self.assertFalse(client._send({'type': 'projectile_progress'}))
+            self.assertTrue(client._send({'type': 'projectile_launch'}))
+            self.assertFalse(client._send({'type': 'battle_result'}))
+        finally:
+            lan_client_module.MAX_OUTBOUND_MESSAGES = original_limit
+
+        self.assertTrue(client.running)
+        self.assertTrue(client.connected)
+        self.assertEqual(2, len(client._outbound_queue))
+        self.assertEqual('projectile_launch',
+                         client._outbound_queue[1][1]['type'])
+        self.assertIsNone(client.last_error)
 
     def test_worker_bot_state_encoding_cannot_cross_transport_generation(self):
         client = self._active_client()
@@ -537,6 +581,35 @@ class AuthorityWorkerClientTests(unittest.TestCase):
 
         self.assertFalse(client._handle_worker_welcome(message))
         self.assertEqual('invalid worker welcome', client.last_error)
+
+    def test_worker_welcome_negotiates_protocol_and_build_labels(self):
+        client = AuthorityWorkerLANClient('127.0.0.1', 28782)
+        message = {
+            'type': 'welcome', 'protocol': PROTOCOL_VERSION + 1,
+            'client_build': 'launcher-local-server',
+            'role': WORKER_ROLE,
+            'worker_id': WORKER_AUTHORITY_ID,
+            'capabilities': list(CLIENT_CAPABILITIES) + [
+                SIMULATION_WORKER_CAPABILITY],
+            'server_capabilities': [
+                lan_client_module.DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+                lan_client_module.RAM_CONTACT_LEDGER_CAPABILITY,
+                lan_client_module.HUMAN_RAM_TIMELINE_CAPABILITY,
+                lan_client_module.PLAYER_FIRE_INTENT_CAPABILITY,
+                lan_client_module.PLAYER_ENVIRONMENT_CAPABILITY,
+                lan_client_module.EFFECTIVE_PARAMS_CAPABILITY,
+                lan_client_module.RICOCHET_CONTINUATION_CAPABILITY,
+            ],
+            'state_revision': 1, 'round_id': 0, 'host_player_id': 1,
+            'authority_epoch': 0, 'server_time_ms': 10, 'team_size': 15,
+            'bot_authority_id': WORKER_AUTHORITY_ID,
+            'phase': 'waiting', 'map': '01_karelia',
+        }
+
+        self.assertTrue(client._handle_worker_welcome(message))
+        self.assertTrue(client.ready)
+        self.assertTrue(client._schema_negotiated)
+        self.assertIsNone(client.last_error)
 
     def test_welcome_roster_and_runtime_projection_keep_dummy_local(self):
         events = []

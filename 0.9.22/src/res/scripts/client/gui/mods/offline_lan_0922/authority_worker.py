@@ -47,7 +47,8 @@ _PROJECTED_BOT_STATE_FIELDS = frozenset(
 _COALESCIBLE_BOT_STATE_FIELDS = frozenset((
     'x', 'y', 'z', 'yaw', 'pitch', 'roll', 'aim_yaw', 'gun_pitch',
     'speed', 'movement_dir', 'rotation_dir', 'reload_time',
-    'siege_time_left_ms'))
+    'burst_time_left', 'siege_time_left_ms',
+    'combat_fire_elapsed', 'combat_fire_timer'))
 _COALESCIBLE_EQUIPMENT_FIELDS = frozenset((
     'cooldownTimeLeft', 'autoPendingElapsed', 'aiPendingElapsed'))
 
@@ -189,6 +190,13 @@ class AuthorityWorkerLANClient(LANClient):
         """Keep the sole simulation authority strict on state corruption."""
         return False
 
+    def _outbound_discrete_headroom_enabled(self, message):
+        """Reserve bounded backlog space for worker combat/protocol edges."""
+        kind = message.get('type') if isinstance(message, dict) else None
+        return kind not in (
+            'bot_state', 'bot_observation', 'projectile_progress',
+            'simulation_progress', 'player_environment')
+
     def _hello_payload(self):
         """Advertise only a worker role; no dummy player data crosses wire."""
         return {
@@ -271,9 +279,9 @@ class AuthorityWorkerLANClient(LANClient):
         authority_id = _authority_id(message.get('bot_authority_id'))
         phase = _safe_text(message.get('phase'), '', 16)
         map_name = _safe_text(message.get('map'), '', 80)
+        protocol = _exact_int(message.get('protocol'))
         if (
-                _exact_int(message.get('protocol')) != PROTOCOL_VERSION or
-                _safe_text(message.get('client_build'), '') != CLIENT_BUILD or
+                protocol is None or protocol <= 0 or
                 message.get('role') != WORKER_ROLE or
                 _exact_int(message.get('worker_id')) != WORKER_AUTHORITY_ID or
                 capabilities is None or
@@ -320,10 +328,12 @@ class AuthorityWorkerLANClient(LANClient):
         self.server_time_ms = server_time_ms
         self.capabilities = capabilities
         self.server_capabilities = server_capabilities
+        self._schema_negotiated = True
         self._notify('welcome', message)
         return True
 
     def _handle_worker_roster(self, message):
+        protocol = _exact_int(message.get('protocol'))
         round_id = _exact_int(message.get('round_id'))
         state_revision = _exact_int(message.get('state_revision'))
         phase = _safe_text(message.get('phase'), '', 16)
@@ -349,7 +359,7 @@ class AuthorityWorkerLANClient(LANClient):
                 value.get('effective_params')) is not None
             for value in players or ())
         if (
-                _exact_int(message.get('protocol')) != PROTOCOL_VERSION or
+                protocol is None or protocol <= 0 or
                 round_id is None or round_id < 0 or
                 state_revision is None or state_revision < 0 or
                 phase not in ('waiting', 'loading', 'battle') or

@@ -473,7 +473,7 @@ class LanClientQueueTests(unittest.TestCase):
         self.assertEqual([], client._outbound_queue)
         self.assertTrue(client.running)
 
-    def test_queue_overflow_fails_transport_closed(self):
+    def test_queue_pressure_preserves_transport_and_accepted_fifo(self):
         client = self.activate()
         sock = client.sock
         original_limit = lan_client_module.MAX_OUTBOUND_MESSAGES
@@ -485,12 +485,26 @@ class LanClientQueueTests(unittest.TestCase):
         finally:
             lan_client_module.MAX_OUTBOUND_MESSAGES = original_limit
 
-        self.assertFalse(client.running)
-        self.assertFalse(client.connected)
-        self.assertTrue(sock.closed)
-        self.assertEqual([], client._outbound_queue)
-        self.assertEqual('LAN outbound queue exceeded limit',
-                         client.last_error)
+        self.assertTrue(client.running)
+        self.assertTrue(client.connected)
+        self.assertFalse(sock.closed)
+        self.assertEqual([1, 2], [
+            item[1]['value'] for item in client._outbound_queue])
+        self.assertIsNone(client.last_error)
+
+    def test_peer_eof_is_quiet_only_after_normal_battle_finish(self):
+        client = self.activate()
+        generation = client._transport_generation
+        sock = client.sock
+        client.phase = 'battle'
+
+        client.combat_phase = 'finished'
+        self.assertFalse(client._record_peer_close(generation, sock))
+        self.assertIsNone(client.last_error)
+
+        client.combat_phase = 'battle'
+        self.assertTrue(client._record_peer_close(generation, sock))
+        self.assertEqual('server closed the connection', client.last_error)
 
     def test_sender_failure_aborts_transport_and_discards_backlog(self):
         client = self.activate(RecordingSocket(fail=True))
