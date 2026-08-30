@@ -2142,6 +2142,30 @@ class VehicleOverlayFetchTest(unittest.TestCase):
             }],
         }
 
+    @staticmethod
+    def _manifest_with_member_count(count):
+        manifest = VehicleOverlayFetchTest._manifest()
+        manifest["members"] = []
+        checksum = hashlib.sha256(
+            VehicleOverlayFetchTest.MEMBER_DATA).hexdigest()
+        for index in range(count):
+            member = (
+                "scripts/item_defs/vehicles/ussr/Capacity_%04d.xml" %
+                index)
+            manifest["members"].append({
+                "sourceMember": member,
+                "sourcePackage": "res/packages/scripts.pkg",
+                "overlayRelativePath": member,
+                "overlaySha256": checksum,
+                "edits": [{
+                    "fieldPath": "speedLimits/forward",
+                    "originalPackedType": "integer",
+                    "originalValue": 32,
+                    "replacementValue": 40,
+                }],
+            })
+        return manifest
+
     class _OverlayConnection(object):
         def __init__(self, manifest=None, present=True, capability=True,
                      member_reply=None):
@@ -2239,6 +2263,31 @@ class VehicleOverlayFetchTest(unittest.TestCase):
             ["hello", "vehicle_overlay_query", "vehicle_overlay_member"],
             [message["type"] for message in connection.sent])
         self.assertTrue(connection.closed)
+
+    def test_fetch_accepts_max_members_above_the_old_manifest_line_cap(self):
+        manifest = self._manifest_with_member_count(
+            core.MAX_OVERLAY_MEMBERS)
+        encoded = json.dumps({
+            "type": "vehicle_overlay_manifest",
+            "present": True,
+            "digest": "0" * 64,
+            "profile": "Capacity",
+            "manifest": manifest,
+            "members": manifest["members"],
+        }).encode("utf-8")
+
+        result, unused_connection = self._fetch(manifest=manifest)
+
+        self.assertGreater(len(encoded), 256 * 1024)
+        self.assertEqual(core.MAX_OVERLAY_MEMBERS, len(result["payload"]))
+
+    def test_fetch_rejects_one_member_over_the_supported_count(self):
+        manifest = self._manifest_with_member_count(
+            core.MAX_OVERLAY_MEMBERS + 1)
+
+        with self.assertRaisesRegex(
+                core.LauncherError, "more than 1024 members"):
+            self._fetch(manifest=manifest)
 
     def test_fetch_reports_a_server_without_the_capability(self):
         result, connection = self._fetch(

@@ -1616,6 +1616,10 @@ def probe_server_protocol(port_version, host, port, timeout=1.5, connect=None):
 
 
 _OVERLAY_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+MAX_OVERLAY_MEMBERS = 1024
+MAX_OVERLAY_MANIFEST_BYTES = 32 * 1024 * 1024
+MAX_OVERLAY_MANIFEST_LINE_BYTES = (
+    MAX_OVERLAY_MANIFEST_BYTES + 1024 * 1024)
 MAX_OVERLAY_MEMBER_BYTES = 8 * 1024 * 1024
 MAX_OVERLAY_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_OVERLAY_LINE_BYTES = MAX_OVERLAY_MEMBER_BYTES * 4 // 3 + 1024 * 1024
@@ -1687,7 +1691,7 @@ def fetch_vehicle_overlay(host, port, timeout=5.0, connect=None):
             return {"supported": False, "present": False, "digest": "",
                     "profile": "", "manifest": None, "payload": {}}
         connection.sendall(b'{"type":"vehicle_overlay_query"}\n')
-        reply = _read_json_line(connection, 256 * 1024)
+        reply = _read_json_line(connection, MAX_OVERLAY_MANIFEST_LINE_BYTES)
         if (not isinstance(reply, dict) or
                 reply.get("type") != "vehicle_overlay_manifest"):
             raise LauncherError("The host vehicle-data reply is invalid.")
@@ -1707,6 +1711,16 @@ def fetch_vehicle_overlay(host, port, timeout=5.0, connect=None):
         members = manifest.get("members")
         if not isinstance(members, list) or not members:
             raise LauncherError("The host vehicle-data manifest is empty.")
+        if len(members) > MAX_OVERLAY_MEMBERS:
+            raise LauncherError(
+                "The host vehicle-data manifest contains more than %d "
+                "members." % MAX_OVERLAY_MEMBERS)
+        manifest_bytes = (json.dumps(
+            manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if len(manifest_bytes) > MAX_OVERLAY_MANIFEST_BYTES:
+            raise LauncherError(
+                "The host vehicle-data manifest is larger than %d MiB." %
+                (MAX_OVERLAY_MANIFEST_BYTES // (1024 * 1024)))
         payload = {}
         total = 0
         for entry in members:

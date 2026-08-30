@@ -9,6 +9,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,12 +17,14 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 sys.path.insert(0, str(ROOT / 'launcher'))
 
 from vehicle_overlay_store import (
-    MAX_OVERLAY_MEMBER_BYTES, VehicleOverlayStore,
+    MAX_OVERLAY_MANIFEST_BYTES, MAX_OVERLAY_MEMBER_BYTES,
+    MAX_OVERLAY_MEMBERS, VehicleOverlayStore,
     VehicleOverlayStoreError)
 from lan_battle_server import (
     CLIENT_BUILD_0922, ClientHandler, PROTOCOL_VERSION,
     ThreadedTCPServer, VEHICLE_OVERLAY_CAPABILITY)
 import core as launcher_core
+import vehicle_overlays as launcher_vehicle_overlays
 
 
 MEMBER = "scripts/item_defs/vehicles/ussr/R11_MS-1.xml"
@@ -60,6 +63,12 @@ def _member_entry(member=MEMBER, data=MEMBER_DATA):
     }
 
 
+def _capacity_entries(count):
+    return [_member_entry(
+        member=("scripts/item_defs/vehicles/ussr/Capacity_%04d.xml" %
+                index)) for index in range(count)]
+
+
 class VehicleOverlayStoreTest(unittest.TestCase):
     def setUp(self):
         self.game = tempfile.mkdtemp()
@@ -93,6 +102,20 @@ class VehicleOverlayStoreTest(unittest.TestCase):
         self.assertFalse(payload["present"])
         self.assertEqual([], payload["members"])
         self.assertIsNone(store.member_payload(MEMBER))
+
+    def test_launcher_and_server_capacity_limits_match(self):
+        self.assertEqual(
+            MAX_OVERLAY_MEMBERS,
+            launcher_core.MAX_OVERLAY_MEMBERS)
+        self.assertEqual(
+            MAX_OVERLAY_MEMBERS,
+            launcher_vehicle_overlays.MAX_OVERLAY_MEMBERS)
+        self.assertEqual(
+            MAX_OVERLAY_MANIFEST_BYTES,
+            launcher_core.MAX_OVERLAY_MANIFEST_BYTES)
+        self.assertEqual(
+            MAX_OVERLAY_MANIFEST_BYTES,
+            launcher_vehicle_overlays.MAX_OVERLAY_MANIFEST_BYTES)
 
     def test_a_store_without_a_root_is_empty(self):
         store = VehicleOverlayStore()
@@ -166,6 +189,46 @@ class VehicleOverlayStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(
                 VehicleOverlayStoreError, "size"):
             VehicleOverlayStore(self.game)
+
+    def test_store_accepts_the_full_supported_member_count(self):
+        raw = _manifest_bytes(_capacity_entries(MAX_OVERLAY_MEMBERS))
+
+        def read_file(path):
+            if path.endswith("vehicle_overlays.json"):
+                return raw
+            return MEMBER_DATA
+
+        with mock.patch(
+                "vehicle_overlay_store.os.path.isfile", return_value=True):
+            store = VehicleOverlayStore(self.game, read_file=read_file)
+
+        self.assertEqual(MAX_OVERLAY_MEMBERS, store.member_count)
+        self.assertLess(len(raw), MAX_OVERLAY_MANIFEST_BYTES)
+
+    def test_store_rejects_one_member_over_the_supported_count(self):
+        raw = _manifest_bytes(_capacity_entries(MAX_OVERLAY_MEMBERS + 1))
+
+        with mock.patch(
+                "vehicle_overlay_store.os.path.isfile", return_value=True), \
+                self.assertRaisesRegex(
+                    VehicleOverlayStoreError, "more than 1024 members"):
+            VehicleOverlayStore(
+                self.game,
+                read_file=lambda unused_path: raw)
+
+    def test_store_rejects_a_manifest_above_the_byte_limit(self):
+        raw = _manifest_bytes([_member_entry()])
+
+        with mock.patch(
+                "vehicle_overlay_store.os.path.isfile", return_value=True), \
+                mock.patch(
+                    "vehicle_overlay_store.MAX_OVERLAY_MANIFEST_BYTES",
+                    len(raw) - 1), self.assertRaisesRegex(
+                        VehicleOverlayStoreError,
+                        "vehicle_overlays.json is larger"):
+            VehicleOverlayStore(
+                self.game,
+                read_file=lambda unused_path: raw)
 
 
 class VehicleOverlayProbeExchangeTest(unittest.TestCase):

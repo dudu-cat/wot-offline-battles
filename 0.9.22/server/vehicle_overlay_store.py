@@ -23,7 +23,8 @@ import re
 
 MANIFEST_RELATIVE = ("res_mods", "0.9.22.0.1", "vehicle_overlays.json")
 OVERLAY_ROOT_RELATIVE = ("res_mods", "0.9.22.0.1")
-MAX_OVERLAY_MEMBERS = 64
+MAX_OVERLAY_MEMBERS = 1024
+MAX_OVERLAY_MANIFEST_BYTES = 32 * 1024 * 1024
 MAX_OVERLAY_MEMBER_BYTES = 8 * 1024 * 1024
 MAX_OVERLAY_TOTAL_BYTES = 64 * 1024 * 1024
 
@@ -66,6 +67,10 @@ class VehicleOverlayStore(object):
         except (IOError, OSError) as error:
             raise VehicleOverlayStoreError(
                 "vehicle_overlays.json is unreadable: %s" % error)
+        if len(raw) > MAX_OVERLAY_MANIFEST_BYTES:
+            raise VehicleOverlayStoreError(
+                "vehicle_overlays.json is larger than %d MiB." %
+                (MAX_OVERLAY_MANIFEST_BYTES // (1024 * 1024)))
         try:
             manifest = json.loads(raw.decode("utf-8"))
         except (TypeError, ValueError) as error:
@@ -75,10 +80,13 @@ class VehicleOverlayStore(object):
             raise VehicleOverlayStoreError(
                 "vehicle_overlays.json must be an object.")
         members = manifest.get("members")
-        if (not isinstance(members, list) or
-                len(members) > MAX_OVERLAY_MEMBERS):
+        if not isinstance(members, list):
             raise VehicleOverlayStoreError(
                 "the overlay manifest member list is invalid.")
+        if len(members) > MAX_OVERLAY_MEMBERS:
+            raise VehicleOverlayStoreError(
+                "the overlay manifest contains more than %d members." %
+                MAX_OVERLAY_MEMBERS)
         root = os.path.join(game_root, *OVERLAY_ROOT_RELATIVE)
         loaded = {}
         entries = []

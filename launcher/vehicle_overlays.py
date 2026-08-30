@@ -58,6 +58,8 @@ PROFILE_STORE_APPDATA_PARTS = (
 PROFILE_STORE_SCHEMA = 1
 ORIGINAL_PROFILE_LABEL = "Original vehicle values"
 MAX_PROFILE_NAME_LENGTH = 64
+MAX_OVERLAY_MEMBERS = 1024
+MAX_OVERLAY_MANIFEST_BYTES = 32 * 1024 * 1024
 
 _COMPONENT_MEMBER = re.compile(
     r"^scripts/item_defs/vehicles/([a-z][a-z0-9_]*)/components/"
@@ -1511,6 +1513,10 @@ def _validate_manifest(value):
     members = value.get("members")
     if not isinstance(members, list):
         raise VehicleOverlayError("The overlay manifest member list is invalid.")
+    if len(members) > MAX_OVERLAY_MEMBERS:
+        raise VehicleOverlayError(
+            "The overlay manifest contains more than %d members." %
+            MAX_OVERLAY_MEMBERS)
     seen_members = set()
     for entry in members:
         if not isinstance(entry, dict):
@@ -1556,6 +1562,10 @@ def _validate_manifest(value):
                   not isinstance(edit["replacementValue"], str)):
                 raise VehicleOverlayError(
                     "A Packed string manifest edit must keep string values.")
+    if len(_manifest_bytes(value)) > MAX_OVERLAY_MANIFEST_BYTES:
+        raise VehicleOverlayError(
+            "The overlay manifest is larger than %d MiB." %
+            (MAX_OVERLAY_MANIFEST_BYTES // (1024 * 1024)))
     return value
 
 
@@ -2509,6 +2519,7 @@ def _profile_manifest(profile):
     manifest = _empty_manifest()
     manifest["createdAt"] = profile["createdAt"]
     manifest["updatedAt"] = profile["updatedAt"]
+    manifest["activeProfile"] = profile["name"]
     manifest["members"] = copy.deepcopy(profile["members"])
     return _validate_manifest(manifest)
 

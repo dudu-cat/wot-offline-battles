@@ -1191,6 +1191,68 @@ class VehicleOverlayTest(unittest.TestCase):
                 self.game, self.VEHICLE, "speedLimits/forward", "40",
                 is_running=lambda: False)
 
+    def test_manifest_accepts_the_full_supported_member_count(self):
+        manifest = vehicle_overlays._empty_manifest()
+        manifest["members"] = []
+        for index in range(vehicle_overlays.MAX_OVERLAY_MEMBERS):
+            member = (
+                "scripts/item_defs/vehicles/ussr/Capacity_%04d.xml" %
+                index)
+            manifest["members"].append({
+                "sourceMember": member,
+                "sourcePackage": vehicle_overlays.SOURCE_PACKAGE,
+                "overlayRelativePath": member,
+                "overlaySha256": "0" * 64,
+                "edits": [{
+                    "fieldPath": "speedLimits/forward",
+                    "originalPackedType": "integer",
+                    "originalValue": 32,
+                    "replacementValue": 40,
+                }],
+            })
+
+        validated = vehicle_overlays._validate_manifest(manifest)
+
+        self.assertEqual(
+            vehicle_overlays.MAX_OVERLAY_MEMBERS,
+            len(validated["members"]))
+
+    def test_manifest_rejects_one_member_over_the_supported_count(self):
+        manifest = vehicle_overlays._empty_manifest()
+        entry = {
+            "sourceMember": self.VEHICLE,
+            "sourcePackage": vehicle_overlays.SOURCE_PACKAGE,
+            "overlayRelativePath": self.VEHICLE,
+            "overlaySha256": "0" * 64,
+            "edits": [{
+                "fieldPath": "speedLimits/forward",
+                "originalPackedType": "integer",
+                "originalValue": 32,
+                "replacementValue": 40,
+            }],
+        }
+        manifest["members"] = [entry] * (
+            vehicle_overlays.MAX_OVERLAY_MEMBERS + 1)
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "more than 1024 members"):
+            vehicle_overlays._validate_manifest(manifest)
+
+    def test_manifest_size_error_is_distinct_from_member_count(self):
+        manifest = vehicle_overlays._empty_manifest()
+
+        class OversizedPayload(object):
+            def __len__(self):
+                return vehicle_overlays.MAX_OVERLAY_MANIFEST_BYTES + 1
+
+        with mock.patch.object(
+                vehicle_overlays, "_manifest_bytes",
+                return_value=OversizedPayload()), self.assertRaisesRegex(
+                    vehicle_overlays.VehicleOverlayError,
+                    "larger than 32 MiB"):
+            vehicle_overlays._validate_manifest(manifest)
+
     def test_manifest_values_cannot_change_the_recorded_packed_type(self):
         vehicle_overlays.apply_vehicle_edit(
             self.game, self.VEHICLE, "speedLimits/forward", "40",
