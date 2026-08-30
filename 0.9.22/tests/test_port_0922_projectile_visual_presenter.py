@@ -96,11 +96,13 @@ class _ProjectileMover(object):
         self.hide_calls.append(args)
         if self.hide_error is not None:
             raise self.hide_error
+        self._ProjectileMover__projectiles.pop(args[0], None)
 
     def explode(self, *args):
         self.explode_calls.append(args)
         if self.explode_error is not None:
             raise self.explode_error
+        self._ProjectileMover__projectiles.pop(args[0], None)
 
     def destroy(self):
         self.destroy_calls += 1
@@ -298,6 +300,88 @@ class ProjectileVisualPresenterTests(unittest.TestCase):
             self.assertEqual(1, len(mover.hide_calls))
             self.assertEqual(visual_id, mover.hide_calls[0][0])
 
+    def test_native_explosion_failure_disables_only_later_explosions(self):
+        effects = {'groundHit': ('stages', 'effect', None)}
+        with mock.patch.dict(sys.modules, _modules({7: effects})):
+            factory = self._factory()
+            first = factory.play_projectile_tracer(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, -5.0, 0.0), 9.81, 640.0, 42, 'first')
+            second = factory.play_projectile_tracer(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, -5.0, 0.0), 9.81, 640.0, 42, 'second')
+            mover = _ProjectileMover.instances[0]
+            mover.explode_error = RuntimeError('native explosion failed')
+
+            self.assertTrue(factory.stop_projectile_tracer(
+                'first', (12.0, 0.0, 3.0),
+                explosion=(effects, 'ground', (2.0, -2.0, 0.0))))
+            mover.explode_error = None
+            self.assertTrue(factory.stop_projectile_tracer(
+                'second', (13.0, 0.0, 3.0),
+                explosion=(effects, 'ground', (2.0, -2.0, 0.0))))
+
+            self.assertEqual([first], [call[0] for call in mover.explode_calls])
+            self.assertEqual([first, second],
+                             [call[0] for call in mover.hide_calls])
+
+    def test_cosmetic_budget_is_per_attacker_and_refills(self):
+        presenter = _RemoteShotPresenter(
+            self.bigworld, self.math, types.SimpleNamespace(), 7)
+
+        for index in range(16):
+            self.assertTrue(presenter.admit_visual(
+                42, 'shot:%d' % index, now=10.0))
+        self.assertFalse(presenter.admit_visual(
+            42, 'shot:overflow', now=10.0))
+        self.assertTrue(presenter.admit_visual(
+            43, 'other:0', now=10.0))
+        self.assertTrue(presenter.admit_visual(
+            42, 'shot:refilled', now=10.2))
+        # A duplicate launch decision never consumes a second token.
+        self.assertTrue(presenter.admit_visual(
+            42, 'shot:0', now=10.2))
+
+    def test_same_attacker_pressure_hides_oldest_without_ghost_rows(self):
+        with mock.patch.dict(sys.modules, _modules()):
+            presenter = _RemoteShotPresenter(
+                self.bigworld, self.math, types.SimpleNamespace(), 7)
+            for index in range(25):
+                projectile_id = 'rapid:%d' % index
+                self.assertTrue(presenter.admit_visual(
+                    42, projectile_id, now=float(index)))
+                self.assertTrue(presenter.play_canonical(
+                    _descriptor(), 0, (float(index), 1.0, 0.0),
+                    (100.0, 0.0, 0.0), 9.81, 640.0, 42,
+                    projectile_id))
+
+            mover = _ProjectileMover.instances[0]
+            self.assertEqual(24, len(presenter._projectile_shots))
+            self.assertEqual(24, len(mover._ProjectileMover__projectiles))
+            self.assertNotIn('rapid:0', presenter._projectile_shots)
+            self.assertIn('rapid:24', presenter._projectile_shots)
+            self.assertEqual([1000000],
+                             [call[0] for call in mover.hide_calls])
+
+    def test_pressure_hide_failure_stops_new_cosmetic_load(self):
+        with mock.patch.dict(sys.modules, _modules()):
+            presenter = _RemoteShotPresenter(
+                self.bigworld, self.math, types.SimpleNamespace(), 7)
+            presenter._MAX_ACTIVE_PER_ATTACKER = 1
+            self.assertTrue(presenter.play_canonical(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, 0.0, 0.0), 9.81, 640.0, 42, 'first'))
+            mover = _ProjectileMover.instances[0]
+            mover.hide_error = RuntimeError('native hide failed')
+
+            self.assertFalse(presenter.play_canonical(
+                _descriptor(), 0, (1.0, 1.0, 0.0),
+                (100.0, 0.0, 0.0), 9.81, 640.0, 42, 'second'))
+
+            self.assertEqual(1, len(mover.calls))
+            self.assertEqual({'first'}, set(presenter._projectile_shots))
+            self.assertFalse(presenter._launches_enabled)
+
     def test_failed_terminal_hide_keeps_mapping_for_a_safe_retry(self):
         with mock.patch.dict(sys.modules, _modules()):
             factory = self._factory()
@@ -399,6 +483,26 @@ class ProjectileVisualPresenterTests(unittest.TestCase):
             self.assertEqual(1000001, recreated)
             self.assertEqual(2, len(mover.calls))
             self.assertIn(recreated, mover._ProjectileMover__projectiles)
+
+    def test_unrelated_launch_prunes_native_retired_dedupe_row(self):
+        with mock.patch.dict(sys.modules, _modules()):
+            factory = self._factory()
+            retired = factory.play_projectile_tracer(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, 0.0, 0.0), 9.81, 640.0, 42,
+                'retired-shot')
+            mover = _ProjectileMover.instances[0]
+            mover._ProjectileMover__projectiles.pop(retired)
+
+            self.assertTrue(factory.play_projectile_tracer(
+                _descriptor(), 0, (0.0, 1.0, 0.0),
+                (100.0, 0.0, 0.0), 9.81, 640.0, 42,
+                'next-shot'))
+
+            self.assertNotIn(
+                'retired-shot', factory._shot_presenter._projectile_shots)
+            self.assertNotIn(
+                'retired-shot', factory._shot_presenter._projectile_order)
 
     def test_invalid_native_values_and_missing_effects_fail_closed(self):
         with mock.patch.dict(sys.modules, _modules({})):

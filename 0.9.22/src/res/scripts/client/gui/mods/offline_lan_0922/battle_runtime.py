@@ -87,6 +87,22 @@ class _LiveSpaceVisibilityPending(Exception):
     """The mapped native space has not reached BigWorld.spaces yet."""
 
 
+class _MutedShootingExtra(object):
+    """Keep stock shot bookkeeping while suppressing one cosmetic extra."""
+
+    def __init__(self, original):
+        self._original = original
+
+    def startFor(self, unused_vehicle, unused_burst_count):
+        return None
+
+    def stopFor(self, unused_vehicle):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
 # AvatarInputHandler._Targeting gives the native BigWorld.target these exact
 # values.  The manual target adapter applies the static-world mouse-ray gate
 # separately; the physical gun line is still irrelevant to an outline.
@@ -7551,6 +7567,9 @@ class BattleRuntime(object):
         if (not target_record.get('local') and
                 not bool(target_record.get('spot_visible', True))):
             return False
+        if not self._projectile_cosmetic_allowed(
+                event, self._projectile_visual_meta):
+            return False
 
         effects_index = _field(shell, 'effectsIndex', None)
         if effects_index is None:
@@ -7569,16 +7588,24 @@ class BattleRuntime(object):
         add_effect = getattr(terrain_effects, 'addNew', None)
         if not callable(add_effect):
             raise RuntimeError('#1513 terrain hit-effects boundary is unavailable')
+        if not self._optional_feature_enabled(
+                'projectile impact presentation'):
+            return False
         self._report_effect(
             'armour_hit', effect_group, effects_index,
             (_number(event.get('x')), _number(event.get('y')),
              _number(event.get('z'))), direction)
-        add_effect(
-            hit_position, effects, stages, None, dir=direction,
-            start=hit_position - direction.scale(0.4),
-            end=hit_position + direction.scale(0.4),
-            showShockWave=bool(target_record.get('local')),
-            showFlashBang=bool(target_record.get('local')))
+        try:
+            add_effect(
+                hit_position, effects, stages, None, dir=direction,
+                start=hit_position - direction.scale(0.4),
+                end=hit_position + direction.scale(0.4),
+                showShockWave=bool(target_record.get('local')),
+                showFlashBang=bool(target_record.get('local')))
+        except Exception as error:
+            self._warn_optional_failure(
+                'projectile impact presentation', error)
+            return False
         return True
 
     _DECAL_REPORT_LIMIT = 32
@@ -8578,6 +8605,61 @@ class BattleRuntime(object):
         self._local_fire_intent = None
         return True
 
+    def _admit_projectile_visual(self, attacker_id, projectile_id, now):
+        """Ask the presenter for cosmetic capacity, never authority capacity."""
+        if projectile_id is None or self._remote_factory is None:
+            return True
+        callback = getattr(
+            self._remote_factory, 'admit_projectile_visual', None)
+        if not callable(callback):
+            # Compatibility factories used by older local tools have no
+            # budget seam; preserving their existing presentation is safe.
+            return True
+        try:
+            return bool(callback(attacker_id, projectile_id, now))
+        except Exception as error:
+            self._warn_optional_failure(
+                'projectile visual admission', error)
+            return False
+
+    @staticmethod
+    def _projectile_cosmetic_allowed(event, visual_meta):
+        projectile_id = (event.get('projectile_id')
+                         if isinstance(event, dict) else None)
+        if projectile_id is None:
+            return True
+        visual = visual_meta.get(str(projectile_id))
+        return visual is None or bool(visual.get('admitted', True))
+
+    def _show_local_shot_without_extra(self, entity, burst_count):
+        """Advance stock local shot state without starting another effect."""
+        descriptor = getattr(entity, 'typeDescriptor', None)
+        extras = getattr(descriptor, 'extrasDict', None)
+        try:
+            original = extras.get('shoot')
+        except AttributeError:
+            original = None
+        if original is None:
+            # No shoot extra means the stock call itself has no cosmetic work
+            # for us to suppress, while its dispersion handshake still matters.
+            return entity.showShooting(burst_count, False)
+        try:
+            original.stopFor(entity)
+        except Exception as error:
+            self._warn_optional_failure(
+                'shot muzzle retirement', error, disable=False)
+        muted = _MutedShootingExtra(original)
+        try:
+            extras['shoot'] = muted
+        except Exception:
+            # A non-mutable descriptor cannot be safely intercepted. Preserve
+            # stock shot convergence rather than leaving gameplay state stale.
+            return entity.showShooting(burst_count, False)
+        try:
+            return entity.showShooting(burst_count, False)
+        finally:
+            extras['shoot'] = original
+
     def _show_shot(self, event, update_state=True):
         key = self._event_entity_key(event, 'attacker')
         if key is None:
@@ -8599,6 +8681,7 @@ class BattleRuntime(object):
         transient_names = []
         try:
             normalized = None
+            visual_admitted = True
             try:
                 burst_index = int(event.get('burst_index', 0))
             except (TypeError, ValueError, OverflowError):
@@ -8625,6 +8708,8 @@ class BattleRuntime(object):
                 origin = event.get('origin')
                 velocity = event.get('velocity')
                 gravity = _number(event.get('gravity'))
+                visual_admitted = self._admit_projectile_visual(
+                    entity.id, projectile_id, self._clock())
                 elapsed = self._projectile_launch_age(event, self._clock())
                 reference_origin = trajectory_position(
                     origin, velocity, (0.0, -gravity, 0.0), elapsed)
@@ -8637,6 +8722,7 @@ class BattleRuntime(object):
                         'origin': tuple(float(value) for value in origin),
                         'velocity': tuple(float(value) for value in velocity),
                         'gravity': gravity,
+                        'admitted': visual_admitted,
                     }
                 for name, value in (
                         ('_offlineLANShotOrigin', origin),
@@ -8655,16 +8741,23 @@ class BattleRuntime(object):
                 # stock local Vehicle has no such delegate, so launch its
                 # authoritative tracer explicitly from the event instead of
                 # reconstructing it from a later muzzle pose.
-                if ((not bool(getattr(
-                        entity, '_offlineLANPresentation', False)) or
-                        burst_index > 0) and
+                if (visual_admitted and
+                        (not bool(getattr(
+                            entity, '_offlineLANPresentation', False)) or
+                         burst_index > 0 or
+                         not self._optional_feature_enabled(
+                             'shot muzzle presentation')) and
                         self._remote_factory is not None):
-                    self._remote_factory.play_projectile_tracer(
-                        entity.typeDescriptor,
-                        entity._offlineLANShotIndex,
-                        origin, velocity, gravity,
-                        event.get('maxDistance'), entity.id, projectile_id,
-                        reference_origin, reference_velocity)
+                    self._run_optional_feature(
+                        'projectile visual launch',
+                        self._remote_factory.play_projectile_tracer,
+                        args=(
+                            entity.typeDescriptor,
+                            entity._offlineLANShotIndex,
+                            origin, velocity, gravity,
+                            event.get('maxDistance'), entity.id,
+                            projectile_id, reference_origin,
+                            reference_velocity))
             if burst_index == 0:
                 # One native call owns the grouped muzzle effect and local
                 # waiting-for-shot handshake.  Later physical rounds already
@@ -8681,7 +8774,17 @@ class BattleRuntime(object):
                     burst_count = int(burst_count)
                 except (TypeError, ValueError, OverflowError):
                     burst_count = 1
-                entity.showShooting(max(1, burst_count), False)
+                burst_count = max(1, burst_count)
+                if (visual_admitted and self._optional_feature_enabled(
+                        'shot muzzle presentation')):
+                    self._run_optional_feature(
+                        'shot muzzle presentation', entity.showShooting,
+                        args=(burst_count, False))
+                elif record.get('local'):
+                    self._run_optional_feature(
+                        'local shot convergence',
+                        self._show_local_shot_without_extra,
+                        args=(entity, burst_count))
         finally:
             for name in transient_names:
                 try:
@@ -9295,6 +9398,9 @@ class BattleRuntime(object):
         """Play the stock armour-hit family on one visible retained wreck."""
         if self._worker_mode:
             return False
+        visual = self._projectile_visual_meta.get(projectile_id)
+        if visual is not None and not bool(visual.get('admitted', True)):
+            return False
         wreck_hit = event.get('wreck_hit')
         if (not isinstance(wreck_hit, dict) or
                 set(wreck_hit) != {'target_kind', 'target_id'}):
@@ -9353,15 +9459,22 @@ class BattleRuntime(object):
         hit_position = self._vector(_xyz(impact))
         terrain_effects = getattr(self._avatar, 'terrainEffects', None)
         add_effect = getattr(terrain_effects, 'addNew', None)
-        if not callable(add_effect):
+        if (not callable(add_effect) or
+                not self._optional_feature_enabled(
+                    'projectile impact presentation')):
             return False
         self._report_effect(
             'wreck_hit', 'armorHit', effects_index, impact, direction)
-        add_effect(
-            hit_position, effects, stages, None, dir=direction,
-            start=hit_position - direction.scale(0.4),
-            end=hit_position + direction.scale(0.4),
-            showShockWave=False, showFlashBang=False)
+        try:
+            add_effect(
+                hit_position, effects, stages, None, dir=direction,
+                start=hit_position - direction.scale(0.4),
+                end=hit_position + direction.scale(0.4),
+                showShockWave=False, showFlashBang=False)
+        except Exception as error:
+            self._warn_optional_failure(
+                'projectile impact presentation', error)
+            return False
         return True
 
     def _ensure_projectile_visual(self, normalized, now):
@@ -9412,15 +9525,29 @@ class BattleRuntime(object):
             # attribution.  A disconnected shooter must not erase a live
             # projectile restored from the durable snapshot.
             attacker_id = int(normalized['shooter_id'])
-        return bool(self._remote_factory.play_projectile_tracer(
-            descriptor, normalized['shell_index'],
-            normalized['segment_origin'], normalized['segment_velocity'],
-            gravity, max(
-                0.001, normalized['max_distance'] -
-                normalized['checked_distance']),
-            attacker_id, normalized['projectile_id'], reference_origin,
-            reference_velocity,
-            is_ricochet=bool(normalized['ricochet_count'])))
+        admitted = (bool(existing_visual.get('admitted', True))
+                    if existing_visual is not None else
+                    self._admit_projectile_visual(
+                        attacker_id, normalized['projectile_id'], now))
+        self._projectile_visual_meta[normalized['projectile_id']][
+            'admitted'] = admitted
+        if not admitted or not self._optional_feature_enabled(
+                'projectile visual launch'):
+            return False
+        try:
+            return bool(self._remote_factory.play_projectile_tracer(
+                descriptor, normalized['shell_index'],
+                normalized['segment_origin'],
+                normalized['segment_velocity'], gravity, max(
+                    0.001, normalized['max_distance'] -
+                    normalized['checked_distance']),
+                attacker_id, normalized['projectile_id'], reference_origin,
+                reference_velocity,
+                is_ricochet=bool(normalized['ricochet_count'])))
+        except Exception as error:
+            self._warn_optional_failure(
+                'projectile visual launch', error)
+            return False
 
     def _projectile_explosion(self, projectile_id, impact):
         """Return ``(effectsDescr, effectMaterial, velocity)`` for a world hit.
@@ -9431,6 +9558,9 @@ class BattleRuntime(object):
         """
         meta = self._projectile_meta.get(projectile_id)
         if meta is None or meta.get('hit_vehicle') is not False:
+            return None
+        visual = self._projectile_visual_meta.get(projectile_id)
+        if visual is not None and not bool(visual.get('admitted', True)):
             return None
         shot = self._projectile_shot(meta)
         shell = _field(shot, 'shell', None)
@@ -9512,9 +9642,17 @@ class BattleRuntime(object):
                     (0.0, -visual['gravity'], 0.0), elapsed)
         if impact is None:
             return False
-        stopped = bool(self._remote_factory.stop_projectile_tracer(
-            projectile_id, impact,
-            explosion=self._projectile_explosion(projectile_id, impact)))
+        try:
+            stopped = bool(self._remote_factory.stop_projectile_tracer(
+                projectile_id, impact,
+                explosion=self._projectile_explosion(
+                    projectile_id, impact)))
+        except Exception as error:
+            # Terminal authority has already been applied.  A native cosmetic
+            # retirement failure must not poison the ordered event journal.
+            self._warn_optional_failure(
+                'projectile visual retirement', error, disable=False)
+            stopped = False
         self._projectile_visual_meta.pop(projectile_id, None)
         return stopped
 

@@ -267,6 +267,14 @@ class _RemoteShotPresenter(object):
     #1513 adaptation of the mature 0.8.2 remote-shot presentation path.
     """
 
+    # A stock gun can emit a short autocannon burst, so keep a generous
+    # immediate allowance.  Sustained edited reloads are presentation-only
+    # load and refill more slowly than they can create native particles.
+    _VISUAL_BURST_CAPACITY = 16.0
+    _VISUAL_REFILL_PER_SECOND = 5.0
+    _MAX_ACTIVE_PER_ATTACKER = 24
+    _MAX_ACTIVE_TOTAL = 128
+
     def __init__(self, bigworld, math_module, model_assembler, space_id):
         self._bigworld = bigworld
         self._math = math_module
@@ -275,8 +283,70 @@ class _RemoteShotPresenter(object):
         self._mover = None
         self._next_shot_id = 1000000
         self._projectile_shots = {}
+        self._projectile_order = []
+        self._visual_budgets = {}
+        self._visual_admissions = {}
         self._failure_stages = set()
+        self._launches_enabled = True
+        self._explosions_enabled = True
         self._closed = False
+
+    def admit_visual(self, attacker_id, projectile_id=None, now=None):
+        """Bound cosmetic work without rejecting the authoritative shot.
+
+        One admission owns the muzzle, tracer and terminal effect family for
+        a projectile.  Callers may ask before entering native ``showShooting``;
+        ``play_canonical`` then reuses the stored decision instead of charging
+        the same projectile twice.
+        """
+        if self._closed or not self._launches_enabled:
+            return False
+        try:
+            attacker_id = int(attacker_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if attacker_id <= 0:
+            return False
+        key = None
+        if projectile_id is not None:
+            try:
+                key = str(projectile_id)
+            except Exception:
+                return False
+            if not key or len(key) > 128:
+                return False
+            decision = self._visual_admissions.get(key)
+            if decision is not None:
+                return bool(decision[1]) if decision[0] == attacker_id else False
+        moment = self._visual_clock(now)
+        state = self._visual_budgets.get(attacker_id)
+        if state is None:
+            tokens = self._VISUAL_BURST_CAPACITY
+        else:
+            tokens, updated = state
+            elapsed = max(0.0, moment - updated)
+            tokens = min(
+                self._VISUAL_BURST_CAPACITY,
+                tokens + elapsed * self._VISUAL_REFILL_PER_SECOND)
+        admitted = tokens >= 1.0 - 1.0e-9
+        if admitted:
+            tokens = max(0.0, tokens - 1.0)
+        self._visual_budgets[attacker_id] = (tokens, moment)
+        if key is not None:
+            self._visual_admissions[key] = (attacker_id, admitted)
+        return admitted
+
+    def _visual_clock(self, now):
+        moment = self._finite_float(now)
+        if moment is not None:
+            return moment
+        callback = getattr(self._bigworld, 'time', None)
+        if callable(callback):
+            try:
+                moment = self._finite_float(callback())
+            except Exception:
+                moment = None
+        return time.time() if moment is None else moment
 
     def setup_recoil(self, vehicle):
         if vehicle.model is None or vehicle.typeDescriptor is None:
@@ -355,7 +425,7 @@ class _RemoteShotPresenter(object):
         Invalid native-boundary values fail closed before ProjectileMover is
         constructed or called.
         """
-        if self._closed:
+        if self._closed or not self._launches_enabled:
             return False
         shot = self._shot_at(descriptor, shell_index)
         shell = _component_value(shot, 'shell')
@@ -382,13 +452,16 @@ class _RemoteShotPresenter(object):
             if not projectile_id or len(projectile_id) > 128:
                 return False
             existing = self._projectile_shots.get(projectile_id)
-            if existing is None and len(self._projectile_shots) >= 128:
-                return False
         if (visual_start is None or reference_start is None or
                 reference_velocity is None or gravity is None or
                 maximum is None or gravity < 0.0 or maximum <= 0.0 or
                 attacker_id <= 0):
             return False
+        if (existing is None and
+                not self.admit_visual(attacker_id, projectile_id)):
+            return False
+        mover = None
+        shot_id = None
         try:
             from items import vehicles
             effects_descr = vehicles.g_cache.shotEffects[effects_index]
@@ -401,8 +474,11 @@ class _RemoteShotPresenter(object):
             mover = self._projectile_mover()
             if mover is None:
                 return False
+            self._prune_stale_projectiles(mover)
+            existing = (self._projectile_shots.get(projectile_id)
+                        if projectile_id is not None else None)
             if existing is not None:
-                existing_id, existing_artillery = existing
+                existing_id, existing_artillery = existing[:2]
                 if existing_artillery:
                     return existing_id
                 active = getattr(
@@ -413,7 +489,9 @@ class _RemoteShotPresenter(object):
                 # The native simulator discarded or retired the projectile
                 # without an authoritative terminal.  Drop only our stale
                 # dedupe entry so the active snapshot can recreate it.
-                self._projectile_shots.pop(projectile_id, None)
+                self._remove_projectile_mapping(projectile_id)
+            if not self._ensure_visual_capacity(mover, attacker_id):
+                return False
             camera = getattr(self._bigworld, 'camera', None)
             camera = camera() if callable(camera) else None
             camera_position = self._finite_vector(
@@ -444,15 +522,103 @@ class _RemoteShotPresenter(object):
             if is_ricochet:
                 hold = getattr(mover, 'hold', None)
                 if not callable(hold):
+                    self._hide_untracked(mover, shot_id, reference_start)
                     return False
-                hold(shot_id)
+                try:
+                    hold(shot_id)
+                except Exception as error:
+                    self._hide_untracked(mover, shot_id, reference_start)
+                    self._report_failure('native hold exception', error)
+                    return False
             if projectile_id is not None:
                 self._projectile_shots[projectile_id] = (
-                    shot_id, artillery)
+                    shot_id, artillery, attacker_id, reference_start)
+                self._projectile_order.append(projectile_id)
             return shot_id
         except Exception as error:
+            if mover is not None and shot_id is not None:
+                self._hide_untracked(mover, shot_id, reference_start)
+            self._launches_enabled = False
             self._report_failure('launch exception', error)
             return False
+
+    def _prune_stale_projectiles(self, mover):
+        """Release dedupe rows already retired by native ballistics."""
+        active = getattr(mover, '_ProjectileMover__projectiles', None)
+        if not isinstance(active, dict):
+            return False
+        changed = False
+        for projectile_id, entry in tuple(self._projectile_shots.items()):
+            shot_id, artillery = entry[:2]
+            if not artillery and shot_id not in active:
+                self._remove_projectile_mapping(projectile_id)
+                changed = True
+        return changed
+
+    def _ensure_visual_capacity(self, mover, attacker_id):
+        """Retire oldest visuals before native pools can grow unbounded."""
+        while True:
+            attacker_active = sum(
+                1 for entry in self._projectile_shots.values()
+                if len(entry) > 2 and entry[2] == attacker_id)
+            total_active = len(self._projectile_shots)
+            if (attacker_active < self._MAX_ACTIVE_PER_ATTACKER and
+                    total_active < self._MAX_ACTIVE_TOTAL):
+                return True
+            candidate = None
+            for projectile_id in tuple(self._projectile_order):
+                entry = self._projectile_shots.get(projectile_id)
+                if entry is None:
+                    self._remove_projectile_order(projectile_id)
+                    continue
+                if (attacker_active >= self._MAX_ACTIVE_PER_ATTACKER and
+                        len(entry) > 2 and entry[2] != attacker_id):
+                    continue
+                candidate = projectile_id
+                break
+            if candidate is None:
+                return False
+            if not self._retire_for_pressure(mover, candidate):
+                # A failed native hide is the exact moment to stop adding
+                # cosmetic work.  Authority continues without this presenter.
+                self._launches_enabled = False
+                return False
+
+    def _retire_for_pressure(self, mover, projectile_id):
+        entry = self._projectile_shots.get(projectile_id)
+        if entry is None:
+            return True
+        shot_id = entry[0]
+        endpoint = entry[3] if len(entry) > 3 else None
+        if not self._hide_untracked(mover, shot_id, endpoint):
+            return False
+        attacker_id = entry[2] if len(entry) > 2 else 0
+        self._remove_projectile_mapping(projectile_id)
+        if attacker_id > 0:
+            self._visual_admissions[projectile_id] = (attacker_id, False)
+        return True
+
+    def _hide_untracked(self, mover, shot_id, endpoint):
+        callback = getattr(mover, 'hide', None)
+        endpoint = self._finite_vector(endpoint)
+        if not callable(callback) or endpoint is None:
+            return False
+        try:
+            callback(shot_id, endpoint)
+        except Exception as error:
+            self._report_failure('pressure hide exception', error)
+            return False
+        return True
+
+    def _remove_projectile_mapping(self, projectile_id):
+        self._projectile_shots.pop(projectile_id, None)
+        self._remove_projectile_order(projectile_id)
+
+    def _remove_projectile_order(self, projectile_id):
+        try:
+            self._projectile_order.remove(projectile_id)
+        except ValueError:
+            pass
 
     def stop_canonical(self, projectile_id, end_position,
                        explosion=None):
@@ -474,14 +640,20 @@ class _RemoteShotPresenter(object):
             return False
         entry = self._projectile_shots.get(projectile_id)
         end = self._finite_vector(end_position)
-        if entry is None or end is None:
+        if entry is None:
+            # A denied or pressure-retired visual still receives the complete
+            # authoritative terminal.  Forget only its cosmetic admission.
+            self._visual_admissions.pop(projectile_id, None)
             return False
-        shot_id, unused_artillery = entry
+        if end is None:
+            return False
+        shot_id = entry[0]
         mover = self._mover
         if mover is None:
             return False
         if self._explode_canonical(mover, shot_id, end, explosion):
-            self._projectile_shots.pop(projectile_id, None)
+            self._remove_projectile_mapping(projectile_id)
+            self._visual_admissions.pop(projectile_id, None)
             return True
         callback = getattr(mover, 'hide', None) if mover is not None else None
         if not callable(callback):
@@ -489,9 +661,11 @@ class _RemoteShotPresenter(object):
         try:
             callback(shot_id, end)
         except Exception as error:
+            self._launches_enabled = False
             self._report_failure('terminal hide exception', error)
             return False
-        self._projectile_shots.pop(projectile_id, None)
+        self._remove_projectile_mapping(projectile_id)
+        self._visual_admissions.pop(projectile_id, None)
         return True
 
     def _explode_canonical(self, mover, shot_id, end, explosion):
@@ -502,7 +676,7 @@ class _RemoteShotPresenter(object):
         terminal point and direction, or marks the live projectile to render
         the explosion from the native terminal callback.
         """
-        if not explosion:
+        if not explosion or not self._explosions_enabled:
             return False
         explode = getattr(mover, 'explode', None)
         if not callable(explode):
@@ -529,7 +703,9 @@ class _RemoteShotPresenter(object):
             direction.normalise()
             explode(shot_id, effects_descr, str(effect_material), end,
                     direction)
-        except Exception:
+        except Exception as error:
+            self._explosions_enabled = False
+            self._report_failure('terminal explosion exception', error)
             return False
         return True
 
@@ -562,7 +738,8 @@ class _RemoteShotPresenter(object):
             return None
 
     def _projectile_mover(self):
-        if self._mover is None and not self._closed:
+        if (self._mover is None and not self._closed and
+                self._launches_enabled):
             mover = None
             try:
                 from ProjectileMover import ProjectileMover
@@ -584,6 +761,7 @@ class _RemoteShotPresenter(object):
                         destroy()
                     except Exception:
                         pass
+                self._launches_enabled = False
                 self._report_failure('mover setup', error)
                 return None
         return self._mover
@@ -672,6 +850,9 @@ class _RemoteShotPresenter(object):
         # instead of leaking a callback subscription with no Python owner.
         self._mover = None
         self._projectile_shots = {}
+        self._projectile_order = []
+        self._visual_budgets = {}
+        self._visual_admissions = {}
 
 
 class _RemoteFilter(object):
@@ -2129,6 +2310,11 @@ class RemoteVehicleFactory(object):
             descriptor, shell_index, origin, velocity, gravity,
             max_distance, attacker_id, projectile_id,
             reference_position, reference_velocity, is_ricochet)
+
+    def admit_projectile_visual(self, attacker_id, projectile_id, now=None):
+        """Reserve one bounded cosmetic slot for a canonical projectile."""
+        return self._shot_presenter.admit_visual(
+            attacker_id, projectile_id, now)
 
     def stop_projectile_tracer(self, projectile_id, end_position,
                                explosion=None):

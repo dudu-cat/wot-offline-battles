@@ -507,6 +507,41 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual((100.0, 10.0, 0.0), arguments[9])
         source.showShooting.assert_called_once_with(1, False)
 
+    def test_denied_cosmetic_still_installs_authoritative_projectile(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        source = battle._server_entity(41)
+        source.showShooting = mock.Mock(return_value=True)
+        battle._remote_factory = types.SimpleNamespace(
+            admit_projectile_visual=mock.Mock(return_value=False),
+            play_projectile_tracer=mock.Mock(return_value=1000000))
+
+        self.assertTrue(battle._show_shot(_event()))
+
+        self.assertIn('player:7:1', battle._projectile_meta)
+        self.assertFalse(
+            battle._projectile_visual_meta['player:7:1']['admitted'])
+        source.showShooting.assert_not_called()
+        battle._remote_factory.play_projectile_tracer.assert_not_called()
+
+    def test_native_muzzle_exception_is_cosmetic_and_disables_retries(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        source = battle._server_entity(41)
+        source.showShooting = mock.Mock(
+            side_effect=RuntimeError('native muzzle failed'))
+        battle._remote_factory = types.SimpleNamespace(
+            admit_projectile_visual=mock.Mock(return_value=True),
+            play_projectile_tracer=mock.Mock(return_value=1000000))
+
+        self.assertTrue(battle._show_shot(_event()))
+        second = dict(_event(), projectile_id='player:7:2', shot_seq=2)
+        self.assertTrue(battle._show_shot(second))
+
+        self.assertEqual(1, source.showShooting.call_count)
+        self.assertEqual(
+            2, battle._remote_factory.play_projectile_tracer.call_count)
+        self.assertIn(
+            'shot muzzle presentation', battle._disabled_optional_features)
+
     def test_terminal_event_hides_visual_at_authoritative_impact_once(self):
         battle, unused_bigworld = _battle()
         battle._remote_factory = types.SimpleNamespace(
@@ -525,6 +560,24 @@ class BattleProjectileTests(unittest.TestCase):
         # explosion, so the armour-hit effect is never doubled up.
         battle._remote_factory.stop_projectile_tracer.assert_called_once_with(
             'player:7:1', [5.0, 0.875, 0.0], explosion=None)
+
+    def test_native_terminal_exception_does_not_block_authority_cleanup(self):
+        battle, unused_bigworld = _battle()
+        battle._remote_factory = types.SimpleNamespace(
+            stop_projectile_tracer=mock.Mock(
+                side_effect=RuntimeError('native retire failed')))
+        self.assertTrue(battle._accept_projectile_event(_event()))
+
+        self.assertTrue(battle._apply_projectile_terminal_event({
+            'kind': 'projectile_impact',
+            'projectile_id': 'player:7:1',
+            'outcome': 'impact', 'resolved_time_ms': 500,
+            'impact': [5.0, 0.875, 0.0],
+        }))
+
+        self.assertNotIn('player:7:1', battle._projectile_meta)
+        self.assertNotIn('player:7:1', battle._projectile_visual_meta)
+        self.assertFalse(battle._projectiles.contains('player:7:1'))
 
     def test_non_authority_snapshot_keeps_metadata_for_ground_terminal(self):
         battle, unused_bigworld = _battle(now=1.0)
@@ -578,6 +631,16 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, velocity.length)
         self.assertAlmostEqual(-100.0 / math.sqrt(100.0 ** 2 + 10.0 ** 2),
                                velocity[1])
+
+    def test_denied_projectile_has_no_ground_explosion_work(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._projectile_meta['p1'] = {
+            'hit_vehicle': False, 'terminal_velocity': (0.0, -100.0, 10.0),
+            'shooter_kind': 'player', 'shooter_id': 7, 'shell_index': 0}
+        battle._projectile_visual_meta['p1'] = {'admitted': False}
+
+        self.assertIsNone(
+            battle._projectile_explosion('p1', (1.0, 2.0, 3.0)))
 
     def test_a_vehicle_terminal_carries_no_ground_explosion(self):
         battle, unused_bigworld = _battle(now=1.0)

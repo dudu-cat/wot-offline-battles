@@ -9891,6 +9891,71 @@ class BattleRuntimeContractTests(unittest.TestCase):
             value['eventType']
             for value in battle._avatar.battle_events[0]])
 
+    def test_native_impact_effect_exception_keeps_nonvisual_feedback(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        target = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
+                          {'health': 500})
+        attacker = _Vehicle(11, _Descriptor(), _Vector(10, 0, 0),
+                            (0, 0, 0), {'health': 500})
+        runtime.bigworld.entities.update({10: target, 11: attacker})
+        battle._local_position = (0.0, 0.0, 0.0)
+        target_record = {
+            'engine_id': 10, 'state': {'team': 1, 'health': 500},
+            'kind': 'player', 'network_id': 1, 'local': True}
+        attacker_record = {
+            'engine_id': 11,
+            'state': {'team': 2, 'health': 500,
+                      'x': 10.0, 'y': 0.0, 'z': 0.0},
+            'kind': 'bot', 'network_id': 2, 'local': False}
+        event = {
+            'kind': 'bot_human_hit', 'world_pose': True,
+            'projectile_id': 'bot:2:1',
+            'x': 0.5, 'y': 1.0, 'z': 0.0, 'shell_index': 0,
+            'shot_result': 2, 'damage': 144, 'source': 'shot'}
+        battle._projectile_visual_meta['bot:2:1'] = {'admitted': True}
+        add_effect = battle._avatar.terrainEffects.addNew
+        add_effect.side_effect = RuntimeError('native impact failed')
+
+        self.assertFalse(battle._present_combat_hit(
+            event, target_record, attacker_record, 11))
+        add_effect.side_effect = None
+        self.assertFalse(battle._present_combat_hit(
+            event, target_record, attacker_record, 11))
+
+        self.assertEqual(1, add_effect.call_count)
+        self.assertEqual(2, len(battle._avatar.hit_directions))
+        self.assertIn(
+            'projectile impact presentation',
+            battle._disabled_optional_features)
+
+    def test_suppressed_local_muzzle_keeps_stock_shot_handshake(self):
+        battle = BattleRuntime(_runtime())
+        shooting_extra = types.SimpleNamespace(
+            stopFor=mock.Mock(), startFor=mock.Mock())
+        descriptor = types.SimpleNamespace(
+            extrasDict={'shoot': shooting_extra})
+        handshakes = []
+        entity = types.SimpleNamespace(typeDescriptor=descriptor)
+
+        def show_shooting(burst_count, is_predicted=False):
+            extra = descriptor.extrasDict['shoot']
+            extra.stopFor(entity)
+            extra.startFor(entity, burst_count)
+            handshakes.append((burst_count, is_predicted))
+            return True
+
+        entity.showShooting = show_shooting
+
+        self.assertTrue(battle._show_local_shot_without_extra(entity, 3))
+
+        shooting_extra.stopFor.assert_called_once_with(entity)
+        shooting_extra.startFor.assert_not_called()
+        self.assertEqual([(3, False)], handshakes)
+        self.assertIs(
+            shooting_extra, descriptor.extrasDict['shoot'])
+
     def test_he_splash_uses_the_stock_vehicle_explosion_effect(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
