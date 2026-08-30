@@ -56,6 +56,8 @@ PROFILE_STORE_APPDATA_PARTS = (
 PROFILE_STORE_SCHEMA = 1
 ORIGINAL_PROFILE_LABEL = "Original vehicle values"
 MAX_PROFILE_NAME_LENGTH = 64
+MAX_OVERLAY_MEMBERS = 1024
+MAX_OVERLAY_MANIFEST_BYTES = 32 * 1024 * 1024
 
 _COMPONENT_MEMBER = re.compile(
     r"^scripts/item_defs/vehicles/([a-z][a-z0-9_]*)/components/"
@@ -1531,6 +1533,10 @@ def _validate_manifest(value):
     members = value.get("members")
     if not isinstance(members, list):
         raise VehicleOverlayError("The overlay manifest member list is invalid.")
+    if len(members) > MAX_OVERLAY_MEMBERS:
+        raise VehicleOverlayError(
+            "The overlay manifest contains more than %d members." %
+            MAX_OVERLAY_MEMBERS)
     seen_members = set()
     for entry in members:
         if not isinstance(entry, dict):
@@ -1594,6 +1600,10 @@ def _validate_manifest(value):
                   not isinstance(edit["replacementValue"], str)):
                 raise VehicleOverlayError(
                     "A Packed string manifest edit must keep string values.")
+    if len(_manifest_bytes(value)) > MAX_OVERLAY_MANIFEST_BYTES:
+        raise VehicleOverlayError(
+            "The overlay manifest is larger than %d MiB." %
+            (MAX_OVERLAY_MANIFEST_BYTES // (1024 * 1024)))
     return value
 
 
@@ -2547,6 +2557,7 @@ def _profile_manifest(profile):
     manifest = _empty_manifest()
     manifest["createdAt"] = profile["createdAt"]
     manifest["updatedAt"] = profile["updatedAt"]
+    manifest["activeProfile"] = profile["name"]
     manifest["members"] = copy.deepcopy(profile["members"])
     return _validate_manifest(manifest)
 
@@ -2931,3 +2942,95 @@ def prepare_vehicle_profile(game_root, profile_name=None, is_running=None):
         "installedMembers": installed,
         "removedMembers": 0,
     }
+
+
+def vehicle_overlay_digest(game_root, is_running=None):
+    """Return the SHA-256 of the installed overlay manifest, or ''.
+
+    The digest covers the exact ``vehicle_overlays.json`` bytes, so the room
+    server (which hashes the same file) and this launcher agree without any
+    cross-machine serialization contract.
+    """
+    status, unused_package = _require_target(game_root, is_running=is_running)
+    path = manifest_path(status["path"])
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as stream:
+            return _sha256(stream.read())
+    except (IOError, OSError) as error:
+        raise VehicleOverlayError(
+            "vehicle_overlays.json is unreadable: %s" % error)
+
+
+def active_vehicle_overlay(game_root, is_running=None):
+    """Return ``(manifest, {member: bytes}, digest)`` of the installed overlay.
+
+    ``(None, {}, '')`` means no launcher-owned overlay is installed.  Every
+    member is re-read and checked against the manifest checksum, so the caller
+    can safely hand the payload to the room server.
+    """
+    status, unused_package = _require_target(game_root, is_running=is_running)
+    manifest, exists = _load_manifest(status["path"])
+    if not exists or not manifest["members"]:
+        return None, {}, ""
+    root = os.path.join(status["path"], *OVERLAY_ROOT.split("/"))
+    payload = {}
+    for entry in manifest["members"]:
+        member = entry["sourceMember"]
+        path = os.path.join(root, *member.split("/"))
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise VehicleOverlayError(
+                "The installed overlay member is missing: %s" % member)
+        try:
+            data = _read_file(path)
+        except (IOError, OSError) as error:
+            raise VehicleOverlayError(
+                "The installed overlay member is unreadable: %s (%s)" %
+                (member, error))
+        if _sha256(data) != entry["overlaySha256"]:
+            raise VehicleOverlayError(
+                "The installed overlay member was changed: %s" % member)
+        payload[member] = data
+    digest = _sha256(_read_file(manifest_path(status["path"])))
+    return manifest, payload, digest
+
+
+def install_vehicle_overlay(game_root, manifest, members, is_running=None):
+    """Install the room host's vehicle-data overlay, transactionally.
+
+    The manifest is validated with the same ownership rules as a local
+    profile, every member must match its checksum, and the commit uses the
+    same recovery-journaled transaction as ``activate_vehicle_profile``.  Any
+    previously installed overlay is removed first, so the room host's data
+    always wins.
+    """
+    if not isinstance(manifest, dict) or not isinstance(members, dict):
+        raise VehicleOverlayError("The host vehicle-data overlay is invalid.")
+    _validate_manifest(manifest)
+    expected = _entry_map(manifest)
+    if not expected:
+        raise VehicleOverlayError(
+            "The host vehicle-data overlay carries no members.")
+    if set(members) != set(expected):
+        raise VehicleOverlayError(
+            "The host vehicle-data overlay members do not match its "
+            "manifest.")
+    for member, data in members.items():
+        if not isinstance(data, bytes) or not data:
+            raise VehicleOverlayError(
+                "The host vehicle-data member is invalid: %s" % member)
+        if _sha256(data) != expected[member]["overlaySha256"]:
+            raise VehicleOverlayError(
+                "The host vehicle-data member failed its checksum: %s" %
+                member)
+    status, unused_package = _require_target(
+        game_root, require_closed=True, is_running=is_running)
+    ensure_original_vehicle_data(status["path"], is_running=lambda: False)
+    writes = [(_overlay_path(status["path"], member), members[member])
+              for member in sorted(members)]
+    writes.append((manifest_path(status["path"]), _manifest_bytes(manifest)))
+    _transactional_write(
+        status["path"], writes,
+        expected_absent=[target for target, unused_data in writes])
+    return len(members)

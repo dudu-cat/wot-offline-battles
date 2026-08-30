@@ -63,6 +63,48 @@ _CHINESE = {
     "New profile...": "新建方案…",
     "Edit selected profile...": "编辑所选方案…",
     "Delete selected profile...": "删除所选方案…",
+    "The running LAN room keeps the vehicle data it pinned at room start; "
+    "the selected profile applies when the room restarts.":
+        "运行中的房间保持开房时固定的车辆数据；所选方案将在房间重启后生效。",
+    "The running LAN room keeps the vehicle data it pinned at room start.":
+        "运行中的房间保持开房时固定的车辆数据。",
+    "The LAN room runs original vehicle data; no vehicle profile is shared.":
+        "房间使用原版车辆数据，不共享任何属性方案。",
+    "The LAN room pins vehicle profile '%s' (%d package member%s); joiners "
+    "receive it automatically.":
+        "房间已固定属性方案“%s”（%d 个数据包成员）；加入者将自动同步该方案。",
+    "The host vehicle data could not be fetched: %s":
+        "无法获取房主的车辆数据：%s",
+    "The local vehicle data could not be verified: %s":
+        "无法校验本机车辆数据：%s",
+    "This server does not share vehicle data; the selected vehicle profile "
+    "was ignored.": "该服务器不共享车辆数据；已忽略所选属性方案。",
+    "This server does not share vehicle data; original vehicle values stay "
+    "active.": "该服务器不共享车辆数据；继续使用原版车辆数值。",
+    "The LAN room runs original vehicle data, but a vehicle profile is "
+    "active locally. Stop the LAN room or select 'Original vehicle values', "
+    "then start again.":
+        "房间使用原版车辆数据，但本机激活了属性方案。请先关闭房间，或选择"
+        "“原版车辆数值”后重新开始。",
+    "The host runs original vehicle data; the selected vehicle profile was "
+    "ignored.": "房主使用原版车辆数据；已忽略所选属性方案。",
+    "The host runs original vehicle data; no vehicle profile is shared.":
+        "房主使用原版车辆数据，不共享属性方案。",
+    "Your vehicle data matches the room profile '%s'.":
+        "本机车辆数据与房间方案“%s”一致。",
+    "Your vehicle data matches the room.": "本机车辆数据与房间一致。",
+    "The LAN room is pinned to the vehicle profile '%s'. Stop the LAN room "
+    "and start it again after changing the vehicle profile.":
+        "房间已固定属性方案“%s”。如需更换方案，请先关闭房间再重新启动。",
+    "The host vehicle data could not be installed: %s":
+        "无法安装房主的车辆数据：%s",
+    "Installed the host vehicle data profile '%s' (%d package member%s); "
+    "original data is restored after this session.":
+        "已安装房主的车辆属性方案“%s”（%d 个数据包成员）；本次结束后恢复原版数据。",
+    "The local vehicle profile could not be removed: %s":
+        "无法移除本机车辆属性方案：%s",
+    "Vehicle profiles are available for the 0.9.22 client.":
+        "车辆属性方案仅适用于 0.9.22 客户端。",
     "Repair": "修复",
     "Repair startup (keep saved data)": "修复启动问题（保留存档）",
     "Normal client stuck loading? Clean preferences...":
@@ -292,6 +334,7 @@ class LauncherWindow(object):
         self._room_worker = None
         self._room_worker_starter_root = None
         self._room_worker_stop_lock = threading.Lock()
+        self._room_vehicle_overlay_root = None
         self._game = None
         self._game_starter_root = None
         self._busy = False
@@ -800,7 +843,8 @@ class LauncherWindow(object):
                    else "disabled"))
         profile_state = (
             "readonly" if maintenance_state == "normal" and
-            self.mode.get() == core.MODE_SINGLE else "disabled")
+            self.mode.get() in (core.MODE_SINGLE, core.MODE_JOIN)
+            else "disabled")
         self.vehicle_profile_box.config(state=profile_state)
         create_state = (
             "normal" if profile_state == "readonly" else "disabled")
@@ -1243,11 +1287,12 @@ class LauncherWindow(object):
                         self._log(
                             "Could not close the started process: %s" % error)
         self._stop_worker()
-        if stop_persistent_server:
-            self._stop_worker(room_owned=True)
         if force_cleanup:
             core.kill_game()
-        self._stop_server(force=stop_persistent_server)
+        if stop_persistent_server:
+            self._stop_lan_room()
+        else:
+            self._stop_server()
         return True
 
     def _request_starter_stop(self, process, game_root):
@@ -1457,10 +1502,9 @@ class LauncherWindow(object):
             self._log("Wait for the current launcher operation to finish.")
             return False
         status = self._refresh_client()
-        if (status.get("client") != core.PORT_0_9_22 or
-                self.mode.get() != core.MODE_SINGLE):
+        if status.get("client") != core.PORT_0_9_22:
             self._log(
-                "Vehicle profiles are available for 0.9.22 single player.")
+                "Vehicle profiles are available for the 0.9.22 client.")
             return False
         raw_name = self._ask_profile_name()
         if raw_name is None:
@@ -1577,6 +1621,10 @@ class LauncherWindow(object):
         self._save_settings()
         self._stop_requested = False
         self._set_maintenance_busy(True)
+        profile_name = (
+            self.vehicle_profile.get().strip()
+            if self.vehicle_profile.get().strip() in self._profile_names
+            else None)
 
         def run():
             try:
@@ -1585,6 +1633,26 @@ class LauncherWindow(object):
                 for action in core.install_client_mod(
                         status["path"], status["client"]):
                     self._log(action)
+                if status["client"] == core.PORT_0_9_22:
+                    # The room pins one vehicle-data overlay for its whole
+                    # lifetime: the hidden worker reads it at startup and the
+                    # server serves it to joiners.
+                    self._room_vehicle_overlay_root = status["path"]
+                    prepared = vehicle_overlays.prepare_vehicle_profile(
+                        status["path"], profile_name)
+                    if prepared["profile"] is None:
+                        self._log(
+                            "The LAN room runs original vehicle data; no "
+                            "vehicle profile is shared.")
+                    else:
+                        self._log(
+                            "The LAN room pins vehicle profile '%s' (%d "
+                            "package member%s); joiners receive it "
+                            "automatically." % (
+                                prepared["profile"],
+                                prepared["installedMembers"],
+                                "" if prepared["installedMembers"] == 1
+                                else "s"))
                 start_options = {
                     "persistent": True,
                     "require_owned": True,
@@ -1597,10 +1665,11 @@ class LauncherWindow(object):
                         status["path"], core.LOCAL_HOST,
                         core.DEFAULT_SERVER_PORT, room_owned=True):
                     self.root.after(0, self._use_local_server_address)
-                elif started:
-                    self._log(
-                        "The LAN room was not opened because its hidden "
-                        "simulation worker is unavailable.")
+                else:
+                    if started:
+                        self._log(
+                            "The LAN room was not opened because its hidden "
+                            "simulation worker is unavailable.")
                     self._stop_lan_room()
             except core.LauncherError as error:
                 self._stop_lan_room()
@@ -1631,8 +1700,7 @@ class LauncherWindow(object):
         status = self._refresh_client()
         selected_profile = self.vehicle_profile.get().strip()
         profile_name = (
-            selected_profile if self.mode.get() == core.MODE_SINGLE and
-            selected_profile in self._profile_names
+            selected_profile if selected_profile in self._profile_names
             else None)
         try:
             session_mode = self.mode.get()
@@ -1676,6 +1744,9 @@ class LauncherWindow(object):
         automatic_report_path = None
         self._worker_exited_unexpectedly = False
         reused_server = self._server_is_running()
+        owned_room = (
+            session["mode"] == core.MODE_JOIN and
+            self._owned_room_root(game_root, reused_server))
         try:
             report_session = error_reports.begin_session(
                 game_root, needs_worker=needs_worker,
@@ -1707,16 +1778,33 @@ class LauncherWindow(object):
                                                   session["client"]):
                 self._log(action)
             if session["client"] == core.PORT_0_9_22:
-                prepared = vehicle_overlays.prepare_vehicle_profile(
-                    game_root, session.get("vehicle_profile"))
-                if prepared["profile"] is None:
-                    self._log(
-                        "No launcher-owned vehicle profile is active; other "
-                        "installed mods are unchanged.")
+                if owned_room:
+                    # The running room pinned its vehicle data at room start
+                    # and its hidden worker (a WorldOfTanks.exe) already
+                    # loaded it.  Touching the overlay now would both trip
+                    # the game-running guard and desync this client from the
+                    # room; only the digest check below may act, and cleanup
+                    # runs when the room stops.
+                    if session.get("vehicle_profile"):
+                        self._log(
+                            "The running LAN room keeps the vehicle data it "
+                            "pinned at room start; the selected profile "
+                            "applies when the room restarts.")
+                    else:
+                        self._log(
+                            "The running LAN room keeps the vehicle data it "
+                            "pinned at room start.")
                 else:
-                    self._log(
-                        "Activated single-player vehicle profile '%s' "
-                        "(%d package member%s)." % (
+                    prepared = vehicle_overlays.prepare_vehicle_profile(
+                        game_root, session.get("vehicle_profile"))
+                    if prepared["profile"] is None:
+                        self._log(
+                            "No launcher-owned vehicle profile is active; "
+                            "other installed mods are unchanged.")
+                    else:
+                        self._log(
+                            "Activated single-player vehicle profile '%s' "
+                            "(%d package member%s)." % (
                             prepared["profile"],
                             prepared["installedMembers"],
                             "" if prepared["installedMembers"] == 1 else "s"))
@@ -1745,6 +1833,10 @@ class LauncherWindow(object):
                 if status == core.LISTENER_COMPATIBLE:
                     self._log("The compatible server at %s:%d answered." %
                               (host, port))
+                    if (session["client"] == core.PORT_0_9_22 and
+                            not self._sync_vehicle_overlay(
+                                game_root, host, port, reused_server)):
+                        return
                 elif status == core.LISTENER_OCCUPIED:
                     self._log("Something at %s:%d answered, but it is not "
                               "the server for this client. The game was not "
@@ -1791,23 +1883,8 @@ class LauncherWindow(object):
             crash_roles.update(self._observed_crash_roles)
             self._stop_server()
             if session.get("client") == core.PORT_0_9_22:
-                try:
-                    if not core.wait_for_game_shutdown():
-                        self._log(
-                            "A World of Tanks process did not finish closing; "
-                            "vehicle cleanup will retry at the next launcher "
-                            "start.")
-                    else:
-                        removed = (
-                            vehicle_overlays.ensure_original_vehicle_data(
-                                game_root))
-                        if removed:
-                            self._log(
-                                "Removed the temporary vehicle profile; "
-                                "original vehicle data is active again.")
-                except vehicle_overlays.VehicleOverlayError as error:
-                    self._log(
-                        "Could not restore original vehicle data: %s" % error)
+                if not owned_room:
+                    self._restore_original_vehicle_data(game_root)
             report_finalized = False
             if report_session is not None and self._crash_capture_enabled:
                 try:
@@ -1858,6 +1935,104 @@ class LauncherWindow(object):
                     self._offer_crash_report(path))
             if self._close_pending:
                 self.root.after(0, self._finish_close)
+
+    def _owned_room_root(self, game_root, reused_server):
+        """Return whether the running launcher room shares this game root."""
+        context_root = (self._server_context or {}).get("game_root") or ""
+        return bool(
+            reused_server and context_root and
+            os.path.normcase(os.path.realpath(context_root)) ==
+            os.path.normcase(os.path.realpath(game_root)))
+
+    def _sync_vehicle_overlay(self, game_root, host, port, reused_server):
+        """Make this client run exactly the vehicle data the room serves.
+
+        The room host's launcher pins one overlay at room start.  This client
+        either already runs it (host case, digest match), installs the copy
+        the server distributes (joiner case), or refuses to start when the
+        local game root would disagree with the room's hidden worker.
+        """
+        try:
+            fetched = core.fetch_vehicle_overlay(host, port)
+        except core.LauncherError as error:
+            self._log("The host vehicle data could not be fetched: %s" %
+                      error)
+            return False
+        try:
+            local_digest = vehicle_overlays.vehicle_overlay_digest(game_root)
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log("The local vehicle data could not be verified: %s" %
+                      error)
+            return False
+        room_matches = self._owned_room_root(game_root, reused_server)
+        if not fetched["supported"]:
+            if local_digest:
+                try:
+                    vehicle_overlays.ensure_original_vehicle_data(game_root)
+                except vehicle_overlays.VehicleOverlayError as error:
+                    self._log(
+                        "The local vehicle profile could not be removed: %s"
+                        % error)
+                    return False
+                self._log(
+                    "This server does not share vehicle data; the selected "
+                    "vehicle profile was ignored.")
+            else:
+                self._log(
+                    "This server does not share vehicle data; original "
+                    "vehicle values stay active.")
+            return True
+        if not fetched["present"]:
+            if local_digest:
+                if room_matches:
+                    self._log(
+                        "The LAN room runs original vehicle data, but a "
+                        "vehicle profile is active locally. Stop the LAN "
+                        "room or select 'Original vehicle values', then "
+                        "start again.")
+                    return False
+                try:
+                    vehicle_overlays.ensure_original_vehicle_data(game_root)
+                except vehicle_overlays.VehicleOverlayError as error:
+                    self._log(
+                        "The local vehicle profile could not be removed: %s"
+                        % error)
+                    return False
+                self._log(
+                    "The host runs original vehicle data; the selected "
+                    "vehicle profile was ignored.")
+            else:
+                self._log(
+                    "The host runs original vehicle data; no vehicle "
+                    "profile is shared.")
+            return True
+        if fetched["digest"] == local_digest:
+            if fetched["profile"]:
+                self._log(
+                    "Your vehicle data matches the room profile '%s'." %
+                    fetched["profile"])
+            else:
+                self._log("Your vehicle data matches the room.")
+            return True
+        if room_matches:
+            self._log(
+                "The LAN room is pinned to the vehicle profile '%s'. Stop "
+                "the LAN room and start it again after changing the vehicle "
+                "profile." % fetched["profile"])
+            return False
+        try:
+            installed = vehicle_overlays.install_vehicle_overlay(
+                game_root, fetched["manifest"], fetched["payload"])
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log("The host vehicle data could not be installed: %s" %
+                      error)
+            return False
+        self._log(
+            "Installed the host vehicle data profile '%s' (%d package "
+            "member%s); original data is restored after this session." % (
+                fetched["profile"], installed,
+                "" if installed == 1 else "s"))
+        return True
 
     def _start_server(self, game_root, port_version,
                       loopback_only=False, persistent=False,
@@ -2242,9 +2417,32 @@ class LauncherWindow(object):
         self.root.after(0, self._update_action_controls)
         return server is not None
 
+    def _restore_original_vehicle_data(self, game_root):
+        try:
+            if not core.wait_for_game_shutdown():
+                self._log(
+                    "A World of Tanks process did not finish closing; "
+                    "vehicle cleanup will retry at the next launcher start.")
+                return False
+            removed = vehicle_overlays.ensure_original_vehicle_data(game_root)
+            if removed:
+                self._log(
+                    "Removed the temporary vehicle profile; original "
+                    "vehicle data is active again.")
+            return True
+        except vehicle_overlays.VehicleOverlayError as error:
+            self._log(
+                "Could not restore original vehicle data: %s" % error)
+            return False
+
     def _stop_lan_room(self):
+        game_root = self._room_vehicle_overlay_root
         self._stop_worker(room_owned=True)
-        return self._stop_server(force=True)
+        stopped = self._stop_server(force=True)
+        if (game_root is not None and
+                self._restore_original_vehicle_data(game_root)):
+            self._room_vehicle_overlay_root = None
+        return stopped
 
     def _on_close(self):
         if self._maintenance_busy:

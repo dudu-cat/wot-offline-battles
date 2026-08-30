@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import shutil
@@ -9,7 +10,6 @@ from unittest import mock
 
 import core
 import vehicle_overlays
-
 
 packed = vehicle_overlays.packed_xml
 
@@ -1255,6 +1255,68 @@ class VehicleOverlayTest(unittest.TestCase):
                 self.game, self.VEHICLE, "speedLimits/forward", "40",
                 is_running=lambda: False)
 
+    def test_manifest_accepts_the_full_supported_member_count(self):
+        manifest = vehicle_overlays._empty_manifest()
+        manifest["members"] = []
+        for index in range(vehicle_overlays.MAX_OVERLAY_MEMBERS):
+            member = (
+                "scripts/item_defs/vehicles/ussr/Capacity_%04d.xml" %
+                index)
+            manifest["members"].append({
+                "sourceMember": member,
+                "sourcePackage": vehicle_overlays.SOURCE_PACKAGE,
+                "overlayRelativePath": member,
+                "overlaySha256": "0" * 64,
+                "edits": [{
+                    "fieldPath": "speedLimits/forward",
+                    "originalPackedType": "integer",
+                    "originalValue": 32,
+                    "replacementValue": 40,
+                }],
+            })
+
+        validated = vehicle_overlays._validate_manifest(manifest)
+
+        self.assertEqual(
+            vehicle_overlays.MAX_OVERLAY_MEMBERS,
+            len(validated["members"]))
+
+    def test_manifest_rejects_one_member_over_the_supported_count(self):
+        manifest = vehicle_overlays._empty_manifest()
+        entry = {
+            "sourceMember": self.VEHICLE,
+            "sourcePackage": vehicle_overlays.SOURCE_PACKAGE,
+            "overlayRelativePath": self.VEHICLE,
+            "overlaySha256": "0" * 64,
+            "edits": [{
+                "fieldPath": "speedLimits/forward",
+                "originalPackedType": "integer",
+                "originalValue": 32,
+                "replacementValue": 40,
+            }],
+        }
+        manifest["members"] = [entry] * (
+            vehicle_overlays.MAX_OVERLAY_MEMBERS + 1)
+
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "more than 1024 members"):
+            vehicle_overlays._validate_manifest(manifest)
+
+    def test_manifest_size_error_is_distinct_from_member_count(self):
+        manifest = vehicle_overlays._empty_manifest()
+
+        class OversizedPayload(object):
+            def __len__(self):
+                return vehicle_overlays.MAX_OVERLAY_MANIFEST_BYTES + 1
+
+        with mock.patch.object(
+                vehicle_overlays, "_manifest_bytes",
+                return_value=OversizedPayload()), self.assertRaisesRegex(
+                    vehicle_overlays.VehicleOverlayError,
+                    "larger than 32 MiB"):
+            vehicle_overlays._validate_manifest(manifest)
+
     def test_integer_required_manifest_value_cannot_become_text(self):
         vehicle_overlays.apply_vehicle_edit(
             self.game, self.GUNS, "shared/Gun-A/maxAmmo", "46",
@@ -1637,6 +1699,92 @@ class VehicleOverlayTest(unittest.TestCase):
         self.assertIn('--paths', content)
         self.assertIn('--hidden-import packed_xml', content)
         self.assertIn('Launcher build dependency is missing', content)
+
+
+class FetchedOverlayTest(VehicleOverlayTest):
+    """A room host's overlay can be read, installed, and restored."""
+
+    def _activated_payload(self):
+        vehicle_overlays.create_vehicle_profile(self.game, "Fast MS-1")
+        vehicle_overlays.apply_profile_edit(
+            self.game, "Fast MS-1", self.VEHICLE,
+            "speedLimits/forward", "40", is_running=lambda: False)
+        activated = vehicle_overlays.activate_vehicle_profile(
+            self.game, "Fast MS-1", is_running=lambda: False)
+        self.assertEqual(1, activated)
+        manifest, payload, digest = vehicle_overlays.active_vehicle_overlay(
+            self.game, is_running=lambda: False)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(1, len(payload))
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        return manifest, payload, digest
+
+    def test_digest_is_empty_without_an_overlay(self):
+        self.assertEqual(
+            "", vehicle_overlays.vehicle_overlay_digest(
+                self.game, is_running=lambda: False))
+
+    def test_install_round_trip_matches_the_activated_overlay(self):
+        manifest, payload, digest = self._activated_payload()
+        self.assertTrue(os.path.exists(self._overlay(self.VEHICLE)))
+        self.assertTrue(os.path.exists(
+            vehicle_overlays.manifest_path(self.game)))
+
+        removed = vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        self.assertEqual(1, removed)
+        self.assertEqual(
+            "", vehicle_overlays.vehicle_overlay_digest(
+                self.game, is_running=lambda: False))
+
+        installed = vehicle_overlays.install_vehicle_overlay(
+            self.game, manifest, payload, is_running=lambda: False)
+        self.assertEqual(1, installed)
+        again, again_payload, again_digest = (
+            vehicle_overlays.active_vehicle_overlay(
+                self.game, is_running=lambda: False))
+        self.assertEqual(manifest, again)
+        self.assertEqual(payload, again_payload)
+        self.assertEqual(digest, again_digest)
+
+        # The fetched install is removed by the same stock-restore path.
+        removed = vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        self.assertEqual(1, removed)
+
+    def test_install_rejects_a_tampered_member(self):
+        manifest, payload, digest = self._activated_payload()
+        vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        payload = dict(payload)
+        payload[self.VEHICLE] = payload[self.VEHICLE] + b"tampered"
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "checksum"):
+            vehicle_overlays.install_vehicle_overlay(
+                self.game, manifest, payload, is_running=lambda: False)
+
+    def test_install_rejects_a_manifest_member_mismatch(self):
+        manifest, payload, digest = self._activated_payload()
+        vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        payload = dict(payload)
+        del payload[self.VEHICLE]
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError,
+                "members do not match"):
+            vehicle_overlays.install_vehicle_overlay(
+                self.game, manifest, payload, is_running=lambda: False)
+
+    def test_install_rejects_a_foreign_manifest(self):
+        manifest, payload, digest = self._activated_payload()
+        vehicle_overlays.ensure_original_vehicle_data(
+            self.game, is_running=lambda: False)
+        manifest = copy.deepcopy(manifest)
+        manifest["members"][0]["edits"] = []
+        with self.assertRaisesRegex(
+                vehicle_overlays.VehicleOverlayError, "logical edits"):
+            vehicle_overlays.install_vehicle_overlay(
+                self.game, manifest, payload, is_running=lambda: False)
 
 
 if __name__ == "__main__":

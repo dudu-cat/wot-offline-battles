@@ -21,6 +21,7 @@ SERVER_TEAM1_SIZE_ENV = "WOT_0922_TEAM1_SIZE"
 SERVER_TEAM2_SIZE_ENV = "WOT_0922_TEAM2_SIZE"
 SERVER_BOT_LINEUP_ENV = "WOT_0922_BOT_LINEUP"
 SERVER_LOOPBACK_ONLY_ENV = "WOT_0922_LOOPBACK_ONLY"
+SERVER_VEHICLE_OVERLAY_ROOT_ENV = "WOT_0922_VEHICLE_OVERLAY_ROOT"
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
 # Get-NetFirewallRule can take many seconds on a busy machine.
 FIREWALL_QUERY_TIMEOUT_SECONDS = 60.0
@@ -217,6 +218,15 @@ def _bot_lineup_from_environment(environment=None):
     return value
 
 
+def _vehicle_overlay_root_from_environment(environment=None):
+    """Return the host game root whose res_mods overlay this server pins."""
+    environment = os.environ if environment is None else environment
+    root = environment.get(SERVER_VEHICLE_OVERLAY_ROOT_ENV)
+    if root is None or not str(root).strip():
+        return None
+    return str(root).strip()
+
+
 def main():
     loopback_only = _loopback_only_from_environment()
     server_host = SERVER_LOOPBACK_HOST if loopback_only else SERVER_HOST
@@ -231,6 +241,7 @@ def main():
         default_map, run_server = _load_server()
         team1_size, team2_size = _team_sizes_from_environment()
         bot_lineup = _bot_lineup_from_environment()
+        vehicle_overlay_root = _vehicle_overlay_root_from_environment()
         if not loopback_only:
             _ensure_windows_firewall_rule(SERVER_PORT)
         run_server(
@@ -239,6 +250,7 @@ def main():
             team1_size=team1_size,
             team2_size=team2_size,
             bot_lineup=bot_lineup,
+            vehicle_overlay_root=vehicle_overlay_root,
         )
     except Exception:
         traceback.print_exc()

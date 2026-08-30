@@ -3,6 +3,8 @@ name: Tests
 on:
   push:
   pull_request:
+  # Forks do not run push-triggered workflows; dispatch keeps CI available.
+  workflow_dispatch:
 
 permissions:
   contents: read
