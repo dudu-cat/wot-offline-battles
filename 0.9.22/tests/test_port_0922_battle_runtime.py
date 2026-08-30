@@ -15858,7 +15858,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         current_matrix[0] = NativeTreeMatrix((2.0, 1.0, 4.0))
         bodies[:] = []
-        self.assertTrue(battle._refresh_fallen_tree_foliage(1.1))
+        self.assertFalse(battle._refresh_fallen_tree_foliage(1.1))
         battle._foliage.settle_fallen_tree.assert_called_once_with(3, 9)
         self.assertNotIn((3, 9), battle._fallen_tree_foliage_seen_bodies)
 
@@ -15908,6 +15908,47 @@ class BattleRuntimeContractTests(unittest.TestCase):
         update = battle._foliage.update_fallen_tree_pose.call_args[0]
         self.assertEqual((8.0, 6.0, -2.0), update[2])
         battle._foliage.settle_fallen_tree.assert_called_once_with(3, 9)
+
+    def test_fallen_tree_foliage_accepts_set_loaded_chunk_container(self):
+        runtime = _runtime()
+        runtime.bigworld.wg_getChunkMatrix = mock.Mock()
+        runtime.area_destructibles = types.SimpleNamespace(
+            g_destructiblesAnimator=types.SimpleNamespace(
+                _DestructiblesAnimator__bodies=[]),
+            g_destructiblesManager=types.SimpleNamespace(
+                forceNoAnimation=False,
+                _DestructiblesManager__loadedChunkIDs=set(),
+                _DestructiblesManager__destructiblesWaitDestroy={}))
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._foliage = mock.Mock()
+        battle._foliage.refreshing_fallen_tree_wires.return_value = ((3, 9),)
+
+        self.assertFalse(battle._refresh_fallen_tree_foliage(1.0))
+        runtime.bigworld.wg_getChunkMatrix.assert_not_called()
+        battle._foliage.fallen_tree_profile.assert_not_called()
+
+    def test_fallen_tree_body_disappearance_settles_before_native_query(self):
+        runtime = _runtime()
+        runtime.bigworld.wg_getChunkMatrix = mock.Mock()
+        runtime.area_destructibles = types.SimpleNamespace(
+            g_destructiblesAnimator=types.SimpleNamespace(
+                _DestructiblesAnimator__bodies=[]),
+            g_destructiblesManager=types.SimpleNamespace(
+                forceNoAnimation=False,
+                _DestructiblesManager__loadedChunkIDs={3},
+                _DestructiblesManager__destructiblesWaitDestroy={}))
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._foliage = mock.Mock()
+        battle._foliage.refreshing_fallen_tree_wires.return_value = ((3, 9),)
+        battle._fallen_tree_foliage_seen_bodies.add((3, 9))
+
+        self.assertFalse(battle._refresh_fallen_tree_foliage(1.0))
+        battle._foliage.settle_fallen_tree.assert_called_once_with(3, 9)
+        runtime.bigworld.wg_getChunkMatrix.assert_not_called()
+        battle._foliage.fallen_tree_profile.assert_not_called()
+        self.assertNotIn((3, 9), battle._fallen_tree_foliage_seen_bodies)
 
     def test_canonical_event_never_reenters_an_isolated_native_wire(self):
         runtime = _runtime()

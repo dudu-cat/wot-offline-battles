@@ -16729,8 +16729,19 @@ class BattleRuntime(object):
                     int(chunk_id) in waiting):
                 self._fallen_tree_foliage_stable.pop(identity, None)
                 continue
-            if (isinstance(loaded, dict) and
-                    int(chunk_id) not in loaded):
+            if loaded is not None:
+                try:
+                    chunk_loaded = int(chunk_id) in loaded
+                except Exception:
+                    chunk_loaded = False
+                if not chunk_loaded:
+                    self._fallen_tree_foliage_stable.pop(identity, None)
+                    continue
+            if (body_identities is not None and
+                    identity in self._fallen_tree_foliage_seen_bodies and
+                    identity not in body_identities):
+                settle(chunk_id, item_index)
+                self._fallen_tree_foliage_seen_bodies.discard(identity)
                 self._fallen_tree_foliage_stable.pop(identity, None)
                 continue
             try:
