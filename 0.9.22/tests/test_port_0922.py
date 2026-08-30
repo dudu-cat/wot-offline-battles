@@ -14,6 +14,7 @@ import types
 import unittest
 from unittest import mock
 import weakref
+import xml.etree.ElementTree as ET
 import zipfile
 
 
@@ -237,7 +238,7 @@ class WotmodValidatorTests(unittest.TestCase):
                 directories.add('/'.join(parts[:index]) + '/')
         meta = (
             '<root><id>org.peng.offline_lan_0922</id>'
-            '<version>0.6.0-alpha.7</version></root>')
+            '<version>0.6.1</version></root>')
         with zipfile.ZipFile(path, 'w', compression) as archive:
             if include_directories:
                 for directory in sorted(directories):
@@ -325,6 +326,31 @@ class PortSourceTests(unittest.TestCase):
         self.assertTrue((
             PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
             'mods' / 'mod_offline_lan_0922.py').is_file())
+
+    def test_release_version_metadata_is_aligned(self):
+        packager_path = PORT_ROOT / 'build_wotmod.py'
+        spec = importlib.util.spec_from_file_location(
+            'build_wotmod_version_test', packager_path)
+        packager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packager)
+        package_path = (
+            PORT_ROOT / 'src' / 'res' / 'scripts' / 'client' / 'gui' /
+            'mods' / 'offline_lan_0922' / '__init__.py')
+        spec = importlib.util.spec_from_file_location(
+            'offline_lan_0922_version_test', package_path)
+        package = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(package)
+        meta_version = ET.parse(PORT_ROOT / 'meta.xml').getroot().findtext(
+            'version')
+        build_script = (PORT_ROOT / 'build_for_client.sh').read_text(
+            encoding='utf-8')
+
+        self.assertEqual('0.6.1', packager.MOD_VERSION)
+        self.assertEqual(packager.MOD_VERSION, package.PORT_VERSION)
+        self.assertEqual(packager.MOD_VERSION, meta_version)
+        self.assertIn(
+            'org.peng.offline_lan_0922_%s.wotmod' % packager.MOD_VERSION,
+            build_script)
 
     def test_port_sources_are_python_2_compatible_syntax(self):
         source_root = PORT_ROOT / 'src'
@@ -5670,7 +5696,7 @@ class BootstrapContractTests(unittest.TestCase):
             'mods' / 'offline_lan_0922' / 'bootstrap.py')
         bigworld = _BigWorld()
         package = types.ModuleType('gui.mods.offline_lan_0922')
-        package.PORT_VERSION = '0.6.0-alpha.7'
+        package.PORT_VERSION = '0.6.1'
         package.TARGET_CLIENT_VERSION = '0.9.22.0.1'
         package.TARGET_CLIENT_BUILD = '1513'
         package.__path__ = []
