@@ -32,7 +32,8 @@ from gui.mods.offline_lan_0922.entities.native_remote_vehicle import \
 from gui.mods.offline_lan_0922.entities.remote_vehicle import (
     RemoteVehicleFactory, _collide_vehicle_evidence_at_matrix,
     _component_aim_angles, _pose_components, collide_vehicle_at_matrix,
-    pose_animation_writes, reset_pose_animation_writes)
+    encode_damage_sticker, pose_animation_writes,
+    reset_pose_animation_writes)
 from gui.mods.offline_lan_0922.entities.runtime import EntityPropertyBuilder
 from gui.mods.offline_lan_0922.projectile_manager import InFlightProjectiles
 from gui.mods.offline_lan_0922.projectile_runtime import (
@@ -7699,6 +7700,40 @@ class BattleRuntime(object):
                     result |= 1 << (24 + crew[role])
         return result
 
+    def _present_damage_sticker(self, event, target_record):
+        """Add one server-admitted direct hit to the stock sticker owner."""
+        if (self._worker_mode or 'damage_sticker' not in event or
+                event.get('splash', False) or
+                not self._optional_feature_enabled(
+                    'projectile damage stickers')):
+            return False
+        target = self._server_entity(target_record.get('engine_id'))
+        if (target is None or not getattr(target, 'isStarted', False) or
+                getattr(target, 'typeDescriptor', None) is None):
+            return False
+        try:
+            from VehicleEffects import DamageFromShotDecoder
+            code = event['damage_sticker']
+            component_name, sticker_id, segment_start, segment_end = \
+                DamageFromShotDecoder.decodeSegment(
+                    code, target.typeDescriptor)
+            add_sticker = getattr(
+                getattr(target, 'appearance', None),
+                'addDamageSticker', None)
+            if (not component_name or segment_start is None or
+                    segment_end is None or segment_start == segment_end or
+                    not callable(add_sticker)):
+                raise RuntimeError(
+                    '#1513 damage-sticker boundary is unavailable')
+            add_sticker(
+                code, component_name, sticker_id,
+                segment_start, segment_end)
+        except Exception as error:
+            self._warn_optional_failure(
+                'projectile damage stickers', error, disable=False)
+            return False
+        return True
+
     def _present_combat_hit(self, event, target_record, attacker_record,
                             attacker_id):
         """Port the mature 0.8.2 hit feedback through exact #1513 APIs."""
@@ -7981,6 +8016,15 @@ class BattleRuntime(object):
                  int(event.get('shot_result', 2)) == 2)):
             raise RuntimeError(
                 'ordered combat event has inconsistent blocked_damage')
+        if 'damage_sticker' in event:
+            damage_sticker = event.get('damage_sticker')
+            if (source != 'shot' or bool(event.get('splash', False)) or
+                    isinstance(damage_sticker, bool) or
+                    not isinstance(damage_sticker, _INTEGER_TYPES) or
+                    not 0 <= damage_sticker <=
+                    lan_protocol.MAX_PROJECTILE_DAMAGE_STICKER):
+                raise RuntimeError(
+                    'ordered combat event has invalid damage_sticker')
         attacker_key = self._event_entity_key(event, 'attacker')
         if source in ('shot', 'fire', 'ram') and attacker_key is None:
             raise RuntimeError(
@@ -8181,6 +8225,7 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'ordered combat event attacker has no native entity: %s:%s' %
                 (attacker_kind, attacker))
+        self._present_damage_sticker(event, record)
         blind_local_attack = bool(
             attacker_record is not None and
             self._is_blind_local_attack(record, attacker_record))
@@ -10651,9 +10696,65 @@ class BattleRuntime(object):
             return None
         return self._server_entity(record.get('engine_id'))
 
+    def _projectile_damage_sticker(self, record, target, shot, start, end,
+                                   collisions, result, historic=False):
+        """Encode one direct hit against the exact sampled component pose."""
+        try:
+            shell = _field(shot, 'shell', None)
+            effects_index = _field(shell, 'effectsIndex', None)
+            effects_descr = self._runtime.vehicles.g_cache.shotEffects[
+                effects_index]
+            target_stickers = _field(
+                effects_descr, 'targetStickers', {}) or {}
+            sticker_key = ('armorPierced' if int(result) == 2 else
+                           'armorResisted')
+            sticker_id = _field(target_stickers, sticker_key, None)
+            if (isinstance(sticker_id, bool) or
+                    not isinstance(sticker_id, _INTEGER_TYPES) or
+                    not 0 <= sticker_id <= 255):
+                return None
+            nearest = min(collisions, key=lambda item: float(item.dist))
+            component_name = nearest.compName
+            chassis_matrix = None
+            if historic:
+                body_matrix = getattr(target, 'matrix', None)
+            elif record.get('local') and self._local_matrix is not None:
+                body_matrix = self._local_body_pose()
+                chassis_matrix = self._local_matrix
+            elif record.get('native_remote'):
+                body_matrix, chassis_matrix = \
+                    self._projectile_vehicle_matrices(record, target)
+            else:
+                body_matrix = getattr(target, 'matrix', None)
+            encoded = encode_damage_sticker(
+                target, body_matrix, start, end, component_name,
+                sticker_id, self._runtime.math,
+                chassis_matrix=chassis_matrix)
+            if encoded is None:
+                return None
+            from VehicleEffects import DamageFromShotDecoder
+            decoded_component, decoded_sticker, decoded_start, decoded_end = \
+                DamageFromShotDecoder.decodeSegment(
+                    encoded, target.typeDescriptor)
+            component = getattr(
+                target.typeDescriptor, decoded_component, None)
+            tester = _field(component, 'hitTester', None)
+            local_hit_test = getattr(tester, 'localHitTest', None)
+            if (decoded_sticker != sticker_id or
+                    decoded_start is None or decoded_end is None or
+                    decoded_start == decoded_end or
+                    not callable(local_hit_test) or
+                    not local_hit_test(decoded_start, decoded_end)):
+                return None
+            return encoded
+        except Exception:
+            # A missing cosmetic contract must never discard admitted damage
+            # or turn an otherwise terminal projectile into an expiration.
+            return None
+
     def _projectile_effect(self, record, damage, result, impact,
                            critical, hull_damage, critical_delta,
-                           target_position=None):
+                           target_position=None, damage_sticker=None):
         target_kind = record.get('kind')
         if target_kind == 'human':
             target_kind = 'player'
@@ -10673,6 +10774,8 @@ class BattleRuntime(object):
                 'target_y': float(target_position[1]),
                 'target_z': float(target_position[2]),
             })
+        if damage_sticker is not None:
+            effect['damage_sticker'] = damage_sticker
         if isinstance(critical, dict):
             effect['critical'] = critical
             effect.update(self._critical_proposal_contract(
@@ -10741,6 +10844,10 @@ class BattleRuntime(object):
                     matching[0].worldNormal)
         armor = combat_rules.he_nominal_armor(
             collisions, getattr(critical_target, 'typeDescriptor', None))
+        damage_sticker = self._projectile_damage_sticker(
+            record, critical_target, shot, trace_start, trace_end,
+            collisions, result,
+            historic=isinstance(collision_pose, dict))
         damage = combat_rules.damage(shot, result, armor)
         hull_damage = damage
         legacy_shell = combat_rules.legacy_shot(shot).get('shell') or {}
@@ -10783,7 +10890,8 @@ class BattleRuntime(object):
             critical_target, critical)
         return self._projectile_effect(
             record, damage, result, terminal_data['impact'],
-            critical, hull_damage, critical_delta)
+            critical, hull_damage, critical_delta,
+            damage_sticker=damage_sticker)
 
     def _projectile_splash_effects(self, meta, impact, direct_key):
         source = self._projectile_source_entity(meta)

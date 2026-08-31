@@ -218,6 +218,7 @@ MODERN_VISIBLE_MESSAGE_TYPES = frozenset((
 PROJECTILE_MAX_ACTIVE = 128
 PROJECTILE_MAX_PER_SHOOTER = 32
 PROJECTILE_MAX_ID = 2147483647
+PROJECTILE_MAX_DAMAGE_STICKER = (1 << 64) - 1
 PROJECTILE_MAX_PROGRESS_BATCH = 30
 PROJECTILE_MAX_SPLASH_TARGETS = 30
 PROJECTILE_MAX_DESTRUCTIBLES = 64
@@ -2067,6 +2068,15 @@ class BattleState:
         if not event.get("dead", False) and death_reason != 0:
             raise RuntimeError(
                 "nonfatal combat event has nonzero death_reason")
+        if "damage_sticker" in event:
+            damage_sticker = event.get("damage_sticker")
+            if (source != "shot" or bool(event.get("splash", False)) or
+                    isinstance(damage_sticker, bool) or
+                    not isinstance(damage_sticker, int) or
+                    not 0 <= damage_sticker <=
+                    PROJECTILE_MAX_DAMAGE_STICKER):
+                raise RuntimeError(
+                    "combat event has invalid damage_sticker")
         has_attacker = "attacker" in event or "attacker_bot" in event
         if "attacker" in event and "attacker_bot" in event:
             raise RuntimeError("combat event has ambiguous attacker")
@@ -6711,6 +6721,7 @@ class BattleState:
             "hull_damage", "critical_delta", "potential_damage",
             "stun_end_server_time_ms",
             "target_x", "target_y", "target_z",
+            "damage_sticker",
         }
         required = {
             "target_kind", "target_id", "damage", "shot_result",
@@ -6767,6 +6778,14 @@ class BattleState:
         elif (target_kind == record["shooter_kind"] and
               target_id == record["shooter_id"]):
             raise ValueError("direct self hit")
+
+        damage_sticker = None
+        if "damage_sticker" in raw:
+            if splash:
+                raise ValueError("splash effect cannot carry damage sticker")
+            damage_sticker = _exact_int(
+                raw.get("damage_sticker"), 0,
+                PROJECTILE_MAX_DAMAGE_STICKER)
 
         critical = _critical_payload(raw.get("critical"))
         critical_delta = None
@@ -6825,6 +6844,7 @@ class BattleState:
             "hull_damage": hull_damage, "splash": bool(splash),
             "retired_target": retired_target,
             "stun_end_server_time_ms": stun_end_server_time_ms,
+            "damage_sticker": damage_sticker,
         }
 
     def ricochet_projectile(self, player_id, message):
@@ -6921,9 +6941,13 @@ class BattleState:
                     message.get("base_penetration_multiplier"),
                     0.0, 1.0, False)
                 raw_direct = message.get("direct")
-                if (not isinstance(raw_direct, dict) or set(raw_direct) != {
-                        "target_kind", "target_id", "damage", "shot_result",
-                        "x", "y", "z"}):
+                direct_fields = {
+                    "target_kind", "target_id", "damage", "shot_result",
+                    "x", "y", "z"}
+                if (not isinstance(raw_direct, dict) or
+                        set(raw_direct) not in (
+                            direct_fields,
+                            direct_fields | {"damage_sticker"})):
                     raise ValueError(
                         "ricochet direct effect has optional terminal fields")
                 direct = self._normalize_projectile_effect(
@@ -7095,6 +7119,8 @@ class BattleState:
             "x": proposal["pose"][0], "y": proposal["pose"][1],
             "z": proposal["pose"][2],
         }
+        if proposal.get("damage_sticker") is not None:
+            event["damage_sticker"] = proposal["damage_sticker"]
         if critical is not None:
             event["critical_accepted"] = bool(
                 (admitted_critical is not None or critical_noop) and

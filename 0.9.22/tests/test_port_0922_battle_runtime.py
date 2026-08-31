@@ -1910,6 +1910,8 @@ def _runtime():
                     'armorResisted': ('resistedStages', 'resistedFx', None),
                     'armorHit': ('hitStages', 'hitFx', None),
                     'armorSplashHit': ('splashStages', 'splashFx', None),
+                    'targetStickers': {
+                        'armorResisted': 7, 'armorPierced': 9},
                 }})))
 
 
@@ -2513,6 +2515,51 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertTrue(vehicle._release_stickers())
         self.assertIsNone(vehicle._vehicle_stickers)
         self.assertEqual(2, stickers.detach.call_count)
+
+    def test_remote_appearance_delegates_damage_sticker_to_stock_owner(self):
+        runtime = _runtime()
+        vehicle = RemoteVehicle(
+            11, _Descriptor(), {}, _Vector(), (0.0, 0.0, 0.0),
+            runtime.math)
+        stickers = types.SimpleNamespace(addDamageSticker=mock.Mock())
+        vehicle.attach_stickers(stickers)
+        start = _Vector(0.0, 0.0, -1.0)
+        end = _Vector(0.0, 0.0, 1.0)
+
+        vehicle.appearance.addDamageSticker(
+            123, 'hull', 7, start, end)
+
+        stickers.addDamageSticker.assert_called_once_with(
+            123, 'hull', 7, start, end)
+
+    def test_damage_sticker_encoder_clips_and_packs_component_local_ray(self):
+        descriptor = _Descriptor()
+        descriptor.chassis.hullPosition = _Vector()
+        descriptor.hull.hitTester = types.SimpleNamespace(bbox=(
+            _Vector(-1.0, -1.0, -1.0),
+            _Vector(1.0, 1.0, 1.0), None))
+        vehicle = _Vehicle(
+            11, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        math_module = types.SimpleNamespace(
+            Vector3=_Vector, Matrix=_Matrix)
+
+        encoded = remote_vehicle_module.encode_damage_sticker(
+            vehicle, vehicle.matrix,
+            _Vector(0.0, 0.0, -3.0), _Vector(0.0, 0.0, 3.0),
+            'vehicleHull', 37, math_module)
+
+        self.assertIsNotNone(encoded)
+        self.assertEqual(37, encoded & 255)
+        self.assertEqual(1, (encoded >> 8) & 255)
+        self.assertEqual(
+            [128, 128, 0, 128, 128, 255],
+            [(encoded >> shift) & 255
+             for shift in (16, 24, 32, 40, 48, 56)])
+        self.assertIsNone(remote_vehicle_module.encode_damage_sticker(
+            vehicle, vehicle.matrix,
+            _Vector(2.0, 0.0, -3.0), _Vector(2.0, 0.0, 3.0),
+            'vehicleHull', 37, math_module))
 
     def test_failed_effect_detach_keeps_entity_and_effect_for_retry(self):
         runtime = _runtime()
@@ -10037,6 +10084,121 @@ class BattleRuntimeContractTests(unittest.TestCase):
             (10, 17, 3 | (50 << 8), (5.0,)),
             (10, 17, 3, (0.0,)),
         ], battle._avatar.misc_statuses)
+
+    def test_projectile_damage_sticker_uses_exact_target_sticker_ids(self):
+        runtime = _runtime()
+        runtime.vehicles.g_cache.shotEffects[3]['targetStickers'] = {
+            'armorResisted': 17, 'armorPierced': 29}
+        battle = BattleRuntime(runtime)
+        descriptor = _Descriptor()
+        descriptor.hull.hitTester.localHitTest = mock.Mock(
+            return_value=[object()])
+        target = _Vehicle(
+            10, descriptor, _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        shot = descriptor.gun.shots[0]
+        collision = types.SimpleNamespace(
+            dist=1.0, compName='vehicleHull')
+        start = _Vector(0.0, 0.0, -2.0)
+        end = _Vector(0.0, 0.0, 2.0)
+        decoder = types.SimpleNamespace(decodeSegment=lambda code, unused: (
+            'hull', code, _Vector(0.0, 0.0, -1.0),
+            _Vector(0.0, 0.0, 1.0)))
+        vehicle_effects = types.SimpleNamespace(
+            DamageFromShotDecoder=decoder)
+
+        with mock.patch.object(
+                battle_runtime_module, 'encode_damage_sticker',
+                side_effect=lambda *args, **unused: args[5]) as encode, \
+                mock.patch.dict(
+                    sys.modules, {'VehicleEffects': vehicle_effects}):
+            codes = [battle._projectile_damage_sticker(
+                {'local': False, 'native_remote': False}, target, shot,
+                start, end, (collision,), result, historic=True)
+                     for result in (0, 1, 2)]
+
+        self.assertEqual([17, 17, 29], codes)
+        self.assertEqual(
+            [17, 17, 29],
+            [call.args[5] for call in encode.call_args_list])
+        self.assertEqual(3, descriptor.hull.hitTester.localHitTest.call_count)
+
+    def test_present_damage_sticker_uses_stock_appearance_while_hidden(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        target = _Vehicle(
+            10, _Descriptor(), _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        target.appearance.addDamageSticker = mock.Mock()
+        runtime.bigworld.entities[10] = target
+        target_record = {
+            'engine_id': 10, 'spot_visible': False,
+            'kind': 'bot', 'network_id': 2, 'local': False}
+        start = _Vector(0.0, 0.0, -1.0)
+        end = _Vector(0.0, 0.0, 1.0)
+        decoder = types.SimpleNamespace(decodeSegment=mock.Mock(
+            return_value=('hull', 29, start, end)))
+
+        with mock.patch.dict(sys.modules, {
+                'VehicleEffects': types.SimpleNamespace(
+                    DamageFromShotDecoder=decoder)}):
+            self.assertTrue(battle._present_damage_sticker(
+                {'damage_sticker': 123, 'source': 'shot'}, target_record))
+            self.assertFalse(battle._present_damage_sticker(
+                {'damage_sticker': 124, 'source': 'shot', 'splash': True},
+                target_record))
+
+        target.appearance.addDamageSticker.assert_called_once_with(
+            123, 'hull', 29, start, end)
+
+    def test_one_damage_sticker_failure_does_not_disable_later_hits(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        target = _Vehicle(
+            10, _Descriptor(), _Vector(), (0.0, 0.0, 0.0),
+            {'health': 500})
+        target.appearance.addDamageSticker = mock.Mock(side_effect=(
+            RuntimeError('one native sticker failed'), None))
+        runtime.bigworld.entities[10] = target
+        target_record = {'engine_id': 10}
+        decoder = types.SimpleNamespace(decodeSegment=mock.Mock(
+            return_value=(
+                'hull', 29, _Vector(0.0, 0.0, -1.0),
+                _Vector(0.0, 0.0, 1.0))))
+
+        with mock.patch.dict(sys.modules, {
+                'VehicleEffects': types.SimpleNamespace(
+                    DamageFromShotDecoder=decoder)}):
+            self.assertFalse(battle._present_damage_sticker(
+                {'damage_sticker': 123}, target_record))
+            self.assertTrue(battle._present_damage_sticker(
+                {'damage_sticker': 124}, target_record))
+
+        self.assertNotIn(
+            'projectile damage stickers',
+            battle._disabled_optional_features)
+        self.assertEqual(2, target.appearance.addDamageSticker.call_count)
+
+    def test_ordered_damage_sticker_contract_is_direct_shot_uint64(self):
+        battle = BattleRuntime(_runtime())
+        event = {
+            'kind': 'hit', 'source': 'shot', 'attacker': 1, 'target': 2,
+            'attack_reason': 0, 'death_reason': 0, 'dead': False,
+            'damage_sticker': (1 << 64) - 1}
+
+        self.assertEqual(
+            ('shot', 0), battle._validate_combat_event_contract(event))
+
+        for invalid in (True, 1.0, -1, 1 << 64):
+            with self.subTest(damage_sticker=invalid):
+                with self.assertRaisesRegex(
+                        RuntimeError, 'invalid damage_sticker'):
+                    battle._validate_combat_event_contract(dict(
+                        event, damage_sticker=invalid))
+        with self.assertRaisesRegex(
+                RuntimeError, 'invalid damage_sticker'):
+            battle._validate_combat_event_contract(dict(
+                event, splash=True))
 
     def test_local_victim_gets_native_hit_direction_and_world_effect(self):
         runtime = _runtime()
@@ -17866,6 +18028,14 @@ class BattleRuntimeContractTests(unittest.TestCase):
             effect['x'], effect['y'], effect['z']))
         self.assertEqual((20.0, 2.0, 0.0), (
             effect['target_x'], effect['target_y'], effect['target_z']))
+        self.assertNotIn('damage_sticker', effect)
+
+        direct = battle._projectile_effect(
+            {'kind': 'bot', 'network_id': 2}, 40, 2,
+            (10.0, 1.0, 0.0), None, None, None,
+            damage_sticker=12345678901234567890)
+        self.assertEqual(
+            12345678901234567890, direct['damage_sticker'])
 
     def test_worker_launch_uses_visible_trigger_ray_not_model_node(self):
         runtime = _runtime()

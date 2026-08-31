@@ -1917,6 +1917,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         original_launch_time = record['launch_server_time_ms']
         request = _ricochet(
             '1:p:1:1', destructibles=[_destructible()])
+        request['direct']['damage_sticker'] = 12345678901234567890
         revision = state.projectile_revision
 
         self.assertTrue(state.ricochet_projectile(
@@ -1942,6 +1943,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                          [event['kind'] for event in events])
         self.assertEqual(0, events[-1]['damage'])
         self.assertEqual(0, events[-1]['shot_result'])
+        self.assertEqual(
+            request['direct']['damage_sticker'],
+            events[-1]['damage_sticker'])
         snapshot = state._projectile_snapshot()[0]
         for key, value in snapshot.items():
             self.assertEqual(value, events[1][key])
@@ -1983,6 +1987,15 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             {'direct': _effect(damage=0, shot_result=1)},
             {'direct': dict(
                 _effect(damage=0, shot_result=0), potential_damage=5000)},
+            {'direct': _effect(
+                damage=0, shot_result=0, damage_sticker=True)},
+            {'direct': _effect(
+                damage=0, shot_result=0, damage_sticker=-1)},
+            {'direct': _effect(
+                damage=0, shot_result=0,
+                damage_sticker=(1 << 64))},
+            {'direct': _effect(
+                damage=0, shot_result=0, damage_sticker=1.0)},
             {'segment_velocity': [0.0, 0.0, 0.0]},
             {'segment_velocity': [3000.0, 0.0, 1.0]},
             {'penetration_factor': 0.999999},
@@ -2212,7 +2225,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
     def test_resolve_is_atomic_idempotent_and_preserves_hit_contract(self):
         state = _state()
         self.assertTrue(_launch_authority(state, _launch()))
-        message = _resolve('1:p:1:1')
+        sticker = (1 << 64) - 1
+        message = _resolve(
+            '1:p:1:1', direct=_effect(damage_sticker=sticker))
 
         self.assertTrue(state.resolve_projectile(SIMULATION_WORKER_AUTHORITY_ID, message))
         self.assertEqual(900, state.players[2].health)
@@ -2225,6 +2240,7 @@ class ServerProjectileLedgerTests(unittest.TestCase):
                          [event['kind'] for event in events])
         self.assertTrue(events[1]['hit_vehicle'])
         self.assertEqual('shot', events[-1]['source'])
+        self.assertEqual(sticker, events[-1]['damage_sticker'])
         outgoing = state.vehicle_interactions[
             ('player', 1)]['player:2']
         incoming = state.vehicle_interactions[
@@ -2242,6 +2258,23 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertFalse(state.resolve_projectile(
             SIMULATION_WORKER_AUTHORITY_ID,
             dict(message, checked_distance=11.0)))
+
+        for invalid in (True, 1.0, -1, 1 << 64):
+            with self.subTest(damage_sticker=invalid):
+                other = _state()
+                self.assertTrue(_launch_authority(other, _launch()))
+                self.assertFalse(other.resolve_projectile(
+                    SIMULATION_WORKER_AUTHORITY_ID,
+                    _resolve('1:p:1:1', direct=_effect(
+                        damage_sticker=invalid))))
+
+        splash_state = _state()
+        self.assertTrue(_launch_authority(splash_state, _launch()))
+        self.assertFalse(splash_state.resolve_projectile(
+            SIMULATION_WORKER_AUTHORITY_ID,
+            _resolve('1:p:1:1', direct=None, splash=[_effect(
+                target_kind='bot', target_id=16,
+                target_pose=(10.0, 1.0, 0.0), damage_sticker=1)])))
 
     def test_internal_projectile_stun_is_durable_expires_and_assists(self):
         state = _state(players=3)
