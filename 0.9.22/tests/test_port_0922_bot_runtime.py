@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import io
 import json
@@ -13,7 +14,8 @@ PORT_ROOT = ROOT / '0.9.22'
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 
 from lan_battle_server import (
-    BattleState, CLIENT_BUILD_0922, DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
+    BattleState, CLIENT_BUILD_0922, ClientHandler,
+    DESTRUCTIBLE_CATALOG_V5_CAPABILITY,
     EFFECTIVE_PARAMS_CAPABILITY,
     HUMAN_RAM_TIMELINE_CAPABILITY, PLAYER_ENVIRONMENT_CAPABILITY,
     PLAYER_FIRE_INTENT_CAPABILITY, Player,
@@ -410,6 +412,34 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         bot['combat_seq'] = bot['combat_ack_seq']
         return {'round_id': server.round_id, 'bots': [bot]}
 
+    @staticmethod
+    def _canonical_bot_commit_snapshot(server):
+        return {
+            'bot_source_time_us': server.bot_source_time_us,
+            'bot_source_receipt_time_us':
+                server.bot_source_receipt_time_us,
+            'bot_source_batch_horizon_us':
+                server.bot_source_batch_horizon_us,
+            'bot_launch_clock_offset_us':
+                server.bot_launch_clock_offset_us,
+            'bot_state_time_us': server.bot_state_time_us,
+            'motion_time_offset_us': server.motion_time_offset_us,
+            'bot_states': copy.deepcopy(server.bot_states),
+            'bot_state_revision': server.bot_state_revision,
+            'pending_events': copy.deepcopy(server.pending_events),
+            'bot_pending_projectile_launches': copy.deepcopy(
+                server.bot_pending_projectile_launches),
+            'bot_pending_projectile_metadata': copy.deepcopy(
+                server.bot_pending_projectile_metadata),
+            'human_ram_probe_requests': copy.deepcopy(
+                server.human_ram_probe_requests),
+            'human_ram_probe_fingerprints': copy.deepcopy(
+                server.human_ram_probe_fingerprints),
+            'human_ram_retired_probe_pairs': copy.deepcopy(
+                server.human_ram_retired_probe_pairs),
+            'battle_result': copy.deepcopy(server.battle_result),
+        }
+
     def test_revision_survives_player_departure_and_resets(self):
         server, manifest_bot, authority_socket = self._server()
         self.assertEqual(0, server.bot_state_revision)
@@ -741,6 +771,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         # maximum integration step drops the atomic state but re-anchors the
         # trusted source clock. A later normal sample can recover immediately.
         now[0] = 100.500
+        committed_before_rebase = self._canonical_bot_commit_snapshot(server)
         oversized = self._publication(server, 9.0)
         oversized['sample_time_us'] = 1000000
         oversized['source_batch_horizon_us'] = 1000000
@@ -751,7 +782,18 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(580000, server.bot_state_time_us)
         self.assertEqual(1000000, server.bot_source_time_us)
         self.assertEqual(500000, server.bot_source_receipt_time_us)
+        self.assertEqual(1000000, server.bot_source_batch_horizon_us)
         self.assertEqual(90000, server.motion_time_offset_us)
+        rebased = self._canonical_bot_commit_snapshot(server)
+        source_lineage = {
+            'bot_source_time_us', 'bot_source_receipt_time_us',
+            'bot_source_batch_horizon_us',
+            'bot_launch_clock_offset_us',
+        }
+        for field in committed_before_rebase:
+            if field not in source_lineage:
+                self.assertEqual(
+                    committed_before_rebase[field], rebased[field], field)
 
         now[0] = 100.530
         recovered = self._publication(server, 2.6)
@@ -776,6 +818,111 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         server._reset_round()
         self.assertIsNone(server.bot_source_receipt_time_us)
         self.assertEqual(0, server.motion_time_offset_us)
+
+    def test_malformed_future_publications_do_not_rebase_any_clock_or_state(self):
+        now = [100.0]
+        server, _, unused_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+
+        now[0] = 100.200
+        baseline = self._publication(server, 0.4)
+        baseline['sample_time_us'] = 40000
+        baseline['source_batch_horizon_us'] = 40000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, baseline))
+        committed = self._canonical_bot_commit_snapshot(server)
+
+        malformed = []
+
+        empty_batch = self._publication(server, 1.0)
+        empty_batch['bots'] = []
+        malformed.append(('batch_shape', empty_batch))
+
+        bad_row = self._publication(server, 1.0)
+        bad_row['bots'][0].pop('x')
+        malformed.append(('bot_shape', bad_row))
+
+        bad_ram = self._publication(server, 1.0)
+        bad_ram['human_ram_armors'] = [{}]
+        malformed.append(('human_ram_armors', bad_ram))
+
+        bad_combat = self._publication(server, 1.0)
+        bad_combat['bots'][0]['combat_seq'] = (
+            bad_combat['bots'][0]['combat_ack_seq'] + 2)
+        malformed.append(('combat_contract', bad_combat))
+
+        bad_ammo = self._publication(server, 1.0)
+        bad_ammo['bots'][0]['ammo_remaining'] = list(
+            bad_ammo['bots'][0]['ammo_remaining'])
+        bad_ammo['bots'][0]['ammo_remaining'][0] += 1
+        malformed.append(('ammo_contract', bad_ammo))
+
+        for index, (reject_code, publication) in enumerate(malformed):
+            now[0] = 100.210 + index * 0.005
+            publication['sample_time_us'] = 1000000 + index * 10000
+            publication['source_batch_horizon_us'] = (
+                publication['sample_time_us'])
+            self.assertFalse(server.update_bot_states(
+                SIMULATION_WORKER_AUTHORITY_ID, publication))
+            self.assertEqual(reject_code, server.last_bot_state_reject_code)
+            self.assertEqual(
+                committed, self._canonical_bot_commit_snapshot(server),
+                reject_code)
+
+        # Because every malformed future packet left the accepted source
+        # frontier untouched, the producer can resume from its last-good clock.
+        now[0] = 100.260
+        recovered = self._publication(server, 0.8)
+        recovered['sample_time_us'] = 80000
+        recovered['source_batch_horizon_us'] = 80000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, recovered),
+            server.last_bot_state_reject)
+        self.assertEqual(80000, server.bot_source_time_us)
+        self.assertEqual(2, server.bot_state_revision)
+        self.assertEqual(0.8, server.bot_states[11]['x'])
+
+    def test_dispatcher_counts_only_validated_clock_rebase_as_advancement(self):
+        now = [100.0]
+        server, _, unused_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+        now[0] = 100.200
+        baseline = self._publication(server, 0.4)
+        baseline['sample_time_us'] = 40000
+        baseline['source_batch_horizon_us'] = 40000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, baseline))
+
+        handler = object.__new__(ClientHandler)
+        wrapper = types.SimpleNamespace(state=server)
+        malformed = self._publication(server, 1.0)
+        malformed['sample_time_us'] = 1000000
+        malformed['source_batch_horizon_us'] = 1000000
+        malformed['bots'] = []
+        malformed['type'] = 'bot_state'
+        committed = self._canonical_bot_commit_snapshot(server)
+
+        now[0] = 100.210
+        self.assertFalse(handler._dispatch_simulation_worker_message(
+            wrapper, server.simulation_worker, malformed))
+        self.assertEqual('batch_shape', server.last_bot_state_reject_code)
+        self.assertEqual(
+            committed, self._canonical_bot_commit_snapshot(server))
+        self.assertIs(server.simulation_worker,
+                      wrapper.state.simulation_worker)
+        self.assertTrue(server.simulation_worker.connected)
+
+        complete = self._publication(server, 1.0)
+        complete['sample_time_us'] = 1000000
+        complete['source_batch_horizon_us'] = 1000000
+        complete['type'] = 'bot_state'
+        self.assertTrue(handler._dispatch_simulation_worker_message(
+            wrapper, server.simulation_worker, complete))
+        self.assertEqual('sample_time_rate',
+                         server.last_bot_state_reject_code)
+        self.assertEqual(1000000, server.bot_source_time_us)
 
     def test_bot_state_after_battle_result_is_an_idempotent_noop(self):
         server, unused_worker, unused_authority_socket = self._server()

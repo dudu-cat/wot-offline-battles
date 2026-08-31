@@ -5079,6 +5079,7 @@ class BattleState:
             previous_source_time_us = self.bot_source_time_us
             source_time_us = None
             source_batch_horizon_us = None
+            source_clock_rebase = False
             if "sample_time_us" in message:
                 try:
                     source_time_us = _exact_int(
@@ -5129,26 +5130,17 @@ class BattleState:
                     if source_delta_us > (
                             receipt_elapsed_us +
                             MAX_BOT_SAMPLE_LEAD_US):
-                        # Retain the last-good Bot checkpoint, but advance the
-                        # trusted worker clock origin.  Otherwise every later
-                        # normal sample remains ahead after one render stall or
-                        # coalesced outbound backlog.
-                        self.bot_source_time_us = source_time_us
-                        self.bot_source_receipt_time_us = (
-                            received_raw_motion_time_us)
-                        self.bot_source_batch_horizon_us = (
-                            source_batch_horizon_us)
-                        self.bot_launch_clock_offset_us = (
-                            self._server_time_ms() * 1000 -
-                            source_batch_horizon_us)
-                        return self._set_protocol_reject(
-                            "bot_state", "sample_time_rate",
-                            ("sample_delta=%s receipt_elapsed=%s "
-                             "max_lead=%s") % (
-                                source_delta_us, receipt_elapsed_us,
-                                MAX_BOT_SAMPLE_LEAD_US))
-                    next_bot_state_time_us = (
-                        self.bot_state_time_us + source_delta_us)
+                        # A complete, valid publication may re-anchor the
+                        # trusted source clock after a render stall or a
+                        # coalesced outbound backlog.  Defer that rebase until
+                        # every row and side ledger has been validated so a
+                        # malformed future packet cannot poison the accepted
+                        # lineage.
+                        source_clock_rebase = True
+                        next_bot_state_time_us = self.bot_state_time_us
+                    else:
+                        next_bot_state_time_us = (
+                            self.bot_state_time_us + source_delta_us)
             elif "source_batch_horizon_us" in message:
                 return self._set_protocol_reject(
                     "bot_state", "sample_horizon_without_time",
@@ -5170,7 +5162,11 @@ class BattleState:
                 self.motion_time_offset_us,
                 next_bot_state_time_us - received_raw_motion_time_us)
             next_launch_clock_offset_us = self.bot_launch_clock_offset_us
-            if (source_time_us is not None and
+            if source_clock_rebase:
+                next_launch_clock_offset_us = (
+                    self._server_time_ms() * 1000 -
+                    source_batch_horizon_us)
+            elif (source_time_us is not None and
                     next_launch_clock_offset_us is None):
                 next_launch_clock_offset_us = (
                     self._server_time_ms() * 1000 -
@@ -5361,6 +5357,21 @@ class BattleState:
                 return self._set_protocol_reject(
                     "bot_state", "batch_members",
                     "missing=%s" % sorted(set(identities) - seen))
+            if source_clock_rebase:
+                # The complete packet proved its source lineage, but its rows
+                # remain outside the admitted motion frontier.  Commit only
+                # the source clock origin so the next normal publication can
+                # recover without publishing speculative pose, combat, event,
+                # projectile, or revision state.
+                self.bot_source_time_us = source_time_us
+                self.bot_source_receipt_time_us = received_raw_motion_time_us
+                self.bot_source_batch_horizon_us = source_batch_horizon_us
+                self.bot_launch_clock_offset_us = next_launch_clock_offset_us
+                return self._set_protocol_reject(
+                    "bot_state", "sample_time_rate",
+                    ("sample_delta=%s receipt_elapsed=%s max_lead=%s") % (
+                        source_delta_us, receipt_elapsed_us,
+                        MAX_BOT_SAMPLE_LEAD_US))
             self._commit_human_ram_armors(human_ram_armors)
             self.bot_states = next_states
             for bot_id in stun_clears:
@@ -11976,15 +11987,16 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 # State publications are atomic.  A timing, precision or
                 # model-contract mismatch can safely retain the last-good
                 # checkpoint while the local trusted worker sends its next
-                # full publication.  Treat the soft drop as liveness so a
-                # persistent diagnostic never turns into a forced draw.
+                # full publication. Only a fully validated source-clock
+                # rebase advances liveness; malformed soft drops do not prove
+                # that authoritative simulation is progressing.
                 if server.state.should_log_protocol_reject(
                         "bot_state", accepted):
                     _server_log(
                         "BOT STATE dropped authority=%d code=%s reason=%s" % (
                             authority_id, reject_code,
                             server.state.last_bot_state_reject))
-                accepted = True
+                return reject_code == "sample_time_rate"
             elif server.state.should_log_protocol_reject(
                     "bot_state", accepted):
                 _server_log(
