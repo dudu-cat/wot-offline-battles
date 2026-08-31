@@ -43,6 +43,13 @@ WORKER_CONTROL_SECONDS = 0.10
 # catch-up step.  Remaining elapsed stays as debt for later callbacks instead
 # of multiplying full-roster native work in the frame that already stalled.
 MAX_CONTROL_STEPS_PER_FRAME = 2
+# A second full-roster step is useful only while the first one leaves enough
+# room inside the worker's 10 Hz period.  Once the first step alone consumes
+# half that period, repeating it in the same render callback creates the
+# measured slow-frame feedback loop.  This wall budget only defers catch-up;
+# the simulation elapsed that drives one-shot transitions remains in the
+# accumulator.
+CONTROL_CATCH_UP_WALL_BUDGET_SECONDS = WORKER_CONTROL_SECONDS * 0.5
 LOCAL_ACTION_SECONDS = 0.10
 TACTICAL_REFRESH_SECONDS = 1.0
 # Eight protocol-maximum exact paths can share only two of the four native
@@ -1727,7 +1734,8 @@ class BotRuntime(object):
                  motion_resolver=None, motion_report=None,
                  world_receipt_probe=None, probe_timing_seconds=0.0,
                  water_depth_probe=None, ram_contact_probe=None,
-                 bot_equipment_resolver=None, control_seconds=None):
+                 bot_equipment_resolver=None, control_seconds=None,
+                 control_work_clock=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.player_descriptor_resolver = player_descriptor_resolver
@@ -1802,6 +1810,9 @@ class BotRuntime(object):
         self._fixed_control = control_seconds is not None
         self._control_seconds = max(
             0.001, _number(control_seconds, PUBLICATION_SECONDS))
+        self._control_work_clock = (
+            control_work_clock if callable(control_work_clock) else None)
+        self._control_work_clock_failed = False
         self._water_depth_probe = (
             water_depth_probe if callable(water_depth_probe) else
             (lambda unused_position: -1.0))
@@ -7628,12 +7639,13 @@ class BotRuntime(object):
     def update(self, dt, now, players=None, neighbours=None):
         """Advance fixed-rate Bot control with bounded render catch-up.
 
-        Render callbacks only add elapsed debt.  At most two configured fixed
-        control steps run in one callback, so a stall cannot immediately
-        multiply all roster probes and projections. Debt is retained, never
-        discarded; ordinary render rates drain it over following callbacks.
-        Burst clocks still advance across the complete processed step and
-        enqueue every crossed physical round with its exact due timestamp.
+        Render callbacks only add elapsed debt. At most two configured fixed
+        control steps run in one callback, and a costly first step defers the
+        second, so a stall cannot immediately multiply all roster probes and
+        projections. Debt is retained, never discarded; healthy render
+        callbacks drain it later. Burst clocks still advance across the
+        complete processed step and enqueue every crossed physical round with
+        its exact due timestamp.
         """
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
@@ -7676,6 +7688,20 @@ class BotRuntime(object):
                             frame_step, step_now, players, neighbours))
                 else:
                     steps = 0
+                    work_started = None
+                    if (self._control_work_clock is not None and
+                            not self._control_work_clock_failed and
+                            self._accumulator + 1e-9 >=
+                            self._control_seconds * 2.0):
+                        try:
+                            work_started = float(self._control_work_clock())
+                            if (math.isnan(work_started) or
+                                    math.isinf(work_started)):
+                                work_started = None
+                                self._control_work_clock_failed = True
+                        except Exception:
+                            work_started = None
+                            self._control_work_clock_failed = True
                     while (steps < MAX_CONTROL_STEPS_PER_FRAME and
                            self._accumulator + 1e-9 >=
                            self._control_seconds):
@@ -7686,6 +7712,32 @@ class BotRuntime(object):
                             self._control_seconds, step_now,
                             players, neighbours))
                         steps += 1
+                        if (steps == 1 and
+                                self._accumulator + 1e-9 >=
+                                self._control_seconds and
+                                self._control_work_clock is not None):
+                            # A broken or regressing diagnostic clock fails to
+                            # the one-step path. It may delay catch-up, but it
+                            # can never discard debt or alter this completed
+                            # step's command and one-shot outcomes.
+                            if (self._control_work_clock_failed or
+                                    work_started is None):
+                                break
+                            try:
+                                work_finished = float(
+                                    self._control_work_clock())
+                                work_elapsed = work_finished - work_started
+                                if (math.isnan(work_elapsed) or
+                                        math.isinf(work_elapsed) or
+                                        work_elapsed < 0.0):
+                                    self._control_work_clock_failed = True
+                                    break
+                            except Exception:
+                                self._control_work_clock_failed = True
+                                break
+                            if (work_elapsed >=
+                                    CONTROL_CATCH_UP_WALL_BUDGET_SECONDS):
+                                break
             finally:
                 if receipt_frame_open:
                     self._finish_world_receipt_frame()

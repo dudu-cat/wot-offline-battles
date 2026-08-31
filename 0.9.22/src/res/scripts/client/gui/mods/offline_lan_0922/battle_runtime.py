@@ -60,8 +60,9 @@ from gui.mods.offline_lan_0922 import (
 # and makes copied local physics, authority bots and remote interpolation step
 # even while the renderer itself reports a healthy frame rate.
 FRAME_SECONDS = 0.0
-# This release is intentionally a measurement build.  The profiler is
-# observational only: it never feeds a gameplay clock, deadline or budget.
+# Runtime profiling is observational. The same process-time clock separately
+# gates whether a hidden-worker callback may run its second fixed catch-up
+# step; it never becomes simulation time or changes retained elapsed debt.
 PERFORMANCE_DIAGNOSTICS = True
 WORKER_NATIVE_PROBE_SECONDS = 5.0
 # Keep enough timing evidence for user-submitted logs without displacing
@@ -2806,7 +2807,9 @@ class BattleRuntime(object):
                 probe_timing_seconds=(
                     WORKER_NATIVE_PROBE_SECONDS if self._worker_mode else 0.0),
                 control_seconds=(
-                    WORKER_CONTROL_SECONDS if self._worker_mode else None))
+                    WORKER_CONTROL_SECONDS if self._worker_mode else None),
+                control_work_clock=(
+                    _PROFILE_CLOCK if self._worker_mode else None))
             self._bots.debug_logging = bool(
                 self._config.get('debug_logging', False))
             # Sampled here, not before BotRuntime exists: the bot, navigator

@@ -4577,6 +4577,84 @@ class BotRuntimeTests(unittest.TestCase):
             for message in all_messages))
         self.assertAlmostEqual(0.0, runtime._accumulator)
 
+    def test_worker_slow_first_step_defers_second_step_and_keeps_debt(self):
+        clock_values = iter((10.0, 10.06))
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS,
+            control_work_clock=lambda: next(clock_values))
+        runtime.authority_id = 1
+        runtime.adapter = object()
+        runtime._decision_cache[11] = ('last-command',)
+        steps = []
+        runtime._update_once = lambda step, *unused: steps.append(step) or []
+
+        runtime.update(0.3, 1.0)
+
+        self.assertEqual([self.module.WORKER_CONTROL_SECONDS], steps)
+        self.assertAlmostEqual(0.2, runtime._accumulator)
+        self.assertEqual(('last-command',), runtime._decision_cache[11])
+
+    def test_worker_fast_first_step_still_consumes_one_catch_up_step(self):
+        clock_values = iter((10.0, 10.01))
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS,
+            control_work_clock=lambda: next(clock_values))
+        runtime.authority_id = 1
+        runtime.adapter = object()
+        steps = []
+        runtime._update_once = lambda step, *unused: steps.append(step) or []
+
+        runtime.update(0.3, 1.0)
+
+        self.assertEqual(
+            [self.module.WORKER_CONTROL_SECONDS] * 2, steps)
+        self.assertAlmostEqual(0.1, runtime._accumulator)
+
+    def test_worker_without_work_clock_keeps_legacy_two_step_cap(self):
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.authority_id = 1
+        runtime.adapter = object()
+        steps = []
+        runtime._update_once = lambda step, *unused: steps.append(step) or []
+
+        runtime.update(0.3, 1.0)
+
+        self.assertEqual(
+            [self.module.WORKER_CONTROL_SECONDS] * 2, steps)
+        self.assertAlmostEqual(0.1, runtime._accumulator)
+
+    def test_worker_broken_work_clock_fails_to_one_step_without_losing_debt(self):
+        calls = [0]
+
+        def broken_clock():
+            calls[0] += 1
+            if calls[0] == 1:
+                return 10.0
+            raise RuntimeError('clock failed')
+
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS,
+            control_work_clock=broken_clock)
+        runtime.authority_id = 1
+        runtime.adapter = object()
+        steps = []
+        runtime._update_once = lambda step, *unused: steps.append(step) or []
+
+        runtime.update(0.3, 1.0)
+
+        self.assertEqual([self.module.WORKER_CONTROL_SECONDS], steps)
+        self.assertAlmostEqual(0.2, runtime._accumulator)
+        self.assertTrue(runtime._control_work_clock_failed)
+        self.assertEqual(2, calls[0])
+
+        runtime.update(0.0, 1.0)
+
+        self.assertEqual(
+            [self.module.WORKER_CONTROL_SECONDS] * 2, steps)
+        self.assertAlmostEqual(0.1, runtime._accumulator)
+        self.assertEqual(2, calls[0])
+
     def test_authority_publication_and_server_ack_remain_live_for_two_minutes(self):
         command = {
             'target_yaw': 0.0, 'throttle': 0.0, 'turn': 0.0,
@@ -7197,11 +7275,20 @@ class BotRuntimeTests(unittest.TestCase):
             'afterShot': 4.0, 'afterShotInBurst': 1.0,
             'turretRotation': 0.0,
         }
+        work_time = [0.0]
+
+        def slow_work_clock():
+            value = work_time[0]
+            work_time[0] += (
+                self.module.CONTROL_CATCH_UP_WALL_BUDGET_SECONDS + 0.01)
+            return value
+
         runtime = self.module.BotRuntime(
             1, friendly_lane_probe=lambda *unused: True,
             direct_launch_origin_probe=lambda source, *unused: (
                 source['x'], source['y'] + 1.0, source['z']),
-            control_seconds=self.module.WORKER_CONTROL_SECONDS)
+            control_seconds=self.module.WORKER_CONTROL_SECONDS,
+            control_work_clock=slow_work_clock)
         runtime.round_id = 5
         runtime.authority_id = 1
         runtime.adapter = object()
@@ -7246,10 +7333,10 @@ class BotRuntimeTests(unittest.TestCase):
 
         runtime._update_once = simulate
         runtime.update(1.0, 1.0)
-        self.assertEqual(3, len(runtime._pending_launches))
-        self.assertAlmostEqual(0.8, runtime._accumulator)
+        self.assertEqual(2, len(runtime._pending_launches))
+        self.assertAlmostEqual(0.9, runtime._accumulator)
 
-        for unused in range(4):
+        for unused in range(9):
             runtime.update(0.0, 1.0)
 
         self.assertEqual(count, len(runtime._pending_launches))
