@@ -8,7 +8,9 @@ for visibility, collision probes, and applying commands to any client entity.
 
 import math
 
-from gui.mods.offline_lan_0922.ai.driver import LocalDriver
+from gui.mods.offline_lan_0922.ai.driver import (
+    LocalDriver, WAYPOINT_ARRIVAL_RADIUS,
+)
 from gui.mods.offline_lan_0922.ai.planner import BattleDirector
 
 
@@ -108,17 +110,37 @@ class BotAdapter(object):
         movement_intent = not (
             throttle_override is not None and
             float(throttle_override) <= 0.0)
-        local = self.driver.drive(
-            bot_id, position, float(state.get('yaw', 0.0)),
-            float(state.get('speed', 0.0)), float(state.get('dt', 0.0)),
-            target, state.get('neighbours', ()), direction_clear,
-            velocity=state.get('velocity'),
-            half_length=float(state.get('half_length', 3.5)),
-            half_width=float(state.get('half_width', 1.7)),
-            movement_intent=movement_intent,
-            stopping_distance=state.get('stopping_distance'),
-            stop_at_target=stop_at_target,
-            decision_horizon=float(state.get('decision_horizon', 0.0)))
+        requested_dx = float(move_position[0]) - float(position[0])
+        requested_dz = float(move_position[2]) - float(position[2])
+        target_dx = float(target[0]) - float(position[0])
+        target_dz = float(target[2]) - float(position[2])
+        navigation_wait = bool(
+            movement_intent and
+            requested_dx * requested_dx + requested_dz * requested_dz > 225.0 and
+            target_dx * target_dx + target_dz * target_dz <=
+            WAYPOINT_ARRIVAL_RADIUS * WAYPOINT_ARRIVAL_RADIUS)
+        if navigation_wait:
+            # TerrainNavigator returned the current pose because a resumable A*
+            # job is still pending. This is a planner wait, not route arrival and
+            # not physical evidence that should advance LocalDriver recovery.
+            local = {
+                'throttle': 0.0,
+                'turn': 0.0,
+                'target_yaw': float(state.get('yaw', 0.0)),
+                'recovery_mode': 'nav_wait',
+            }
+        else:
+            local = self.driver.drive(
+                bot_id, position, float(state.get('yaw', 0.0)),
+                float(state.get('speed', 0.0)), float(state.get('dt', 0.0)),
+                target, state.get('neighbours', ()), direction_clear,
+                velocity=state.get('velocity'),
+                half_length=float(state.get('half_length', 3.5)),
+                half_width=float(state.get('half_width', 1.7)),
+                movement_intent=movement_intent,
+                stopping_distance=state.get('stopping_distance'),
+                stop_at_target=stop_at_target,
+                decision_horizon=float(state.get('decision_horizon', 0.0)))
         # Preserve the mature face-position intent which is separate from the
         # gun target.  At a route/cover stop it gives armoured turreted tanks
         # their stable 12-30 degree hull angle while the turret keeps tracking
@@ -128,7 +150,7 @@ class BotAdapter(object):
         turn = float(local['turn'])
         dx = float(face_position[0]) - float(position[0])
         dz = float(face_position[2]) - float(position[2])
-        if (recovery_mode == 'arrived' and
+        if (recovery_mode in ('arrived', 'nav_wait') and
                 dx * dx + dz * dz > 0.01):
             target_yaw = math.atan2(dx, dz)
             difference = target_yaw - float(state.get('yaw', 0.0))

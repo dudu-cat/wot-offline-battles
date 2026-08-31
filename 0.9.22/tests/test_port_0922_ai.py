@@ -400,6 +400,32 @@ class BotAiPortTests(unittest.TestCase):
         self.assertGreater(order['turn'], 0.0)
         self.assertAlmostEqual(math.atan2(20.0, 40.0), order['target_yaw'])
 
+    def test_adapter_reports_pending_navigation_as_wait_not_arrival(self):
+        descriptor = {'type': {'name': 'MS-1', 'tags': ('mediumTank',)},
+                      'physics': {'speedLimits': (18.0,)}, 'hull': {},
+                      'turret': {}, 'gun': {'shots': ()}}
+        adapter = BotAdapter(
+            '01_karelia', 7,
+            navigation_target=lambda unused_id, position, *unused: position)
+        adapter.register(1, 1, descriptor)
+
+        order = adapter.decide_with_order({
+            'id': 1, 'position': (0.0, 0.0, 0.0), 'yaw': 0.25,
+            'speed': 0.0, 'dt': 0.05, 'now': 1.0,
+            'neighbours': (),
+        }, {
+            'move_position': (0.0, 0.0, 100.0),
+            'fire_allowed': False, 'fire_range': 400.0,
+            'combat_mode': 'route', 'shell_index': 0,
+        }, lambda unused_yaw: self.fail(
+            'pending navigation must not probe movement corridors'))
+
+        self.assertEqual((0.0, 0.0, 0.0), order['move_position'])
+        self.assertEqual('nav_wait', order['recovery_mode'])
+        self.assertEqual(0.0, order['throttle'])
+        self.assertLess(order['turn'], 0.0)
+        self.assertEqual(0.0, order['target_yaw'])
+
     def test_local_director_does_not_jiggle_without_confirmed_cover(self):
         descriptor = {
             'type': {'name': 'heavy', 'tags': ('heavyTank',)},
