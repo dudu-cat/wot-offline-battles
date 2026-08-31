@@ -8,6 +8,21 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 
 ## Stability and recovery
 
+- Every admitted current-round fire intent now reaches an idempotent terminal
+  result even when the worker cannot launch it. The client clears its native
+  shot wait without consuming ammunition or starting reload, and later shots
+  can continue from the acknowledged sequence.
+- Future Bot publications are validated as one transaction before they can
+  rebase simulation clocks or refresh worker liveness. A malformed publication
+  can no longer keep a frozen authority alive by advancing only its timestamps.
+- Worker Bot manifests remain immutable and pending until the LAN transport
+  accepts them. Temporary backpressure retries the same lineup; a fixed startup
+  deadline retires the failed worker and terminates the loading round instead of
+  leaving the room permanently half-started.
+- The server tick thread is supervised. One uncertain active tick produces an
+  explicit no-settlement terminal result and the ordinary round reset; repeated
+  failures close the listener instead of leaving a TCP server that answers while
+  simulation is dead.
 - Compatible 0.9.22 clients and simulation workers now recover from transient
   stalls, duplicate or reordered updates, queue pressure, and timing drift
   without unnecessarily ending the battle. Identity, round, roster, and
@@ -40,9 +55,20 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 
 ## Battle behavior
 
+- Direct vehicle hits now enter the stock #1513 damage-sticker chain and leave
+  persistent pierced or resisted marks on the correct frozen hull component.
+  Ricochets retain their distinct stock impact effect and use the available
+  resisted sticker; splash damage does not create a direct-hit decal.
+- A lethal hit's final crew-state refresh now retains the real attacker, so
+  player damage remains orange instead of being overwritten by generic red.
+  Ally, blind-shot, and all-crew-knocked-out paths keep their original category.
 - Destroying an unspotted enemy now finalizes its death immediately. Its wreck
   remains visible independently of spotting in normal, sniper, artillery, and
   overhead views, subject only to normal rendering distance and view culling.
+- Bot overlap recovery now tests the real current hull pose rather than rotating
+  its collision box to a future route heading. Failed steering directions use a
+  circular cache, so equivalent angles around the +/-pi seam share one penalty
+  instead of reopening the opposite turn every time `atan2` wraps.
 - Bots align their hull before committing to a route, reducing base spinning
   and stop-start movement. Discovered artillery is now a priority target
   without making every bot focus the same vehicle.
