@@ -7935,6 +7935,23 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(moved_pose, team_spotted['aim_position'])
         self.assertEqual(stale, missing['aim_position'])
 
+        stable = self.module._overlay_live_target_pose(dict(
+            command, combat_mode='support_hold', stable_hull_face=True,
+            face_position=stale), {
+                'alive': True, 'visible': True, 'position': moved_pose})
+        self.assertEqual(moved_pose, stable['aim_position'])
+        self.assertEqual(stale, stable['face_position'])
+        self.assertNotEqual(
+            self.module._server_order_signature(stable),
+            self.module._server_order_signature(dict(
+                stable, face_position=(10.0, 1.0, 10.0))))
+        with self.assertRaisesRegex(
+                ValueError, 'stable hull face flag is invalid'):
+            self.module._overlay_live_target_pose(
+                dict(command, stable_hull_face=1), {
+                    'alive': True, 'visible': True,
+                    'position': moved_pose})
+
         with self.assertRaisesRegex(
                 ValueError, 'alive flag is invalid'):
             self.module._overlay_live_target_pose(command, {

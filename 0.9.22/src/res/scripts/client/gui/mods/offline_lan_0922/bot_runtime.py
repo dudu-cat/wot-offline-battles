@@ -1573,10 +1573,13 @@ def _overlay_live_target_pose(command, target, source_position=None):
     if any(math.isnan(value) or math.isinf(value) for value in position):
         raise ValueError('canonical live target position must be finite')
     result['aim_position'] = position
+    stable_hull_face = result.get('stable_hull_face', False)
+    if not isinstance(stable_hull_face, bool):
+        raise ValueError('stable hull face flag is invalid')
     angle_degrees = result.get('hull_angle_degrees')
-    if angle_degrees is None:
+    if not stable_hull_face and angle_degrees is None:
         result['face_position'] = position
-    else:
+    elif not stable_hull_face:
         origin = source_position
         if isinstance(origin, dict):
             origin = (origin.get('x'), origin.get('y'), origin.get('z'))
@@ -1615,7 +1618,8 @@ def _server_order_signature(order):
     result = dict(order or {})
     if result.get('target_id') is not None:
         result.pop('aim_position', None)
-        result.pop('face_position', None)
+        if not result.get('stable_hull_face', False):
+            result.pop('face_position', None)
         if result.get('combat_mode') == 'advance_contact':
             result.pop('move_position', None)
     return result
