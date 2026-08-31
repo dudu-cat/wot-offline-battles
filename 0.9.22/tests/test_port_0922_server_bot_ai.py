@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -468,6 +469,57 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual('base_screen', staged[404]['combat_mode'])
         self.assertEqual(4, staged[404]['route_index'])
         self.assertEqual(0.0, staged[404]['throttle_override'])
+
+    def test_malinovka_shared_connector_advances_through_forward_corridor(self):
+        graph = json.loads(
+            (PORT_ROOT / 'navgraphs' / '02_malinovka.json').read_text())
+        baked = next(
+            route for route in graph['routes']['2']
+            if route['id'] == 'central_field')
+        route = _route(
+            baked['id'],
+            [(point[0], point[1], point[2])
+             for point in baked['waypoints']])
+        bot = _bot(24, 2, 0, route, 'AT-SPG')
+        bot['state'] = _state(24, 2, -360.68, 104.85)
+        planner = BotPlanner()
+        planner._route_states[24] = {
+            'index': 1,
+            'route_id': 'central_field',
+            'join_index': 1,
+            'join_anchor': {'x': -374.0, 'y': 0.0, 'z': 110.0},
+        }
+
+        route_id, index, point, anchor, route_join = planner._route(bot, 1.0)
+
+        self.assertEqual('central_field', route_id)
+        self.assertEqual(2, index)
+        self.assertEqual({'x': -362.0, 'y': 0.0, 'z': 106.0}, point)
+        self.assertEqual({'x': -374.0, 'y': 0.0, 'z': 106.0}, anchor)
+        self.assertFalse(route_join)
+
+    def test_route_corridor_does_not_accept_lateral_or_distant_bypasses(self):
+        route = _route('bounded-corridor', [
+            (0, -20, False), (0, 0, False), (12, 0, False),
+            (80, 80, False),
+        ])
+        planner = BotPlanner()
+
+        for bot_id, x, z in ((25, 8.0, 13.1), (26, 40.0, 0.0)):
+            bot = _bot(bot_id, 1, 0, route, 'mediumTank')
+            bot['state'] = _state(bot_id, 1, x, z)
+            planner._route_states[bot_id] = {
+                'index': 1,
+                'route_id': 'bounded-corridor',
+                'join_index': 1,
+                'join_anchor': {'x': 0.0, 'y': 0.0, 'z': -20.0},
+            }
+
+            unused_route_id, index, point, unused_anchor, unused_join = (
+                planner._route(bot, 1.0))
+
+            self.assertEqual(1, index)
+            self.assertEqual({'x': 0.0, 'y': 0.0, 'z': 0.0}, point)
 
     def test_spgs_yield_capture_slots_to_regular_vehicles(self):
         planner = BotPlanner()

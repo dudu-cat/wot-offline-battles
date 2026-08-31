@@ -44,6 +44,7 @@ COMBAT_RANGE_HYSTERESIS_MAX = 20.0
 RETREAT_ARRIVAL_RADIUS = 6.0
 RETREAT_PROGRESS_TIMEOUT_SECONDS = 10.0
 RETREAT_PROGRESS_EPSILON = 2.0
+ROUTE_ARRIVAL_RADIUS = 13.0
 CLOSE_THREAT_DISTANCE = 50.0
 CLOSE_THREAT_SCORE_BONUS = 100.0
 CLOSE_THREAT_FOCUS_LIMIT = 4
@@ -86,6 +87,38 @@ def _point(raw):
         "y": round(_clamp(_number(raw.get("y")), -1000.0, 1000.0), 3),
         "z": round(_clamp(_number(raw.get("z")), -2000.0, 2000.0), 3),
     }
+
+
+def _route_point_reached(bx, bz, waypoints, index, route_limit):
+    """Accept an exact waypoint or its bounded forward route corridor."""
+    point = waypoints[index]
+    px = _number(point.get("x"))
+    pz = _number(point.get("z"))
+    if math.hypot(px - bx, pz - bz) <= ROUTE_ARRIVAL_RADIUS:
+        return True
+    if index >= route_limit:
+        return False
+
+    following = waypoints[index + 1]
+    segment_x = _number(following.get("x")) - px
+    segment_z = _number(following.get("z")) - pz
+    length_squared = segment_x * segment_x + segment_z * segment_z
+    if length_squared <= 0.000001:
+        return False
+    offset_x = bx - px
+    offset_z = bz - pz
+    progress = (offset_x * segment_x + offset_z * segment_z) / length_squared
+    if progress <= 0.0:
+        return False
+    # Macro points are lane gates, not parking spots. A convoy can push a hull
+    # just beyond a shared gate without ever putting its centre inside the
+    # arrival circle. Accept only the finite capsule leading to the next gate;
+    # lateral or distant bypasses still retain the current target and A* keeps
+    # ownership of every following segment and hazard decision.
+    progress = min(1.0, progress)
+    closest_x = px + segment_x * progress
+    closest_z = pz + segment_z * progress
+    return math.hypot(closest_x - bx, closest_z - bz) <= ROUTE_ARRIVAL_RADIUS
 
 
 def _order_signature(order):
@@ -1656,7 +1689,8 @@ class BotPlanner(object):
         point = _point(waypoints[index])
         bx = _number(bot["state"].get("x"))
         bz = _number(bot["state"].get("z"))
-        reached = math.hypot(point["x"] - bx, point["z"] - bz) <= 13.0
+        reached = _route_point_reached(
+            bx, bz, waypoints, index, route_limit)
         # Macro points describe the lane, not parking places.  Tanks keep
         # advancing until combat, safety or the final destination stops them.
         if reached and index < route_limit:
