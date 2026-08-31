@@ -11,6 +11,8 @@ import math
 
 WAYPOINT_ARRIVAL_RADIUS = 1.5
 TRAFFIC_WAIT_LEASE_SECONDS = 1.5
+# Fifteen-degree circular buckets centre both the +/-pi seam and cardinal yaws.
+FAILED_YAW_BUCKET_COUNT = 24
 
 
 def _angle_delta(target, current):
@@ -191,7 +193,11 @@ class LocalDriver(object):
 		return state
 
 	def _yaw_key(self, yaw):
-		return int(math.floor(float(yaw) * 4.0 + 0.5))
+		turn = math.pi * 2.0
+		from_anchor = (float(yaw) + math.pi) % turn
+		bucket = int(math.floor(
+			from_anchor * FAILED_YAW_BUCKET_COUNT / turn + 0.5))
+		return bucket % FAILED_YAW_BUCKET_COUNT
 
 	def remember_failure(self, bot_id, yaw, ttl=None):
 		"""Temporarily penalize a direction after a caller-observed bad path.
@@ -246,7 +252,7 @@ class LocalDriver(object):
 			return neighbour.get('position') or neighbour.get('pos')
 		return neighbour
 
-	def _separation_yaw(self, position, desired_yaw, neighbours,
+	def _separation_yaw(self, position, current_yaw, neighbours,
 			half_length, half_width):
 		"""Return an escape heading only for hulls that already overlap.
 
@@ -285,8 +291,10 @@ class LocalDriver(object):
 				other_yaw = float(neighbour.get('yaw', 0.0) or 0.0)
 				other_length = float(neighbour.get('half_length', half_length) or half_length)
 				other_width = float(neighbour.get('half_width', half_width) or half_width)
+			# Existing overlap belongs to the physical hull pose. The route heading
+			# is only a future steering candidate and cannot rotate that pose early.
 			if not self._obb_overlap(
-					position, desired_yaw, half_length + 0.20, half_width + 0.20,
+					position, current_yaw, half_length + 0.20, half_width + 0.20,
 					other, other_yaw, other_length + 0.20, other_width + 0.20):
 				continue
 			weight = max(0.15, (self.separation_radius - dist) / self.separation_radius)
@@ -395,10 +403,10 @@ class LocalDriver(object):
 					return False
 		return True
 
-	def _choose_yaw(self, state, desired_yaw, position, speed, velocity,
-				neighbours, direction_clear, half_length, half_width):
+	def _choose_yaw(self, state, desired_yaw, current_yaw, position, speed,
+			velocity, neighbours, direction_clear, half_length, half_width):
 		separation = self._separation_yaw(
-			position, desired_yaw, neighbours, half_length, half_width)
+			position, current_yaw, neighbours, half_length, half_width)
 		candidates = []
 		for offset in self._CANDIDATE_OFFSETS:
 			candidate = desired_yaw + offset
@@ -539,7 +547,7 @@ class LocalDriver(object):
 			chosen_yaw = old_yaw
 		if chosen_yaw is None:
 			chosen_yaw = self._choose_yaw(
-				state, desired_yaw, position, speed, velocity, neighbours,
+				state, desired_yaw, yaw, position, speed, velocity, neighbours,
 				direction_clear, own_half_length, own_half_width)
 			state['plan_age'] = 0.0
 		if chosen_yaw is None:

@@ -835,6 +835,102 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual(1.0, order['throttle'])
         self.assertAlmostEqual(0.0, order['target_yaw'])
 
+    def test_current_hull_yaw_detects_front_overlap_during_route_turn(self):
+        driver = LocalDriver()
+        position = (0.0, 0.0, 0.0)
+        desired_yaw = math.pi * 0.5
+        neighbour = {
+            'position': (0.0, 0.0, 6.0),
+            'yaw': 0.0,
+            'half_length': 3.5,
+            'half_width': 1.7,
+        }
+        self.assertTrue(driver._obb_overlap(
+            position, 0.0, 3.7, 1.9,
+            neighbour['position'], 0.0, 3.7, 1.9))
+        self.assertFalse(driver._obb_overlap(
+            position, desired_yaw, 3.7, 1.9,
+            neighbour['position'], 0.0, 3.7, 1.9))
+
+        order = driver.drive(
+            134, position, 0.0, 0.0, 0.1,
+            (50.0, 0.0, 0.0), (neighbour,),
+            lambda unused_yaw: True,
+            half_length=3.5, half_width=1.7)
+
+        self.assertEqual('avoid', order['recovery_mode'])
+        self.assertGreater(
+            abs(order['target_yaw'] - desired_yaw), 1.0)
+
+    def test_current_hull_yaw_ignores_side_gap_during_route_turn(self):
+        driver = LocalDriver()
+        position = (0.0, 0.0, 0.0)
+        desired_yaw = math.pi * 0.5
+        neighbour = {
+            'position': (5.0, 0.0, 0.0),
+            'yaw': 0.0,
+            'half_length': 3.5,
+            'half_width': 1.7,
+        }
+        self.assertFalse(driver._obb_overlap(
+            position, 0.0, 3.7, 1.9,
+            neighbour['position'], 0.0, 3.7, 1.9))
+        self.assertTrue(driver._obb_overlap(
+            position, desired_yaw, 3.7, 1.9,
+            neighbour['position'], 0.0, 3.7, 1.9))
+
+        order = driver.drive(
+            135, position, 0.0, 0.0, 0.1,
+            (50.0, 0.0, 0.0), (neighbour,),
+            lambda unused_yaw: True,
+            half_length=3.5, half_width=1.7)
+
+        self.assertEqual('drive', order['recovery_mode'])
+        self.assertAlmostEqual(desired_yaw, order['target_yaw'])
+
+    def test_failed_yaw_cache_uses_circular_buckets(self):
+        driver = LocalDriver()
+        state = driver._state(136, (0.0, 0.0, 0.0))
+        turn = math.pi * 2.0
+        for yaw in (-math.pi, -2.70, -0.51, 0.13, 1.73,
+                    math.pi - 0.11):
+            expected = driver._yaw_key(yaw)
+            for turns in range(-4, 5):
+                self.assertEqual(
+                    expected, driver._yaw_key(yaw + turns * turn))
+        self.assertEqual(
+            driver._yaw_key(math.pi), driver._yaw_key(-math.pi))
+
+        # The four common hull headings are bucket centres, not representation
+        # seams where tiny measurement noise would select another penalty.
+        for yaw in (-math.pi, -math.pi * 0.5, 0.0, math.pi * 0.5):
+            expected = driver._yaw_key(yaw)
+            self.assertEqual(expected, driver._yaw_key(yaw - 0.04))
+            self.assertEqual(expected, driver._yaw_key(yaw + 0.04))
+
+        failed_yaw = math.pi - 0.04
+        equivalents = (
+            failed_yaw - turn * 3.0,
+            failed_yaw + turn * 4.0,
+        )
+        driver.remember_failure(136, failed_yaw, ttl=5.0)
+        expected_penalty = driver._failure_penalty(state, failed_yaw)
+        self.assertGreater(expected_penalty, 0.0)
+        for yaw in equivalents:
+            self.assertEqual(driver._yaw_key(failed_yaw),
+                             driver._yaw_key(yaw))
+            self.assertAlmostEqual(
+                expected_penalty, driver._failure_penalty(state, yaw))
+
+        # These are distinct numeric angles on opposite sides of +/-pi but
+        # adjacent physical directions inside the same circular bucket.
+        opposite_seam_side = -math.pi + 0.04
+        self.assertEqual(driver._yaw_key(failed_yaw),
+                         driver._yaw_key(opposite_seam_side))
+        self.assertAlmostEqual(
+            expected_penalty,
+            driver._failure_penalty(state, opposite_seam_side))
+
     def test_slow_callback_advances_the_complete_planner_interval(self):
         driver = LocalDriver()
 
