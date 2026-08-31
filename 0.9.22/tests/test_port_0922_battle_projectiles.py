@@ -486,7 +486,7 @@ class BattleProjectileTests(unittest.TestCase):
         self.assertEqual(10.0, battle._projectile_server_local_time)
         self.assertEqual(11000, battle._projectile_estimated_server_time(11.0))
 
-    def test_delayed_tracer_reference_matches_authority_launch_age(self):
+    def test_delayed_tracer_starts_at_server_confirmed_cursor(self):
         battle, bigworld = _battle(now=1.0)
         source = battle._server_entity(41)
         source.showShooting = mock.Mock(return_value=True)
@@ -503,9 +503,39 @@ class BattleProjectileTests(unittest.TestCase):
 
         arguments = battle._remote_factory.play_projectile_tracer.call_args[0]
         self.assertEqual('player:7:1', arguments[7])
-        self.assertEqual((100.0, 16.0, 0.0), arguments[8])
-        self.assertEqual((100.0, 10.0, 0.0), arguments[9])
+        self.assertEqual((0.0, 1.0, 0.0), arguments[8])
+        self.assertEqual((100.0, 20.0, 0.0), arguments[9])
         source.showShooting.assert_called_once_with(1, False)
+
+    def test_snapshot_tracer_catches_up_only_to_confirmed_cursor(self):
+        battle, unused_bigworld = _battle(now=1.0)
+        battle._projectile_server_time_ms = 1000
+        battle._projectile_server_local_time = 1.0
+        battle._remote_factory = types.SimpleNamespace(
+            admit_projectile_visual=mock.Mock(return_value=True),
+            play_projectile_tracer=mock.Mock(return_value=1000000))
+        source_shot = dict(_event()['source_shot'])
+        source_shot.update({
+            'speed': math.sqrt(10400.0),
+            'gravity': 10.0,
+            'maxDistance': 1000.0,
+        })
+        event = dict(
+            _event(), maxDistance=1000.0, max_time_ms=20000,
+            source_shot=source_shot,
+            velocity=[100.0, 20.0, 0.0],
+            segment_velocity=[100.0, 20.0, 0.0], gravity=10.0,
+            launch_server_time_ms=0, checked_through_ms=400,
+            checked_distance=40.0, piercing_loss=0.0)
+        normalized = battle._projectile_wire_meta(event)
+        normalized['source_descriptor'] = battle._server_entity(
+            41).typeDescriptor
+
+        self.assertTrue(battle._ensure_projectile_visual(normalized, 1.0))
+
+        arguments = battle._remote_factory.play_projectile_tracer.call_args[0]
+        self.assertEqual((40.0, 8.2, 0.0), arguments[8])
+        self.assertEqual((100.0, 16.0, 0.0), arguments[9])
 
     def test_denied_cosmetic_still_installs_authoritative_projectile(self):
         battle, unused_bigworld = _battle(now=1.0)

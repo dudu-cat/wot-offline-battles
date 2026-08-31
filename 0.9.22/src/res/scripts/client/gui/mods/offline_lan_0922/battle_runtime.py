@@ -8983,7 +8983,14 @@ class BattleRuntime(object):
                 gravity = _number(event.get('gravity'))
                 visual_admitted = self._admit_projectile_visual(
                     entity.id, projectile_id, self._clock())
-                elapsed = self._projectile_launch_age(event, self._clock())
+                # Present from the last server-committed collision cursor,
+                # not from an extrapolated wall-clock age.  The hidden
+                # worker can still be resolving later chords when this launch
+                # reaches the visible client.  Fast-forwarding the native
+                # mover beyond that cursor lets its cosmetic simulator pass a
+                # tank (or strike the world) before the canonical terminal
+                # arrives a few frames later.
+                elapsed = self._projectile_visual_age(normalized)
                 reference_origin = trajectory_position(
                     origin, velocity, (0.0, -gravity, 0.0), elapsed)
                 reference_velocity = (
@@ -9198,24 +9205,32 @@ class BattleRuntime(object):
         return max(
             0.0, min(self._projectiles.now, float(now) - age))
 
-    def _projectile_launch_age(self, raw, now):
-        """Return the current canonical segment age for simulation/tracer."""
+    @staticmethod
+    def _projectile_visual_age(raw):
+        """Return only the server-confirmed age of a visual segment.
+
+        Native ``ProjectileMover`` advances independently after ``add``.  Its
+        reference point therefore starts at the durable collision cursor, not
+        at an estimated current server time that can be ahead of the worker's
+        terminal receipt.
+        """
         if not isinstance(raw, dict):
             return 0.0
-        launch_time = raw.get('launch_server_time_ms')
         segment_start = raw.get('segment_start_time_ms', 0)
+        checked_through = raw.get(
+            'base_checked_ms', raw.get('checked_through_ms', segment_start))
         max_time_ms = raw.get('max_time_ms', PROJECTILE_MAX_TIME_MS)
         try:
-            launch_time = int(launch_time) + int(segment_start)
+            segment_start = int(segment_start)
+            checked_through = int(checked_through)
             maximum = max(
-                0.0, float(int(max_time_ms) - int(segment_start)) / 1000.0)
+                0.0, float(int(max_time_ms) - segment_start) / 1000.0)
         except (TypeError, ValueError, OverflowError):
             return 0.0
-        estimated = self._projectile_estimated_server_time(now)
-        if estimated is None:
-            return 0.0
         return max(
-            0.0, min(maximum, float(estimated - launch_time) / 1000.0))
+            0.0, min(
+                maximum,
+                float(checked_through - segment_start) / 1000.0))
 
     @staticmethod
     def _projectile_wire_meta(raw):
@@ -9773,7 +9788,7 @@ class BattleRuntime(object):
                     'resolved_time_ms': normalized[
                         'segment_start_time_ms'],
                 })
-        elapsed = self._projectile_launch_age(normalized, now)
+        elapsed = self._projectile_visual_age(normalized)
         gravity = normalized['gravity']
         reference_origin = trajectory_position(
             normalized['segment_origin'], normalized['segment_velocity'],
