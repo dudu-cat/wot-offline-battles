@@ -69,6 +69,14 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   its collision box to a future route heading. Failed steering directions use a
   circular cache, so equivalent angles around the +/-pi seam share one penalty
   instead of reopening the opposite turn every time `atan2` wraps.
+- Pending paths no longer become false failures at water or map edges. A chosen
+  shallow ford remains authorized across control steps, repeated completed hard
+  contacts penalize only that Bot's failed segment, and out-of-bounds goals are
+  rejected before edge-cell rounding can send a vehicle beyond the red line.
+- Route following now looks ahead by speed, begins terminal braking from the
+  copied vehicle stopping distance, and counts translation or steadily
+  converging heading as progress. Alternating in-place turns therefore enter a
+  bounded recovery instead of keeping a visibly stuck Bot alive forever.
 - Bots align their hull before committing to a route, reducing base spinning
   and stop-start movement. Discovered artillery is now a priority target
   without making every bot focus the same vehicle.
@@ -79,6 +87,15 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Heavy tanks keep moving through ordinary side turns and reserve stationary
   pivots for targets behind the hull. Final Bot movement, tank pushes, and
   rotation are constrained by the complete chassis at the official map edge.
+- Target movement leases survive one incomplete firing-lane sample while fire
+  authorization still fails closed. Cover approaches, peeks, returns, support
+  holds, and retreats now have progress or arrival terminals; unreachable cover
+  is temporarily retired, and support vehicles advance until the target is
+  inside their real firing range.
+- Engagement distance uses a small hysteresis band and dwell time, while stable
+  support, cover, and retreat holds retain one hull-facing anchor as the target
+  moves. This reduces the repeated forward/reverse and left/right indecision
+  seen near thresholds and cover edges.
 - Player driving, collision deflection, slope sliding, airborne carry, tank
   pushes, and pivoting now use the same complete-chassis map-edge constraint.
   A stale out-of-bounds pose can drive inward but cannot drift farther out.
@@ -89,12 +106,17 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 
 ## Performance
 
-- Full-team tactical synthesis and expensive firing-lane and cover scans run
-  at 1 Hz. Ordinary target and ballistic solutions run at 10 Hz, local
-  route/contact decisions at their measured 6.7 Hz cadence, visibility reports
-  at 2.5 Hz, and spotting samples at 6 Hz. Motion, collision, gun movement,
-  burst fire, and client publication remain at 30 Hz for smooth presentation
-  and exact hits.
+- Full-team tactical synthesis and expensive firing-lane and cover scans run at
+  1 Hz. The hidden worker now advances Bot control and copied motion on a fixed
+  10 Hz clock independent of render FPS, keeps the last valid movement command
+  between decisions, and limits a slow render callback to two roster catch-up
+  steps while retaining the remaining elapsed debt. Projectile progression,
+  admitted shot terminals, and ordered one-shot events remain on their own
+  precise clocks; crossed burst edges keep their exact logical launch times.
+- A* searches use deterministic elapsed-time expansion credit with a bounded
+  per-frame budget and round-robin fairness. Machine load no longer changes a
+  route merely because the former 2.5 ms CPU wall-clock cutoff expired, and one
+  slow frame cannot concentrate an unlimited whole-roster search backlog.
 - Repeated native muzzle reads and critical-module parsing are reused only
   within their safe authority tick, reducing worker-side Python and native
   boundary work without putting private cache state on the wire.
