@@ -20,6 +20,7 @@ from lan_battle_server import (  # noqa: E402
     PLAYER_ENVIRONMENT_CAPABILITY, PLAYER_FIRE_INTENT_CAPABILITY,
     RAM_CONTACT_LEDGER_CAPABILITY,
     PROJECTILE_CAPABILITY, PROJECTILE_MAX_ACTIVE,
+    PROJECTILE_MAX_ID,
     RICOCHET_CONTINUATION_CAPABILITY, SERVER_CAPABILITIES,
     Player, SimulationWorker, SIMULATION_WORKER_AUTHORITY_ID,
     SIEGE_DISABLED, SIEGE_ENABLED, SIEGE_SWITCHING_OFF,
@@ -459,6 +460,9 @@ class ServerProjectileLedgerTests(unittest.TestCase):
     def test_server_overturn_owns_control_lock_and_terminal_death(self):
         state = _state()
         player = state.players[1]
+        results = []
+        player.offer_reliable = lambda message: (
+            results.append(dict(message)) or True)
         self.assertTrue(_update_player_input(
             state, 1, up_cosine=0.0, forward=1.0, turn=1.0,
             speed=20.0))
@@ -467,7 +471,16 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertTrue(state._player_overturn_danger(1))
         self.assertEqual((0.0, 0.0, 0.0),
                          (player.forward, player.turn, player.speed))
-        self.assertFalse(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual([{
+            'type': 'fire_intent_result', 'round_id': state.round_id,
+            'intent_seq': 1, 'accepted': False,
+            'reason': 'player_overturned',
+        }], results)
+        self.assertEqual(1, player.fire_intent_seq)
+        self.assertEqual((False, 'player_overturned'),
+                         player.fire_intent_results[1])
+        self.assertFalse(player.pending_fire_intents)
         self.assertEqual(1, state._tick_player_overturn(29.9))
         self.assertFalse(player.alive)
         self.assertEqual(0, player.health)
@@ -1282,23 +1295,228 @@ class ServerProjectileLedgerTests(unittest.TestCase):
         self.assertEqual(1, public['next_shell_index'])
         self.assertFalse(public['shell_change_pending'])
 
-    def test_player_fire_intent_rejects_untrusted_trigger_rays(self):
+    def test_malformed_fire_intents_do_not_advance_the_server_frontier(self):
         state = _state()
+        player = state.players[1]
+        results = []
+        player.offer_reliable = lambda message: (
+            results.append(dict(message)) or True)
         self.assertTrue(_update_player_input(state, 1))
-        invalid = (
+        malformed = (
+            {'round_id': state.round_id + 1},
+            {'intent_seq': 2},
+            {'input_seq': '1'},
             {'shot_origin': (0.0, 1.0, 0.0)},
-            {'shot_origin': [100.0, 1.0, 0.0]},
-            {'shot_direction': [0.0, 0.0, 0.0]},
-            {'shot_direction': [0.0, 0.0, 0.5]},
+            {'shot_origin': [5001.0, 1.0, 0.0]},
             {'shot_direction': [float('nan'), 0.0, 1.0]},
             {'dispersion_angle': float('inf')},
             {'dispersion_angle': 0.5001},
         )
 
-        for changes in invalid:
-            self.assertFalse(state.submit_fire_intent(
-                1, _fire_intent(state, **changes)), changes)
-        self.assertEqual(0, state.players[1].fire_intent_seq)
+        for changes in malformed:
+            with self.subTest(changes=changes):
+                self.assertFalse(state.submit_fire_intent(
+                    1, _fire_intent(state, **changes)))
+                self.assertEqual(0, player.fire_intent_seq)
+                self.assertFalse(player.fire_intent_fingerprints)
+                self.assertFalse(player.fire_intent_results)
+                self.assertFalse(results)
+
+        missing = _fire_intent(state)
+        missing.pop('shot_origin')
+        self.assertFalse(state.submit_fire_intent(1, missing))
+        self.assertFalse(state.submit_fire_intent(
+            1, dict(_fire_intent(state), unexpected=True)))
+        self.assertEqual(0, player.fire_intent_seq)
+        self.assertFalse(results)
+
+    def test_finite_untrusted_fire_rays_receive_terminal_results(self):
+        cases = (
+            ({'shot_origin': [100.0, 1.0, 0.0]},
+             'shot_origin_untrusted'),
+            ({'shot_direction': [0.0, 0.0, 0.0]},
+             'shot_direction_untrusted'),
+            ({'shot_direction': [0.0, 0.0, 0.5]},
+             'shot_direction_untrusted'),
+        )
+        for changes, reason in cases:
+            with self.subTest(changes=changes):
+                state = _state()
+                player = state.players[1]
+                results = []
+                player.offer_reliable = lambda message: (
+                    results.append(dict(message)) or True)
+                self.assertTrue(_update_player_input(state, 1))
+
+                self.assertTrue(state.submit_fire_intent(
+                    1, _fire_intent(state, **changes)))
+
+                self.assertEqual(1, player.fire_intent_seq)
+                self.assertEqual((False, reason),
+                                 player.fire_intent_results[1])
+                self.assertEqual(reason, results[0]['reason'])
+                self.assertFalse(player.pending_fire_intents)
+                self.assertEqual(0, player.fire_seq)
+
+    def test_operational_fire_rejections_advance_exactly_once(self):
+        cases = (
+            ('battle_finished',
+             lambda state, unused_player: setattr(
+                 state, 'battle_result', {'winner': 0}), {}),
+            ('combat_not_accepting',
+             lambda state, unused_player: setattr(state, 'tick', 0), {}),
+            ('player_not_participating',
+             lambda unused_state, player: setattr(
+                 player, 'participating', False), {}),
+            ('player_dead',
+             lambda unused_state, player: setattr(player, 'alive', False),
+             {}),
+            ('input_checkpoint_stale',
+             lambda unused_state, player: setattr(player, 'input_seq', 2),
+             {'input_seq': 1}),
+            ('shell_mismatch', lambda unused_state, unused_player: None,
+             {'shell_index': 1}),
+            ('pose_unavailable',
+             lambda unused_state, player: setattr(
+                 player, 'pose_time_us', None), {}),
+            ('fire_sequence_exhausted',
+             lambda unused_state, player: setattr(
+                 player, 'fire_seq', PROJECTILE_MAX_ID), {}),
+        )
+        for reason, mutate, changes in cases:
+            with self.subTest(reason=reason):
+                state = _state(players=1)
+                player = state.players[1]
+                results = []
+                player.offer_reliable = lambda message: (
+                    results.append(dict(message)) or True)
+                self.assertTrue(_update_player_input(state, 1))
+                mutate(state, player)
+
+                self.assertTrue(state.submit_fire_intent(
+                    1, _fire_intent(state, **changes)))
+
+                self.assertEqual(1, player.fire_intent_seq)
+                self.assertEqual((False, reason),
+                                 player.fire_intent_results[1])
+                self.assertEqual(reason, results[0]['reason'])
+                self.assertFalse(player.pending_fire_intents)
+
+    def test_no_worker_rejection_is_idempotent_and_next_intent_recovers(self):
+        state = _state(players=1)
+        player = state.players[1]
+        results = []
+        player.offer_reliable = lambda message: (
+            results.append(dict(message)) or True)
+        self.assertTrue(_update_player_input(state, 1))
+        message = _fire_intent(state)
+        state.simulation_worker = None
+        state.bot_authority_id = None
+
+        self.assertTrue(state.submit_fire_intent(1, message))
+        self.assertEqual([{
+            'type': 'fire_intent_result', 'round_id': state.round_id,
+            'intent_seq': 1, 'accepted': False,
+            'reason': 'worker_unavailable',
+        }], results)
+        self.assertEqual((False, 'worker_unavailable'),
+                         player.fire_intent_results[1])
+        self.assertEqual(1, player.fire_intent_seq)
+        self.assertFalse(player.pending_fire_intents)
+        self.assertEqual((0, 0), (player.fire_seq, player.shell_index))
+
+        self.assertTrue(state.submit_fire_intent(1, dict(message)))
+        self.assertEqual(1, len(results))
+        self.assertFalse(state.submit_fire_intent(
+            1, dict(message, dispersion_angle=0.010000001)))
+        self.assertEqual(1, len(results))
+
+        relayed = []
+        worker = _attach_worker_authority(state)
+        worker.offer_reliable = lambda relay: (
+            relayed.append(dict(relay)) or True)
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual(2, player.fire_intent_seq)
+        self.assertEqual([2], list(player.pending_fire_intents))
+        self.assertEqual(2, relayed[0]['intent_seq'])
+
+    def test_stale_gun_checkpoint_terminal_allows_the_next_intent(self):
+        state = _state(players=1)
+        player = state.players[1]
+        results = []
+        relayed = []
+        player.offer_reliable = lambda message: (
+            results.append(dict(message)) or True)
+        state.simulation_worker.offer_reliable = lambda message: (
+            relayed.append(dict(message)) or True)
+        self.assertTrue(_update_player_input(state, 1))
+        player.gun_checkpoint_seq = 0
+
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual('gun_checkpoint_unavailable', results[0]['reason'])
+        self.assertEqual(1, player.fire_intent_seq)
+        self.assertFalse(player.pending_fire_intents)
+
+        self.assertTrue(_update_player_input(state, 1))
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual(2, player.fire_intent_seq)
+        self.assertEqual([2], list(player.pending_fire_intents))
+        self.assertEqual(2, relayed[0]['intent_seq'])
+
+    def test_pending_capacity_rejection_consumes_only_the_new_intent(self):
+        state = _state(players=1)
+        player = state.players[1]
+        worker = state.simulation_worker
+        results = []
+        relayed = []
+        player.offer_reliable = lambda message: (
+            results.append(dict(message)) or True)
+        worker.offer_reliable = lambda message: (
+            relayed.append(dict(message)) or True)
+        self.assertTrue(_update_player_input(state, 1))
+
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual([1], list(player.pending_fire_intents))
+
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual('fire_intent_pending', results[0]['reason'])
+        self.assertEqual([1], list(player.pending_fire_intents))
+        self.assertEqual(2, player.fire_intent_seq)
+
+        self.assertTrue(state.resolve_fire_intent(
+            SIMULATION_WORKER_AUTHORITY_ID, {
+                'type': 'fire_intent_result',
+                'round_id': state.round_id,
+                'authority_epoch': state.authority_epoch,
+                'player_id': 1, 'intent_seq': 1,
+                'accepted': False, 'reason': 'gun_not_ready',
+            }))
+        self.assertFalse(player.pending_fire_intents)
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+        self.assertEqual([3], list(player.pending_fire_intents))
+        self.assertEqual([1, 3], [relay['intent_seq'] for relay in relayed])
+
+    def test_worker_offer_stall_publishes_terminal_before_round_failure(self):
+        state = _state(players=1)
+        player = state.players[1]
+        worker = state.simulation_worker
+        results = []
+        player.offer_reliable = lambda message: (
+            results.append(dict(message)) or True)
+        worker.offer_reliable = lambda unused_message: False
+        self.assertTrue(_update_player_input(state, 1))
+
+        self.assertTrue(state.submit_fire_intent(1, _fire_intent(state)))
+
+        self.assertEqual('fire_intent_result', results[0]['type'])
+        self.assertEqual('worker_send_stalled', results[0]['reason'])
+        self.assertEqual(1, player.fire_intent_seq)
+        self.assertEqual((False, 'worker_send_stalled'),
+                         player.fire_intent_results[1])
+        self.assertFalse(player.pending_fire_intents)
+        self.assertEqual(0, player.fire_seq)
+        self.assertIsNone(state.simulation_worker)
+        self.assertIsNotNone(state.battle_result)
 
     def test_worker_fire_rejection_is_committed_after_visible_delivery(self):
         state = _state()

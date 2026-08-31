@@ -5940,26 +5940,56 @@ class BattleState:
             self.bot_authority_id == SIMULATION_WORKER_AUTHORITY_ID and
             worker is not None and worker.connected)
 
+    def _commit_fire_intent_rejection_locked(
+            self, player, intent_seq, fingerprint, reason,
+            already_admitted=False):
+        """Consume one identified trigger and publish its terminal result."""
+        reason = str(reason or "rejected")[:64]
+        terminal = (False, reason)
+        previous_fingerprint = player.fire_intent_fingerprints.get(
+            intent_seq)
+        if already_admitted:
+            if (player.fire_intent_seq != intent_seq or
+                    previous_fingerprint != fingerprint):
+                return False
+        else:
+            if (previous_fingerprint is not None or
+                    intent_seq != player.fire_intent_seq + 1):
+                return False
+            player.fire_intent_seq = intent_seq
+            player.fire_intent_fingerprints[intent_seq] = fingerprint
+            while (len(player.fire_intent_fingerprints) >
+                   PLAYER_FIRE_INTENT_HISTORY):
+                player.fire_intent_fingerprints.popitem(last=False)
+
+        player.pending_fire_intents.pop(intent_seq, None)
+        player.fire_intent_results[intent_seq] = terminal
+        while len(player.fire_intent_results) > PLAYER_FIRE_INTENT_HISTORY:
+            player.fire_intent_results.popitem(last=False)
+
+        result_message = {
+            "type": "fire_intent_result",
+            "round_id": self.round_id,
+            "intent_seq": intent_seq,
+            "accepted": False,
+            "reason": reason,
+        }
+        delivered = player.offer_reliable(result_message)
+        if not delivered:
+            self.remove_player(player.player_id, expected=player)
+        return bool(delivered)
+
     def submit_fire_intent(self, player_id, message):
-        """Relay one ordered trigger to the configured internal authority."""
+        """Consume one ordered trigger or relay it to the native authority."""
         with self.lock:
             if (self.client_build != CLIENT_BUILD_0922 or
                     not self._message_round_matches(message) or
-                    not self._combat_accepting() or
-                    self.battle_result is not None or
+                    not isinstance(message, dict) or
                     set(message) != {
                         "type", "round_id", "intent_seq", "input_seq",
                         "shell_index", "shot_origin", "shot_direction",
-                        "dispersion_angle"}):
-                return False
-            player = self.players.get(player_id)
-            worker = self.simulation_worker
-            worker_mode = self._trusted_internal_projectile_authority(
-                SIMULATION_WORKER_AUTHORITY_ID)
-            if (player is None or not player.connected or
-                    not player.participating or not player.alive or
-                    self._player_overturn_danger(player_id) or
-                    not worker_mode):
+                        "dispersion_angle"} or
+                    message.get("type") != "fire_intent"):
                 return False
             try:
                 intent_seq = _exact_int(
@@ -5979,19 +6009,50 @@ class BattleState:
                     MAX_PLAYER_DISPERSION_ANGLE)
             except (TypeError, ValueError, OverflowError):
                 return False
+
+            player = self.players.get(player_id)
+            if player is None:
+                return False
+            fingerprint = _message_fingerprint({
+                "player_id": int(player_id),
+                "wire": message,
+            })
+            previous = player.fire_intent_fingerprints.get(intent_seq)
+            if previous is not None:
+                return previous == fingerprint
+            if intent_seq != player.fire_intent_seq + 1:
+                return False
+
+            def reject(reason):
+                return self._commit_fire_intent_rejection_locked(
+                    player, intent_seq, fingerprint, reason)
+
+            if self.battle_result is not None:
+                return reject("battle_finished")
+            if not self._combat_accepting():
+                return reject("combat_not_accepting")
+            if not player.connected:
+                return reject("player_disconnected")
+            if not player.participating:
+                return reject("player_not_participating")
+            if not player.alive:
+                return reject("player_dead")
+            if self._player_overturn_danger(player_id):
+                return reject("player_overturned")
+
             direction_length = math.sqrt(sum(
                 component * component for component in shot_direction))
             if not 0.999 <= direction_length <= 1.001:
-                return False
+                return reject("shot_direction_untrusted")
             if sum((shot_origin[index] - coordinate) ** 2
                    for index, coordinate in enumerate(
                        (player.x, player.y, player.z))) > \
                     PLAYER_FIRE_ORIGIN_RADIUS ** 2:
-                return False
+                return reject("shot_origin_untrusted")
             gun_checkpoint = player.gun_checkpoints.get(input_seq)
-            if (gun_checkpoint is None or
+            if (not isinstance(gun_checkpoint, dict) or
                     player.gun_checkpoint_seq != input_seq):
-                return False
+                return reject("gun_checkpoint_unavailable")
             normalized = {
                 "player_id": int(player_id),
                 "intent_seq": intent_seq,
@@ -6005,20 +6066,22 @@ class BattleState:
                 "gun_checkpoint_seq": input_seq,
                 "gun_checkpoint": dict(gun_checkpoint),
             }
-            fingerprint = _message_fingerprint(normalized)
-            previous = player.fire_intent_fingerprints.get(intent_seq)
-            if previous is not None:
-                return previous == fingerprint
-            if intent_seq != player.fire_intent_seq + 1:
-                return False
-            if (input_seq != player.input_seq or
-                    shell_index != player.shell_index or
-                    player.pose_time_us is None or
-                    player.fire_seq >= PROJECTILE_MAX_ID):
-                return False
+            if input_seq != player.input_seq:
+                return reject("input_checkpoint_stale")
+            if shell_index != player.shell_index:
+                return reject("shell_mismatch")
+            if player.pose_time_us is None:
+                return reject("pose_unavailable")
+            if player.fire_seq >= PROJECTILE_MAX_ID:
+                return reject("fire_sequence_exhausted")
             if len(player.pending_fire_intents) >= \
                     PLAYER_FIRE_INTENT_MAX_PENDING:
-                return False
+                return reject("fire_intent_pending")
+            worker = self.simulation_worker
+            worker_mode = self._trusted_internal_projectile_authority(
+                SIMULATION_WORKER_AUTHORITY_ID)
+            if not worker_mode:
+                return reject("worker_unavailable")
             relay = {
                 "type": "fire_intent",
                 "round_id": self.round_id,
@@ -6054,14 +6117,13 @@ class BattleState:
             while (len(player.fire_intent_fingerprints) >
                    PLAYER_FIRE_INTENT_HISTORY):
                 player.fire_intent_fingerprints.popitem(last=False)
-            if worker_mode:
-                if worker.offer_reliable(relay):
-                    return True
-                player.pending_fire_intents.pop(intent_seq, None)
-                player.fire_intent_fingerprints.pop(intent_seq, None)
-                player.fire_intent_seq -= 1
-                self.remove_simulation_worker(worker, "worker_send_stalled")
-                return False
+            if worker.offer_reliable(relay):
+                return True
+            delivered = self._commit_fire_intent_rejection_locked(
+                player, intent_seq, fingerprint,
+                "worker_send_stalled", already_admitted=True)
+            self.remove_simulation_worker(worker, "worker_send_stalled")
+            return delivered
 
     def resolve_fire_intent(self, player_id, message):
         """Commit one internal-authority rejection for a player trigger."""

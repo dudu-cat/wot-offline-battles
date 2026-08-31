@@ -17724,8 +17724,17 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle = BattleRuntime(runtime)
         battle._avatar = runtime.bigworld.avatar
         battle._start_message = {'round_id': 7}
+        battle._gun_state = types.SimpleNamespace(
+            ammo=[20, 10], clip=2, reload_time=1.25,
+            reload_duration=5.0, shot_index=0, pending_index=None)
         battle._local_fire_intent = {
             'intent_seq': 3, 'input_seq': 4, 'sent_at': 1.0}
+        gun_before = (
+            list(battle._gun_state.ammo), battle._gun_state.clip,
+            battle._gun_state.reload_time,
+            battle._gun_state.reload_duration,
+            battle._gun_state.shot_index,
+            battle._gun_state.pending_index)
 
         self.assertTrue(battle.on_fire_intent_result({
             'type': 'fire_intent_result', 'round_id': 7,
@@ -17735,6 +17744,12 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
         self.assertIsNone(battle._local_fire_intent)
         battle._avatar.cancelWaitingForShot.assert_called_once_with()
+        self.assertEqual(gun_before, (
+            list(battle._gun_state.ammo), battle._gun_state.clip,
+            battle._gun_state.reload_time,
+            battle._gun_state.reload_duration,
+            battle._gun_state.shot_index,
+            battle._gun_state.pending_index))
 
     def test_worker_fire_intent_ignores_transport_receipt_time(self):
         battle = BattleRuntime(_runtime())
