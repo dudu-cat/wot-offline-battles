@@ -896,6 +896,7 @@ def _load_runtime():
     from helpers import EffectMaterialCalculation
     import material_kinds
     from gun_rotation_shared import encodeGunAngles
+    from projectile_trajectory import getShotAngles
     from gui.app_loader import g_appLoader
     from gui.app_loader.settings import GUI_GLOBAL_SPACE_ID
     from gui.battle_control.battle_constants import FEEDBACK_EVENT_ID
@@ -929,6 +930,7 @@ def _load_runtime():
     runtime.effect_material_calculation = EffectMaterialCalculation
     runtime.material_kinds = material_kinds
     runtime.encode_gun_angles = encodeGunAngles
+    runtime.get_shot_angles = getShotAngles
     runtime.game = game
     runtime.gui_global_space_id = GUI_GLOBAL_SPACE_ID
     runtime.hangar_space = HangarSpace
@@ -1003,6 +1005,7 @@ class _LANInputSender(object):
         self.aim_yaw = 0.0
         self.gun_pitch = 0.0
         self.aim_pitch = 0.0
+        self.aim_point = None
         self.handbrake = False
 
     def align_aim(self, turret_yaw=0.0, gun_pitch=0.0):
@@ -1014,6 +1017,7 @@ class _LANInputSender(object):
             float(getattr(self.owner, '_local_pitch', 0.0)) +
             float(getattr(self.owner, '_local_siege_aim_pitch', 0.0)) +
             self.gun_pitch)
+        self.aim_point = None
         return True
 
     def send_avatar_input(self, vehicle_id, kind, payload):
@@ -1048,6 +1052,7 @@ class _LANInputSender(object):
                 float(getattr(
                     self.owner, '_local_siege_aim_pitch', 0.0)) +
                 gun_pitch)
+            self.aim_point = None
             self.owner._echo_local_gun_angles(turret_yaw, gun_pitch)
             return self.send_current()
         if kind == 'shoot':
@@ -1067,11 +1072,15 @@ class _LANInputSender(object):
         target = _xyz(point)
         if relative:
             dx, dy, dz = target
+            origin = self.owner.local_stabilised_position()
+            self.aim_point = tuple(
+                origin[index] + target[index] for index in range(3))
         else:
             position, unused_yaw = self.owner.local_pose()
             dx = target[0] - position[0]
             dy = target[1] - position[1]
             dz = target[2] - position[2]
+            self.aim_point = target
         horizontal = math.sqrt(dx * dx + dz * dz)
         self.aim_yaw = math.atan2(dx, dz)
         # Exact #1513 stores the rendered gun angle as negative-up.  The
@@ -1288,6 +1297,7 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_flat_body_matrix = None
         self._local_siege_aim_matrix = None
         self._local_siege_aim_world_matrix = None
         self._local_siege_aim_pitch = 0.0
@@ -1548,6 +1558,7 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_flat_body_matrix = None
         self._local_siege_aim_matrix = None
         self._local_siege_aim_world_matrix = None
         self._local_siege_aim_pitch = 0.0
@@ -4824,6 +4835,11 @@ class BattleRuntime(object):
         # compatibility overlay installed at the native model boundary.
         return self._local_position, self._local_yaw
 
+    def local_stabilised_position(self):
+        """Return the exact origin used by #1513's relative gun mailbox."""
+        matrix = self._runtime.math.Matrix(self._local_stabilised_pose())
+        return _xyz(matrix.translation)
+
     def _echo_local_gun_angles(self, turret_yaw=None, gun_pitch=None):
         """Publish #1513's current native rotator angle as the server echo."""
         if self._server is None or self._binding is None:
@@ -4903,6 +4919,10 @@ class BattleRuntime(object):
         self._local_siege_aim_world_matrix = self._matrix_product(
             aim_matrix, self._local_matrix)
         self._local_siege_aim_pitch = 0.0
+
+        body_relative = self._matrix_product(native_body, inverse_ground)
+        self._local_siege_flat_body_matrix = self._matrix_product(
+            body_relative, self._local_matrix)
 
         def transplant(source):
             relative = self._matrix_product(source, inverse_ground)
@@ -4995,15 +5015,35 @@ class BattleRuntime(object):
             if active:
                 if self._sender is None:
                     raise ValueError('hydraulic aim source is unavailable')
-                desired_pitch = float(getattr(
-                    self._sender, 'aim_pitch', self._sender.gun_pitch))
                 gun_minimum, gun_maximum = (
                     hull_aiming.absolute_pitch_limits(descriptor))
-                desired, unused_reachable = (
-                    hull_aiming.world_target_correction(
-                        desired_pitch, float(self._local_pitch),
-                        gun_minimum, gun_maximum,
-                        params['minimum'], params['maximum']))
+                aim_point = getattr(self._sender, 'aim_point', None)
+                get_shot_angles = getattr(
+                    self._runtime, 'get_shot_angles', None)
+                if (aim_point is not None and callable(get_shot_angles) and
+                        self._local_siege_flat_body_matrix is not None):
+                    rotator = getattr(self._avatar, 'gunRotator', None)
+                    if rotator is None:
+                        raise ValueError('native gun rotator is unavailable')
+                    unused_yaw, desired_pitch = get_shot_angles(
+                        descriptor,
+                        self._runtime.math.Matrix(
+                            self._local_siege_flat_body_matrix),
+                        (float(rotator.turretYaw),
+                         float(rotator.gunPitch)),
+                        self._vector(aim_point))
+                    desired, unused_reachable = (
+                        hull_aiming.minimal_correction(
+                            float(desired_pitch), gun_minimum, gun_maximum,
+                            params['minimum'], params['maximum']))
+                else:
+                    desired_pitch = float(getattr(
+                        self._sender, 'aim_pitch', self._sender.gun_pitch))
+                    desired, unused_reachable = (
+                        hull_aiming.world_target_correction(
+                            desired_pitch, float(self._local_pitch),
+                            gun_minimum, gun_maximum,
+                            params['minimum'], params['maximum']))
             self._local_siege_aim_pitch = hull_aiming.slew(
                 self._local_siege_aim_pitch, desired, speed, elapsed)
         except (AttributeError, TypeError, ValueError, OverflowError):
@@ -5257,6 +5297,7 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_flat_body_matrix = None
         self._local_siege_aim_matrix = None
         self._local_siege_aim_world_matrix = None
         self._local_siege_aim_pitch = 0.0
@@ -18798,6 +18839,7 @@ class BattleRuntime(object):
         self._local_siege_body_matrix = None
         self._local_siege_stabilised_matrix = None
         self._local_siege_ground_matrix = None
+        self._local_siege_flat_body_matrix = None
         self._local_siege_aim_matrix = None
         self._local_siege_aim_world_matrix = None
         self._local_siege_aim_pitch = 0.0

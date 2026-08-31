@@ -12130,6 +12130,119 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             battle._local_matrix, battle._local_stabilised_matrix.a)
 
+    def test_close_siege_target_uses_exact_gun_axis_for_pose_marker_and_ray(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        descriptor = _Descriptor('sweden:S22_Strv_S1')
+        descriptor.hasSiegeMode = True
+        descriptor.type.hullAimingParams = {
+            'pitch': {
+                'isAvailable': True,
+                'isEnabled': True,
+                'wheelCorrectionCenterZ': 0.0,
+                'wheelsCorrectionSpeed': 0.2,
+                'wheelsCorrectionAngles': {
+                    'pitchMin': math.radians(-11.0),
+                    'pitchMax': math.radians(11.0),
+                },
+            },
+        }
+        descriptor.gun.pitchLimits = {'absolute': (
+            math.radians(-4.0), math.radians(2.0))}
+        entity = _Vehicle(
+            10, descriptor, _Vector(), (0, 0, 0), {'health': 1000})
+        entity.siegeState = 0
+        entity.filter.bodyMatrix = _Matrix()
+        entity.filter.groundPlacingMatrix = _Matrix()
+        entity.filter.groundPlacingMatrixFiltered = _Matrix()
+        entity.filter.stabilisedMatrix = _Matrix()
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._local_position = (0.0, 0.0, 0.0)
+        battle._local_descriptor = descriptor
+
+        distance = 43.0
+        raw_pitch = math.radians(3.0)
+        target_y = -math.tan(raw_pitch) * distance
+        target = (0.0, target_y, distance)
+        # Exact S22 data puts the gun axis 1.531358 m above and 0.351939 m
+        # forward of the stabilised vehicle origin. At 43 m the omitted axis
+        # offset is about two degrees, enough to cross the +2 degree gun edge.
+        gun_axis_y = 0.503458 + 1.0279
+        gun_axis_z = -0.008279 + 0.360218
+        exact_pitch = -math.atan2(
+            target_y - gun_axis_y, distance - gun_axis_z)
+        expected_correction = exact_pitch - math.radians(2.0)
+        approximate_correction = raw_pitch - math.radians(2.0)
+
+        def exact_angles(actual_descriptor, matrix, angles, point):
+            self.assertIs(descriptor, actual_descriptor)
+            self.assertIsInstance(matrix, _Matrix)
+            self.assertEqual((0.0, 0.0), angles)
+            self.assertEqual(target, (point.x, point.y, point.z))
+            return 0.0, exact_pitch
+
+        runtime.get_shot_angles = mock.Mock(side_effect=exact_angles)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=0.0, aim_yaw=0.0,
+            gun_pitch=raw_pitch, aim_pitch=raw_pitch, aim_point=target,
+            handbrake=False, send_current=mock.Mock(return_value=True))
+        battle._attach_local_presentation()
+        entity.siegeState = 2
+        self.assertTrue(battle._select_local_siege_pose(entity, True))
+
+        self.assertTrue(battle._update_local_hull_aiming(entity, 1.0))
+
+        self.assertAlmostEqual(
+            expected_correction, battle._local_siege_aim_pitch)
+        self.assertAlmostEqual(
+            math.radians(2.0),
+            exact_pitch - battle._local_siege_aim_pitch)
+        self.assertGreater(
+            battle._local_siege_aim_pitch - approximate_correction,
+            math.radians(2.0))
+        runtime.get_shot_angles.assert_called_once()
+        # CompoundModel (barrel), fixed-turret stabilisation (client marker),
+        # and getCurShotPosition (fire ray) retain one hydraulic body pose.
+        self.assertIs(battle._local_pose_matrix, entity.model.matrix)
+        self.assertIs(
+            battle._local_siege_body_matrix,
+            battle._local_pose_matrix.a)
+        self.assertIs(
+            battle._local_siege_body_matrix,
+            battle._local_stabilised_matrix.a)
+        self.assertIs(
+            battle._local_matrix,
+            battle._local_siege_flat_body_matrix.b)
+        shot_direction = _Vector(
+            0.0, -math.sin(exact_pitch), math.cos(exact_pitch))
+        battle._avatar.gunRotator.getCurShotPosition = mock.Mock(
+            return_value=(_Vector(0.0, gun_axis_y, gun_axis_z),
+                          shot_direction))
+        unused_origin, ray = battle._mutable_shot_ray()
+        self.assertAlmostEqual(
+            exact_pitch, -math.atan2(
+                ray.y, math.sqrt(ray.x * ray.x + ray.z * ray.z)))
+
+    def test_non_siege_vehicle_never_uses_exact_hydraulic_solver(self):
+        runtime = _runtime()
+        runtime.get_shot_angles = mock.Mock()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle._sender = types.SimpleNamespace(
+            gun_pitch=0.0, aim_pitch=0.0,
+            aim_point=(0.0, 0.0, 43.0))
+        battle._local_siege_aim_matrix = _Matrix()
+        battle._local_siege_flat_body_matrix = _Matrix()
+        descriptor = _Descriptor('ussr:R11_MS-1')
+        descriptor.hasSiegeMode = False
+        entity = types.SimpleNamespace(typeDescriptor=descriptor)
+
+        self.assertFalse(battle._update_local_hull_aiming(entity, 1.0))
+        runtime.get_shot_angles.assert_not_called()
+
     def test_siege_exit_selects_plain_pose_after_descriptor_reverts(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
@@ -15825,6 +15938,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_relative_gun_tracking_uses_delta_and_stop_uses_hull_yaw(self):
         owner = types.SimpleNamespace(
             local_pose=lambda: ((100.0, 5.0, 200.0), 0.5),
+            local_stabilised_position=lambda: (101.0, 6.0, 202.0),
             client=types.SimpleNamespace(send_input=mock.Mock(return_value=True)))
         owner.shoot = mock.Mock(return_value=True)
         owner._echo_local_gun_angles = mock.Mock(return_value=True)
@@ -15836,6 +15950,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(-math.atan2(2.0, math.sqrt(500.0)),
                                sender.gun_pitch)
         self.assertAlmostEqual(sender.gun_pitch, sender.aim_pitch)
+        self.assertEqual((111.0, 8.0, 222.0), sender.aim_point)
         owner._echo_local_gun_angles.assert_called_once_with()
 
         sender.send_avatar_input(1, 'stop_tracking', {
@@ -15843,6 +15958,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertAlmostEqual(0.75, sender.aim_yaw)
         self.assertAlmostEqual(-0.1, sender.gun_pitch)
         self.assertAlmostEqual(-0.1, sender.aim_pitch)
+        self.assertIsNone(sender.aim_point)
         self.assertEqual(
             [mock.call(), mock.call(0.25, -0.1)],
             owner._echo_local_gun_angles.call_args_list)
