@@ -45,11 +45,14 @@ def _map(name, bounds, base1, base2, routes):
 
 MALINOVKA = _map('02_malinovka', (-500.0, -500.0, 500.0, 500.0),
 	(75.60, -391.92), (-372.70, 108.12), (
-		_route('west_lake_road', 'line', 5, 0.62,
+		# The shore road has only one practical dry egress around the lake. Keep
+		# three hulls there and use the two broad inland lanes for the rest of a
+		# full fifteen-slot formation.
+		_route('west_lake_road', 'line', 3, 0.62,
 			((0, 0, 0), (-80, -370, 0), (-220, -290, 1), (-340, -175, 1), (-410, -35, 1), (0, 0, 0))),
-		_route('central_field', 'fire', 4, 0.70,
+		_route('central_field', 'fire', 5, 0.70,
 			((0, 0, 0), (25, -285, 0), (-35, -175, 1), (-110, -65, 1), (-215, 45, 1), (0, 0, 0))),
-		_route('east_hill_loop', 'flank', 5, 0.78,
+		_route('east_hill_loop', 'flank', 6, 0.78,
 			((0, 0, 0), (230, -320, 0), (395, -180, 1), (410, 20, 1), (290, 235, 1), (35, 315, 0), (0, 0, 0))),
 	))
 

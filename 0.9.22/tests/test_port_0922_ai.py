@@ -156,6 +156,15 @@ class BotAiPortTests(unittest.TestCase):
                 [7, 7],
                 [route['capacity'] for route in ensk['routes'][team]])
 
+        malinovka = maps.TACTICAL_MAPS['02_malinovka']
+        for team in (1, 2):
+            self.assertEqual(
+                ['west_lake_road', 'central_field', 'east_hill_loop'],
+                [route['id'] for route in malinovka['routes'][team]])
+            self.assertEqual(
+                [3, 5, 6],
+                [route['capacity'] for route in malinovka['routes'][team]])
+
     def test_reviewed_route_geometry_is_bidirectional_and_single_gated(self):
         for map_name, reviewed_routes in sorted(
                 reviewed_routes_20260811.REVIEWED_ROUTE_POINTS.items()):
