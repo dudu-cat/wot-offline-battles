@@ -96,6 +96,31 @@ def _contact(target_id, x, z, observers, class_tag='mediumTank'):
     }
 
 
+def _cover_report(bot_id, target_id, candidate_id='rock', x=12.0,
+                  z=0.0):
+    return {
+        'bot_id': bot_id,
+        'target_kind': 'human',
+        'target_id': target_id,
+        'candidates': [{
+            'id': candidate_id,
+            'position': {'x': float(x), 'y': 0.0, 'z': float(z)},
+            'peek_position': {
+                'x': float(x) + 6.0, 'y': 0.0, 'z': float(z) + 4.0,
+            },
+            'travel_distance': abs(float(x)),
+            'route_alignment': 0.8,
+            'enemy_occlusion': 0.9,
+            'exposure': 0.1,
+            'slope': 1.0,
+            'water': 0.0,
+            'ally_congestion': 0.0,
+            'peek_feasible': True,
+            'escape_feasible': True,
+        }],
+    }
+
+
 def _capture_defense():
     return {
         'capture_bases': {
@@ -245,6 +270,98 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual('low_health_retreat', order['combat_mode'])
         self.assertEqual({'x': 0.0, 'y': 0.0, 'z': -100.0},
                          order['move_position'])
+
+    def test_low_health_retreat_reaches_a_defensive_terminal(self):
+        planner = BotPlanner()
+        contact = _contact(2, 0, 150, [11])
+        players = self._report(planner, [contact])
+        self.states[0]['health'] = 200
+
+        retreat = planner.build_orders(
+            self.manifest, self.states, players, 1.0)['orders'][0]
+        self.states[0].update(retreat['move_position'])
+        self.assertEqual(1, planner.report_contacts(
+            [contact], planner.known_targets(self.states, players), 2.0))
+
+        holding = planner.build_orders(
+            self.manifest, self.states, players, 2.0)['orders'][0]
+
+        self.assertEqual('low_health_retreat', holding['combat_mode'])
+        self.assertEqual('low_health_defend', holding['tactical_phase'])
+        self.assertEqual(0.0, holding['throttle_override'])
+        self.assertEqual(retreat['move_position'], holding['move_position'])
+        self.assertTrue(holding['stable_hull_face'])
+
+    def test_pending_shooter_refresh_preserves_movement_but_not_fire(self):
+        planner = BotPlanner()
+        contact = _contact(2, 0, 150, [11])
+        players = self._report(planner, [contact])
+        first = planner.build_orders(
+            self.manifest, self.states, players, 1.0)['orders'][0]
+        self.assertTrue(first['fire_allowed'])
+
+        pending = _contact(2, 0, 150, [])
+        self.assertEqual(1, planner.report_contacts(
+            [pending], planner.known_targets(self.states, players), 1.5))
+        leased = planner.build_orders(
+            self.manifest, self.states, players, 1.5)['orders'][0]
+
+        self.assertEqual(2, leased['target_id'])
+        self.assertEqual(first['combat_mode'], leased['combat_mode'])
+        self.assertEqual(first['move_position'], leased['move_position'])
+        self.assertFalse(leased['fire_allowed'])
+
+        self.assertEqual(1, planner.report_contacts(
+            [pending], planner.known_targets(self.states, players), 3.1))
+        expired = planner.build_orders(
+            self.manifest, self.states, players, 3.1)['orders'][0]
+        self.assertIsNone(expired['target_id'])
+        self.assertEqual('route', expired['combat_mode'])
+
+    def test_cover_lease_outlives_full_roster_refresh_cycle(self):
+        planner = BotPlanner()
+        contact = _contact(2, 0, 150, [11])
+        players = self._report(planner, [contact])
+        known_bots = planner.known_bots(self.manifest, self.states)
+        known_targets = planner.known_targets(self.states, players)
+        self.assertEqual(1, planner.report_affordances(
+            [_cover_report(11, 2)], known_bots, known_targets, 1.0))
+        approach = planner.build_orders(
+            self.manifest, self.states, players, 1.0)['orders'][0]
+        self.states[0].update(approach['move_position'])
+        holding = planner.build_orders(
+            self.manifest, self.states, players, 2.0)['orders'][0]
+        self.assertEqual('cover_hold', holding['combat_mode'])
+
+        self.assertEqual(1, planner.report_contacts(
+            [contact], planner.known_targets(self.states, players), 11.5))
+        refreshed = planner.build_orders(
+            self.manifest, self.states, players, 11.5)['orders'][0]
+
+        self.assertEqual('rock', refreshed['cover_id'])
+        self.assertIn(refreshed['combat_mode'], (
+            'cover_hold', 'cover_peek', 'cover_return'))
+
+    def test_unreachable_cover_candidate_has_a_bounded_exit(self):
+        planner = BotPlanner()
+        contact = _contact(2, 0, 150, [11])
+        players = self._report(planner, [contact])
+        known_bots = planner.known_bots(self.manifest, self.states)
+        known_targets = planner.known_targets(self.states, players)
+        self.assertEqual(1, planner.report_affordances(
+            [_cover_report(11, 2)], known_bots, known_targets, 1.0))
+        first = planner.build_orders(
+            self.manifest, self.states, players, 1.0)['orders'][0]
+        self.assertEqual('take_cover', first['combat_mode'])
+
+        self.assertEqual(1, planner.report_contacts(
+            [contact], planner.known_targets(self.states, players), 9.2))
+        terminal = planner.build_orders(
+            self.manifest, self.states, players, 9.2)['orders'][0]
+
+        self.assertNotIn(terminal['combat_mode'], (
+            'take_cover', 'cover_hold', 'cover_peek', 'cover_return'))
+        self.assertIn('rock', planner._cover_failures[11])
 
     def test_contact_free_capturer_follows_lane_before_enemy_base(self):
         planner = BotPlanner()
@@ -488,6 +605,65 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertGreater(supported._ally_support_score(
             live_bots[0], live_bots,
             supported._contacts[1][('human', 2)]), 0.5)
+
+    def test_support_vehicle_advances_until_inside_its_fire_range(self):
+        planner = BotPlanner()
+        cautious = _bot(
+            12, 1, 0, self.route, 'mediumTank', {'support': 1.0})
+        cautious['profile'].update({
+            'armor': 120.0,
+            'dominant_role': 'support',
+            'desired_range': 200.0,
+            'fire_range': 340.0,
+        })
+        state = _state(12, 1, 0, 0)
+        contact = _contact(2, 0, 395, [12], 'heavyTank')
+        player = {'id': 2, 'team': 2, 'alive': True}
+        self.assertEqual(1, planner.report_contacts(
+            [contact], planner.known_targets([state], [player]), 1.0))
+
+        order = planner.build_orders(
+            [cautious], [state], [player], 1.0)['orders'][0]
+
+        self.assertEqual('advance_contact', order['combat_mode'])
+        self.assertGreater(order['throttle_override'], 0.0)
+        self.assertFalse(order['fire_allowed'])
+
+    def test_range_hysteresis_keeps_mode_and_hull_anchor_stable(self):
+        planner = BotPlanner()
+        cautious = _bot(
+            12, 1, 0, self.route, 'mediumTank', {'support': 1.0})
+        cautious['profile'].update({
+            'armor': 120.0,
+            'dominant_role': 'support',
+            'desired_range': 200.0,
+            'fire_range': 520.0,
+        })
+        state = _state(12, 1, 0, 0)
+        player = {'id': 2, 'team': 2, 'alive': True}
+        far_limit = 200.0 * (
+            1.08 + planner._personality(12)['caution'] * 0.18)
+
+        def order_at(now, distance):
+            contact = _contact(2, 0, distance, [12], 'heavyTank')
+            self.assertEqual(1, planner.report_contacts(
+                [contact], planner.known_targets([state], [player]), now))
+            return planner.build_orders(
+                [cautious], [state], [player], now)['orders'][0]
+
+        outside = order_at(1.0, far_limit + 0.5)
+        inside_band = order_at(2.1, far_limit - 0.5)
+        inside = order_at(3.2, far_limit - 25.0)
+        outside_band = order_at(4.3, far_limit + 0.5)
+
+        self.assertEqual('support_hold', outside['combat_mode'])
+        self.assertEqual('support_hold', inside_band['combat_mode'])
+        self.assertEqual('engage', inside['combat_mode'])
+        self.assertEqual('engage', outside_band['combat_mode'])
+        self.assertEqual(outside['move_position'], inside['move_position'])
+        self.assertEqual(outside['face_position'], inside['face_position'])
+        self.assertTrue(outside['stable_hull_face'])
+        self.assertTrue(inside['stable_hull_face'])
 
     def test_stationary_armored_turreted_vehicle_angles_without_moving(self):
         planner = BotPlanner()
