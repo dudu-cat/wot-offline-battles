@@ -73,6 +73,8 @@ REPLICA_SNAPSHOT_HZ = 15.0
 REPLICA_SNAPSHOT_TICKS = max(
     1, int(round(TICK_HZ / REPLICA_SNAPSHOT_HZ)))
 RESULT_RESET_SECONDS = 5.0
+MAX_TICK_FAILURE_DIAGNOSTIC_CHARS = 512
+MAX_CONSECUTIVE_TICK_FAILURES = 2
 PREBATTLE_SECONDS = 15.0
 BATTLE_DURATION_SECONDS = 900.0
 PLAYER_DROWNING_SECONDS = 10.0
@@ -441,6 +443,21 @@ def _server_log_limited(key, message, interval=5.0):
     _SERVER_LOG_LAST[key] = now
     _server_log(message)
     return True
+
+
+def _tick_failure_diagnostic(error):
+    """Return one bounded single-line diagnostic for a tick failure."""
+    try:
+        error_type = type(error).__name__
+    except Exception:
+        error_type = "Exception"
+    try:
+        detail = str(error)
+    except Exception:
+        detail = "<unprintable>"
+    diagnostic = "%s: %s" % (
+        error_type, detail.replace("\r", " ").replace("\n", " "))
+    return diagnostic[:MAX_TICK_FAILURE_DIAGNOSTIC_CHARS]
 
 
 def _valid_capability_subset(value, required):
@@ -1740,6 +1757,8 @@ class BattleState:
         self.tick = 0
         self.lock = threading.RLock()
         self.running = True
+        self.server_tick_failure_count = 0
+        self.last_server_tick_failure = ""
         self.phase = "waiting"
         self.round_id = 1
         self.state_revision = 0
@@ -8526,6 +8545,38 @@ class BattleState:
         self.pending_events.append(dict(self.battle_result, kind="battle_result"))
         return True
 
+    def handle_tick_failure(self, error):
+        """Terminate one uncertain active round without minting settlement."""
+        diagnostic = _tick_failure_diagnostic(error)
+        with self.lock:
+            self.server_tick_failure_count += 1
+            self.last_server_tick_failure = diagnostic
+            if self.phase not in ("loading", "battle"):
+                return False
+
+            # A tick may have failed after partially consuming a planner or
+            # event batch. Do not retry that unknown transaction. Publish one
+            # clean terminal barrier and let the ordinary result-reset path
+            # return every connected endpoint to the waiting room.
+            self.pending_live_message = None
+            self.pending_events = []
+            if self.battle_result is None:
+                self.phase = "battle"
+                if not self._finish_battle(
+                        0, "server_tick_failure", 0,
+                        record_receipts=False):
+                    raise RuntimeError(
+                        "server tick failure terminal was not committed")
+                self.state_revision += 1
+            else:
+                # The exception may have happened after extracting an
+                # existing terminal event but before every endpoint received
+                # it. Requeue the canonical result rather than inventing a
+                # second outcome.
+                self.pending_events.append(dict(
+                    self.battle_result, kind="battle_result"))
+            return True
+
     def _maybe_finish_battle(self):
         """Finish a standard battle once one of the two teams is eliminated.
 
@@ -12743,25 +12794,131 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
-def _run_tick_loop(state, tick_clock=None, sleeper=None):
+class _TCPShutdownController:
+    """Request socket shutdown without blocking before serve_forever starts."""
+
+    def __init__(self, server):
+        self._server = server
+        self._lock = threading.Lock()
+        self._requested = False
+        self._serving = False
+        self._shutdown_thread = None
+
+    def _start_shutdown_locked(self):
+        if self._shutdown_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._server.shutdown,
+            name="lan-server-shutdown", daemon=True)
+        self._shutdown_thread = thread
+        thread.start()
+
+    def request(self):
+        """Record one idempotent request and never wait for serve_forever."""
+        with self._lock:
+            if self._requested:
+                return False
+            self._requested = True
+            if self._serving:
+                self._start_shutdown_locked()
+            return True
+
+    def serve_forever(self, poll_interval=0.5):
+        with self._lock:
+            if self._requested:
+                return
+            self._serving = True
+        try:
+            self._server.serve_forever(poll_interval=poll_interval)
+        finally:
+            with self._lock:
+                self._serving = False
+
+    def wait(self, timeout=None):
+        with self._lock:
+            thread = self._shutdown_thread
+        if thread is not None:
+            thread.join(timeout)
+
+
+def _stop_failed_tick_loop(state, shutdown_callback, stage, error):
+    """Stop scheduling and ask the owning TCP server to leave service."""
+    state.running = False
+    diagnostic = _tick_failure_diagnostic(error)
+    _server_log_limited(
+        "server-tick-stop:%s" % stage,
+        "SERVER TICK stopped stage=%s diagnostic=%s" % (
+            stage, diagnostic), interval=1.0)
+    if shutdown_callback is None:
+        return
+    try:
+        shutdown_callback()
+    except Exception as shutdown_error:
+        _server_log_limited(
+            "server-tick-shutdown-callback",
+            "SERVER TICK shutdown callback failed diagnostic=%s" %
+            _tick_failure_diagnostic(shutdown_error), interval=1.0)
+
+
+def _run_tick_loop(state, tick_clock=None, sleeper=None,
+                   failure_handler=None, shutdown_callback=None):
     """Run every due fixed simulation step without dropping late ticks."""
     interval = 1.0 / TICK_HZ
     tick_clock = time.perf_counter if tick_clock is None else tick_clock
     sleeper = time.sleep if sleeper is None else sleeper
-    next_tick = tick_clock() + interval
-    while state.running:
-        now = tick_clock()
-        delay = next_tick - now
-        if delay > 0.0:
-            sleeper(delay)
-            continue
-        # A one-second scheduler stall is thirty due rule steps. Consume all
-        # thirty before waiting again; resetting next_tick here would erase
-        # timeout, capture, drowning and movement time from the battle.
-        while state.running and now + 1e-9 >= next_tick:
-            state.tick_once(interval)
-            next_tick += interval
+    if failure_handler is None:
+        failure_handler = getattr(state, "handle_tick_failure", None)
+    consecutive_failures = 0
+    try:
+        next_tick = tick_clock() + interval
+        while state.running:
             now = tick_clock()
+            delay = next_tick - now
+            if delay > 0.0:
+                sleeper(delay)
+                continue
+            # A one-second scheduler stall is thirty due rule steps. Consume
+            # all thirty before waiting again; resetting next_tick here would
+            # erase timeout, capture, drowning and movement time from battle.
+            while state.running and now + 1e-9 >= next_tick:
+                try:
+                    state.tick_once(interval)
+                except Exception as error:
+                    consecutive_failures += 1
+                    _server_log_limited(
+                        "server-tick-failure:%d" % consecutive_failures,
+                        "SERVER TICK failure consecutive=%d diagnostic=%s" % (
+                            consecutive_failures,
+                            _tick_failure_diagnostic(error)),
+                        interval=1.0)
+                    if (consecutive_failures >=
+                            MAX_CONSECUTIVE_TICK_FAILURES):
+                        _stop_failed_tick_loop(
+                            state, shutdown_callback,
+                            "consecutive_tick_failure", error)
+                        return
+                    if not callable(failure_handler):
+                        _stop_failed_tick_loop(
+                            state, shutdown_callback,
+                            "missing_failure_handler", error)
+                        return
+                    try:
+                        failure_handler(error)
+                    except Exception as handler_error:
+                        _stop_failed_tick_loop(
+                            state, shutdown_callback,
+                            "failure_handler", handler_error)
+                        return
+                else:
+                    consecutive_failures = 0
+                # A failed tick is consumed exactly once. Retrying the same
+                # partially-mutated transaction would make the failure loop
+                # unbounded; the handler publishes the terminal on a new tick.
+                next_tick += interval
+                now = tick_clock()
+    except Exception as error:
+        _stop_failed_tick_loop(
+            state, shutdown_callback, "scheduler", error)
 
 
 def run_server(host, port, map_name, max_players,
@@ -12796,9 +12953,12 @@ def run_server(host, port, map_name, max_players,
         "state": state,
         "vehicle_overlay": overlay,
     })()
+    shutdown_controller = _TCPShutdownController(tcp_server)
 
     thread = threading.Thread(
-        target=_run_tick_loop, args=(state,),
+        target=_run_tick_loop,
+        args=(state,),
+        kwargs={"shutdown_callback": shutdown_controller.request},
         name="battle-tick", daemon=True)
     thread.start()
     _server_log(
@@ -12808,13 +12968,15 @@ def run_server(host, port, map_name, max_players,
             state.team_sizes[1], state.team_sizes[2]))
     _server_log("Ready: clients click Battle! to join, choose a map, then click START BATTLE")
     try:
-        tcp_server.serve_forever(poll_interval=0.5)
+        shutdown_controller.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\nStopping server", flush=True)
     finally:
         state.running = False
-        tcp_server.shutdown()
+        shutdown_controller.request()
         tcp_server.server_close()
+        thread.join(2.0)
+        shutdown_controller.wait(2.0)
 
 
 def main():
