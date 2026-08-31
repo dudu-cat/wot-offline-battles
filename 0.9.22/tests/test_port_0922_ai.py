@@ -20,7 +20,8 @@ from gui.mods.offline_lan_0922.ai.planner import (
     BattleDirector, build_vehicle_profile,
 )
 from gui.mods.offline_lan_0922.ai.navigation import (
-    BAKED_SHALLOW_WATER, TerrainGrid, TerrainNavigator,
+    BAKED_SHALLOW_WATER, MAX_SEARCH_EXPANSIONS_PER_FRAME,
+    SEARCH_EXPANSIONS_PER_SECOND, TerrainGrid, TerrainNavigator,
 )
 from gui.mods.offline_lan_0922 import prebaked_navigation
 from lan_battle_server import MAP_POOL
@@ -693,6 +694,43 @@ class BotAiPortTests(unittest.TestCase):
             ('prune', 1.0), ('trim', None),
             ('prune', 2.1), ('trim', None),
         ], calls)
+
+    def test_astar_work_uses_elapsed_credit_with_a_hard_frame_cap(self):
+        class PendingSearch(object):
+            def __init__(self):
+                self.done = False
+                self.last_frame = None
+                self.steps = 0
+
+            def step(self, count):
+                self.steps += int(count)
+
+        navigator = TerrainNavigator(lambda *unused: 0.0)
+        searches = [PendingSearch() for unused in range(4)]
+        navigator.searches = dict(
+            (('job', index), search)
+            for index, search in enumerate(searches))
+
+        navigator.begin_frame(0.05)
+        navigator.tick(1.0)
+        navigator.end_frame()
+
+        earned = int(0.05 * SEARCH_EXPANSIONS_PER_SECOND)
+        self.assertEqual(earned, sum(search.steps for search in searches))
+        self.assertLessEqual(
+            max(search.steps for search in searches) -
+            min(search.steps for search in searches), 1)
+
+        navigator.begin_frame(1.0)
+        navigator.tick(2.0)
+        navigator.end_frame()
+
+        self.assertEqual(
+            earned + MAX_SEARCH_EXPANSIONS_PER_FRAME,
+            sum(search.steps for search in searches))
+        self.assertLessEqual(
+            max(search.steps for search in searches) -
+            min(search.steps for search in searches), 1)
 
     def test_empty_failed_edge_table_skips_route_segment_scans(self):
         grid = TerrainGrid(lambda *unused: 0.0)

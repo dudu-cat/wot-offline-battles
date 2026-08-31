@@ -23,7 +23,8 @@ from gui.mods.offline_lan_0922.authority_worker_probe import \
 from gui.mods.offline_lan_0922.battle_feedback import (
     SixthSenseController, VehicleStatePresenter)
 from gui.mods.offline_lan_0922.bot_runtime import (
-    BOT_WATER_AVOID_DEPTH, BotRuntime, PROBE_KINDS)
+    BOT_WATER_AVOID_DEPTH, BotRuntime, PROBE_KINDS,
+    WORKER_CONTROL_SECONDS)
 from gui.mods.offline_lan_0922.entities.avatar_server import AvatarServerBridge
 from gui.mods.offline_lan_0922.entities.bigworld_binding import \
     BigWorldVehicleBinding
@@ -2792,7 +2793,9 @@ class BattleRuntime(object):
                 native_motion=False,
                 probe_clock=(_PROFILE_CLOCK if self._worker_mode else None),
                 probe_timing_seconds=(
-                    WORKER_NATIVE_PROBE_SECONDS if self._worker_mode else 0.0))
+                    WORKER_NATIVE_PROBE_SECONDS if self._worker_mode else 0.0),
+                control_seconds=(
+                    WORKER_CONTROL_SECONDS if self._worker_mode else None))
             self._bots.debug_logging = bool(
                 self._config.get('debug_logging', False))
             # Sampled here, not before BotRuntime exists: the bot, navigator

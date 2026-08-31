@@ -8273,6 +8273,33 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual((0.0,) * len(after),
                          battle._bots.probe_duration_totals())
 
+    def test_hidden_worker_constructs_ten_hz_bot_control(self):
+        runtime = _runtime()
+        runtime.bigworld.defer_vehicle_entry = True
+        battle = BattleRuntime(runtime)
+        client = _Client()
+        client.player_id = -1
+        client.name = 'Worker'
+        client.bot_authority_id = -1
+        client.is_bot_authority = lambda: True
+        client.send_bot_manifest = lambda *unused: True
+        start = {
+            'round_id': 1, 'map': '01_karelia',
+            'bot_authority_id': -1, 'players': [], 'bots': []}
+
+        self.assertTrue(battle.start({
+            'map': '01_karelia', 'vehicle': 'ussr:R11_MS-1',
+            'name': 'Worker', 'worker_mode': True}, start, client))
+        runtime.bigworld.callbacks.pop(0)()
+        runtime.bigworld.enter_pending_vehicle(battle._server.vehicle_id)
+        runtime.bigworld.callbacks.pop(0)()
+
+        self.assertEqual('running', battle.state)
+        self.assertTrue(battle._bots._fixed_control)
+        self.assertEqual(
+            bot_runtime.WORKER_CONTROL_SECONDS,
+            battle._bots._control_seconds)
+
     def test_player_identity_sync_rejects_arena_dp_mismatch(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)

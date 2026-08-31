@@ -4429,6 +4429,47 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([{'type': 'ram_damage', 'event': 'once'}], events)
         self.assertEqual(0.0, self.runtime._accumulator)
 
+    def test_worker_gap_bounds_catch_up_and_eventually_consumes_debt(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *args: _Adapter(*args),
+            direction_probe=lambda *unused: {'clear': True, 'slope': .2},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.battle_start(self.start)
+        runtime._pending_ram_reports = [{
+            'type': 'ram_damage', 'event': 'once'}]
+        runtime._world_receipt_waiting = [(11, True)]
+
+        self.assertEqual([], runtime.update(0.01, 9.01))
+        self.assertEqual([(11, True)], runtime._world_receipt_waiting)
+
+        first = runtime.update(0.99, 10.0)
+        states = [message for message in first
+                  if message.get('type') == 'bot_state']
+        events = [message for message in first
+                  if message.get('type') == 'ram_damage']
+
+        self.assertEqual([100000, 200000], [
+            message['sample_time_us'] for message in states])
+        self.assertEqual([{'type': 'ram_damage', 'event': 'once'}], events)
+        self.assertAlmostEqual(0.8, runtime._accumulator)
+
+        drained = []
+        for unused in range(4):
+            drained.extend(runtime.update(0.0, 10.0))
+        all_messages = first + drained
+        self.assertEqual(
+            [index * 100000 for index in range(1, 11)],
+            [message['sample_time_us'] for message in all_messages
+             if message.get('type') == 'bot_state'])
+        self.assertEqual(1, sum(
+            message.get('type') == 'ram_damage'
+            for message in all_messages))
+        self.assertAlmostEqual(0.0, runtime._accumulator)
+
     def test_authority_publication_and_server_ack_remain_live_for_two_minutes(self):
         command = {
             'target_yaw': 0.0, 'throttle': 0.0, 'turn': 0.0,
@@ -7038,6 +7079,83 @@ class BotRuntimeTests(unittest.TestCase):
                      for launch in launches])
                 self.assertTrue(all(
                     step <= 0.100000001 for step in substeps))
+
+    def test_worker_gap_retains_every_burst_edge_while_debt_drains(self):
+        count = 11
+        descriptor = _combat_descriptor(
+            reload_time=4.0, clip=(count + 1, 2.0),
+            dispersion=0.01, max_ammo=count + 2)
+        descriptor.gun.burst = (count, 0.1)
+        descriptor.gun.shotDispersionFactors = {
+            'afterShot': 4.0, 'afterShotInBurst': 1.0,
+            'turretRotation': 0.0,
+        }
+        runtime = self.module.BotRuntime(
+            1, friendly_lane_probe=lambda *unused: True,
+            direct_launch_origin_probe=lambda source, *unused: (
+                source['x'], source['y'] + 1.0, source['z']),
+            control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.round_id = 5
+        runtime.authority_id = 1
+        runtime.adapter = object()
+        runtime._descriptors[11] = descriptor
+        state = {
+            'id': 11, 'alive': True, 'health': 1000,
+            'fire_seq': 0, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+            'aim_yaw': 0.0, 'turret_yaw': 0.0,
+            'gun_pitch': -0.01, 'critical': {}, 'profile': {},
+        }
+        target = {
+            'id': 2, 'network_id': 2, 'kind': 'human',
+            'alive': True, 'position': (0.0, 1.0, 100.0),
+        }
+        solution = {'flight_time': 0.5}
+        gun_state = self.module._BotGunState(descriptor)
+        gun_state.elapsed = 10.0
+        ammo_state = self.module._BotAmmoState(descriptor, {}, state)
+        runtime._gun_states[11] = gun_state
+        runtime._ammo_states[11] = ammo_state
+        preview = runtime._direct_launch_preview(
+            state, descriptor, ammo_state.loaded, gun_state, solution)
+        self.assertTrue(runtime._fire(
+            state, gun_state, 1.0, descriptor,
+            ammo_state=ammo_state, launch_preview=preview,
+            launch_time_us=0))
+
+        substeps = []
+
+        def simulate(step, unused_now, unused_players, unused_neighbours):
+            start_us = runtime._sample_time_us
+            duration_us = max(1, int(round(step * 1000000.0)))
+            end_us = start_us + duration_us
+            state['z'] += 10.0 * step
+            substeps.append(step)
+            runtime._advance_active_burst(
+                state, gun_state, ammo_state, 1.0, descriptor,
+                target, solution, step, set(), start_us, end_us)
+            runtime._sample_time_us = end_us
+            return []
+
+        runtime._update_once = simulate
+        runtime.update(1.0, 1.0)
+        self.assertEqual(3, len(runtime._pending_launches))
+        self.assertAlmostEqual(0.8, runtime._accumulator)
+
+        for unused in range(4):
+            runtime.update(0.0, 1.0)
+
+        self.assertEqual(count, len(runtime._pending_launches))
+        self.assertEqual(
+            [index * 100000 for index in range(count)],
+            [launch['launch_time_us']
+             for launch in runtime._pending_launches])
+        self.assertEqual(
+            [round(float(index), 6) for index in range(count)],
+            [round(launch['shot_origin'][2], 6)
+             for launch in runtime._pending_launches])
+        self.assertEqual([0.1] * 10, substeps)
+        self.assertAlmostEqual(0.0, runtime._accumulator)
 
     def test_siege_transition_edge_locks_pose_in_its_starting_tick(self):
         self.runtime.battle_start(self.start)

@@ -10,7 +10,6 @@ probes so it can be tested outside the legacy client.
 
 import heapq
 import math
-import time
 
 from gui.mods.offline_lan_0922.ai.driver import WAYPOINT_ARRIVAL_RADIUS
 
@@ -29,10 +28,9 @@ HARD_CONTACT_REPLAN_VERDICTS = 4
 HARD_CONTACT_EDGE_TTL = 12.0
 HARD_CONTACT_EDGE_PENALTY = 240.0
 
-try:
-	_CLOCK = time.clock
-except AttributeError:
-	_CLOCK = time.perf_counter
+SEARCH_EXPANSIONS_PER_SECOND = 960.0
+MAX_SEARCH_EXPANSIONS_PER_FRAME = 96
+MAX_SEARCH_CREDIT = float(MAX_SEARCH_EXPANSIONS_PER_FRAME)
 
 
 def _distance_2d(first, second):
@@ -865,19 +863,17 @@ class TerrainNavigator(object):
 		self.search_frame_time = None
 		self.housekeeping_time = None
 		self.search_next_key = None
-		self.search_budget_per_frame = 128
-		self.search_budget_per_path = 4
-		self.search_time_budget = 0.0025
+		self.search_credit = 0.0
+		self.search_frame_serial = 0
+		self.search_processed_frame = -1
+		self.search_frame_budget = MAX_SEARCH_EXPANSIONS_PER_FRAME
+		self.search_frame_open = False
+		self.search_auto_time = None
 		# A bounded search returns its best fully-probed partial path. This keeps a
 		# 29-bot room from waiting tens of seconds for 1600 expansions per job; the
 		# continuation search starts after the bot reaches that safe endpoint.
 		self.search_max_expansions = 128
 		if self.grid.prebaked:
-			# Static links are cheap, but searches still run on the render thread.
-			# Preserve fair resumable progress within the measured 0.8.2 budget.
-			self.search_budget_per_frame = 384
-			self.search_budget_per_path = 16
-			self.search_time_budget = 0.0025
 			self.search_max_expansions = 4096
 		self.search_completed = 0
 		self.search_failed = 0
@@ -1114,18 +1110,60 @@ class TerrainNavigator(object):
 				self.searches.pop(key, None)
 				self.search_times.pop(key, None)
 
+	def begin_frame(self, elapsed):
+		"""Accrue deterministic A* work once for one render callback.
+
+		Search progress is paid with simulation elapsed rather than CPU wall time.
+		A long callback can therefore earn work without forcing the complete debt
+		into that same render frame.  Unspent credit is retained up to one bounded
+		frame, and the rotating queue below preserves fairness between jobs.
+		"""
+		elapsed = max(0.0, float(elapsed))
+		self.search_frame_serial += 1
+		self.search_frame_budget = MAX_SEARCH_EXPANSIONS_PER_FRAME
+		self.search_frame_open = True
+		self.search_credit = min(
+			MAX_SEARCH_CREDIT,
+			self.search_credit + elapsed * SEARCH_EXPANSIONS_PER_SECOND)
+
+	def end_frame(self):
+		"""Close an explicit render-frame work budget."""
+		self.search_frame_open = False
+
+	def _begin_automatic_frame(self, now):
+		"""Keep direct TerrainNavigator users deterministic without a runtime."""
+		now = float(now)
+		if (self.search_auto_time is not None and
+				abs(now - self.search_auto_time) < 0.000001):
+			return
+		# A direct caller has no preceding render callback from which to earn its
+		# first credit. Give it one nominal 10 Hz slice; production always opens an
+		# explicit frame with the real elapsed value.
+		elapsed = (0.10 if self.search_auto_time is None else
+		           max(0.0, now - self.search_auto_time))
+		self.search_auto_time = now
+		self.search_frame_serial += 1
+		self.search_frame_budget = MAX_SEARCH_EXPANSIONS_PER_FRAME
+		self.search_credit = min(
+			MAX_SEARCH_CREDIT,
+			self.search_credit + elapsed * SEARCH_EXPANSIONS_PER_SECOND)
+
 	def _advance_searches(self, now):
-		"""Give every pending A* task a fair share of the current frame.
+		"""Give every pending A* task a deterministic fair frame share.
 
 		The old on-demand scheduler handed the whole frame budget to whichever bots
 		were updated first. With a 29-bot room, later join searches could therefore
 		remain pending forever. This rotating queue gives every task one expansion
 		before any task receives a second, and remembers the next task across frames.
+		No branch reads CPU time, so identical elapsed/input produces identical
+		paths on fast and slow machines.
 		"""
 		self.search_now = float(now)
-		if (self.search_frame_time is not None and
-				abs(float(now) - self.search_frame_time) < 0.000001):
+		if not self.search_frame_open:
+			self._begin_automatic_frame(now)
+		if self.search_processed_frame == self.search_frame_serial:
 			return
+		self.search_processed_frame = self.search_frame_serial
 		self.search_frame_time = float(now)
 		keys = sorted(self.searches, key=lambda value: repr(value))
 		if not keys:
@@ -1136,15 +1174,10 @@ class TerrainNavigator(object):
 			queue = keys[start:] + keys[:start]
 		else:
 			queue = keys
-		steps = {}
-		budget = max(0, int(self.search_budget_per_frame))
-		per_path = max(1, int(self.search_budget_per_path))
-		# Preserve the old 32-expansion floor so one expensive probe cannot reduce
-		# a lone search to one node per frame; the clock budget limits only the
-		# additional burst up to the new hard cap.
-		minimum_round = min(budget, max(len(queue), 32))
+		budget = min(
+			max(0, int(self.search_credit)),
+			max(0, int(self.search_frame_budget)))
 		processed = 0
-		started = _CLOCK()
 		while budget > 0 and queue:
 			key = queue.pop(0)
 			search = self.searches.get(key)
@@ -1154,22 +1187,18 @@ class TerrainNavigator(object):
 			search.last_frame = float(now)
 			budget -= 1
 			processed += 1
-			steps[key] = steps.get(key, 0) + 1
 			if search.done:
 				self._finish_search(key, search, now)
-			elif steps[key] < per_path:
+			else:
 				queue.append(key)
-			if (processed >= minimum_round and self.search_time_budget > 0.0 and
-					_CLOCK() - started >= self.search_time_budget):
-				break
+		self.search_credit = max(0.0, self.search_credit - processed)
+		self.search_frame_budget = max(
+			0, int(self.search_frame_budget) - processed)
 		self.search_next_key = queue[0] if queue else None
 		self._trim_cache(now)
 
 	def tick(self, now):
-		"""Advance shared path jobs once per rendered frame, even when bots hold."""
-		if (self.search_frame_time is not None and
-				abs(float(now) - self.search_frame_time) < 0.000001):
-			return
+		"""Advance shared path jobs once per render budget, even when bots hold."""
 		self._advance_searches(now)
 		if (self.housekeeping_time is None or
 				float(now) - float(self.housekeeping_time) >= 1.0):

@@ -32,7 +32,17 @@ from gui.mods.offline_lan_0922 import vehicle_physics
 
 
 OBSERVATION_SECONDS = 0.40
+# The logical runtime keeps its mature 30 Hz default for engine-free callers.
+# Production hidden workers explicitly select the lower-cost 10 Hz control and
+# copied-hull cadence through BotRuntime's internal constructor seam. Native
+# projectile progression remains owned by BattleRuntime's separate clock,
+# while burst edges below retain their exact due timestamps.
 PUBLICATION_SECONDS = 1.0 / 30.0
+WORKER_CONTROL_SECONDS = 0.10
+# A stalled render callback may consume one regular control step plus one
+# catch-up step.  Remaining elapsed stays as debt for later callbacks instead
+# of multiplying full-roster native work in the frame that already stalled.
+MAX_CONTROL_STEPS_PER_FRAME = 2
 LOCAL_ACTION_SECONDS = 0.10
 TACTICAL_REFRESH_SECONDS = 1.0
 # Eight protocol-maximum exact paths can share only two of the four native
@@ -1708,7 +1718,7 @@ class BotRuntime(object):
                  motion_resolver=None, motion_report=None,
                  world_receipt_probe=None, probe_timing_seconds=0.0,
                  water_depth_probe=None, ram_contact_probe=None,
-                 bot_equipment_resolver=None):
+                 bot_equipment_resolver=None, control_seconds=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.player_descriptor_resolver = player_descriptor_resolver
@@ -1780,6 +1790,9 @@ class BotRuntime(object):
         self.bot_equipment_resolver = (
             bot_equipment_resolver if callable(bot_equipment_resolver) else
             (lambda: ()))
+        self._fixed_control = control_seconds is not None
+        self._control_seconds = max(
+            0.001, _number(control_seconds, PUBLICATION_SECONDS))
         self._water_depth_probe = (
             water_depth_probe if callable(water_depth_probe) else
             (lambda unused_position: -1.0))
@@ -7604,36 +7617,72 @@ class BotRuntime(object):
         return result
 
     def update(self, dt, now, players=None, neighbours=None):
-        """Advance the complete elapsed interval in stable bounded substeps."""
+        """Advance fixed-rate Bot control with bounded render catch-up.
+
+        Render callbacks only add elapsed debt.  At most two configured fixed
+        control steps run in one callback, so a stall cannot immediately
+        multiply all roster probes and projections. Debt is retained, never
+        discarded; ordinary render rates drain it over following callbacks.
+        Burst clocks still advance across the complete processed step and
+        enqueue every crossed physical round with its exact due timestamp.
+        """
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
             return []
-        self._accumulator += max(0.0, _number(dt))
-        if self._accumulator <= 0.0:
-            return []
+        elapsed_input = max(0.0, _number(dt))
+        self._accumulator += elapsed_input
         now = _number(now)
-        # Faster render callbacks still bank their elapsed time until the 30 Hz
-        # authority deadline. Once due, consume the entire bank in this call:
-        # a one-second render gap is one second of battle rules, not a capped
-        # pose followed by discarded or future-frame time.
-        if now + 1e-9 < self._next_publication:
-            return []
-        elapsed = self._accumulator
-        self._accumulator = 0.0
+        navigator_begin = getattr(self.navigator, 'begin_frame', None)
+        navigator_end = getattr(self.navigator, 'end_frame', None)
+        if callable(navigator_begin):
+            navigator_begin(elapsed_input)
         outgoing = []
-        # The exact-receipt cap belongs to this render callback, not each
-        # catch-up slice. Resetting it inside _update_once multiplied native
-        # work after a slow frame and made the next callback slow as well.
-        self._begin_world_receipt_frame()
+        receipt_frame_open = False
         try:
-            while elapsed > 1e-12:
-                frame_step = self._bounded_burst_step(min(elapsed, 0.2))
-                elapsed = max(0.0, elapsed - frame_step)
-                step_now = now - elapsed
-                outgoing.extend(self._update_once(
-                    frame_step, step_now, players, neighbours))
+            if not self._fixed_control:
+                # Preserve the mature engine-free seam for focused law tests
+                # and non-production callers. Hidden workers always select the
+                # fixed branch explicitly at construction.
+                if (self._accumulator <= 0.0 or
+                        now + 1e-9 < self._next_publication):
+                    return []
+            elif self._accumulator + 1e-9 < self._control_seconds:
+                return []
+            # Exact world-receipt work is capped per render callback, not per
+            # catch-up step. Do not open an empty receipt frame on intervening
+            # high-FPS callbacks: finishing one without a control step would
+            # retire valid deferred requests as no longer eligible.
+            self._begin_world_receipt_frame()
+            receipt_frame_open = True
+            try:
+                if not self._fixed_control:
+                    elapsed = self._accumulator
+                    self._accumulator = 0.0
+                    while elapsed > 1e-12:
+                        frame_step = self._bounded_burst_step(
+                            min(elapsed, 0.2))
+                        elapsed = max(0.0, elapsed - frame_step)
+                        step_now = now - elapsed
+                        outgoing.extend(self._update_once(
+                            frame_step, step_now, players, neighbours))
+                else:
+                    steps = 0
+                    while (steps < MAX_CONTROL_STEPS_PER_FRAME and
+                           self._accumulator + 1e-9 >=
+                           self._control_seconds):
+                        self._accumulator = max(
+                            0.0, self._accumulator - self._control_seconds)
+                        step_now = now - self._accumulator
+                        outgoing.extend(self._update_once(
+                            self._control_seconds, step_now,
+                            players, neighbours))
+                        steps += 1
+            finally:
+                if receipt_frame_open:
+                    self._finish_world_receipt_frame()
         finally:
-            self._finish_world_receipt_frame()
+            if callable(navigator_end):
+                navigator_end()
         source_batch_horizon_us = self._sample_time_us
         for message in outgoing:
             if message.get('type') != 'bot_state':
@@ -7653,11 +7702,10 @@ class BotRuntime(object):
         step_end_time_us = step_start_time_us + step_duration_us
         if self._next_publication <= 0.0:
             self._next_publication = now
-        # Carry the nominal deadline to preserve an average 30 Hz at render
-        # rates such as 40 FPS. Every bounded slice of a stalled callback
-        # advances this deadline and publishes its ordered catch-up state.
+        # This is a diagnostic authority deadline only; fixed control debt is
+        # scheduled by update() and never derived from render-frame spacing.
         while self._next_publication <= now + 1e-9:
-            self._next_publication += PUBLICATION_SECONDS
+            self._next_publication += self._control_seconds
         self._advance_probe_timing(now)
         self._advance_equipment_clock(frame_step)
         players = list(players or [])
@@ -8593,7 +8641,7 @@ class BotRuntime(object):
                 if (lane_sample is not None and
                         now - lane_sample[0] <=
                         SHOT_LANE_REFRESH_SECONDS +
-                        PUBLICATION_SECONDS + 1e-9 and lane_sample[1]):
+                        self._control_seconds + 1e-9 and lane_sample[1]):
                     observation_entries[key][1].add(
                         int(lane_source['id']))
         if (shot_lane_refresh_due and refresh_shot_lanes and
