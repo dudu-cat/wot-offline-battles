@@ -4938,13 +4938,17 @@ class BattleRuntime(object):
         return True
 
     def _select_local_siege_pose(self, entity, enabled):
-        descriptor = getattr(entity, 'typeDescriptor', None)
-        if not bool(getattr(descriptor, 'hasSiegeMode', False)):
-            return False
+        # ``Vehicle.onSiegeStateUpdated`` can synchronously replace the
+        # active composite descriptor with its ordinary travel descriptor.
+        # That child descriptor need not carry ``hasSiegeMode`` even though
+        # this local vehicle already owns prepared hydraulic providers.  The
+        # final DISABLED edge must still select the plain copied pose; gating
+        # it on the *new* descriptor leaves the old hydraulic body attached
+        # and makes the fixed gun look vertically locked after exit.
         if (self._local_siege_body_matrix is None or
                 self._local_siege_stabilised_matrix is None or
                 self._local_siege_ground_matrix is None):
-            raise RuntimeError('player hydraulic pose was not prepared')
+            return False
         body = (self._local_siege_body_matrix
                 if enabled else self._local_matrix)
         stabilised = body

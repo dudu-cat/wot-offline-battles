@@ -12112,6 +12112,46 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertIs(
             battle._local_matrix, battle._local_stabilised_matrix.a)
 
+    def test_siege_exit_selects_plain_pose_after_descriptor_reverts(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        siege_descriptor = _Descriptor('sweden:S11_Strv_103B')
+        siege_descriptor.hasSiegeMode = True
+        entity = _Vehicle(
+            10, siege_descriptor, _Vector(2, 3, 4), (0, 0, 0),
+            {'health': 500})
+        native_body = _Matrix()
+        native_ground = _Matrix()
+        entity.filter.bodyMatrix = native_body
+        entity.filter.groundPlacingMatrix = native_ground
+        entity.filter.groundPlacingMatrixFiltered = _Matrix()
+        entity.filter.stabilisedMatrix = _Matrix()
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+        battle._sender = types.SimpleNamespace(
+            forward=0.0, turn=0.0, aim_yaw=0.0, gun_pitch=0.0,
+            handbrake=False, send_current=mock.Mock(return_value=True))
+        battle._local_position = (2.0, 3.0, 4.0)
+        battle._local_descriptor = siege_descriptor
+        battle._attach_local_presentation()
+
+        self.assertTrue(battle._select_local_siege_pose(entity, True))
+        self.assertIs(
+            battle._local_siege_body_matrix,
+            battle._local_pose_matrix.a)
+
+        # #1513 changes the active descriptor inside its siege-state
+        # callback.  The travel child is intentionally not another composite.
+        entity.typeDescriptor = _Descriptor()
+        entity.typeDescriptor.hasSiegeMode = False
+
+        self.assertTrue(battle._select_local_siege_pose(entity, False))
+        self.assertIs(battle._local_matrix, battle._local_pose_matrix.a)
+        self.assertIs(
+            battle._local_matrix, battle._local_stabilised_matrix.a)
+
     def test_local_siege_waits_for_native_vehicle_enter_to_finish(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
