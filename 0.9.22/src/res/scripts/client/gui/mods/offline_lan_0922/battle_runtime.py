@@ -142,6 +142,7 @@ STANDARD_GAMEPLAY = 'ctf'
 PREBATTLE_SECONDS = 15.0
 BATTLE_SECONDS = 900.0
 BOT_SPAWN_SECONDS = 0.30
+BOT_MANIFEST_RETRY_SECONDS = 0.25
 PLAYER_ENVIRONMENT_SECONDS = 0.3
 MAX_PENDING_LANDING_IMPACTS = 32
 _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
@@ -1202,6 +1203,9 @@ class BattleRuntime(object):
         self._sender = None
         self._sync = None
         self._bots = None
+        self._next_bot_manifest_retry = 0.0
+        self._bot_manifest_retry_deadline = 0.0
+        self._bot_manifest_retry_identity = None
         self._worker_probe = None
         self._worker_probe_attempted = False
         self._worker_frame_callbacks = 0
@@ -1453,6 +1457,9 @@ class BattleRuntime(object):
         self._worker_probe_bot_send_failed = 0
         self._worker_probe_bot_count = 0
         self._worker_probe_simulation_caps = 0
+        self._next_bot_manifest_retry = 0.0
+        self._bot_manifest_retry_deadline = 0.0
+        self._bot_manifest_retry_identity = None
         area_destructibles = getattr(
             self._runtime, 'area_destructibles', None)
         destructibles_cache = getattr(
@@ -2827,7 +2834,10 @@ class BattleRuntime(object):
                                 'entity': 'bot:%s' % state['id'],
                                 'kind': 'bot', 'id': state['id'],
                                 'state': state})
-                self._send_bot_message(outgoing)
+                if outgoing.get('type') == 'bot_manifest':
+                    self._enqueue_bot_manifest(outgoing)
+                else:
+                    self._send_bot_message(outgoing)
             if self._last_snapshot is not None:
                 self._bots.apply_snapshot(self._last_snapshot)
                 self._remember_ram_bot_snapshot(self._last_snapshot)
@@ -6637,7 +6647,10 @@ class BattleRuntime(object):
         if snapshot.get('battle_result') is not None:
             start['battle_result'] = snapshot.get('battle_result')
         for outgoing in self._bots.battle_start(start):
-            self._send_bot_message(outgoing)
+            if outgoing.get('type') == 'bot_manifest':
+                self._enqueue_bot_manifest(outgoing)
+            else:
+                self._send_bot_message(outgoing)
         self._set_bot_presentation_interpolation(player_id)
         if self._bots.is_authority():
             for state in snapshot.get('bots') or ():
@@ -11639,6 +11652,7 @@ class BattleRuntime(object):
             self._run_optional_feature(
                 'foliage camouflage',
                 self._refresh_fallen_tree_foliage, (now,))
+            self._retry_bot_manifest(now)
             self._maybe_send_battle_ready()
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
@@ -15384,6 +15398,106 @@ class BattleRuntime(object):
                 message.get('base_team'))
         return False
 
+    def _enqueue_bot_manifest(self, message, now=None):
+        """Commit one frozen manifest only after local transport enqueue."""
+        if (not isinstance(message, dict) or
+                message.get('type') != 'bot_manifest' or
+                self._bots is None):
+            return False
+        provider = getattr(self._bots, 'pending_manifest', None)
+        pending = provider() if callable(provider) else None
+        if pending is None or pending != message:
+            return False
+        if now is None:
+            now = self._clock()
+        now = float(now)
+        retry_identity = (
+            self._generation,
+            (self._start_message or {}).get('round_id'),
+            getattr(self._bots, 'authority_id', None),
+            getattr(self.client, 'authority_epoch', None))
+        if (self._bot_manifest_retry_identity == retry_identity and
+                self._bot_manifest_retry_deadline > 0.0 and
+                now + 1.0e-9 >= self._bot_manifest_retry_deadline):
+            self._discard_pending_bot_manifest()
+            raise RuntimeError('worker bot manifest enqueue timed out')
+        if (self._bot_manifest_retry_identity == retry_identity and
+                self._next_bot_manifest_retry > 0.0 and
+                now + 1.0e-9 < self._next_bot_manifest_retry):
+            return False
+        accepted = bool(self._send_bot_message(message))
+        if not accepted:
+            self._next_bot_manifest_retry = (
+                now + BOT_MANIFEST_RETRY_SECONDS)
+            if self._bot_manifest_retry_identity != retry_identity:
+                self._bot_manifest_retry_deadline = (
+                    now + float((self._config or {}).get(
+                        'startupTimeoutSeconds', 30.0)))
+            self._bot_manifest_retry_identity = retry_identity
+            return False
+        marker = getattr(self._bots, 'mark_manifest_enqueued', None)
+        if not callable(marker) or not marker(message):
+            raise RuntimeError(
+                'enqueued bot manifest does not match the pending payload')
+        self._next_bot_manifest_retry = 0.0
+        self._bot_manifest_retry_deadline = 0.0
+        self._bot_manifest_retry_identity = None
+        return True
+
+    def _retry_bot_manifest(self, now):
+        """Retry the current authority tenure's manifest at bounded cadence."""
+        if (not self._worker_mode or self.state != 'running' or
+                self._bots is None):
+            return False
+        if (self._battle_result is not None or
+                getattr(self._bots, 'finished', False)):
+            self._discard_pending_bot_manifest()
+            return False
+        start_round = (self._start_message or {}).get('round_id')
+        current_identity = (
+            self._generation, start_round,
+            getattr(self._bots, 'authority_id', None),
+            getattr(self.client, 'authority_epoch', None))
+        if (self._bot_manifest_retry_identity is not None and
+                self._bot_manifest_retry_identity != current_identity):
+            self._discard_pending_bot_manifest()
+            return False
+        if getattr(self._bots, 'round_id', None) != start_round:
+            self._discard_pending_bot_manifest()
+            return False
+        client_round = getattr(self.client, 'round_id', start_round)
+        if client_round is not None and client_round != start_round:
+            self._discard_pending_bot_manifest()
+            return False
+        authority_check = getattr(self.client, 'is_bot_authority', None)
+        if callable(authority_check) and not authority_check():
+            self._discard_pending_bot_manifest()
+            return False
+        provider = getattr(self._bots, 'pending_manifest', None)
+        pending = provider() if callable(provider) else None
+        if pending is None:
+            self._next_bot_manifest_retry = 0.0
+            self._bot_manifest_retry_deadline = 0.0
+            self._bot_manifest_retry_identity = None
+            return False
+        now = float(now)
+        if (self._bot_manifest_retry_deadline > 0.0 and
+                now + 1.0e-9 >= self._bot_manifest_retry_deadline):
+            self._discard_pending_bot_manifest()
+            raise RuntimeError('worker bot manifest enqueue timed out')
+        if (self._next_bot_manifest_retry > 0.0 and
+                now + 1.0e-9 < self._next_bot_manifest_retry):
+            return False
+        return self._enqueue_bot_manifest(pending, now=now)
+
+    def _discard_pending_bot_manifest(self):
+        discard = getattr(self._bots, 'discard_pending_manifest', None)
+        if callable(discard):
+            discard()
+        self._next_bot_manifest_retry = 0.0
+        self._bot_manifest_retry_deadline = 0.0
+        self._bot_manifest_retry_identity = None
+
     def _enqueue_bot_message(self, message):
         """Join one state enqueue with ordered physical-launch progress."""
         accepted = self._send_bot_message(message)
@@ -18566,6 +18680,9 @@ class BattleRuntime(object):
         self._sender = None
         self._sync = None
         self._bots = None
+        self._next_bot_manifest_retry = 0.0
+        self._bot_manifest_retry_deadline = 0.0
+        self._bot_manifest_retry_identity = None
         self._worker_probe = None
         self._worker_probe_attempted = False
         self._worker_frame_callbacks = 0

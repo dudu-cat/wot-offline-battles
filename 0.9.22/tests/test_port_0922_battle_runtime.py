@@ -21072,6 +21072,191 @@ class BattleRuntimeContractTests(unittest.TestCase):
             bots, sample_time_us=40000,
             source_batch_horizon_us=40000)
 
+    @staticmethod
+    def _pending_manifest_outbox(payload, round_id=7, authority_id=-1):
+        outbox = bot_runtime.BotRuntime(authority_id)
+        outbox.round_id = round_id
+        outbox.authority_id = authority_id
+        outbox._pending_manifest = copy.deepcopy(payload)
+        outbox._pending_manifest_round_id = round_id
+        outbox._pending_manifest_authority_id = authority_id
+        return outbox
+
+    def test_bot_manifest_retries_same_payload_until_enqueue(self):
+        payload = {
+            'type': 'bot_manifest',
+            'bots': [{'id': 11, 'name': 'Frozen'}],
+            'player_collision_profiles': [{
+                'id': 1, 'vehicle': 'ussr:R11_MS-1',
+                'mass': 25000.0, 'shape': [1.5, 3.5, -0.8, 2.0],
+                'ram_profile': {
+                    'spall_coefficient': 1.0,
+                    'ramming_bonus': 0.0}}],
+        }
+        battle = BattleRuntime(_runtime())
+        battle._config = {'startupTimeoutSeconds': 0.6}
+        battle.state = 'running'
+        battle._worker_mode = True
+        battle._start_message = {'round_id': 7}
+        battle._bots = self._pending_manifest_outbox(payload)
+        battle.client = types.SimpleNamespace(
+            round_id=7, authority_epoch=3,
+            is_bot_authority=lambda: True,
+            send_bot_manifest=mock.Mock(
+                side_effect=[False, False, True]))
+
+        self.assertFalse(battle._enqueue_bot_manifest(payload, now=1.0))
+        self.assertEqual(1.6, battle._bot_manifest_retry_deadline)
+        self.assertFalse(battle._enqueue_bot_manifest(payload, now=1.1))
+        self.assertFalse(battle._retry_bot_manifest(1.25))
+        self.assertEqual(1.6, battle._bot_manifest_retry_deadline)
+        self.assertFalse(battle._retry_bot_manifest(1.49))
+        self.assertTrue(battle._retry_bot_manifest(1.5))
+        self.assertFalse(battle._retry_bot_manifest(2.0))
+
+        self.assertEqual(3, battle.client.send_bot_manifest.call_count)
+        expected = (
+            payload['bots'], payload['player_collision_profiles'])
+        self.assertTrue(all(
+            call.args == expected
+            for call in battle.client.send_bot_manifest.call_args_list))
+        self.assertTrue(battle._bots._manifest_sent)
+        self.assertIsNone(battle._bots.pending_manifest())
+        self.assertEqual(0.0, battle._next_bot_manifest_retry)
+        self.assertEqual(0.0, battle._bot_manifest_retry_deadline)
+
+    def test_bot_manifest_retry_timeout_enters_worker_failure_lifecycle(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.5
+        payload = {'type': 'bot_manifest', 'bots': []}
+        callback = mock.Mock()
+        battle = BattleRuntime(runtime)
+        battle._config = {'startupTimeoutSeconds': 0.5}
+        battle.state = 'running'
+        battle._worker_mode = True
+        battle._battle_live = False
+        battle._prebattle_deadline = None
+        battle._last_frame_time = 1.4
+        battle._frame_diagnostics = None
+        battle._start_message = {'round_id': 7}
+        outbox = self._pending_manifest_outbox(payload)
+        battle._bots = outbox
+        battle.client = types.SimpleNamespace(
+            round_id=7, authority_epoch=3,
+            is_bot_authority=lambda: True,
+            send_bot_manifest=mock.Mock(return_value=False),
+            on_event=callback)
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+
+        self.assertFalse(battle._enqueue_bot_manifest(payload, now=1.0))
+        self.assertFalse(battle._retry_bot_manifest(1.25))
+        self.assertEqual(1.5, battle._bot_manifest_retry_deadline)
+
+        with mock.patch('sys.stdout'):
+            battle._frame()
+
+        self.assertEqual('failed', battle.state)
+        self.assertEqual(
+            'worker bot manifest enqueue timed out', battle.error)
+        self.assertIsNone(outbox.pending_manifest())
+        self.assertEqual(2, battle.client.send_bot_manifest.call_count)
+        callback.assert_not_called()
+        self.assertEqual(1, len(runtime.bigworld.callbacks))
+
+        with mock.patch('sys.stdout'):
+            runtime.bigworld.callbacks.pop(0)()
+
+        callback.assert_called_once_with('battle_failed', {
+            'message': 'worker bot manifest enqueue timed out',
+            'round_id': 7,
+            'lobby_restored': True,
+        })
+
+    def test_bot_manifest_normal_first_enqueue_does_not_retry(self):
+        payload = {'type': 'bot_manifest', 'bots': []}
+        battle = BattleRuntime(_runtime())
+        battle.state = 'running'
+        battle._worker_mode = True
+        battle._start_message = {'round_id': 7}
+        battle._bots = self._pending_manifest_outbox(payload)
+        battle.client = types.SimpleNamespace(
+            round_id=7, authority_epoch=3,
+            is_bot_authority=lambda: True,
+            send_bot_manifest=mock.Mock(return_value=True))
+
+        self.assertTrue(battle._enqueue_bot_manifest(payload, now=1.0))
+        self.assertFalse(battle._retry_bot_manifest(2.0))
+
+        battle.client.send_bot_manifest.assert_called_once_with([])
+        self.assertTrue(battle._bots._manifest_sent)
+
+    def test_worker_prebattle_frame_retries_manifest_without_bot_state(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 1.0
+        payload = {'type': 'bot_manifest', 'bots': []}
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._worker_mode = True
+        battle._battle_live = False
+        battle._prebattle_deadline = None
+        battle._last_frame_time = 0.9
+        battle._frame_diagnostics = None
+        battle._start_message = {'round_id': 7}
+        battle._bots = self._pending_manifest_outbox(payload)
+        battle._bots.update = mock.Mock(return_value=[])
+        battle.client = types.SimpleNamespace(
+            round_id=7, authority_epoch=3,
+            is_bot_authority=lambda: True,
+            send_bot_manifest=mock.Mock(return_value=True))
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+
+        battle.client.send_bot_manifest.assert_called_once_with([])
+        battle._bots.update.assert_not_called()
+        battle._schedule.assert_called_once_with(0.0, battle._frame)
+
+    def test_bot_manifest_retry_is_fenced_by_lifecycle_change(self):
+        mutations = (
+            ('generation', lambda battle: setattr(
+                battle, '_generation', battle._generation + 1)),
+            ('authority', lambda battle: setattr(
+                battle._bots, 'authority_id', 2)),
+            ('round', lambda battle: battle._start_message.update(
+                round_id=8)),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                payload = {'type': 'bot_manifest', 'bots': []}
+                battle = BattleRuntime(_runtime())
+                battle.state = 'running'
+                battle._worker_mode = True
+                battle._start_message = {'round_id': 7}
+                battle._bots = self._pending_manifest_outbox(payload)
+                battle.client = types.SimpleNamespace(
+                    round_id=7, authority_epoch=3,
+                    is_bot_authority=lambda: True,
+                    send_bot_manifest=mock.Mock(return_value=False))
+                self.assertFalse(
+                    battle._enqueue_bot_manifest(payload, now=1.0))
+
+                mutate(battle)
+
+                self.assertFalse(battle._retry_bot_manifest(2.0))
+                self.assertEqual(
+                    1, battle.client.send_bot_manifest.call_count)
+                self.assertIsNone(battle._bots.pending_manifest())
+                self.assertEqual(0.0, battle._next_bot_manifest_retry)
+                self.assertEqual(
+                    0.0, battle._bot_manifest_retry_deadline)
+
     def test_bot_launch_outbox_survives_bot_state_enqueue_failure(self):
         battle = BattleRuntime(_runtime())
         outbox = bot_runtime.BotRuntime(1)

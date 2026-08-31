@@ -2,6 +2,7 @@ from __future__ import print_function
 
 """Authority-side, engine-free bridge from v5 bots to the local AI package."""
 
+import copy
 import math
 import random
 import sys
@@ -1810,6 +1811,9 @@ class BotRuntime(object):
         # cannot be mistaken for a variable vehicle speed.
         self._sample_time_us = 0
         self._manifest_sent = False
+        self._pending_manifest = None
+        self._pending_manifest_round_id = None
+        self._pending_manifest_authority_id = None
         self._descriptor_pairs = {}
         self._descriptors = {}
         self._gun_yaw_limits = {}
@@ -2515,6 +2519,9 @@ class BotRuntime(object):
             self._accumulator = 0.0
             self._sample_time_us = 0
             self._manifest_sent = False
+            self._pending_manifest = None
+            self._pending_manifest_round_id = None
+            self._pending_manifest_authority_id = None
             self._descriptor_pairs = {}
             self._descriptors = {}
             self._gun_yaw_limits = {}
@@ -2597,6 +2604,10 @@ class BotRuntime(object):
             isinstance(message.get('bot_manifest'), (list, tuple)))
         if previous_authority != self.authority_id:
             self._sample_time_us = 0
+            self._manifest_sent = False
+            self._pending_manifest = None
+            self._pending_manifest_round_id = None
+            self._pending_manifest_authority_id = None
             self._clear_artillery_intents()
             self._ballistic_solution_cache = {}
             self._friendly_repositions = {}
@@ -2631,8 +2642,6 @@ class BotRuntime(object):
             self._next_shot_lane_refresh = 0.0
             self._next_cover_refresh = 0.0
             self._next_publication = 0.0
-            if self.is_authority():
-                self._manifest_sent = False
         if authority_handoff:
             # The takeover manifest is an explicit server-authority boundary.
             # Existing combat sync entries may still be based on an older
@@ -2644,6 +2653,14 @@ class BotRuntime(object):
         if not self.is_authority():
             return []
         if self.finished:
+            self._pending_manifest = None
+            self._pending_manifest_round_id = None
+            self._pending_manifest_authority_id = None
+            return []
+        pending_manifest = self.pending_manifest()
+        if pending_manifest is not None:
+            return [pending_manifest]
+        if self._manifest_sent:
             return []
         server_manifest = message.get('bot_manifest')
         restoring_authority = bool(server_manifest)
@@ -2863,19 +2880,51 @@ class BotRuntime(object):
             state['clip'] = gun_state.clip
             state['reload_time'] = gun_state.remaining(reload_factor)
             state['reload_duration'] = gun_state.duration(reload_factor)
-        if self._manifest_sent:
-            return []
         bots = [self._manifest_entry(state)
                 for state in self._ordered_states()]
         player_collision_profiles = (
             self._player_collision_manifest(message.get('players'))
             if message.get('human_ram_timeline') else None)
-        self._manifest_sent = True
         outgoing = {'type': 'bot_manifest', 'bots': bots}
         if player_collision_profiles is not None:
             outgoing['player_collision_profiles'] = (
                 player_collision_profiles)
-        return [outgoing]
+        self._pending_manifest = copy.deepcopy(outgoing)
+        self._pending_manifest_round_id = self.round_id
+        self._pending_manifest_authority_id = self.authority_id
+        return [copy.deepcopy(self._pending_manifest)]
+
+    def pending_manifest(self):
+        """Return one isolated copy of the current unsent manifest."""
+        if (self._manifest_sent or self._pending_manifest is None or
+                not self.is_authority() or
+                self._pending_manifest_round_id != self.round_id or
+                self._pending_manifest_authority_id != self.authority_id):
+            return None
+        return copy.deepcopy(self._pending_manifest)
+
+    def discard_pending_manifest(self):
+        """Fence an unsent manifest at a round or authority boundary."""
+        pending = self._pending_manifest is not None
+        self._pending_manifest = None
+        self._pending_manifest_round_id = None
+        self._pending_manifest_authority_id = None
+        return pending
+
+    def mark_manifest_enqueued(self, message):
+        """Commit manifest delivery only after the transport accepts it."""
+        if (not isinstance(message, dict) or self._manifest_sent or
+                self._pending_manifest is None or
+                not self.is_authority() or
+                self._pending_manifest_round_id != self.round_id or
+                self._pending_manifest_authority_id != self.authority_id or
+                message != self._pending_manifest):
+            return False
+        self._manifest_sent = True
+        self._pending_manifest = None
+        self._pending_manifest_round_id = None
+        self._pending_manifest_authority_id = None
+        return True
 
     def _combat_sync_state(self, state):
         bot_id = int(state['id'])

@@ -4018,11 +4018,49 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual((0.0, 0.0), (
             driver_state['stuck_time'], driver_state['recovery_time']))
 
-    def test_authority_builds_manifest_once_from_battle_roster(self):
+    def test_authority_freezes_manifest_until_transport_enqueue(self):
+        resolved = []
+        resolver = self.runtime.descriptor_resolver
+        self.runtime.descriptor_resolver = lambda vehicle: (
+            resolved.append(vehicle) or resolver(vehicle))
         first = self.runtime.battle_start(self.start)
         self.assertEqual('bot_manifest', first[0]['type'])
         self.assertEqual(11, first[0]['bots'][0]['id'])
+        self.assertFalse(self.runtime._manifest_sent)
+        self.assertEqual(['ussr:R11_MS-1'], resolved)
+
+        first[0]['bots'][0]['name'] = 'mutated caller copy'
+        repeated = self.runtime.battle_start(dict(
+            self.start, bots=[dict(
+                self.start['bots'][0], name='rebuilt roster')]))
+
+        self.assertEqual('Bot', repeated[0]['bots'][0]['name'])
+        self.assertEqual(['ussr:R11_MS-1'], resolved)
+        self.assertFalse(self.runtime.mark_manifest_enqueued({
+            'type': 'bot_manifest', 'bots': []}))
+        self.assertTrue(
+            self.runtime.mark_manifest_enqueued(repeated[0]))
+        self.assertTrue(self.runtime._manifest_sent)
+        self.assertIsNone(self.runtime.pending_manifest())
         self.assertEqual([], self.runtime.battle_start(self.start))
+
+    def test_pending_manifest_does_not_cross_authority_or_round(self):
+        first = self.runtime.battle_start(self.start)[0]
+
+        self.assertEqual([], self.runtime.battle_start(dict(
+            self.start, bot_authority_id=2)))
+        self.assertIsNone(self.runtime.pending_manifest())
+        self.assertFalse(self.runtime.mark_manifest_enqueued(first))
+
+        resumed = self.runtime.battle_start(self.start)[0]
+        next_round = dict(
+            self.start, round_id=6,
+            bots=[{'id': 12, 'team': 1, 'slot': 0, 'name': 'Next'}])
+        current = self.runtime.battle_start(next_round)[0]
+
+        self.assertFalse(self.runtime.mark_manifest_enqueued(resumed))
+        self.assertEqual([12], [row['id'] for row in current['bots']])
+        self.assertEqual(current, self.runtime.pending_manifest())
 
     def test_manifest_descriptor_preflight_failure_is_atomic(self):
         for failure_kind in ('resolver', 'siege_pair'):
@@ -4096,6 +4134,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([0.15, 0.10], [
             profile['ram_profile']['ramming_bonus']
             for profile in profiles])
+        self.assertTrue(self.runtime.mark_manifest_enqueued(outgoing[0]))
         self.assertEqual([], self.runtime.battle_start(start))
 
     def test_player_profiles_use_client_mass_ramming_and_camouflage(self):
