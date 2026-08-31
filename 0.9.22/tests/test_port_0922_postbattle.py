@@ -943,6 +943,51 @@ class PostBattleContractTests(unittest.TestCase):
         self.assertTrue(state._deliver_result_receipt(player_two))
         self.assertEqual(1, len(socket_two.payloads))
 
+    def test_terminal_tick_queues_current_receipt_before_result_state(self):
+        state = BattleState(map_name='01_karelia')
+        state.client_build = CLIENT_BUILD_0922
+        state.phase = 'battle'
+        account_key = 'a' * 32
+        transport = _Socket()
+        player = Player(
+            1, transport, ('127.0.0.1', 1), name='Alice',
+            vehicle='ussr:R11_MS-1', team=1, account_key=account_key)
+        state.players = {player.player_id: player}
+
+        old_receipt = _receipt(account_key)
+        old_receipt.update({
+            'type': 'battle_receipt', 'protocol': 5,
+            'receipt_id': 'server:0:1', 'round_id': 0,
+        })
+        state.result_receipts[old_receipt['receipt_id']] = old_receipt
+        self.assertTrue(state._deliver_result_receipt(player))
+        self.assertEqual(old_receipt['receipt_id'], json.loads(
+            transport.payloads[-1].decode('utf-8'))['receipt_id'])
+        transport.payloads[:] = []
+
+        self.assertTrue(state._finish_battle(1, 'elimination'))
+        current_receipt = _latest_receipt(state, account_key)
+        state.tick_once(1.0 / 30.0)
+
+        messages = [json.loads(payload.decode('utf-8'))
+                    for payload in transport.payloads]
+        self.assertEqual(
+            ['battle_receipt', 'events', 'snapshot'],
+            [message['type'] for message in messages[:3]])
+        self.assertEqual(current_receipt['receipt_id'],
+                         messages[0]['receipt_id'])
+        self.assertEqual(state.round_id, messages[0]['round_id'])
+        self.assertTrue(any(
+            event['kind'] == 'battle_result'
+            for event in messages[1]['events']))
+        self.assertIsNotNone(messages[2]['battle_result'])
+
+        reconnect = Player(
+            2, _Socket(), ('127.0.0.1', 2), account_key=account_key)
+        self.assertTrue(state._deliver_result_receipt(reconnect))
+        self.assertEqual(old_receipt['receipt_id'], json.loads(
+            reconnect.conn.payloads[-1].decode('utf-8'))['receipt_id'])
+
     def test_server_receipt_history_is_bounded_across_account_churn(self):
         state = BattleState(map_name='01_karelia')
         state.client_build = CLIENT_BUILD_0922

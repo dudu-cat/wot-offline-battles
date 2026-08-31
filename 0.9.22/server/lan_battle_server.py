@@ -11421,6 +11421,9 @@ class BattleState:
         reset_message = None
         had_pending_live = False
         failed_live_recipients = []
+        failed_receipt_recipients = []
+        failed_receipt_recipient_ids = set()
+        current_receipt_recipients = set()
         failed_event_recipients = []
         authority_observation_relays = ()
         with self.lock:
@@ -11596,12 +11599,32 @@ class BattleState:
             recipients = list(self.players.values())
             if self.simulation_worker is not None:
                 recipients.append(self.simulation_worker)
+            # Settlement is part of the terminal barrier, not a best-effort
+            # follow-up to the state that tears the battle UI down. Prioritize
+            # this round's durable receipt even when the account still owns an
+            # older unacknowledged row; ordinary garage/reconnect delivery
+            # below remains oldest-first.
+            if self.battle_result is not None:
+                for endpoint in recipients:
+                    if not isinstance(endpoint, Player):
+                        continue
+                    receipt = self._result_receipt_for_delivery(
+                        endpoint, round_id=self.round_id)
+                    if receipt is None:
+                        continue
+                    current_receipt_recipients.add(id(endpoint))
+                    if not self._deliver_result_receipt(
+                            endpoint, round_id=self.round_id):
+                        failed_receipt_recipients.append(endpoint)
+                        failed_receipt_recipient_ids.add(id(endpoint))
             # Enqueue ordered causes in the same state transaction that assigns
             # their IDs and removes them from pending_events. A leave, worker
             # loss, or epoch change cannot invalidate this batch between
             # extraction and delivery; the reliable outbox fences its snapshot.
             if events_message is not None:
                 for endpoint in recipients:
+                    if id(endpoint) in failed_receipt_recipient_ids:
+                        continue
                     if not endpoint.offer_reliable(events_message):
                         failed_event_recipients.append(endpoint)
             snapshot_client_build = self.client_build
@@ -11626,10 +11649,14 @@ class BattleState:
                     _server_log(message)
             for endpoint in failed_event_recipients:
                 self._remove_endpoint(endpoint)
+        for endpoint in failed_receipt_recipients:
+            self._remove_endpoint(endpoint)
         # Ordered combat causes must reach the client before the durable state
         # they produced.  Otherwise #1513 observes the new HP/death first and
         # suppresses hit direction, attacker attribution and the fatal shot.
         for player in recipients:
+            if id(player) in failed_receipt_recipient_ids:
+                continue
             replica_limited = bool(
                 snapshot_client_build == CLIENT_BUILD_0922 and
                 isinstance(player, Player) and
@@ -11651,6 +11678,7 @@ class BattleState:
                 snapshot_lineage_due)
             if not snapshot_due:
                 if (isinstance(player, Player) and
+                        id(player) not in current_receipt_recipients and
                         not self._deliver_result_receipt(player)):
                     self.remove_player(player.player_id, expected=player)
                 continue
@@ -11700,6 +11728,7 @@ class BattleState:
                 self._remove_endpoint(player)
                 continue
             if (isinstance(player, Player) and
+                    id(player) not in current_receipt_recipients and
                     not self._deliver_result_receipt(player)):
                 self.remove_player(player.player_id, expected=player)
 
@@ -11795,12 +11824,21 @@ class BattleState:
             result["critical"] = player.critical
         return result
 
-    def _deliver_result_receipt(self, player):
-        """Deliver each unacknowledged result once per TCP connection."""
+    def _result_receipt_for_delivery(self, player, round_id=None):
+        """Select one durable receipt without changing ordinary FIFO order."""
         receipts = self._result_receipts_for_account(player.account_key)
-        if not receipts:
+        if round_id is None:
+            return receipts[0] if receipts else None
+        for receipt in receipts:
+            if receipt.get("round_id") == round_id:
+                return receipt
+        return None
+
+    def _deliver_result_receipt(self, player, round_id=None):
+        """Deliver each unacknowledged result once per TCP connection."""
+        receipt = self._result_receipt_for_delivery(player, round_id)
+        if receipt is None:
             return True
-        receipt = receipts[0]
         receipt_id = receipt.get("receipt_id")
         if receipt_id == player.delivered_receipt_id:
             return True
