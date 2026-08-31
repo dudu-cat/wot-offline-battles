@@ -74,16 +74,21 @@ def _attach_worker(state):
 
 class ServerTeamSizeTests(unittest.TestCase):
     def test_0922_bot_callsigns_use_period_appropriate_chinese_names(self):
-        self.assertGreaterEqual(len(BOT_CALLSIGNS_0922), 30)
+        self.assertGreaterEqual(len(BOT_CALLSIGNS_0922), 120)
+        self.assertEqual(len(BOT_CALLSIGNS_0922), len(set(BOT_CALLSIGNS_0922)))
         self.assertTrue(all(any(ord(char) > 127 for char in name)
                             for name in BOT_CALLSIGNS_0922))
+        self.assertTrue(all(len(name) <= 32 for name in BOT_CALLSIGNS_0922))
 
-        state = BattleState(team_size=4)
+        state = BattleState(team_size=15)
         state.client_build = CLIENT_BUILD_0922
         roster = state._new_bot_roster()
 
-        self.assertEqual(8, len(roster))
+        self.assertEqual(30, len(roster))
+        self.assertEqual(30, len(set(bot['name'] for bot in roster)))
         self.assertTrue(all(any(ord(char) > 127 for char in bot['name'])
+                            for bot in roster))
+        self.assertTrue(all(not bot['name'][-3:-2] == '-'
                             for bot in roster))
 
     def test_visible_clients_may_send_team_size_requests(self):

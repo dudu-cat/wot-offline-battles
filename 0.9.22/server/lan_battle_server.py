@@ -184,13 +184,38 @@ BOT_CALLSIGNS = (
     "Shark", "Sparrow", "Talon", "Tiger", "Viper", "Wolf", "Yak", "Zephyr",
 )
 BOT_CALLSIGNS_0922 = (
-    "暗夜猎手", "百步穿杨", "北方孤狼", "不服来战", "苍穹之刃", "乘风破浪",
-    "赤色彗星", "此路不通", "刀锋战士", "东风破", "风卷残云", "风云再起",
-    "钢铁洪流", "孤胆英雄", "黑色闪电", "横扫千军", "火力全开", "极速狂飙",
-    "剑指苍穹", "决战到底", "雷霆万钧", "亮剑", "龙行天下", "落叶随风",
-    "逆风飞翔", "怒海狂涛", "千里走单骑", "秋名山车神", "热血战魂",
-    "神出鬼没", "铁甲雄风", "铁骑纵横", "无敌小坦克", "西北狼", "逍遥浪子",
-    "一炮入魂", "一骑当千", "勇往直前", "战场幽灵", "追风少年",
+    # Keep some familiar period names, but draw most rosters from a broader
+    # mixture of tactical, everyday, regional, poetic, and playful identities.
+    # These are complete display names; #1513 rosters select them without the
+    # former mandatory ``-NN`` suffix.
+    "暗夜猎手", "百步穿杨", "北方孤狼", "苍穹之刃", "乘风破浪", "赤色彗星",
+    "此路不通", "东风破", "风卷残云", "钢铁洪流", "黑色闪电", "火力全开",
+    "落叶随风", "千里走单骑", "铁骑纵横", "一炮入魂", "战场幽灵", "亮剑",
+    "山海之间", "晚风过境", "雨打芭蕉", "星河入梦", "月落长安", "云起无声",
+    "雾里看山", "松间明月", "江畔听风", "北纬三十度", "夏夜微凉",
+    "冬日余温", "南山有雾", "海边拾光", "风停在七月", "萤火未眠",
+    "青石小巷", "长街听雪", "天边一朵云", "山谷有回声", "清晨第一班",
+    "今天不加班", "装填中别催", "履带又掉了", "草丛观察员", "开局先喝茶",
+    "路过打两炮", "别撞我谢谢", "炮弹已充值", "维修费好贵", "我先探个路",
+    "等我缩圈", "这炮能中", "再来一局", "慢慢开别急", "看见我请鸣笛",
+    "一颗备用螺丝", "车库常驻", "随缘开炮", "今天手感一般", "先瞄五秒钟",
+    "不是故意空炮", "小地图看一眼", "这里不能停车", "刚修好的履带",
+    "我在等装填", "前方可能有车", "先让我亮一下", "别急马上到",
+    "卖头不卖队友", "坡后观察员", "城区慢车", "山口守门员", "南线巡逻车",
+    "北线压路机", "中路看风景", "履带修理工", "炮塔保养员", "弹药架管理员",
+    "车长在路上", "侧甲有点薄", "头铁但谨慎", "老车也能跑", "轻坦不迷路",
+    "重坦慢慢来", "火炮搬运工", "反坦克盆栽", "草丛里的眼睛",
+    "最后一发留着", "别催正在转向", "坡顶先别上", "队友正在赶来",
+    "岭南夜雨", "塞北孤烟", "江南旧梦", "川西来客", "齐鲁小队长",
+    "关中老车长", "东北暖气足", "海西观潮", "燕山脚下", "天府慢行",
+    "黄河拐个弯", "珠江晚风", "太湖边上", "昆仑看雪", "长白山下",
+    "松花江畔", "橘子汽水", "半糖乌龙", "芝麻汤圆", "盐焗小星球",
+    "一只纸飞机", "小熊不冬眠", "猫在看小地图", "企鹅修履带",
+    "河豚正在装填", "海盐苏打", "薄荷气泡", "柠檬不太酸", "栗子开坦克",
+    "土豆观察员", "松鼠搬炮弹", "熊猫慢速前进", "麻雀侦察队", "海鸥绕着飞",
+    "山雀", "白榆", "青禾", "知夏", "归舟", "远岚", "南枝", "拾光",
+    "未央", "长风", "星野", "凌晨四点", "七号车组", "三号观察位",
+    "四零四号履带", "八十八号停车位", "半格信号", "两杯热茶",
 )
 ROUND_SCOPED_MESSAGE_TYPES = frozenset((
     "start_battle", "input", "hit_report", "bot_manifest", "bot_state",
@@ -2139,16 +2164,26 @@ class BattleState:
         callsigns = (BOT_CALLSIGNS_0922
                      if self.client_build == CLIENT_BUILD_0922
                      else BOT_CALLSIGNS)
+        available_callsigns = (list(callsigns)
+                               if self.client_build == CLIENT_BUILD_0922
+                               else [])
+        if available_callsigns:
+            random.shuffle(available_callsigns)
         for team in (1, 2):
             for slot in range(self.team_sizes[team]):
                 if (team, slot) in occupied_slots:
                     continue
-                while True:
-                    name = "%s-%02d" % (
-                        random.choice(callsigns), random.randint(10, 99))
-                    if name.lower() not in used:
-                        used.add(name.lower())
-                        break
+                if available_callsigns:
+                    name = available_callsigns.pop()
+                else:
+                    # The legacy port can request more names than its compact
+                    # callsign pool. Preserve its bounded uniqueness fallback.
+                    while True:
+                        name = "%s-%02d" % (
+                            random.choice(callsigns), random.randint(10, 99))
+                        if name.lower() not in used:
+                            break
+                used.add(name.lower())
                 # Preserve the canonical id for a team slot even when humans
                 # occupy other slots.  This keeps bot identity deterministic
                 # across different waiting-room sizes without slot collisions.
