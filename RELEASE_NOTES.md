@@ -15,6 +15,10 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Future Bot publications are validated as one transaction before they can
   rebase simulation clocks or refresh worker liveness. A malformed publication
   can no longer keep a frozen authority alive by advancing only its timestamps.
+- A complete Bot checkpoint that rebases the source clock after a coalesced or
+  delayed interval now establishes the current firing and ammunition baseline
+  without inventing shots for the missing interval. Later Bot shots continue
+  normally instead of freezing after the rebased `fire_seq` gap.
 - Worker Bot manifests remain immutable and pending until the LAN transport
   accepts them. Temporary backpressure retries the same lineup; a fixed startup
   deadline retires the failed worker and terminates the loading round instead of
@@ -27,9 +31,17 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   stalls, duplicate or reordered updates, queue pressure, and timing drift
   without unnecessarily ending the battle. Identity, round, roster, and
   message-shape boundaries remain enforced.
+- Malformed snapshot/event rows and isolated per-line handler exceptions are
+  contained to that row. Both player and worker transports continue with the
+  following message instead of escalating that recoverable row into a client
+  stop, disconnect, or room-wide system-error result.
 - Projectile progress now converges each cumulative cursor independently, so
   a delayed or skipped worker snapshot no longer rejects the whole active
   projectile batch. Valid destruction receipts in a stale cursor are retained.
+- Visible projectile movers now start from the worker-confirmed collision
+  cursor instead of extrapolating ahead from wall-clock time. This addresses
+  the reported case where the tracer appeared to pass a tank or strike the
+  terrain before the authoritative hit arrived a few frames later.
 - Current-round input, water, and destruction messages already queued when a
   vehicle dies or a battle ends are accepted as terminal no-ops. One stale
   player observation no longer discards unrelated live observations in the
@@ -43,6 +55,14 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Clean victories, draws, garage returns, and intentional worker shutdowns are
   no longer reported as crashes, while genuine client failures still produce
   diagnostic reports.
+- The current battle receipt is queued before terminal events and the final
+  snapshot tear down the battle view. Results therefore settle on the garage
+  return instead of waiting for the next press of the Battle button, while
+  older unacknowledged receipts retain their normal reconnect order.
+- An unreadable durable battle receipt is acknowledged and skipped instead of
+  repeatedly stopping the same account on every reconnect. A structurally
+  complete receipt is accepted even when its informational protocol label is
+  stale.
 - Fallen-tree foliage refreshes now stop before querying unloaded chunks or
   animator bodies that have already disappeared, closing a hidden-worker
   native crash path during chunk streaming.
@@ -51,7 +71,8 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   client in an endless repair-progress retry.
 - The launcher and bundled map-data loaders accept structurally compatible
   deployed 0.9.22 data and recover when optional version metadata is missing
-  or unreadable.
+  or unreadable. Runtime navigation loads and validates the selected graph
+  directly; an optional batch manifest can no longer make a valid map fail.
 
 ## Battle behavior
 
@@ -73,6 +94,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   shallow ford remains authorized across control steps, repeated completed hard
   contacts penalize only that Bot's failed segment, and out-of-bounds goals are
   rejected before edge-cell rounding can send a vehicle beyond the red line.
+- Malinovka assigns fewer vehicles to the single-egress western lake road and
+  moves the released slots to the broad central and eastern routes without
+  changing the full-team formation size.
 - Route following now looks ahead by speed, begins terminal braking from the
   copied vehicle stopping distance, and counts translation or steadily
   converging heading as progress. Alternating in-place turns therefore enter a
@@ -99,8 +123,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Player driving, collision deflection, slope sliding, airborne carry, tank
   pushes, and pivoting now use the same complete-chassis map-edge constraint.
   A stale out-of-bounds pose can drive inward but cannot drift farther out.
-- The 0.9.22 bot roster now draws from 40 Chinese player names styled for the
-  2017 client era.
+- The 0.9.22 bot roster now draws from 142 varied Chinese display names across
+  period, regional, poetic, everyday, and playful styles. Names are complete
+  identities and no longer all receive the same numeric-suffix format.
 - Authoritative artillery stun is enabled and presented through the stock
   0.9.22 client interface.
 
@@ -130,7 +155,9 @@ and run `WoT-Offline-Battles-Launcher.exe`.
 - Swedish Siege mode now keeps the hydraulic hull, visible barrel, reticle,
   and fired ray on one copied pose, uses the active gun's real pitch limits,
   and recenters safely when leaving engineering mode without calling an unsafe
-  native physics path.
+  native physics path. Exiting Siege also releases the hydraulic pose after
+  #1513 restores the ordinary travel descriptor, so vertical gun movement is
+  no longer left locked in travel mode.
 - If a complete saved crew belongs to the wrong nation, the exact #1513
   attribute calculation retries once with that vehicle's default crew. Other
   vehicle-structure or native errors remain visible instead of being hidden.
@@ -141,6 +168,11 @@ and run `WoT-Offline-Battles-Launcher.exe`.
   values for editable numeric fields stored as integers, labels elevation,
   depression, gun elevation speed, and turret traverse speed correctly, and
   rebuilds its own drifted overlays from saved logical edits.
+- The vehicle editor now includes an interactive #1513 armour viewer. Selecting
+  an armour field highlights its exact hull, turret, track, or gun surface;
+  clicking the model selects the matching field across categories. The view
+  supports rotate, zoom, reset, collision-resource variants, and immediate
+  nominal-thickness recolouring after edits.
 - Garage item prices now use #1513-compatible integer values, and both
   standard and bond equipment can be removed free of charge through the
   appropriate shop fields.
