@@ -768,32 +768,29 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(90000, server.motion_time_offset_us)
 
         # An instantaneous source leap beyond real elapsed time plus one
-        # maximum integration step drops the atomic state but re-anchors the
-        # trusted source clock. A later normal sample can recover immediately.
+        # maximum integration step accepts the complete checkpoint as a new
+        # baseline without synthesizing events for its unobserved interval.
         now[0] = 100.500
-        committed_before_rebase = self._canonical_bot_commit_snapshot(server)
+        revision_before_rebase = server.bot_state_revision
+        launches_before_rebase = copy.deepcopy(
+            server.bot_pending_projectile_launches)
         oversized = self._publication(server, 9.0)
         oversized['sample_time_us'] = 1000000
         oversized['source_batch_horizon_us'] = 1000000
-        self.assertFalse(server.update_bot_states(
+        self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, oversized))
-        self.assertEqual('sample_time_rate',
-                         server.last_bot_state_reject_code)
-        self.assertEqual(580000, server.bot_state_time_us)
+        self.assertEqual('', server.last_bot_state_reject_code)
+        self.assertEqual(590000, server.bot_state_time_us)
         self.assertEqual(1000000, server.bot_source_time_us)
         self.assertEqual(500000, server.bot_source_receipt_time_us)
         self.assertEqual(1000000, server.bot_source_batch_horizon_us)
         self.assertEqual(90000, server.motion_time_offset_us)
-        rebased = self._canonical_bot_commit_snapshot(server)
-        source_lineage = {
-            'bot_source_time_us', 'bot_source_receipt_time_us',
-            'bot_source_batch_horizon_us',
-            'bot_launch_clock_offset_us',
-        }
-        for field in committed_before_rebase:
-            if field not in source_lineage:
-                self.assertEqual(
-                    committed_before_rebase[field], rebased[field], field)
+        self.assertEqual(9.0, server.bot_states[11]['x'])
+        self.assertEqual(
+            revision_before_rebase + 1, server.bot_state_revision)
+        self.assertEqual(
+            launches_before_rebase,
+            server.bot_pending_projectile_launches)
 
         now[0] = 100.530
         recovered = self._publication(server, 2.6)
@@ -801,10 +798,10 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         recovered['source_batch_horizon_us'] = 1040000
         self.assertTrue(server.update_bot_states(
             SIMULATION_WORKER_AUTHORITY_ID, recovered))
-        self.assertEqual(620000, server.bot_state_time_us)
+        self.assertEqual(630000, server.bot_state_time_us)
         self.assertEqual(1040000, server.bot_source_time_us)
         self.assertEqual(530000, server.bot_source_receipt_time_us)
-        self.assertEqual(90000, server.motion_time_offset_us)
+        self.assertEqual(100000, server.motion_time_offset_us)
 
         # A visible player departure cannot perturb the dedicated worker's
         # source clock or promote another player to authority.
@@ -813,7 +810,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID, server.bot_authority_id)
         self.assertEqual(1040000, server.bot_source_time_us)
         self.assertEqual(530000, server.bot_source_receipt_time_us)
-        self.assertEqual(90000, server.motion_time_offset_us)
+        self.assertEqual(100000, server.motion_time_offset_us)
 
         server._reset_round()
         self.assertIsNone(server.bot_source_receipt_time_us)
@@ -883,7 +880,7 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         self.assertEqual(2, server.bot_state_revision)
         self.assertEqual(0.8, server.bot_states[11]['x'])
 
-    def test_dispatcher_counts_only_validated_clock_rebase_as_advancement(self):
+    def test_dispatcher_counts_validated_clock_rebase_as_advancement(self):
         now = [100.0]
         server, _, unused_socket = self._server(
             clock=lambda: now[0],
@@ -920,9 +917,63 @@ class ServerBotStateRevisionTests(unittest.TestCase):
         complete['type'] = 'bot_state'
         self.assertTrue(handler._dispatch_simulation_worker_message(
             wrapper, server.simulation_worker, complete))
-        self.assertEqual('sample_time_rate',
-                         server.last_bot_state_reject_code)
+        self.assertEqual('', server.last_bot_state_reject_code)
         self.assertEqual(1000000, server.bot_source_time_us)
+        self.assertEqual(1.0, server.bot_states[11]['x'])
+
+    def test_clock_rebase_absorbs_unobserved_fire_gap_without_freezing_bot(self):
+        now = [100.0]
+        server, _, unused_socket = self._server(
+            clock=lambda: now[0],
+            before_manifest=lambda: now.__setitem__(0, 100.025))
+        now[0] = 100.200
+        baseline = self._publication(server, 0.4)
+        baseline['sample_time_us'] = 40000
+        baseline['source_batch_horizon_us'] = 40000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, baseline))
+
+        now[0] = 100.210
+        rebased = self._publication(server, 1.0)
+        rebased['sample_time_us'] = 1000000
+        rebased['source_batch_horizon_us'] = 1000000
+        bot = rebased['bots'][0]
+        bot['fire_seq'] = 2
+        bot['ammo_remaining'] = [18]
+        bot['ammo_reload_pending'] = True
+        bot['clip'] = 0
+        bot.update(BattleState._ordinary_bot_burst(2, 0))
+
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, rebased),
+            server.last_bot_state_reject)
+        self.assertEqual(2, server.bot_states[11]['fire_seq'])
+        self.assertEqual([18], server.bot_states[11]['ammo_remaining'])
+        self.assertEqual(set(), server.bot_pending_projectile_launches)
+
+        now[0] = 100.240
+        recovered = self._publication(server, 1.4)
+        recovered['sample_time_us'] = 1040000
+        recovered['source_batch_horizon_us'] = 1040000
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, recovered),
+            server.last_bot_state_reject)
+
+        now[0] = 100.270
+        next_shot = self._publication(server, 1.8)
+        next_shot['sample_time_us'] = 1080000
+        next_shot['source_batch_horizon_us'] = 1080000
+        bot = next_shot['bots'][0]
+        bot['fire_seq'] = 3
+        bot['ammo_remaining'] = [17]
+        bot['ammo_reload_pending'] = True
+        bot['clip'] = 0
+        bot.update(BattleState._ordinary_bot_burst(3, 0))
+        self.assertTrue(server.update_bot_states(
+            SIMULATION_WORKER_AUTHORITY_ID, next_shot),
+            server.last_bot_state_reject)
+        self.assertEqual(3, server.bot_states[11]['fire_seq'])
+        self.assertIn((11, 3), server.bot_pending_projectile_launches)
 
     def test_bot_state_after_battle_result_is_an_idempotent_noop(self):
         server, unused_worker, unused_authority_socket = self._server()

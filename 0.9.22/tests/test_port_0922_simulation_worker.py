@@ -1099,6 +1099,51 @@ class SimulationWorkerSocketTests(unittest.TestCase):
             SIMULATION_WORKER_AUTHORITY_ID, worker_welcome['worker_id'])
         self.assertEqual(1, player_welcome['player_id'])
 
+    def test_worker_bad_lines_and_handler_exception_do_not_close_transport(self):
+        worker = self._connect()
+        worker.send(_worker_hello())
+        worker.receive_until('welcome')
+
+        worker.stream.write(b'{invalid-json\n')
+        worker.stream.flush()
+        with mock.patch.object(
+                self.state, 'update_simulation_progress',
+                side_effect=RuntimeError('one bad native probe')) as update:
+            worker.send({
+                'type': 'simulation_progress',
+                'round_id': self.state.round_id,
+                'authority_epoch': self.state.authority_epoch,
+                'frame_seq': 1,
+            })
+            worker.send({'type': 'ping', 'seq': 41})
+            self.assertEqual(41, worker.receive_until('pong')['seq'])
+
+        update.assert_called_once()
+        self.assertIsNotNone(self.state.simulation_worker)
+        self.assertTrue(self.state.simulation_worker.connected)
+        self.assertIsNone(self.state.battle_result)
+
+    def test_player_bad_lines_and_handler_exception_do_not_disconnect_player(self):
+        player = self._connect()
+        player.send(_player_hello())
+        welcome = player.receive_until('welcome')
+
+        player.stream.write(b'not-json\n')
+        player.stream.flush()
+        with mock.patch.object(
+                self.state, 'update_input',
+                side_effect=RuntimeError('one bad input row')) as update:
+            player.send({
+                'type': 'input', 'round_id': self.state.round_id,
+                'input_seq': 1,
+            })
+            player.send({'type': 'ping', 'seq': 42})
+            self.assertEqual(42, player.receive_until('pong')['seq'])
+
+        update.assert_called_once()
+        self.assertIn(welcome['player_id'], self.state.players)
+        self.assertTrue(self.state.players[welcome['player_id']].connected)
+
     def test_handler_worker_disconnect_never_promotes_visible_client(self):
         worker = self._connect()
         worker.send(_worker_hello())

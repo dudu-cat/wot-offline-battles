@@ -3661,7 +3661,8 @@ class LANClient(object):
         a user-visible failure boundary.  Callers must also avoid mutating any
         state before reaching this boundary.
         """
-        if not self._runtime_recovery_enabled():
+        if (kind != 'battle_receipt' and
+                not self._runtime_recovery_enabled()):
             return False
         key = _safe_text(kind, 'unknown', 32)
         now = _monotonic_time()
@@ -3686,6 +3687,22 @@ class LANClient(object):
         self._runtime_drop_diagnostics[key] = (now, 0)
         return True
 
+    def _discard_battle_receipt(self, message, reason):
+        """Acknowledge one poison receipt without ending the session.
+
+        The server verifies receipt ownership before removing it.  A bounded
+        identifier is therefore safe to acknowledge even when the rest of the
+        durable row cannot be consumed by this client build.
+        """
+        receipt_id = (_safe_text(message.get('receipt_id'), '', 97)
+                      if isinstance(message, dict) else '')
+        if receipt_id and len(receipt_id) <= 96:
+            try:
+                self.acknowledge_battle_receipt(receipt_id)
+            except Exception:
+                pass
+        self._ignore_runtime_payload('battle_receipt', reason, message)
+
     def _runtime_round_disposition(self, kind, message, error):
         """Classify a live payload round without hiding identity conflicts."""
         round_id = _exact_int(message.get('round_id'))
@@ -3709,6 +3726,11 @@ class LANClient(object):
         if not isinstance(message, dict):
             return
         kind = message.get('type')
+        if kind == 'battle_receipt':
+            if (not _valid_battle_receipt(message) or
+                    message.get('account_key') != self.account_key):
+                self._discard_battle_receipt(message, 'invalid_receipt')
+                return
         message_round = _exact_int(message.get('round_id'))
         if (kind in RECOVERABLE_RUNTIME_TYPES and
                 self.round_id is not None and
@@ -3718,7 +3740,12 @@ class LANClient(object):
         protocol = message.get('protocol')
         if protocol is not None or kind in SERVER_STATE_TYPES:
             parsed_protocol = _exact_int(protocol)
-            if kind == 'welcome' or self._schema_negotiated:
+            if kind == 'battle_receipt':
+                # The complete receipt schema above is the compatibility
+                # boundary.  A stale informational protocol label must not
+                # make one durable result lock this account out forever.
+                matches_protocol = True
+            elif kind == 'welcome' or self._schema_negotiated:
                 # Welcome carries the full capability contract below.  A
                 # positive version marker is enough to negotiate that known
                 # JSON schema; the exact build/version label is informational.
@@ -3867,11 +3894,7 @@ class LANClient(object):
             self._schema_negotiated = True
             self.server_time_ms = welcome_server_time
         elif kind == 'battle_receipt':
-            if (not _valid_battle_receipt(message) or
-                    message.get('account_key') != self.account_key):
-                self.last_error = 'invalid battle receipt'
-                self.stop()
-                return
+            pass
         elif kind == 'roster':
             round_id = _exact_int(message.get('round_id'))
             if round_id is None:

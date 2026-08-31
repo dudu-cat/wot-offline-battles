@@ -6,7 +6,7 @@ import os
 
 from gui.mods.offline_lan_0922.config import CONFIG_PATH
 from gui.mods.offline_lan_0922.navigation_graph_schema import (
-	short_map_name, validate_graph,
+	SUPPORTED_MAPS, short_map_name, validate_graph,
 )
 
 

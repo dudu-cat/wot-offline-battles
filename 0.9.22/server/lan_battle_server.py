@@ -5191,7 +5191,9 @@ class BattleState:
                         # malformed future packet cannot poison the accepted
                         # lineage.
                         source_clock_rebase = True
-                        next_bot_state_time_us = self.bot_state_time_us
+                        next_bot_state_time_us = max(
+                            received_motion_time_us,
+                            self.bot_state_time_us + 1)
                     else:
                         next_bot_state_time_us = (
                             self.bot_state_time_us + source_delta_us)
@@ -5324,14 +5326,25 @@ class BattleState:
                             raw.get("combat_seq"),
                             (previous or {}).get("combat_ack_seq", 0),
                             error))
-                try:
-                    burst_edges = self._bot_burst_transition(
-                        previous, current)
-                    self._validate_bot_ammo_transition(previous, current)
-                except ValueError as error:
-                    return self._set_protocol_reject(
-                        "bot_state", "ammo_contract",
-                        "bot=%s reason=%s" % (bot_id, error))
+                rebase_fire_gap = bool(
+                    source_clock_rebase and previous is not None and
+                    int(current.get("fire_seq", 0)) >
+                    int(previous.get("fire_seq", 0)))
+                if rebase_fire_gap:
+                    # Publications coalesced behind a render stall can span
+                    # more than one unobserved shot.  Their complete current
+                    # inventory and burst clock form the new trusted baseline;
+                    # never invent projectile edges for the missing interval.
+                    burst_edges = ()
+                else:
+                    try:
+                        burst_edges = self._bot_burst_transition(
+                            previous, current)
+                        self._validate_bot_ammo_transition(previous, current)
+                    except ValueError as error:
+                        return self._set_protocol_reject(
+                            "bot_state", "ammo_contract",
+                            "bot=%s reason=%s" % (bot_id, error))
                 previous_fire = int((previous or {}).get("fire_seq", 0))
                 if (previous is not None and
                         int(previous.get("stun_end_server_time_ms", 0)) > 0 and
@@ -5373,7 +5386,7 @@ class BattleState:
                             "fire", False))):
                     current["fire_attacker_kind"] = ""
                     current["fire_attacker_id"] = 0
-                if (current["alive"] and
+                if (not source_clock_rebase and current["alive"] and
                         (previous is None or previous.get("alive")) and
                         current["fire_seq"] > previous_fire):
                     if self.client_build == CLIENT_BUILD_0922:
@@ -5411,21 +5424,6 @@ class BattleState:
                 return self._set_protocol_reject(
                     "bot_state", "batch_members",
                     "missing=%s" % sorted(set(identities) - seen))
-            if source_clock_rebase:
-                # The complete packet proved its source lineage, but its rows
-                # remain outside the admitted motion frontier.  Commit only
-                # the source clock origin so the next normal publication can
-                # recover without publishing speculative pose, combat, event,
-                # projectile, or revision state.
-                self.bot_source_time_us = source_time_us
-                self.bot_source_receipt_time_us = received_raw_motion_time_us
-                self.bot_source_batch_horizon_us = source_batch_horizon_us
-                self.bot_launch_clock_offset_us = next_launch_clock_offset_us
-                return self._set_protocol_reject(
-                    "bot_state", "sample_time_rate",
-                    ("sample_delta=%s receipt_elapsed=%s max_lead=%s") % (
-                        source_delta_us, receipt_elapsed_us,
-                        MAX_BOT_SAMPLE_LEAD_US))
             self._commit_human_ram_armors(human_ram_armors)
             self.bot_states = next_states
             for bot_id in stun_clears:
@@ -12111,16 +12109,15 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 # State publications are atomic.  A timing, precision or
                 # model-contract mismatch can safely retain the last-good
                 # checkpoint while the local trusted worker sends its next
-                # full publication. Only a fully validated source-clock
-                # rebase advances liveness; malformed soft drops do not prove
-                # that authoritative simulation is progressing.
+                # full publication. Malformed soft drops do not prove that
+                # authoritative simulation is progressing.
                 if server.state.should_log_protocol_reject(
                         "bot_state", accepted):
                     _server_log(
                         "BOT STATE dropped authority=%d code=%s reason=%s" % (
                             authority_id, reject_code,
                             server.state.last_bot_state_reject))
-                return reject_code == "sample_time_rate"
+                return False
             elif server.state.should_log_protocol_reject(
                     "bot_state", accepted):
                 _server_log(
@@ -12270,19 +12267,34 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     if not line:
                         continue
                     if len(line) > MAX_LINE_BYTES:
-                        return
-                    message = json.loads(line.decode("utf-8"))
-                    if not isinstance(message, dict):
+                        _server_log_limited(
+                            "worker-message-too-large",
+                            "WORKER MESSAGE ignored oversized line")
                         continue
-                    dispatched = self._dispatch_simulation_worker_message(
-                        server, worker, message)
-                    if dispatched == "close":
-                        return
-                    if (dispatched and current_key is not None and
-                            (current_key[1] == "loading" or
-                             message.get("type") in
-                             SIMULATION_WORKER_ADVANCEMENT_TYPES)):
-                        last_activity = time.monotonic()
+                    message_type = "invalid"
+                    try:
+                        message = json.loads(line.decode("utf-8"))
+                        if not isinstance(message, dict):
+                            continue
+                        message_type = message.get("type")
+                        dispatched = \
+                            self._dispatch_simulation_worker_message(
+                                server, worker, message)
+                        if dispatched == "close":
+                            return
+                        if (dispatched and current_key is not None and
+                                (current_key[1] == "loading" or
+                                 message_type in
+                                 SIMULATION_WORKER_ADVANCEMENT_TYPES)):
+                            last_activity = time.monotonic()
+                    except (ConnectionError, OSError):
+                        raise
+                    except Exception as error:
+                        _server_log_limited(
+                            "worker-message:%s" % message_type,
+                            "WORKER MESSAGE ignored type=%s error=%s" % (
+                                message_type, type(error).__name__))
+                        continue
                 now = time.monotonic()
                 liveness_timeout = (
                     SIMULATION_WORKER_LOADING_TIMEOUT_SECONDS
@@ -12531,306 +12543,324 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     if not line:
                         continue
                     if len(line) > MAX_LINE_BYTES:
-                        return
-                    message = json.loads(line.decode("utf-8"))
-                    if not isinstance(message, dict):
-                        continue
-                    message_type = message.get("type")
-                    if (message_type in ROUND_SCOPED_MESSAGE_TYPES and
-                            not server.state._message_round_matches(message)):
-                        continue
-                    if (server.state.client_build == CLIENT_BUILD_0922 and
-                            message_type not in MODERN_VISIBLE_MESSAGE_TYPES):
                         _server_log_limited(
-                            "visible-command:%d:%s" % (
-                                player.player_id, message_type),
-                            "VISIBLE COMMAND rejected sender=%d type=%s" % (
-                                player.player_id, message_type))
+                            "visible-message-too-large:%d" %
+                            player.player_id,
+                            "VISIBLE MESSAGE ignored oversized line "
+                            "sender=%d" % player.player_id)
                         continue
-                    if message_type == "input":
-                        if server.state.update_input(
-                                player.player_id, message) is False:
+                    message_type = "invalid"
+                    try:
+                        message = json.loads(line.decode("utf-8"))
+                        if not isinstance(message, dict):
+                            continue
+                        message_type = message.get("type")
+                        if (message_type in ROUND_SCOPED_MESSAGE_TYPES and
+                                not server.state._message_round_matches(message)):
+                            continue
+                        if (server.state.client_build == CLIENT_BUILD_0922 and
+                                message_type not in MODERN_VISIBLE_MESSAGE_TYPES):
                             _server_log_limited(
-                                "player-input:%d" % player.player_id,
-                                "PLAYER INPUT rejected sender=%d" %
-                                player.player_id)
-                    elif message_type == "track_repair":
-                        if not server.state.report_track_repair(
-                                player.player_id, message):
-                            _server_log_limited(
-                                "track-repair:%d" % player.player_id,
-                                "TRACK REPAIR rejected sender=%d seq=%s" % (
-                                    player.player_id,
-                                    message.get("repair_seq")))
-                    elif message_type == "fire_intent":
-                        if not server.state.submit_fire_intent(
-                                player.player_id, message):
-                            _server_log_limited(
-                                "fire-intent:%d" % player.player_id,
-                                "FIRE INTENT rejected sender=%d seq=%s" % (
-                                    player.player_id,
-                                    message.get("intent_seq")))
-                    elif message_type == "equipment_intent":
-                        if not server.state.submit_equipment_intent(
-                                player.player_id, message):
-                            _server_log_limited(
-                                "equipment-intent:%d" % player.player_id,
-                                "EQUIPMENT INTENT rejected sender=%d seq=%s" % (
-                                    player.player_id,
-                                    message.get("intent_seq")))
-                    elif message_type == "landing_observation":
-                        if not server.state.submit_landing_observation(
-                                player.player_id, message):
-                            _server_log_limited(
-                                "landing-observation:%d" % player.player_id,
-                                "LANDING OBSERVATION rejected sender=%d "
-                                "seq=%s" % (
-                                    player.player_id,
-                                    message.get("observation_seq")))
-                    elif message_type == "hit_report":
-                        if not server.state.report_hit(player.player_id, message):
-                            _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
-                                player.player_id, message.get("target"), message.get("shot_seq")))
-                    elif message_type == "projectile_launch":
-                        if not server.state.launch_projectile(
-                                player.player_id, message):
-                            _server_log(
-                                "PROJECTILE LAUNCH rejected sender=%d shooter=%s:%s seq=%s" % (
-                                    player.player_id,
-                                    message.get("shooter_kind"),
-                                    message.get("shooter_id"),
-                                    message.get("shot_seq")))
-                    elif message_type == "projectile_progress":
-                        if not server.state.progress_projectiles(
-                                player.player_id, message):
-                            _server_log(
-                                "PROJECTILE PROGRESS rejected sender=%d epoch=%s count=%s" % (
-                                    player.player_id,
-                                    message.get("authority_epoch"),
-                                    len(message.get("cursors", ()))
-                                    if isinstance(message.get("cursors"), list)
-                                    else None))
-                    elif message_type == "projectile_resolve":
-                        if not server.state.resolve_projectile(
-                                player.player_id, message):
-                            _server_log(
-                                "PROJECTILE RESOLVE rejected sender=%d projectile=%s outcome=%s" % (
-                                    player.player_id,
-                                    message.get("projectile_id"),
-                                    message.get("outcome")))
-                    elif message_type == "bot_manifest":
-                        if server.state.update_bot_manifest(player.player_id, message):
-                            _server_log("BOT MANIFEST authority=%d bots=%d" % (
-                                player.player_id, len(server.state.bot_manifest)))
-                            loading_snapshot = server.state.loading_snapshot()
-                            if loading_snapshot is not None:
-                                server.state.broadcast_loading_transition(
-                                    loading_snapshot)
-                            live = server.state.activate_battle_if_ready()
-                            if live is not None:
-                                _server_log("BATTLE LIVE round=%d countdown=%.1fs players=%d" % (
-                                    live["round_id"], live["countdown_seconds"],
-                                    len(server.state.players)))
-                        else:
-                            _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
-                    elif message_type == "bot_state":
-                        accepted = server.state.update_bot_states(
-                            player.player_id, message)
-                        if server.state.should_log_protocol_reject(
-                                "bot_state", accepted):
-                            _server_log(
-                                "BOT STATE rejected authority=%d code=%s reason=%s" % (
-                                    player.player_id,
-                                    server.state.last_bot_state_reject_code,
-                                    server.state.last_bot_state_reject))
-                    elif message_type == "bot_observation":
-                        relay = server.state.update_bot_observation(
-                            player.player_id, message)
-                        if isinstance(relay, dict):
-                            server.state.broadcast_bot_observation(relay)
-                    elif message_type == "spotted_report":
-                        if not server.state.update_spotted_targets(
-                                player.player_id, message):
-                            _server_log(
-                                "SPOTTED REPORT rejected sender=%d count=%s"
-                                % (player.player_id,
-                                   len(message.get("targets"))
-                                   if isinstance(message.get("targets"), list)
-                                   else None))
-                    elif message_type == "bot_hit_report":
-                        accepted = server.state.report_bot_hit(
-                            player.player_id, message)
-                        if server.state.should_log_protocol_reject(
-                                "bot_hit", accepted):
-                            _server_log(
-                                ("BOT HIT rejected authority=%d attacker_bot=%s "
-                                 "target=%s seq=%s code=%s reason=%s") % (
-                                    player.player_id,
-                                    message.get("attacker_bot"),
-                                    message.get("target"),
-                                    message.get("shot_seq"),
-                                    server.state.last_bot_hit_reject_code,
-                                    server.state.last_bot_hit_reject))
-                    elif message_type == "bot_human_hit":
-                        accepted = server.state.report_bot_human_hit(
-                            player.player_id, message)
-                        if server.state.should_log_protocol_reject(
-                                "bot_human_hit", accepted):
-                            _server_log(
-                                ("BOT HUMAN HIT rejected authority=%d "
-                                 "attacker_bot=%s target=%s seq=%s "
-                                 "code=%s reason=%s") % (
-                                    player.player_id,
-                                    message.get("attacker_bot"),
-                                    message.get("target"),
-                                    message.get("shot_seq"),
-                                    server.state.last_bot_human_hit_reject_code,
-                                    server.state.last_bot_human_hit_reject))
-                    elif message_type == "bot_ram_report":
-                        if not server.state.report_bot_ram(
-                                player.player_id, message):
-                            _server_log(
-                                "BOT RAM rejected authority=%d target=%s:%s" % (
-                                    player.player_id,
-                                    message.get("target_kind"),
-                                    message.get("target_id")))
-                    elif message_type == "rules_state":
-                        server.state.update_rules(player.player_id, message)
-                    elif message_type == "destructible":
-                        if not server.state.report_destructible(
-                                player.player_id, message):
-                            _server_log(
-                                "DESTRUCTIBLE rejected sender=%d chunk=%s item=%s" % (
-                                    player.player_id,
-                                    message.get("chunk_id"),
-                                    message.get("item_index")))
-                    elif message_type == "battle_result":
-                        if not server.state.report_battle_result(player.player_id, message):
-                            _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
-                    elif message_type == "battle_receipt_ack":
-                        if not server.state.acknowledge_result_receipt(
-                                player.player_id, message):
-                            _server_log(
-                                "BATTLE RECEIPT ACK rejected sender=%d" %
-                                player.player_id)
-                    elif message_type == "leave_battle":
-                        if server.state.leave_battle_and_publish(
-                                player.player_id, message):
-                            _server_log("BATTLE LEAVE id=%d round=%d" % (
-                                player.player_id, server.state.round_id))
-                    elif message_type == "battle_ready":
-                        live_message = server.state.mark_battle_ready(
-                            player.player_id, message)
-                        if live_message is not None:
-                            _server_log(
-                                "BATTLE LIVE round=%d countdown=%ss players=%d" % (
-                                    live_message["round_id"],
-                                    live_message["countdown_seconds"],
-                                    len(server.state.players)))
-                    elif message_type == "start_battle":
-                        start_message, start_error = server.state.request_start(
-                            player.player_id, message.get("map"))
-                        if start_message is None:
-                            player.send({
-                                "type": "start_denied",
-                                "protocol": PROTOCOL_VERSION,
-                                "round_id": server.state.round_id,
-                                "state_revision": server.state.state_revision,
-                                "code": start_error,
-                                "players": len(server.state.players),
-                            })
-                            _server_log("START denied for id=%d: %s" % (player.player_id, start_error))
-                        else:
-                            _server_log("BATTLE LOADING round=%d map=%s players=%d requested_by=%s" % (
-                                start_message["round_id"],
-                                start_message["map"],
-                                len(start_message["players"]),
-                                player.name,
-                            ))
-                            if start_message.get("phase") == "loading":
-                                server.state.broadcast_loading_transition(
-                                    start_message)
+                                "visible-command:%d:%s" % (
+                                    player.player_id, message_type),
+                                "VISIBLE COMMAND rejected sender=%d type=%s" % (
+                                    player.player_id, message_type))
+                            continue
+                        if message_type == "input":
+                            if server.state.update_input(
+                                    player.player_id, message) is False:
+                                _server_log_limited(
+                                    "player-input:%d" % player.player_id,
+                                    "PLAYER INPUT rejected sender=%d" %
+                                    player.player_id)
+                        elif message_type == "track_repair":
+                            if not server.state.report_track_repair(
+                                    player.player_id, message):
+                                _server_log_limited(
+                                    "track-repair:%d" % player.player_id,
+                                    "TRACK REPAIR rejected sender=%d seq=%s" % (
+                                        player.player_id,
+                                        message.get("repair_seq")))
+                        elif message_type == "fire_intent":
+                            if not server.state.submit_fire_intent(
+                                    player.player_id, message):
+                                _server_log_limited(
+                                    "fire-intent:%d" % player.player_id,
+                                    "FIRE INTENT rejected sender=%d seq=%s" % (
+                                        player.player_id,
+                                        message.get("intent_seq")))
+                        elif message_type == "equipment_intent":
+                            if not server.state.submit_equipment_intent(
+                                    player.player_id, message):
+                                _server_log_limited(
+                                    "equipment-intent:%d" % player.player_id,
+                                    "EQUIPMENT INTENT rejected sender=%d seq=%s" % (
+                                        player.player_id,
+                                        message.get("intent_seq")))
+                        elif message_type == "landing_observation":
+                            if not server.state.submit_landing_observation(
+                                    player.player_id, message):
+                                _server_log_limited(
+                                    "landing-observation:%d" % player.player_id,
+                                    "LANDING OBSERVATION rejected sender=%d "
+                                    "seq=%s" % (
+                                        player.player_id,
+                                        message.get("observation_seq")))
+                        elif message_type == "hit_report":
+                            if not server.state.report_hit(player.player_id, message):
+                                _server_log("HIT REPORT rejected attacker=%d target=%s seq=%s" % (
+                                    player.player_id, message.get("target"), message.get("shot_seq")))
+                        elif message_type == "projectile_launch":
+                            if not server.state.launch_projectile(
+                                    player.player_id, message):
+                                _server_log(
+                                    "PROJECTILE LAUNCH rejected sender=%d shooter=%s:%s seq=%s" % (
+                                        player.player_id,
+                                        message.get("shooter_kind"),
+                                        message.get("shooter_id"),
+                                        message.get("shot_seq")))
+                        elif message_type == "projectile_progress":
+                            if not server.state.progress_projectiles(
+                                    player.player_id, message):
+                                _server_log(
+                                    "PROJECTILE PROGRESS rejected sender=%d epoch=%s count=%s" % (
+                                        player.player_id,
+                                        message.get("authority_epoch"),
+                                        len(message.get("cursors", ()))
+                                        if isinstance(message.get("cursors"), list)
+                                        else None))
+                        elif message_type == "projectile_resolve":
+                            if not server.state.resolve_projectile(
+                                    player.player_id, message):
+                                _server_log(
+                                    "PROJECTILE RESOLVE rejected sender=%d projectile=%s outcome=%s" % (
+                                        player.player_id,
+                                        message.get("projectile_id"),
+                                        message.get("outcome")))
+                        elif message_type == "bot_manifest":
+                            if server.state.update_bot_manifest(player.player_id, message):
+                                _server_log("BOT MANIFEST authority=%d bots=%d" % (
+                                    player.player_id, len(server.state.bot_manifest)))
+                                loading_snapshot = server.state.loading_snapshot()
+                                if loading_snapshot is not None:
+                                    server.state.broadcast_loading_transition(
+                                        loading_snapshot)
+                                live = server.state.activate_battle_if_ready()
+                                if live is not None:
+                                    _server_log("BATTLE LIVE round=%d countdown=%.1fs players=%d" % (
+                                        live["round_id"], live["countdown_seconds"],
+                                        len(server.state.players)))
                             else:
-                                # Preserve the mature 0.8.2 immediate-battle
-                                # publisher exactly; only #1513 has a loading
-                                # membership barrier to repair.
-                                server.state.broadcast(start_message)
-                    elif message_type == "descriptor_catalog":
-                        server.state.store_vehicle_catalog(
-                            player.player_id, message)
-                    elif message_type == "select_vehicle":
-                        if server.state.select_vehicle(
-                                player.player_id, message):
-                            _server_log("VEHICLE id=%d vehicle=%s hp=%d" % (
-                                player.player_id, player.vehicle,
-                                player.max_health))
-                            server.state.broadcast_current_roster()
-                    elif message_type == "select_team":
-                        accepted, team_error = server.state.select_team(
-                            player.player_id, message.get("team"))
-                        if accepted:
-                            _server_log("TEAM id=%d team=%d slot=%d" % (
-                                player.player_id, player.team, player.slot))
-                            server.state.broadcast_current_roster()
-                        else:
+                                _server_log("BOT MANIFEST rejected sender=%d" % player.player_id)
+                        elif message_type == "bot_state":
+                            accepted = server.state.update_bot_states(
+                                player.player_id, message)
+                            if server.state.should_log_protocol_reject(
+                                    "bot_state", accepted):
+                                _server_log(
+                                    "BOT STATE rejected authority=%d code=%s reason=%s" % (
+                                        player.player_id,
+                                        server.state.last_bot_state_reject_code,
+                                        server.state.last_bot_state_reject))
+                        elif message_type == "bot_observation":
+                            relay = server.state.update_bot_observation(
+                                player.player_id, message)
+                            if isinstance(relay, dict):
+                                server.state.broadcast_bot_observation(relay)
+                        elif message_type == "spotted_report":
+                            if not server.state.update_spotted_targets(
+                                    player.player_id, message):
+                                _server_log(
+                                    "SPOTTED REPORT rejected sender=%d count=%s"
+                                    % (player.player_id,
+                                       len(message.get("targets"))
+                                       if isinstance(message.get("targets"), list)
+                                       else None))
+                        elif message_type == "bot_hit_report":
+                            accepted = server.state.report_bot_hit(
+                                player.player_id, message)
+                            if server.state.should_log_protocol_reject(
+                                    "bot_hit", accepted):
+                                _server_log(
+                                    ("BOT HIT rejected authority=%d attacker_bot=%s "
+                                     "target=%s seq=%s code=%s reason=%s") % (
+                                        player.player_id,
+                                        message.get("attacker_bot"),
+                                        message.get("target"),
+                                        message.get("shot_seq"),
+                                        server.state.last_bot_hit_reject_code,
+                                        server.state.last_bot_hit_reject))
+                        elif message_type == "bot_human_hit":
+                            accepted = server.state.report_bot_human_hit(
+                                player.player_id, message)
+                            if server.state.should_log_protocol_reject(
+                                    "bot_human_hit", accepted):
+                                _server_log(
+                                    ("BOT HUMAN HIT rejected authority=%d "
+                                     "attacker_bot=%s target=%s seq=%s "
+                                     "code=%s reason=%s") % (
+                                        player.player_id,
+                                        message.get("attacker_bot"),
+                                        message.get("target"),
+                                        message.get("shot_seq"),
+                                        server.state.last_bot_human_hit_reject_code,
+                                        server.state.last_bot_human_hit_reject))
+                        elif message_type == "bot_ram_report":
+                            if not server.state.report_bot_ram(
+                                    player.player_id, message):
+                                _server_log(
+                                    "BOT RAM rejected authority=%d target=%s:%s" % (
+                                        player.player_id,
+                                        message.get("target_kind"),
+                                        message.get("target_id")))
+                        elif message_type == "rules_state":
+                            server.state.update_rules(player.player_id, message)
+                        elif message_type == "destructible":
+                            if not server.state.report_destructible(
+                                    player.player_id, message):
+                                _server_log(
+                                    "DESTRUCTIBLE rejected sender=%d chunk=%s item=%s" % (
+                                        player.player_id,
+                                        message.get("chunk_id"),
+                                        message.get("item_index")))
+                        elif message_type == "battle_result":
+                            if not server.state.report_battle_result(player.player_id, message):
+                                _server_log("BATTLE RESULT rejected sender=%d" % player.player_id)
+                        elif message_type == "battle_receipt_ack":
+                            if not server.state.acknowledge_result_receipt(
+                                    player.player_id, message):
+                                _server_log(
+                                    "BATTLE RECEIPT ACK rejected sender=%d" %
+                                    player.player_id)
+                        elif message_type == "leave_battle":
+                            if server.state.leave_battle_and_publish(
+                                    player.player_id, message):
+                                _server_log("BATTLE LEAVE id=%d round=%d" % (
+                                    player.player_id, server.state.round_id))
+                        elif message_type == "battle_ready":
+                            live_message = server.state.mark_battle_ready(
+                                player.player_id, message)
+                            if live_message is not None:
+                                _server_log(
+                                    "BATTLE LIVE round=%d countdown=%ss players=%d" % (
+                                        live_message["round_id"],
+                                        live_message["countdown_seconds"],
+                                        len(server.state.players)))
+                        elif message_type == "start_battle":
+                            start_message, start_error = server.state.request_start(
+                                player.player_id, message.get("map"))
+                            if start_message is None:
+                                player.send({
+                                    "type": "start_denied",
+                                    "protocol": PROTOCOL_VERSION,
+                                    "round_id": server.state.round_id,
+                                    "state_revision": server.state.state_revision,
+                                    "code": start_error,
+                                    "players": len(server.state.players),
+                                })
+                                _server_log("START denied for id=%d: %s" % (player.player_id, start_error))
+                            else:
+                                _server_log("BATTLE LOADING round=%d map=%s players=%d requested_by=%s" % (
+                                    start_message["round_id"],
+                                    start_message["map"],
+                                    len(start_message["players"]),
+                                    player.name,
+                                ))
+                                if start_message.get("phase") == "loading":
+                                    server.state.broadcast_loading_transition(
+                                        start_message)
+                                else:
+                                    # Preserve the mature 0.8.2 immediate-battle
+                                    # publisher exactly; only #1513 has a loading
+                                    # membership barrier to repair.
+                                    server.state.broadcast(start_message)
+                        elif message_type == "descriptor_catalog":
+                            server.state.store_vehicle_catalog(
+                                player.player_id, message)
+                        elif message_type == "select_vehicle":
+                            if server.state.select_vehicle(
+                                    player.player_id, message):
+                                _server_log("VEHICLE id=%d vehicle=%s hp=%d" % (
+                                    player.player_id, player.vehicle,
+                                    player.max_health))
+                                server.state.broadcast_current_roster()
+                        elif message_type == "select_team":
+                            accepted, team_error = server.state.select_team(
+                                player.player_id, message.get("team"))
+                            if accepted:
+                                _server_log("TEAM id=%d team=%d slot=%d" % (
+                                    player.player_id, player.team, player.slot))
+                                server.state.broadcast_current_roster()
+                            else:
+                                player.send({
+                                    "type": "team_denied",
+                                    "protocol": PROTOCOL_VERSION,
+                                    "round_id": server.state.round_id,
+                                    "state_revision": server.state.state_revision,
+                                    "code": team_error,
+                                    "team": message.get("team"),
+                                    "team_sizes": server.state._team_sizes_wire(),
+                                })
+                        elif message_type == "set_team_size":
+                            accepted, size_error = server.state.set_team_size(
+                                player.player_id, message.get("team"),
+                                message.get("size"))
+                            if accepted:
+                                _server_log(
+                                    "TEAM SIZE id=%d team=%s size=%s" % (
+                                        player.player_id, message.get("team"),
+                                        message.get("size")))
+                                server.state.broadcast_current_roster()
+                            else:
+                                player.send({
+                                    "type": "team_size_denied",
+                                    "protocol": PROTOCOL_VERSION,
+                                    "round_id": server.state.round_id,
+                                    "state_revision": server.state.state_revision,
+                                    "code": size_error,
+                                    "team": message.get("team"),
+                                    "size": message.get("size"),
+                                    "team_sizes": server.state._team_sizes_wire(),
+                                })
+                        elif message_type == "set_bot_tier_mode":
+                            accepted, mode_error = server.state.set_bot_tier_mode(
+                                player.player_id, message.get("mode"))
+                            if accepted:
+                                _server_log(
+                                    "BOT TIER MODE id=%d mode=%s" % (
+                                        player.player_id,
+                                        server.state.bot_tier_mode))
+                                server.state.broadcast_current_roster()
+                            else:
+                                player.send({
+                                    "type": "bot_tier_mode_denied",
+                                    "protocol": PROTOCOL_VERSION,
+                                    "round_id": server.state.round_id,
+                                    "state_revision": server.state.state_revision,
+                                    "code": mode_error,
+                                    "mode": message.get("mode"),
+                                    "bot_tier_mode": server.state.bot_tier_mode,
+                                })
+                        elif message_type == "ping":
                             player.send({
-                                "type": "team_denied",
-                                "protocol": PROTOCOL_VERSION,
-                                "round_id": server.state.round_id,
-                                "state_revision": server.state.state_revision,
-                                "code": team_error,
-                                "team": message.get("team"),
-                                "team_sizes": server.state._team_sizes_wire(),
+                                "type": "pong",
+                                "seq": message.get("seq"),
+                                "client_time": message.get("client_time"),
+                                "server_time": time.time(),
                             })
-                    elif message_type == "set_team_size":
-                        accepted, size_error = server.state.set_team_size(
-                            player.player_id, message.get("team"),
-                            message.get("size"))
-                        if accepted:
-                            _server_log(
-                                "TEAM SIZE id=%d team=%s size=%s" % (
-                                    player.player_id, message.get("team"),
-                                    message.get("size")))
-                            server.state.broadcast_current_roster()
-                        else:
-                            player.send({
-                                "type": "team_size_denied",
-                                "protocol": PROTOCOL_VERSION,
-                                "round_id": server.state.round_id,
-                                "state_revision": server.state.state_revision,
-                                "code": size_error,
-                                "team": message.get("team"),
-                                "size": message.get("size"),
-                                "team_sizes": server.state._team_sizes_wire(),
-                            })
-                    elif message_type == "set_bot_tier_mode":
-                        accepted, mode_error = server.state.set_bot_tier_mode(
-                            player.player_id, message.get("mode"))
-                        if accepted:
-                            _server_log(
-                                "BOT TIER MODE id=%d mode=%s" % (
-                                    player.player_id,
-                                    server.state.bot_tier_mode))
-                            server.state.broadcast_current_roster()
-                        else:
-                            player.send({
-                                "type": "bot_tier_mode_denied",
-                                "protocol": PROTOCOL_VERSION,
-                                "round_id": server.state.round_id,
-                                "state_revision": server.state.state_revision,
-                                "code": mode_error,
-                                "mode": message.get("mode"),
-                                "bot_tier_mode": server.state.bot_tier_mode,
-                            })
-                    elif message_type == "ping":
-                        player.send({
-                            "type": "pong",
-                            "seq": message.get("seq"),
-                            "client_time": message.get("client_time"),
-                            "server_time": time.time(),
-                        })
-                    elif message_type == "leave":
-                        return
+                        elif message_type == "leave":
+                            return
+                    except (ConnectionError, OSError):
+                        raise
+                    except Exception as error:
+                        _server_log_limited(
+                            "visible-message:%d:%s" % (
+                                player.player_id, message_type),
+                            "VISIBLE MESSAGE ignored sender=%d type=%s "
+                            "error=%s" % (
+                                player.player_id, message_type,
+                                type(error).__name__))
+                        continue
         except (TypeError, ValueError, UnicodeError, json.JSONDecodeError) as error:
             _server_log("Invalid message from %s:%d: %s" % (self.client_address[0], self.client_address[1], error))
         except (ConnectionError, OSError) as error:

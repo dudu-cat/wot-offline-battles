@@ -9782,32 +9782,38 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertFalse(pending['state']['alive'])
         self.assertEqual(3, pending['state']['death_reason'])
 
-    def test_unknown_ordered_entity_fails_battle_before_acceptance(self):
+    def test_unknown_ordered_entity_is_dropped_without_failing_battle(self):
         battle = BattleRuntime(_runtime())
         battle.state = 'running'
         battle._fail = mock.Mock()
 
-        self.assertFalse(battle.on_events({'events': [{
+        self.assertTrue(battle.on_events({'events': [{
             'event_id': '1:10:0', 'kind': 'bot_shot',
             'attacker_bot': 99}]}))
 
-        self.assertNotIn('1:10:0', battle._accepted_event_ids)
-        error = battle._fail.call_args.args[0]
-        self.assertIn('unknown entity bot:99', str(error))
+        self.assertIn('1:10:0', battle._accepted_event_ids)
+        self.assertIn('1:10:0', battle._applied_event_ids)
+        self.assertEqual([], battle._event_journal)
+        battle._fail.assert_not_called()
 
-    def test_unknown_ordered_event_kind_fails_before_acceptance(self):
+    def test_unknown_ordered_event_kind_does_not_block_following_event(self):
         battle = BattleRuntime(_runtime())
+        battle._avatar = battle._runtime.bigworld.avatar
         battle.state = 'running'
         battle._fail = mock.Mock()
 
-        self.assertFalse(battle.on_events({'events': [{
-            'event_id': '1:10:1', 'kind': 'future_magic'}]}))
+        self.assertTrue(battle.on_events({'events': [
+            {'event_id': '1:10:1', 'kind': 'future_magic'},
+            {'event_id': '1:10:2', 'kind': 'battle_result', 'winner': 2,
+             'reason': 'team_eliminated'},
+        ]}))
 
-        self.assertNotIn('1:10:1', battle._accepted_event_ids)
-        error = battle._fail.call_args.args[0]
-        self.assertIn('kind is unsupported: future_magic', str(error))
+        self.assertIn('1:10:1', battle._applied_event_ids)
+        self.assertIn('1:10:2', battle._applied_event_ids)
+        self.assertEqual(1, len(battle._avatar.round_finished))
+        battle._fail.assert_not_called()
 
-    def test_ordered_native_exception_fails_without_marking_applied(self):
+    def test_ordered_native_exception_is_local_to_that_event(self):
         battle = BattleRuntime(_runtime())
         battle.state = 'running'
         battle._records = {'player:1': {
@@ -9818,14 +9824,26 @@ class BattleRuntimeContractTests(unittest.TestCase):
             side_effect=RuntimeError('native shot failed'))
         battle._fail = mock.Mock()
 
-        self.assertFalse(battle.on_events({'events': [{
+        self.assertTrue(battle.on_events({'events': [{
             'event_id': '1:11:0', 'kind': 'shot', 'attacker': 1}]}))
 
         self.assertIn('1:11:0', battle._accepted_event_ids)
-        self.assertNotIn('1:11:0', battle._applied_event_ids)
-        self.assertEqual(1, len(battle._event_journal))
-        error = battle._fail.call_args.args[0]
-        self.assertEqual('native shot failed', str(error))
+        self.assertIn('1:11:0', battle._applied_event_ids)
+        self.assertEqual([], battle._event_journal)
+        battle._fail.assert_not_called()
+
+    def test_snapshot_exception_keeps_last_good_state_and_round_running(self):
+        battle = BattleRuntime(_runtime())
+        battle.state = 'running'
+        battle._last_snapshot = {'server_tick': 7}
+        battle._sync = types.SimpleNamespace(
+            snapshot=mock.Mock(side_effect=ValueError('stale snapshot')))
+        battle._fail = mock.Mock()
+
+        self.assertFalse(battle.on_snapshot({'server_tick': 8}))
+
+        self.assertEqual({'server_tick': 7}, battle._last_snapshot)
+        battle._fail.assert_not_called()
 
     def test_repair_presentation_never_opens_a_client_damage_lineage(self):
         runtime = _runtime()

@@ -6330,7 +6330,8 @@ class BattleRuntime(object):
 
     def on_snapshot(self, message):
         if self.state in ('failed', 'stopped', 'leaving'):
-            return
+            return False
+        previous_snapshot = self._last_snapshot
         try:
             self._last_snapshot = dict(message or {})
             self._restore_local_equipment_snapshot(
@@ -6356,8 +6357,26 @@ class BattleRuntime(object):
                 self._remember_ram_bot_snapshot(self._last_snapshot)
             if self._sync is not None:
                 self._sync.snapshot(message)
+            return True
         except Exception as error:
-            self._fail(error)
+            self._last_snapshot = previous_snapshot
+            self._ignore_live_payload('snapshot', error, message)
+            return False
+
+    def _ignore_live_payload(self, kind, error, message=None):
+        """Contain one recoverable live payload without ending the round."""
+        reason = self._bounded_failure_reason(error)
+        callback = getattr(
+            getattr(self, 'client', None), '_ignore_runtime_payload', None)
+        if callable(callback):
+            try:
+                if callback(kind, reason, message):
+                    return True
+            except Exception:
+                pass
+        self._warn_optional_failure(
+            'recoverable %s payload' % kind, error, disable=False)
+        return True
 
     def _remember_ram_bot_snapshot(self, snapshot):
         """Retain the canonical bot bodies referenced by player contacts."""
@@ -6941,7 +6960,12 @@ class BattleRuntime(object):
         try:
             self._observe_destructibles_disabled(message)
             self._observe_projectile_message(message or {})
-            for raw_event in (message or {}).get('events') or ():
+        except Exception as error:
+            self._ignore_live_payload('events', error, message)
+            return False
+        for raw_event in (message or {}).get('events') or ():
+            event_id = None
+            try:
                 if not isinstance(raw_event, dict):
                     raise RuntimeError('ordered LAN event is malformed')
                 event = dict(raw_event)
@@ -6954,11 +6978,14 @@ class BattleRuntime(object):
                 self._prepare_ordered_event(event)
                 self._accepted_event_ids.add(event_id)
                 self._event_journal.append(event)
-            self._drain_event_journal()
-            return True
-        except Exception as error:
-            self._fail(error)
-            return False
+            except Exception as error:
+                if event_id:
+                    event_id = str(event_id)
+                    self._accepted_event_ids.add(event_id)
+                    self._applied_event_ids.add(event_id)
+                self._ignore_live_payload('events', error, message)
+        self._drain_event_journal()
+        return True
 
     @staticmethod
     def _event_entity_key(event, role):
@@ -7480,9 +7507,28 @@ class BattleRuntime(object):
     def _drain_event_journal(self):
         while self._event_journal:
             event = self._event_journal[0]
-            if not self._event_is_ready(event):
+            try:
+                ready = self._event_is_ready(event)
+            except Exception as error:
+                self._ignore_live_payload('events', error, {
+                    'round_id': (self._start_message or {}).get('round_id'),
+                    'event_id': event.get('event_id'),
+                    'event_kind': event.get('kind'),
+                })
+                event_id = str(event['event_id'])
+                self._applied_event_ids.add(event_id)
+                self._event_journal.pop(0)
+                continue
+            if not ready:
                 return False
-            self._apply_ordered_event(event)
+            try:
+                self._apply_ordered_event(event)
+            except Exception as error:
+                self._ignore_live_payload('events', error, {
+                    'round_id': (self._start_message or {}).get('round_id'),
+                    'event_id': event.get('event_id'),
+                    'event_kind': event.get('kind'),
+                })
             event_id = str(event['event_id'])
             self._applied_event_ids.add(event_id)
             self._event_journal.pop(0)
