@@ -603,27 +603,43 @@ class BotAiPortTests(unittest.TestCase):
             (10.0, 0.0, 20.0), (18.0, 0.0, 20.0),
             BAKED_SHALLOW_WATER))
 
-    def test_pending_and_failed_searches_do_not_claim_shallow_direct_goal(self):
+    def test_pending_shallow_search_holds_without_arming_recovery(self):
         graph = self._baked_graph(3, 1)
         graph['hazards'] = [0, 4, 0]
         current = (10.0, 0.0, 20.0)
         goal = (18.0, 0.0, 20.0)
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        navigator._path = lambda *unused: (('search-result',), None)
+        navigator.grid.safe_local_target = lambda *unused: None
 
-        for path_result in (None, ()):
-            navigator = TerrainNavigator(
-                lambda *unused: None, baked_graph=graph)
-            navigator._path = lambda *unused, result=path_result: (
-                ('search-result',), result)
-            navigator.grid.safe_local_target = lambda *unused: None
+        selected = navigator.next_target(
+            7, current, goal, ('route', 1, 'wet-shortcut'), 1.0)
 
-            selected = navigator.next_target(
-                7, current, goal, ('route', 1, 'wet-shortcut'), 1.0)
+        self.assertEqual(current, selected)
+        self.assertEqual('pending', navigator.fallback_modes[7])
+        self.assertTrue(TerrainNavigator.navigation_paused(
+            current, goal, selected, minimum_request_distance=5.0))
+        self.assertFalse(navigator.controlled_shallow_step(
+            7, current, math.pi * 0.5))
 
-            with self.subTest(path_result=path_result):
-                self.assertEqual(goal, selected)
-                self.assertEqual('reactive', navigator.fallback_modes[7])
-                self.assertFalse(navigator.controlled_shallow_step(
-                    7, current, math.pi * 0.5))
+    def test_failed_shallow_search_keeps_reactive_local_recovery(self):
+        graph = self._baked_graph(3, 1)
+        graph['hazards'] = [0, 4, 0]
+        current = (10.0, 0.0, 20.0)
+        goal = (18.0, 0.0, 20.0)
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        navigator._path = lambda *unused: (('search-result',), ())
+        navigator.grid.safe_local_target = lambda *unused: None
+
+        selected = navigator.next_target(
+            7, current, goal, ('route', 1, 'wet-shortcut'), 1.0)
+
+        self.assertEqual(goal, selected)
+        self.assertEqual('reactive', navigator.fallback_modes[7])
+        self.assertFalse(navigator.controlled_shallow_step(
+            7, current, math.pi * 0.5))
 
     def test_unavoidable_astar_shallow_edge_authorizes_only_planned_heading(self):
         graph = self._baked_graph(3, 1)
@@ -644,6 +660,22 @@ class BotAiPortTests(unittest.TestCase):
             7, current, math.pi * 0.5))
         self.assertFalse(navigator.controlled_shallow_step(
             7, current, math.pi * 0.5 + 0.42))
+
+        retained = navigator.next_target(
+            7, current, goal, ('route', 1, 'only-ford'), 1.2)
+        self.assertEqual(selected, retained)
+        self.assertNotIn(7, navigator.fallback_modes)
+        self.assertTrue(navigator.controlled_shallow_step(
+            7, current, math.pi * 0.5))
+
+    def test_prebaked_segment_rejects_destination_beyond_map_bounds(self):
+        graph = self._baked_graph(3, 1)
+        grid = TerrainGrid(lambda *unused: None, baked_graph=graph)
+
+        self.assertTrue(grid.segment_clear(
+            (14.0, 0.0, 20.0), (18.0, 0.0, 20.0)))
+        self.assertFalse(grid.segment_clear(
+            (14.0, 0.0, 20.0), (22.1, 0.0, 20.0)))
 
     def test_navigation_housekeeping_runs_once_per_second(self):
         navigator = TerrainNavigator(lambda *unused: 0.0)
@@ -681,6 +713,28 @@ class BotAiPortTests(unittest.TestCase):
             (0.0, 0.0, 0.0), (4.0, 0.0, 0.0), 1.0))
         self.assertTrue(grid.path_has_penalty((
             (0.0, 0.0, 0.0), (4.0, 0.0, 0.0)), 1.0))
+
+    def test_repeated_hard_contact_replans_only_the_blocked_bot(self):
+        graph = self._baked_graph(5, 3)
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        current = (10.0, 0.0, 24.0)
+        goal = (26.0, 0.0, 24.0)
+        route_key = ('route', 1, 'contact-detour')
+        navigator.next_target(11, current, goal, route_key, 1.0)
+
+        escalated = [navigator.report_hard_contact(
+            11, current, goal, now) for now in (1.0, 1.34, 1.68, 2.02)]
+
+        self.assertEqual([False, False, False, True], escalated)
+        self.assertFalse(navigator.grid._failed_edges)
+        self.assertTrue(navigator.bot_failed_edges[11])
+        self.assertNotIn(12, navigator.bot_failed_edges)
+        navigator.next_target(11, current, goal, route_key, 2.03)
+        navigator.next_target(11, current, goal, route_key, 2.04)
+        active_key = navigator.bot_states[11]['path_key']
+        self.assertEqual('recovery', active_key[0][0])
+        self.assertEqual(1, navigator.bot_states[11]['hard_contact_replans'])
 
     def test_superseded_route_join_search_is_cancelled_for_its_bot(self):
         navigator = TerrainNavigator(lambda *unused: 0.0)
@@ -943,8 +997,8 @@ class BotAiPortTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, state['clock'])
 
     def test_large_route_turn_pivots_before_driving_and_never_reverses(self):
-        # A target far behind the bow commands a stationary pivot. Rotation is
-        # progress, so the driver must not reinterpret it as a stuck recovery.
+        # A stable target with monotonically shrinking heading error receives a
+        # finite pivot lease without treating arbitrary rotation as translation.
         driver = LocalDriver()
         yaw = 0.0
         modes = set()
@@ -962,6 +1016,41 @@ class BotAiPortTests(unittest.TestCase):
         self.assertIn(0.0, throttles)
         self.assertIn(1.0, throttles)
         self.assertGreater(abs(yaw), 2.5)
+
+    def test_alternating_stationary_turns_reach_stuck_recovery(self):
+        driver = LocalDriver()
+        yaw = 0.0
+        recovery = None
+        for tick in range(300):
+            target_yaw = 1.15 if tick % 2 == 0 else -1.15
+            target = (math.sin(target_yaw) * 50.0, 0.0,
+                      math.cos(target_yaw) * 50.0)
+            order = driver.drive(
+                70, (0.0, 0.0, 0.0), yaw, 0.0, 1.0 / 30.0,
+                target, (), lambda unused_yaw: True)
+            if order['recovery_mode'] in ('reverse_turn', 'pivot_recovery'):
+                recovery = order
+                break
+            yaw += order['turn'] * 0.66 * (1.0 / 30.0)
+
+        self.assertIsNotNone(recovery)
+        self.assertGreater(driver.states[70]['stuck_time'], 0.0)
+
+    def test_terminal_target_coasts_inside_copied_stopping_distance(self):
+        driver = LocalDriver()
+        terminal = driver.drive(
+            71, (0.0, 0.0, 0.0), 0.0, 14.0, 0.15,
+            (0.0, 0.0, 8.0), (), lambda unused_yaw: True,
+            stopping_distance=6.0, stop_at_target=True,
+            decision_horizon=0.15)
+        corridor = driver.drive(
+            72, (0.0, 0.0, 0.0), 0.0, 14.0, 0.15,
+            (0.0, 0.0, 8.0), (), lambda unused_yaw: True,
+            stopping_distance=6.0, stop_at_target=False,
+            decision_horizon=0.15)
+
+        self.assertEqual(0.0, terminal['throttle'])
+        self.assertEqual(1.0, corridor['throttle'])
 
     def test_prohorovka_west_ridge_corner_keeps_forward_progress(self):
         driver = LocalDriver()

@@ -101,6 +101,9 @@ class BotAdapter(object):
         if callable(self.navigation_target):
             target = _position(self.navigation_target(
                 bot_id, position, target, strategic, state), target)
+        stop_at_target = bool(state.get(
+            'navigation_stop_at_target',
+            strategic.get('combat_mode') not in ('route', 'advance')))
         throttle_override = strategic.get('throttle_override')
         movement_intent = not (
             throttle_override is not None and
@@ -112,7 +115,10 @@ class BotAdapter(object):
             velocity=state.get('velocity'),
             half_length=float(state.get('half_length', 3.5)),
             half_width=float(state.get('half_width', 1.7)),
-            movement_intent=movement_intent)
+            movement_intent=movement_intent,
+            stopping_distance=state.get('stopping_distance'),
+            stop_at_target=stop_at_target,
+            decision_horizon=float(state.get('decision_horizon', 0.0)))
         # Preserve the mature face-position intent which is separate from the
         # gun target.  At a route/cover stop it gives armoured turreted tanks
         # their stable 12-30 degree hull angle while the turret keeps tracking

@@ -3030,6 +3030,9 @@ class BotRuntimeTests(unittest.TestCase):
             physics_ground_probe=lambda *unused: 0.0,
             spawn_resolver=_spawn_resolver, baked_graph=_graph())
         runtime.battle_start(self.start)
+        contact_reports = []
+        runtime.navigator.report_hard_contact = (
+            lambda *args: contact_reports.append(args))
         state = runtime.states[11]
         state.update(x=0.0, y=0.0, z=0.0, yaw=attempted_yaw,
                      speed=4.0, grounded_once=True)
@@ -3043,6 +3046,9 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertNotIn(11, runtime._motion_probe_cache)
         self.assertEqual([(11, attempted_yaw, 5.0)],
                          adapter.driver.calls)
+        self.assertEqual(1, len(contact_reports))
+        self.assertEqual((11, before_position, aim, 1.0),
+                         contact_reports[0])
         self.assertEqual(1, len(adapter.calls))
 
         status[0] = 'clear'
@@ -11287,7 +11293,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         class Navigator(object):
             def next_target(self, bot_id, position, goal, path_key, now,
-                            anchor, avoid):
+                            anchor, avoid, lookahead_distance=None):
                 calls.append((bot_id, path_key, anchor))
                 return goal
 
@@ -11338,7 +11344,7 @@ class BotRuntimeTests(unittest.TestCase):
                 self.grid = Grid()
 
             def next_target(self, bot_id, position, goal, path_key, now,
-                            anchor, avoid):
+                            anchor, avoid, lookahead_distance=None):
                 calls.append(('planned', bot_id, path_key))
                 return (4.0, 0.0, 8.0)
 
@@ -11370,7 +11376,7 @@ class BotRuntimeTests(unittest.TestCase):
 
         class Navigator(object):
             def next_target(self, bot_id, position, goal, path_key, now,
-                            anchor, avoid):
+                            anchor, avoid, lookahead_distance=None):
                 calls.append(path_key)
                 return goal
 

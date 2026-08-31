@@ -184,10 +184,11 @@ class LocalDriver(object):
 				'escape_side': 0.0,
 				'escape_side_until': 0.0,
 				'last_desired_yaw': None,
-				'last_yaw': None,
+				'last_heading_error': None,
 				'traffic_waiting': False,
 				'traffic_wait_time': 0.0,
 				'last_step': 0.0,
+				'braking_target': None,
 			}
 			self.states[bot_id] = state
 		return state
@@ -432,7 +433,8 @@ class LocalDriver(object):
 
 	def drive(self, bot_id, position, yaw, speed, dt, target, neighbours,
 			direction_clear, velocity=None, half_length=3.5, half_width=1.7,
-			movement_intent=True):
+			movement_intent=True, stopping_distance=None,
+			stop_at_target=True, decision_horizon=0.0):
 		"""Return ``throttle``, ``turn``, ``target_yaw`` and ``recovery_mode``.
 
 		All timing uses the complete supplied interval.  The authority caller
@@ -449,8 +451,18 @@ class LocalDriver(object):
 		self._prune_failures(state)
 		state['steering_age'] += step
 		state['plan_age'] += step
+		previous_desired_yaw = state.get('last_desired_yaw')
 		desired_yaw = _yaw_to(position, target)
+		heading_error = abs(_angle_delta(desired_yaw, yaw))
+		previous_heading_error = state.get('last_heading_error')
+		stable_heading = bool(
+			previous_desired_yaw is not None and
+			abs(_angle_delta(desired_yaw, previous_desired_yaw)) <= 0.12)
+		heading_progress = bool(
+			stable_heading and previous_heading_error is not None and
+			heading_error + 0.002 < previous_heading_error)
 		state['last_desired_yaw'] = desired_yaw
+		state['last_heading_error'] = heading_error
 		target_distance = _distance(position, target)
 		if not movement_intent:
 			# Cover/engagement orders intentionally stop within a tolerance. Do not
@@ -458,6 +470,7 @@ class LocalDriver(object):
 			state['stuck_time'] = 0.0
 			state['recovery_time'] = 0.0
 			state['steering_yaw'] = None
+			state['braking_target'] = None
 			return {
 				'throttle': 0.0,
 				'turn': 0.0,
@@ -467,17 +480,15 @@ class LocalDriver(object):
 		displacement = _distance((position[0], 0.0, position[2]),
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
-		state['last_position'] = (float(position[0]), float(position[2]))
-		previous_yaw = state['last_yaw']
-		state['last_yaw'] = float(yaw)
-		yaw_rate = (abs(_angle_delta(float(yaw), previous_yaw)) /
-		            max(step, 1.0e-6) if previous_yaw is not None else 0.0)
 		if target_distance <= WAYPOINT_ARRIVAL_RADIUS:
 			# Reaching a waypoint is a stop, not a request to drive north: atan2(0, 0)
 			# is zero and previously produced full throttle until the next order tick.
 			state['stuck_time'] = 0.0
 			state['recovery_time'] = 0.0
 			state['steering_yaw'] = None
+			state['last_position'] = (
+				float(position[0]), float(position[2]))
+			state['braking_target'] = None
 			return {
 				'throttle': 0.0,
 				'turn': 0.0,
@@ -485,13 +496,19 @@ class LocalDriver(object):
 				'recovery_mode': 'arrived',
 			}
 
-		# A low reported speed alone is not enough: waiting at a hold point should
-		# not trigger recovery. Displacement, velocity and rotation must all fail.
-		if (displacement < 0.08 and
-				abs(float(speed)) < 0.35 and yaw_rate < 0.25):
-			state['stuck_time'] += step
+		# Physical progress is translation. A stable pivot may borrow a bounded
+		# heading-progress lease while its error is actually shrinking, but merely
+		# rotating (especially alternating left/right) cannot keep a wedged hull
+		# alive forever. Keep the position as an accumulation anchor so genuine
+		# low-speed travel is not lost between short planner samples.
+		if displacement >= 0.08:
+			state['last_position'] = (
+				float(position[0]), float(position[2]))
+			state['stuck_time'] = 0.0
+		elif heading_progress:
+			state['stuck_time'] = max(0.0, state['stuck_time'] - step)
 		else:
-			state['stuck_time'] = max(0.0, state['stuck_time'] - step * 2.0)
+			state['stuck_time'] += step
 
 		threshold = self.stuck_seconds + state['phase'] * 0.42
 		if state['recovery_time'] > 0.0:
@@ -587,6 +604,32 @@ class LocalDriver(object):
 			# diagonal route corners retain forward progress while steering, which
 			# avoids long zero-throttle pauses on slow heavy tanks.
 			throttle = 0.0
+		if stop_at_target and not avoiding and stopping_distance is not None:
+			try:
+				brake_distance = max(0.0, float(stopping_distance))
+				reaction_distance = (abs(float(speed)) *
+				                     max(0.0, float(decision_horizon)))
+			except (TypeError, ValueError, OverflowError):
+				brake_distance = 0.0
+				reaction_distance = 0.0
+			target_key = (round(float(target[0]), 2),
+			              round(float(target[2]), 2))
+			if state.get('braking_target') not in (None, target_key):
+				state['braking_target'] = None
+			if (target_distance <= WAYPOINT_ARRIVAL_RADIUS +
+					brake_distance + reaction_distance):
+				state['braking_target'] = target_key
+			if state.get('braking_target') == target_key:
+				# Releasing the throttle uses the same copied coast law that
+				# produced ``stopping_distance``. If tuning or a slope leaves the
+				# hull stopped short, release the latch and approach again.
+				if (abs(float(speed)) <= 0.35 and
+						target_distance > WAYPOINT_ARRIVAL_RADIUS + 0.5):
+					state['braking_target'] = None
+				else:
+					throttle = 0.0
+		elif not stop_at_target:
+			state['braking_target'] = None
 		return {
 			'throttle': throttle,
 			'turn': turn,

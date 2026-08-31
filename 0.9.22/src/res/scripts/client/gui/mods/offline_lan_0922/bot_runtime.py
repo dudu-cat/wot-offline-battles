@@ -5103,15 +5103,18 @@ class BotRuntime(object):
                    for index in range(4))
 
     def _navigation_target(self, bot_id, position, goal, strategic, state):
+        mode = strategic.get('combat_mode', 'route')
+        stop_at_goal = mode not in ('route', 'advance')
         if self.navigator is None:
+            state['navigation_stop_at_target'] = stop_at_goal
             return goal
         if _distance(position, goal) <= 15.0:
             grid = getattr(self.navigator, 'grid', None)
             direct = getattr(grid, 'dry_segment_clear', None)
             if callable(direct) and direct(
                     position, goal, state.get('now', 0.0)):
+                state['navigation_stop_at_target'] = stop_at_goal
                 return goal
-        mode = strategic.get('combat_mode', 'route')
         route_index = int(_number(strategic.get('route_index'), 0))
         if mode == 'base_defense':
             path_key = (
@@ -5145,9 +5148,19 @@ class BotRuntime(object):
         # teammate repeatedly change the selected waypoint and produced visible
         # drive/stop cycles, especially for slow heavy tanks.
         avoid = None
-        return self.navigator.next_target(
+        grid = getattr(self.navigator, 'grid', None)
+        cell_size = max(1.0, _number(getattr(grid, 'cell_size', 1.0), 1.0))
+        lookahead_distance = max(
+            cell_size * 2.0,
+            abs(_number(state.get('speed'))) *
+            BAKED_MOTION_LOOKAHEAD_SECONDS)
+        target = self.navigator.next_target(
             bot_id, position, goal, path_key, state.get('now', 0.0),
-            anchor, avoid)
+            anchor, avoid, lookahead_distance)
+        terminal = getattr(self.navigator, 'target_is_terminal', None)
+        state['navigation_stop_at_target'] = bool(
+            stop_at_goal and callable(terminal) and terminal(bot_id))
+        return target
 
     @staticmethod
     def _player_neighbours(players):
@@ -7804,6 +7817,21 @@ class BotRuntime(object):
                 if decision_cache is not None:
                     decision_step = max(
                         step, _number(now) - decision_cache[2])
+                detail_tier = self._detail_tier(state)
+                decision_horizon = (
+                    DECISION_SECONDS * DECISION_TIER_FACTOR[detail_tier])
+                stopping_distance = None
+                expected_mode = (
+                    server_order.get('combat_mode', 'route')
+                    if isinstance(server_order, dict) else None)
+                physics_params = self._physics_params.get(state['id'])
+                if (physics_params is not None and
+                        abs(_number(state.get('speed'))) > 0.35 and
+                        expected_mode not in ('route', 'advance')):
+                    previous_command = (
+                        decision_cache[3] if decision_cache is not None else {})
+                    stopping_distance = self._cached_traffic_stopping_distance(
+                        state, previous_command, physics_params)
                 decision_state = {
                     'id': state['id'], 'position': position,
                     'yaw': state['yaw'],
@@ -7821,6 +7849,8 @@ class BotRuntime(object):
                         _number(state.get('speed'))),
                     'half_length': _number(state.get('half_length'), 3.5),
                     'half_width': _number(state.get('half_width'), 1.7),
+                    'stopping_distance': stopping_distance,
+                    'decision_horizon': decision_horizon,
                 }
                 reposition_order, reposition_expired = \
                     self._friendly_reposition_order(state, targets, now)
@@ -8378,6 +8408,13 @@ class BotRuntime(object):
                         self._hard_contact_response(
                             state, position, state['yaw'], speed,
                             descriptor, step, now)
+                    report_contact = getattr(
+                        self.navigator, 'report_hard_contact', None)
+                    if (callable(report_contact) and
+                            command.get('move_position') is not None):
+                        report_contact(
+                            state['id'], position,
+                            command.get('move_position'), now)
                 elif motion_status in ('soft', 'cap_crushed'):
                     self._hard_contact_grinds[state['id']] = 1
                 if resolved_motion and callable(self.motion_report):
