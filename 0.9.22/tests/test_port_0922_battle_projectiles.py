@@ -1152,6 +1152,121 @@ class BattleProjectileTests(unittest.TestCase):
             if entity_id != 41:
                 entity.collideSegmentExt.assert_not_called()
 
+    def test_projectile_advance_memoizes_repeated_historic_pose_queries(self):
+        battle, bigworld = _battle()
+        source = battle._server_entity(41)
+        entities = {41: source}
+        for index in range(29):
+            engine_id = 1000 + index
+            entities[engine_id] = types.SimpleNamespace(
+                id=engine_id, isStarted=True,
+                position=_Vector((1000.0 + index, 0.0, 1000.0)),
+                isAlive=lambda: True,
+                collideSegmentExt=mock.Mock(return_value=[]))
+            battle._records['bot:%d' % index] = {
+                'engine_id': engine_id, 'network_id': index, 'kind': 'bot',
+                'local': False, 'ready': True,
+                'state': {'health': 100, 'alive': True}}
+        battle._server_entity = lambda entity_id: entities.get(entity_id)
+        for shot_seq in range(1, 3):
+            event = dict(_event())
+            event.update({
+                'projectile_id': 'player:7:%d' % shot_seq,
+                'shot_seq': shot_seq,
+                'burst_group_seq': shot_seq,
+                'gravity': 190.0,
+                'maxDistance': 10000.0,
+            })
+            event['source_shot'] = dict(event['source_shot'])
+            event['source_shot'].update(
+                gravity=190.0, maxDistance=10000.0)
+            self.assertTrue(battle._accept_projectile_event(event))
+        uncached = mock.Mock(
+            wraps=battle._projectile_historic_pose_uncached)
+        battle._projectile_historic_pose_uncached = uncached
+
+        bigworld.now = 1.0
+        self.assertTrue(battle._advance_projectiles(1.0))
+
+        self.assertEqual(32, battle._projectile_perf['chords'])
+        self.assertEqual(960, battle._projectile_perf['scans'])
+        self.assertEqual(0, battle._projectile_perf['candidates'])
+        # Two identical trajectories share 33 exact time samples for every
+        # one of the 29 non-source records instead of recomputing all
+        # 32 * 29 * 3 chord queries.
+        self.assertEqual(957, uncached.call_count)
+        self.assertIsNone(battle._projectile_historic_pose_cache)
+
+    def test_projectile_pose_cache_is_advance_scoped_and_detached(self):
+        battle, bigworld = _battle()
+        source = battle._server_entity(41)
+        target = types.SimpleNamespace(
+            id=42, isStarted=True, position=_Vector((10.0, 0.0, 0.0)),
+            isAlive=lambda: True)
+        entities = {41: source, 42: target}
+        battle._server_entity = lambda entity_id: entities.get(entity_id)
+        battle._records['bot:8'] = {
+            'engine_id': 42, 'network_id': 8, 'kind': 'bot',
+            'local': False, 'ready': True,
+            'state': {'health': 100, 'alive': True}}
+        uncached = mock.Mock(
+            wraps=battle._projectile_historic_pose_uncached)
+        battle._projectile_historic_pose_uncached = uncached
+        observed = []
+
+        def advance(now, unused_chord, unused_terminal,
+                    maximum_chords=None):
+            self.assertEqual(32, maximum_chords)
+            self.assertIsInstance(
+                battle._projectile_historic_pose_cache, dict)
+            first = battle._projectile_historic_pose('bot:8', 2.0)
+            second = battle._projectile_historic_pose('bot:8', 2.0)
+            if first is None:
+                self.assertIsNone(second)
+            else:
+                first['x'] = -999.0
+                observed.append(second['x'])
+            return True
+
+        battle._projectiles.advance = advance
+        bigworld.now = 1.0
+        self.assertTrue(battle._advance_projectiles(1.0))
+        self.assertEqual(1, uncached.call_count)
+        self.assertIsNone(battle._projectile_historic_pose_cache)
+
+        target.position = _Vector((20.0, 0.0, 0.0))
+        bigworld.now = 2.0
+        self.assertTrue(battle._advance_projectiles(2.0))
+
+        self.assertEqual([20.0], observed)
+        self.assertEqual(2, uncached.call_count)
+        self.assertIsNone(battle._projectile_historic_pose_cache)
+
+    def test_projectile_pose_cache_has_a_hard_entry_limit(self):
+        battle, unused_bigworld = _battle()
+        module = sys.modules[BattleRuntime.__module__]
+        self.assertEqual(4096, module.PROJECTILE_POSE_CACHE_ENTRIES)
+        uncached = mock.Mock(side_effect=lambda unused_key, wanted: {
+            'x': wanted, 'y': 0.0, 'z': 0.0})
+        battle._projectile_historic_pose_uncached = uncached
+        battle._projectile_historic_pose_cache = {}
+        try:
+            with mock.patch.object(
+                    module, 'PROJECTILE_POSE_CACHE_ENTRIES', 2):
+                first = battle._projectile_historic_pose('bot:8', 1.0)
+                first['x'] = -999.0
+                self.assertEqual(
+                    1.0,
+                    battle._projectile_historic_pose('bot:8', 1.0)['x'])
+                battle._projectile_historic_pose('bot:8', 2.0)
+                battle._projectile_historic_pose('bot:8', 3.0)
+                battle._projectile_historic_pose('bot:8', 3.0)
+                self.assertEqual(2, len(
+                    battle._projectile_historic_pose_cache))
+                self.assertEqual(4, uncached.call_count)
+        finally:
+            battle._projectile_historic_pose_cache = None
+
     def test_budgeted_catchup_uses_historic_target_pose_for_relative_sweep(self):
         battle, bigworld = _battle()
         target = types.SimpleNamespace(

@@ -136,6 +136,9 @@ PROJECTILE_MAX_CHORDS_PER_FRAME = 256
 # motion rather than silently treating one midpoint matrix as exact.
 PROJECTILE_POSE_MAX_ANGLE_STEP = math.pi / 180.0
 PROJECTILE_POSE_MAX_SWEEP_STEPS = 16
+# Historic collision poses repeat across adjacent chords and simultaneous
+# shots. Keep the synchronous advance cache bounded for the 32-bit worker.
+PROJECTILE_POSE_CACHE_ENTRIES = 4096
 # Size the fair global budget for the observed low-FPS boundary without ever
 # exceeding the previous release's 256-chord hard cap.
 PROJECTILE_SUSTAIN_SECONDS = 1.0 / 15.0
@@ -148,6 +151,7 @@ BOT_MANIFEST_RETRY_SECONDS = 0.25
 PLAYER_ENVIRONMENT_SECONDS = 0.3
 MAX_PENDING_LANDING_IMPACTS = 32
 _SHOT_EVENT_KINDS = ('shot', 'bot_shot')
+_PROJECTILE_POSE_CACHE_MISS = object()
 # Ordered kinds that carry no shot or combat contract.  An unknown kind still
 # fails the round closed: the stream also carries health and kills, and a
 # silently skipped authority event would desynchronise the battle.
@@ -1430,6 +1434,7 @@ class BattleRuntime(object):
         self._projectile_terminal_data = {}
         self._projectile_target_positions = {}
         self._projectile_position_history = []
+        self._projectile_historic_pose_cache = None
         self._projectile_lineage = set()
         self._projectile_epoch = None
         self._projectile_server_time_ms = None
@@ -1675,6 +1680,7 @@ class BattleRuntime(object):
         self._projectile_terminal_data = {}
         self._projectile_target_positions = {}
         self._projectile_position_history = []
+        self._projectile_historic_pose_cache = None
         self._projectile_lineage = set()
         self._projectile_epoch = None
         self._projectile_server_time_ms = None
@@ -10176,10 +10182,23 @@ class BattleRuntime(object):
 
     def _projectile_historic_pose(self, key, absolute_time):
         """Interpolate one covered pose; never invent pre-history state."""
+        wanted = float(absolute_time)
+        cache = self._projectile_historic_pose_cache
+        cache_key = (key, wanted)
+        if cache is not None:
+            cached = cache.get(cache_key, _PROJECTILE_POSE_CACHE_MISS)
+            if cached is not _PROJECTILE_POSE_CACHE_MISS:
+                return dict(cached) if cached is not None else None
+        result = self._projectile_historic_pose_uncached(key, wanted)
+        if cache is not None and len(cache) < PROJECTILE_POSE_CACHE_ENTRIES:
+            cache[cache_key] = dict(result) if result is not None else None
+        return result
+
+    def _projectile_historic_pose_uncached(self, key, wanted):
+        """Compute one detached historic pose from the current history."""
         history = self._projectile_position_history
         if not history:
             return None
-        wanted = float(absolute_time)
         first_time, first_poses = history[0]
         if wanted < first_time - 1.0e-9:
             return None
@@ -10269,9 +10288,13 @@ class BattleRuntime(object):
             PROJECTILE_MAX_CHORDS_PER_FRAME,
             max(PROJECTILE_CHORDS_PER_FRAME, active * 2, sustainable))
         advance_start = _PROFILE_CLOCK()
-        advanced = self._projectiles.advance(
-            now, self._projectile_chord, self._projectile_terminal,
-            maximum_chords=chord_budget)
+        self._projectile_historic_pose_cache = {}
+        try:
+            advanced = self._projectiles.advance(
+                now, self._projectile_chord, self._projectile_terminal,
+                maximum_chords=chord_budget)
+        finally:
+            self._projectile_historic_pose_cache = None
         advance_seconds = max(0.0, _PROFILE_CLOCK() - advance_start)
         metrics = self._projectiles.last_advance_metrics()
         self._projectile_perf = {
@@ -18683,6 +18706,7 @@ class BattleRuntime(object):
         self._projectile_terminal_data = {}
         self._projectile_target_positions = {}
         self._projectile_position_history = []
+        self._projectile_historic_pose_cache = None
         self._projectile_lineage = set()
         if self._artillery is not None:
             self._artillery.reset()
