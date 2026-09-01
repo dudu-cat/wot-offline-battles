@@ -90,8 +90,12 @@ class EffectiveParamsContractTests(unittest.TestCase):
         descriptor.miscAttrs = {}
         descriptor.type = types.SimpleNamespace(
             crewRoles=(('commander',),))
-        crew = [types.SimpleNamespace(skills=[types.SimpleNamespace(
-            name='gunner_sniper', isActive=True, level=100.0)])]
+        crew = [types.SimpleNamespace(skills=[
+            types.SimpleNamespace(
+                name='gunner_sniper', isActive=True, level=100.0),
+            types.SimpleNamespace(
+                name='loader_intuition', isActive=True, level=100.0),
+        ])]
         equipment_descriptor = types.SimpleNamespace(
             name='ration', id=(0, 9), compactDescr=1009,
             reuseCount=-1, cooldownSeconds=0.0,
@@ -144,9 +148,6 @@ class EffectiveParamsContractTests(unittest.TestCase):
                 mock.patch(
                     'gui.mods.offline_lan_0922.loadout.ramming_bonus',
                     return_value=0.0), \
-                mock.patch(
-                    'gui.mods.offline_lan_0922.loadout.intuition_chances',
-                    return_value=1), \
                 mock.patch(
                     'gui.mods.offline_lan_0922.vehicle_physics.derive_params',
                     return_value=expected['physics']) as derive_params, \
