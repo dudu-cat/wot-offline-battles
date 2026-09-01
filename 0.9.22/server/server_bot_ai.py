@@ -1689,11 +1689,14 @@ class BotPlanner(object):
         point = _point(waypoints[index])
         bx = _number(bot["state"].get("x"))
         bz = _number(bot["state"].get("z"))
-        reached = _route_point_reached(
-            bx, bz, waypoints, index, route_limit)
         # Macro points describe the lane, not parking places.  Tanks keep
         # advancing until combat, safety or the final destination stops them.
-        if reached and index < route_limit:
+        # Consume every already-reached adjacent gate in this one 1 Hz global
+        # tactics pass; otherwise a short next segment makes LocalDriver stop
+        # at it until the following planner tick.
+        while (index < route_limit and
+               _route_point_reached(
+                   bx, bz, waypoints, index, route_limit)):
             index += 1
             state["index"] = index
             point = _point(waypoints[index])

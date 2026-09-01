@@ -1186,6 +1186,7 @@ class BotAiPortTests(unittest.TestCase):
         self.assertEqual((40.0, 0.0, 40.0), order['move_position'])
         self.assertEqual(2, agent['waypoint_index'])
         self.assertEqual((0.0, 0.0, -20.0), order['route_anchor'])
+        self.assertTrue(order['route_join'])
 
     def test_normal_route_turn_keeps_full_throttle(self):
         driver = LocalDriver()

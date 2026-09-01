@@ -493,9 +493,9 @@ class ServerBotTacticsTests(unittest.TestCase):
         route_id, index, point, anchor, route_join = planner._route(bot, 1.0)
 
         self.assertEqual('central_field', route_id)
-        self.assertEqual(2, index)
-        self.assertEqual({'x': -362.0, 'y': 0.0, 'z': 106.0}, point)
-        self.assertEqual({'x': -374.0, 'y': 0.0, 'z': 106.0}, anchor)
+        self.assertEqual(3, index)
+        self.assertEqual({'x': -270.0, 'y': 0.0, 'z': 174.0}, point)
+        self.assertEqual({'x': -362.0, 'y': 0.0, 'z': 106.0}, anchor)
         self.assertFalse(route_join)
 
     def test_route_corridor_does_not_accept_lateral_or_distant_bypasses(self):

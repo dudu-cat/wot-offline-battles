@@ -3586,7 +3586,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual((0.0,) * len(self.module.PROBE_KINDS),
                          runtime.probe_duration_totals())
 
-    def test_flat_full_roster_uses_one_ground_query_per_bot_frame(self):
+    def test_full_roster_keeps_support_and_budgets_visual_ground_samples(self):
         calls = []
         roster = [
             {'id': 11 + index,
@@ -3608,19 +3608,23 @@ class BotRuntimeTests(unittest.TestCase):
 
         runtime.update(0.04, 1.0)
 
-        # Spawn tick: every Bot receives one centre-support query and one
-        # four-point visual hull target in the same authority tick.
+        # Spawn tick: every Bot receives one centre-support query, while only
+        # the bounded rotating cohort receives a four-point visual target.
         first_frame = 29 + 4 * self.module.MAX_SLOPE_POSE_SAMPLES_PER_FRAME
         self.assertEqual(first_frame, len(calls))
         self.assertEqual(first_frame, dict(zip(
             self.module.PROBE_KINDS, runtime.probe_totals()))['ground'])
 
-        # Further stationary frames reuse every verified pose target without
-        # ever dropping the per-frame centre support sample.
-        for frame in range(1, 5):
+        # The remaining visual targets rotate through the roster without ever
+        # dropping the per-frame centre support sample.
+        for frame in range(1, 6):
             before = len(calls)
             runtime.update(0.04, 1.0 + frame * 0.04)
-            self.assertEqual(29, len(calls) - before)
+            remaining = max(
+                0, 29 - frame * self.module.MAX_SLOPE_POSE_SAMPLES_PER_FRAME)
+            sampled = min(
+                self.module.MAX_SLOPE_POSE_SAMPLES_PER_FRAME, remaining)
+            self.assertEqual(29 + 4 * sampled, len(calls) - before)
         self.assertTrue(all(
             'pose_sample' in state for state in runtime.states.values()))
 
@@ -4536,7 +4540,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([{'type': 'ram_damage', 'event': 'once'}], events)
         self.assertEqual(0.0, self.runtime._accumulator)
 
-    def test_worker_gap_bounds_catch_up_and_eventually_consumes_debt(self):
+    def test_worker_stall_runs_one_roster_step_per_callback(self):
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: _combat_descriptor(),
             adapter_factory=lambda *args: _Adapter(*args),
@@ -4559,7 +4563,7 @@ class BotRuntimeTests(unittest.TestCase):
         events = [message for message in first
                   if message.get('type') == 'ram_damage']
 
-        self.assertEqual([100000, 200000], [
+        self.assertEqual([200000], [
             message['sample_time_us'] for message in states])
         self.assertEqual([{'type': 'ram_damage', 'event': 'once'}], events)
         self.assertAlmostEqual(0.8, runtime._accumulator)
@@ -4569,7 +4573,7 @@ class BotRuntimeTests(unittest.TestCase):
             drained.extend(runtime.update(0.0, 10.0))
         all_messages = first + drained
         self.assertEqual(
-            [index * 100000 for index in range(1, 11)],
+            [index * 200000 for index in range(1, 6)],
             [message['sample_time_us'] for message in all_messages
              if message.get('type') == 'bot_state'])
         self.assertEqual(1, sum(
@@ -4577,40 +4581,39 @@ class BotRuntimeTests(unittest.TestCase):
             for message in all_messages))
         self.assertAlmostEqual(0.0, runtime._accumulator)
 
-    def test_worker_slow_first_step_defers_second_step_and_keeps_debt(self):
-        clock_values = iter((10.0, 10.06))
+    def test_worker_sustained_five_fps_consumes_elapsed_without_debt(self):
         runtime = self.module.BotRuntime(
-            1, control_seconds=self.module.WORKER_CONTROL_SECONDS,
-            control_work_clock=lambda: next(clock_values))
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
         runtime.authority_id = 1
         runtime.adapter = object()
         runtime._decision_cache[11] = ('last-command',)
         steps = []
         runtime._update_once = lambda step, *unused: steps.append(step) or []
 
-        runtime.update(0.3, 1.0)
+        for frame in range(5):
+            runtime.update(0.2, 1.0 + frame * 0.2)
 
-        self.assertEqual([self.module.WORKER_CONTROL_SECONDS], steps)
-        self.assertAlmostEqual(0.2, runtime._accumulator)
+        self.assertEqual([0.2] * 5, steps)
+        self.assertAlmostEqual(0.0, runtime._accumulator)
         self.assertEqual(('last-command',), runtime._decision_cache[11])
 
-    def test_worker_fast_first_step_still_consumes_one_catch_up_step(self):
-        clock_values = iter((10.0, 10.01))
+    def test_worker_subthreshold_callbacks_keep_bounded_control_cadence(self):
         runtime = self.module.BotRuntime(
-            1, control_seconds=self.module.WORKER_CONTROL_SECONDS,
-            control_work_clock=lambda: next(clock_values))
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
         runtime.authority_id = 1
         runtime.adapter = object()
         steps = []
         runtime._update_once = lambda step, *unused: steps.append(step) or []
 
-        runtime.update(0.3, 1.0)
+        runtime.update(0.06, 1.00)
+        runtime.update(0.06, 1.06)
+        runtime.update(0.08, 1.14)
+        runtime.update(0.02, 1.16)
 
-        self.assertEqual(
-            [self.module.WORKER_CONTROL_SECONDS] * 2, steps)
-        self.assertAlmostEqual(0.1, runtime._accumulator)
+        self.assertEqual([0.12, 0.10], steps)
+        self.assertAlmostEqual(0.0, runtime._accumulator)
 
-    def test_worker_without_work_clock_keeps_legacy_two_step_cap(self):
+    def test_worker_gap_debt_is_stable_at_five_fps_and_then_recovers(self):
         runtime = self.module.BotRuntime(
             1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
         runtime.authority_id = 1
@@ -4620,40 +4623,76 @@ class BotRuntimeTests(unittest.TestCase):
 
         runtime.update(0.3, 1.0)
 
-        self.assertEqual(
-            [self.module.WORKER_CONTROL_SECONDS] * 2, steps)
+        self.assertEqual([self.module.MAX_CONTROL_ELAPSED_SECONDS], steps)
         self.assertAlmostEqual(0.1, runtime._accumulator)
 
-    def test_worker_broken_work_clock_fails_to_one_step_without_losing_debt(self):
-        calls = [0]
+        # At the exact 200 ms physics bound, one callback cannot consume old
+        # debt without either exceeding that bound or running the full roster
+        # twice. The lag stays constant instead of growing.
+        for frame in range(3):
+            before = len(steps)
+            runtime.update(0.2, 1.2 + frame * 0.2)
+            self.assertEqual(before + 1, len(steps))
+            self.assertAlmostEqual(0.1, runtime._accumulator)
 
-        def broken_clock():
-            calls[0] += 1
-            if calls[0] == 1:
-                return 10.0
-            raise RuntimeError('clock failed')
+        # The measured bad session still delivered 8.85 callbacks per second.
+        # That leaves enough room under the 200 ms step bound to retire the
+        # carried interval without a second roster pass in either callback.
+        observed_slow_frame = 1.0 / 8.85
+        runtime.update(observed_slow_frame, 1.8)
+        self.assertAlmostEqual(
+            0.1 + observed_slow_frame -
+            self.module.MAX_CONTROL_ELAPSED_SECONDS,
+            runtime._accumulator)
+        runtime.update(observed_slow_frame, 1.8 + observed_slow_frame)
+        self.assertAlmostEqual(0.0, runtime._accumulator)
+        self.assertTrue(all(
+            step <= self.module.MAX_CONTROL_ELAPSED_SECONDS + 1.0e-9
+            for step in steps))
 
+    def test_worker_low_fps_reuses_valid_drive_and_moves_continuously(self):
+        command = self._stationary_command()
+        command.update({
+            'throttle': 1.0, 'combat_mode': 'route',
+            'move_position': (0.0, 0.0, 100.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        })
+        adapter = _FixedAdapter(command)
         runtime = self.module.BotRuntime(
-            1, control_seconds=self.module.WORKER_CONTROL_SECONDS,
-            control_work_clock=broken_clock)
-        runtime.authority_id = 1
-        runtime.adapter = object()
-        steps = []
-        runtime._update_once = lambda step, *unused: steps.append(step) or []
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: adapter,
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.battle_start(self.start)
+        runtime.navigator = None
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=4.0,
+                     grounded_once=True)
+        original_decision_seconds = self.module.DECISION_SECONDS
+        original_pose_safe = self.module.prebaked_navigation.pose_is_safe
+        self.module.DECISION_SECONDS = 2.0
+        self.module.prebaked_navigation.pose_is_safe = (
+            lambda *unused, **unused_kwargs: True)
+        positions = []
+        try:
+            for frame in range(5):
+                runtime.update(0.2, 1.0 + frame * 0.2)
+                positions.append(state['z'])
+                self.assertEqual(1, state['movement_dir'])
+        finally:
+            self.module.DECISION_SECONDS = original_decision_seconds
+            self.module.prebaked_navigation.pose_is_safe = original_pose_safe
 
-        runtime.update(0.3, 1.0)
-
-        self.assertEqual([self.module.WORKER_CONTROL_SECONDS], steps)
-        self.assertAlmostEqual(0.2, runtime._accumulator)
-        self.assertTrue(runtime._control_work_clock_failed)
-        self.assertEqual(2, calls[0])
-
-        runtime.update(0.0, 1.0)
-
-        self.assertEqual(
-            [self.module.WORKER_CONTROL_SECONDS] * 2, steps)
-        self.assertAlmostEqual(0.1, runtime._accumulator)
-        self.assertEqual(2, calls[0])
+        self.assertEqual(sorted(positions), positions)
+        self.assertTrue(all(second > first for first, second in
+                            zip(positions, positions[1:])))
+        self.assertEqual(1000000, runtime._sample_time_us)
+        self.assertAlmostEqual(0.0, runtime._accumulator)
+        self.assertEqual(1, len(adapter.calls))
 
     def test_authority_publication_and_server_ack_remain_live_for_two_minutes(self):
         command = {
@@ -5581,7 +5620,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.update(.20, 2.2)
         self.assertEqual(58, len(calls))
 
-    def test_full_roster_visual_slope_targets_refresh_in_one_tick(self):
+    def test_full_roster_visual_slope_targets_rotate_under_frame_budget(self):
         ground_calls = []
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: _combat_descriptor(),
@@ -5610,10 +5649,15 @@ class BotRuntimeTests(unittest.TestCase):
             self.module.MAX_SLOPE_POSE_SAMPLES_PER_FRAME,
             sum('pose_sample' in state for state in runtime.states.values()))
 
-        for frame in range(1, 5):
+        for frame in range(1, 6):
             before = len(ground_calls)
             runtime.update(0.04, 1.0 + frame * 0.04)
-            self.assertEqual(29, len(ground_calls) - before)
+            remaining = max(
+                0, 29 - frame * self.module.MAX_SLOPE_POSE_SAMPLES_PER_FRAME)
+            sampled = min(
+                self.module.MAX_SLOPE_POSE_SAMPLES_PER_FRAME, remaining)
+            self.assertEqual(29 + 4 * sampled,
+                             len(ground_calls) - before)
         self.assertTrue(all(
             'pose_sample' in state for state in runtime.states.values()))
 
@@ -7265,7 +7309,7 @@ class BotRuntimeTests(unittest.TestCase):
                 self.assertTrue(all(
                     step <= 0.100000001 for step in substeps))
 
-    def test_worker_gap_retains_every_burst_edge_while_debt_drains(self):
+    def test_worker_burst_edges_stay_exact_and_debt_recovers_at_slow_fps(self):
         count = 11
         descriptor = _combat_descriptor(
             reload_time=4.0, clip=(count + 1, 2.0),
@@ -7275,20 +7319,11 @@ class BotRuntimeTests(unittest.TestCase):
             'afterShot': 4.0, 'afterShotInBurst': 1.0,
             'turretRotation': 0.0,
         }
-        work_time = [0.0]
-
-        def slow_work_clock():
-            value = work_time[0]
-            work_time[0] += (
-                self.module.CONTROL_CATCH_UP_WALL_BUDGET_SECONDS + 0.01)
-            return value
-
         runtime = self.module.BotRuntime(
             1, friendly_lane_probe=lambda *unused: True,
             direct_launch_origin_probe=lambda source, *unused: (
                 source['x'], source['y'] + 1.0, source['z']),
-            control_seconds=self.module.WORKER_CONTROL_SECONDS,
-            control_work_clock=slow_work_clock)
+            control_seconds=self.module.WORKER_CONTROL_SECONDS)
         runtime.round_id = 5
         runtime.authority_id = 1
         runtime.adapter = object()
@@ -7336,8 +7371,16 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(2, len(runtime._pending_launches))
         self.assertAlmostEqual(0.9, runtime._accumulator)
 
-        for unused in range(9):
-            runtime.update(0.0, 1.0)
+        observed_slow_frame = 1.0 / 8.85
+        callbacks = 0
+        while ((runtime._burst_states[11].active or
+                runtime._accumulator > 1.0e-9) and callbacks < 64):
+            before = len(substeps)
+            callbacks += 1
+            runtime.update(
+                observed_slow_frame,
+                1.0 + callbacks * observed_slow_frame)
+            self.assertLessEqual(len(substeps) - before, 1)
 
         self.assertEqual(count, len(runtime._pending_launches))
         self.assertEqual(
@@ -7348,7 +7391,8 @@ class BotRuntimeTests(unittest.TestCase):
             [round(float(index), 6) for index in range(count)],
             [round(launch['shot_origin'][2], 6)
              for launch in runtime._pending_launches])
-        self.assertEqual([0.1] * 10, substeps)
+        self.assertEqual([0.1] * 10, substeps[:10])
+        self.assertLess(callbacks, 64)
         self.assertAlmostEqual(0.0, runtime._accumulator)
 
     def test_siege_transition_edge_locks_pose_in_its_starting_tick(self):
@@ -11658,6 +11702,337 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(('route', 2, 'forest', 1), calls[2][1])
         self.assertIsNone(calls[2][2])
 
+    def test_shared_route_lanes_are_unique_stable_and_keep_their_side(self):
+        class Grid(object):
+            cell_size = 4.0
+
+            @staticmethod
+            def _ground(unused_x, unused_z, unused_hint):
+                return 0.0
+
+            @staticmethod
+            def segment_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def point_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def dry_segment_clear(*unused):
+                return True
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(
+            grid=Grid(), bot_states={})
+        runtime.baked_graph = {'bounds': (-100.0, -100.0, 100.0, 100.0)}
+        runtime.states = dict((bot_id, {
+            'id': bot_id, 'team': 1, 'slot': slot,
+            'half_length': 3.5, 'half_width': 1.7,
+        }) for slot, bot_id in enumerate(range(11, 16)))
+        position = (0.0, 0.0, 0.0)
+        selected = (0.0, 0.0, 40.0)
+        goal = (0.0, 0.0, 80.0)
+        strategic = {
+            'combat_mode': 'route', 'route_id': 'forest', 'route_index': 1,
+            'route_anchor': (0.0, 0.0, 0.0),
+        }
+
+        first = [runtime._route_lane_target(
+            bot_id, position, goal, selected, strategic, 1.0)
+                 for bot_id in range(11, 16)]
+        repeated = [runtime._route_lane_target(
+            bot_id, position, goal, selected, strategic, 1.1)
+                    for bot_id in range(11, 16)]
+        desired = [runtime.states[bot_id]['_route_lane_desired']
+                   for bot_id in range(11, 16)]
+
+        self.assertEqual(list(self.module.ROUTE_LANE_OFFSETS), desired)
+        self.assertEqual(5, len(set(point[0] for point in first)))
+        self.assertEqual(first, repeated)
+        self.assertEqual([0.0, -5.0, 5.0, -10.0, 10.0],
+                         [point[0] for point in first])
+
+        advanced = dict(strategic, route_index=2)
+        second_segment = [runtime._route_lane_target(
+            bot_id, position, goal, selected, advanced, 2.0)
+                          for bot_id in range(11, 16)]
+        self.assertEqual(first, second_segment)
+        self.assertEqual(desired, [
+            runtime.states[bot_id]['_route_lane_desired']
+            for bot_id in range(11, 16)])
+
+        # Moving one member to another route preserves every remaining lease;
+        # a newly joining member receives the now-unoccupied centre lane.
+        runtime._route_lane_target(
+            11, position, goal, selected,
+            dict(strategic, route_id='hill'), 3.0)
+        retained = [runtime.states[bot_id]['_route_lane_desired']
+                    for bot_id in range(12, 16)]
+        runtime.states[16] = {
+            'id': 16, 'team': 1, 'slot': 5,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        runtime._route_lane_target(
+            16, position, goal, selected, strategic, 3.1)
+        self.assertEqual([5.0, -5.0, 10.0, -10.0], retained)
+        self.assertEqual(0.0, runtime.states[16]['_route_lane_desired'])
+        self.assertEqual(retained, [
+            runtime.states[bot_id]['_route_lane_desired']
+            for bot_id in range(12, 16)])
+
+    def test_route_lane_collision_and_hull_bounds_narrow_without_oscillation(self):
+        class Grid(object):
+            cell_size = 4.0
+
+            def __init__(self):
+                self.block_before_x = -8.0
+
+            @staticmethod
+            def _ground(unused_x, unused_z, unused_hint):
+                return 0.0
+
+            @staticmethod
+            def segment_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def point_has_baked_hazard(*unused):
+                return False
+
+            def dry_segment_clear(self, unused_start, end, unused_now):
+                return end[0] >= self.block_before_x
+
+        grid = Grid()
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(grid=grid, bot_states={})
+        runtime.baked_graph = {
+            'bounds': (-100.0, -100.0, 100.0, 100.0)}
+        group = (1, 'west')
+        runtime.states = {14: {
+            'id': 14, 'team': 1, 'slot': 3,
+            'half_length': 3.5, 'half_width': 1.7,
+            '_route_lane_group': group,
+            '_route_lane_desired': 10.0,
+        }}
+        strategic = {
+            'combat_mode': 'route', 'route_id': 'west', 'route_index': 1,
+            'route_anchor': (0.0, 0.0, 0.0),
+        }
+        position = (0.0, 0.0, 0.0)
+        selected = (0.0, 0.0, 40.0)
+        goal = (0.0, 0.0, 80.0)
+
+        narrowed = runtime._route_lane_target(
+            14, position, goal, selected, strategic, 1.0)
+        self.assertEqual(-5.0, narrowed[0])
+        self.assertEqual(5.0, runtime.states[14]['_route_lane_offset'])
+
+        # Removing the obstacle cannot make this route leg jump back outward.
+        grid.block_before_x = -100.0
+        repeated = runtime._route_lane_target(
+            14, position, goal, selected, strategic, 1.1)
+        self.assertEqual(narrowed, repeated)
+
+        # A new macro leg retries the desired lane, but the complete hull still
+        # cannot cross the authored -8 m boundary and settles at +5 again.
+        runtime.baked_graph = {
+            'bounds': (-8.0, -100.0, 100.0, 100.0)}
+        advanced = dict(strategic, route_index=2)
+        bounded = runtime._route_lane_target(
+            14, position, goal, selected, advanced, 2.0)
+        self.assertEqual(-5.0, bounded[0])
+        self.assertEqual(10.0, runtime.states[14]['_route_lane_desired'])
+
+    def test_route_lane_rejects_backward_arrival_candidate(self):
+        class Grid(object):
+            @staticmethod
+            def _ground(unused_x, unused_z, unused_hint):
+                return 0.0
+
+            @staticmethod
+            def segment_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def point_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def dry_segment_clear(*unused):
+                return True
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(
+            grid=Grid(), bot_states={})
+        runtime.baked_graph = {
+            'bounds': (-500.0, -500.0, 500.0, 500.0)}
+        group = (1, 'central_ridges')
+        runtime.states = {8: {
+            'id': 8, 'team': 1, 'slot': 7,
+            'half_length': 3.5, 'half_width': 1.7,
+            '_route_lane_group': group,
+            '_route_lane_desired': 5.0,
+        }}
+        position = (338.0, 0.0, -218.0)
+        selected = (342.0, 0.0, -218.0)
+
+        target = runtime._route_lane_target(
+            8, position, (358.0, 0.0, -6.0), selected, {
+                'route_id': 'central_ridges', 'route_index': 2,
+                'route_anchor': position,
+            }, 1.0)
+
+        self.assertEqual(selected, target)
+        self.assertEqual(0.0, runtime.states[8]['_route_lane_offset'])
+
+    def test_route_lane_narrows_around_bot_local_contact_penalty(self):
+        class Grid(object):
+            @staticmethod
+            def _ground(unused_x, unused_z, unused_hint):
+                return 0.0
+
+            @staticmethod
+            def segment_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def point_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def dry_segment_clear(*unused):
+                return True
+
+        checked = []
+
+        def bot_edges_penalized(bot_id, unused_start, end, unused_now):
+            checked.append((bot_id, end))
+            return end[0] < -8.0
+
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(
+            grid=Grid(), bot_states={},
+            bot_segment_penalized=bot_edges_penalized)
+        runtime.baked_graph = {
+            'bounds': (-100.0, -100.0, 100.0, 100.0)}
+        group = (1, 'west')
+        runtime.states = {14: {
+            'id': 14, 'team': 1, 'slot': 3,
+            'half_length': 3.5, 'half_width': 1.7,
+            '_route_lane_group': group,
+            '_route_lane_desired': 10.0,
+        }}
+
+        target = runtime._route_lane_target(
+            14, (0.0, 0.0, 0.0), (0.0, 0.0, 80.0),
+            (0.0, 0.0, 40.0), {
+                'route_id': 'west', 'route_index': 1,
+                'route_anchor': (0.0, 0.0, 0.0),
+            }, 1.0)
+
+        self.assertEqual(-5.0, target[0])
+        self.assertEqual(5.0, runtime.states[14]['_route_lane_offset'])
+        self.assertEqual([14, 14], [value[0] for value in checked])
+
+    def test_malinovka_route_lanes_reject_shallow_and_fatal_hazards(self):
+        graph = json.loads(
+            (PORT_ROOT / 'navgraphs' / '02_malinovka.json').read_text())
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = self.module.TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        runtime.baked_graph = graph
+        state = {
+            'id': 24, 'team': 2, 'slot': 4,
+            'half_length': 3.5, 'half_width': 1.7,
+        }
+        runtime.states = {24: state}
+
+        central_group = (2, 'central_field')
+        state.update(_route_lane_group=central_group,
+                     _route_lane_desired=-10.0)
+        central_minus_ten = (
+            -226.92893218813452, 0.0, 202.92893218813452)
+        central_minus_five = (
+            -230.46446609406726, 0.0, 206.46446609406726)
+        self.assertTrue(runtime.navigator.grid.point_has_baked_hazard(
+            central_minus_ten, self.module.BAKED_SHALLOW_WATER))
+        self.assertTrue(runtime.navigator.grid.point_has_baked_hazard(
+            central_minus_five, self.module.BAKED_SHALLOW_WATER))
+        central = runtime._route_lane_target(
+            24, (-270.0, 0.0, 174.0), (-234.0, 0.0, 210.0),
+            (-234.0, 0.0, 210.0), {
+                'route_id': 'central_field', 'route_index': 3,
+                'route_anchor': (-270.0, 0.0, 174.0),
+            }, 1.0)
+        self.assertEqual((-234.0, 0.0, 210.0), central)
+        self.assertEqual(0.0, state['_route_lane_offset'])
+
+        west_group = (2, 'west_lake_road')
+        state.update(_route_lane_group=west_group,
+                     _route_lane_desired=-10.0)
+        state.pop('_route_lane_segment', None)
+        west_minus_ten = (
+            -340.2469504755442, 0.0, -293.8086880944303)
+        west_minus_five = (
+            -337.12347523777214, 0.0, -289.90434404721515)
+        self.assertTrue(runtime.navigator.grid.point_has_baked_hazard(
+            west_minus_ten, self.module.BAKED_FATAL_HAZARDS))
+        self.assertFalse(runtime.navigator.grid.point_has_baked_hazard(
+            west_minus_five, self.module.BAKED_FATAL_HAZARDS |
+            self.module.BAKED_SHALLOW_WATER))
+        west = runtime._route_lane_target(
+            24, (-354.0, 0.0, -270.0), (-334.0, 0.0, -286.0),
+            (-334.0, 0.0, -286.0), {
+                'route_id': 'west_lake_road', 'route_index': 2,
+                'route_anchor': (-354.0, 0.0, -270.0),
+            }, 2.0)
+        self.assertEqual(-5.0, state['_route_lane_offset'])
+        self.assertFalse(runtime.navigator.grid.point_has_baked_hazard(
+            west, self.module.BAKED_FATAL_HAZARDS |
+            self.module.BAKED_SHALLOW_WATER))
+        self.assertTrue(runtime.navigator.grid.dry_segment_clear(
+            (-354.0, 0.0, -270.0), west, 2.0))
+
+    def test_route_lane_keeps_a_planner_selected_shallow_ford_centered(self):
+        class Grid(object):
+            @staticmethod
+            def _ground(unused_x, unused_z, unused_hint):
+                return 0.0
+
+            @staticmethod
+            def segment_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def point_has_baked_hazard(*unused):
+                return False
+
+            @staticmethod
+            def dry_segment_clear(*unused):
+                return True
+
+        selected = (0.0, 0.0, 40.0)
+        runtime = self.module.BotRuntime(1)
+        runtime.navigator = types.SimpleNamespace(
+            grid=Grid(), bot_states={11: {
+                'controlled_shallow_target': selected,
+            }})
+        runtime.baked_graph = {'bounds': (-100.0, -100.0, 100.0, 100.0)}
+        runtime.states = {11: {
+            'id': 11, 'team': 1, 'slot': 3,
+            'half_length': 3.5, 'half_width': 1.7,
+        }}
+
+        target = runtime._route_lane_target(
+            11, (0.0, 0.0, 0.0), (0.0, 0.0, 80.0), selected, {
+                'route_id': 'only-ford', 'route_index': 1,
+                'route_anchor': (0.0, 0.0, 0.0),
+            }, 1.0)
+
+        self.assertEqual(selected, target)
+        self.assertEqual(0.0, runtime.states[11]['_route_lane_offset'])
+
     def test_short_navigation_goal_uses_planner_when_direct_path_is_shallow(self):
         calls = []
 
@@ -11671,11 +12046,22 @@ class BotRuntimeTests(unittest.TestCase):
         class Navigator(object):
             def __init__(self):
                 self.grid = Grid()
+                self.penalized = False
+                self.penalty_calls = []
 
             def next_target(self, bot_id, position, goal, path_key, now,
                             anchor, avoid, lookahead_distance=None):
                 calls.append(('planned', bot_id, path_key))
                 return (4.0, 0.0, 8.0)
+
+            @staticmethod
+            def target_is_terminal(unused_bot_id):
+                return False
+
+            def bot_segment_penalized(
+                    self, bot_id, start, end, now):
+                self.penalty_calls.append((bot_id, start, end, now))
+                return self.penalized
 
         runtime = self.module.BotRuntime(1)
         runtime.navigator = Navigator()
@@ -11691,6 +12077,13 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual((4.0, 0.0, 8.0), selected)
         self.assertEqual('planned', calls[-1][0])
 
+        runtime.navigator.penalty_calls[:] = []
+        runtime._navigation_target(
+            11, (0.0, 0.0, 0.0), (100.0, 0.0, 0.0), strategic,
+            {'now': 7.0})
+
+        self.assertEqual([], runtime.navigator.penalty_calls)
+
         runtime.navigator.grid.allow_direct = True
         calls[:] = []
         selected = runtime._navigation_target(
@@ -11699,6 +12092,25 @@ class BotRuntimeTests(unittest.TestCase):
 
         self.assertEqual((8.0, 0.0, 0.0), selected)
         self.assertEqual(['direct'], [call[0] for call in calls])
+
+        hold_state = {'now': 5.0}
+        selected = runtime._navigation_target(
+            11, (0.0, 0.0, 0.0), (8.0, 0.0, 0.0), {
+                'combat_mode': 'hold', 'route_id': 'shore',
+                'route_index': 2,
+            }, hold_state)
+
+        self.assertEqual((8.0, 0.0, 0.0), selected)
+        self.assertTrue(hold_state['navigation_stop_at_target'])
+
+        runtime.navigator.penalized = True
+        calls[:] = []
+        selected = runtime._navigation_target(
+            11, (0.0, 0.0, 0.0), (8.0, 0.0, 0.0), strategic,
+            {'now': 6.0})
+
+        self.assertEqual((4.0, 0.0, 8.0), selected)
+        self.assertEqual('planned', calls[-1][0])
 
     def test_base_defense_navigation_key_ignores_combat_target_changes(self):
         calls = []

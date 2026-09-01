@@ -2813,9 +2813,7 @@ class BattleRuntime(object):
                 probe_timing_seconds=(
                     WORKER_NATIVE_PROBE_SECONDS if self._worker_mode else 0.0),
                 control_seconds=(
-                    WORKER_CONTROL_SECONDS if self._worker_mode else None),
-                control_work_clock=(
-                    _PROFILE_CLOCK if self._worker_mode else None))
+                    WORKER_CONTROL_SECONDS if self._worker_mode else None))
             self._bots.debug_logging = bool(
                 self._config.get('debug_logging', False))
             # Sampled here, not before BotRuntime exists: the bot, navigator

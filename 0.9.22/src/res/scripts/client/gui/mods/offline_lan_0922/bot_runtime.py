@@ -39,17 +39,12 @@ OBSERVATION_SECONDS = 0.40
 # while burst edges below retain their exact due timestamps.
 PUBLICATION_SECONDS = 1.0 / 30.0
 WORKER_CONTROL_SECONDS = 0.10
-# A stalled render callback may consume one regular control step plus one
-# catch-up step.  Remaining elapsed stays as debt for later callbacks instead
-# of multiplying full-roster native work in the frame that already stalled.
-MAX_CONTROL_STEPS_PER_FRAME = 2
-# A second full-roster step is useful only while the first one leaves enough
-# room inside the worker's 10 Hz period.  Once the first step alone consumes
-# half that period, repeating it in the same render callback creates the
-# measured slow-frame feedback loop.  This wall budget only defers catch-up;
-# the simulation elapsed that drives one-shot transitions remains in the
-# accumulator.
-CONTROL_CATCH_UP_WALL_BUDGET_SECONDS = WORKER_CONTROL_SECONDS * 0.5
+# Run at most one full-roster step in a render callback. A late callback
+# consumes its actual elapsed interval in that one step instead of queuing
+# another complete planner/probe pass or leaking permanent simulation debt.
+# The mature variable-step seam already bounds copied physics at 200 ms; keep
+# the worker inside that reviewed limit and carry only larger one-off stalls.
+MAX_CONTROL_ELAPSED_SECONDS = 0.20
 LOCAL_ACTION_SECONDS = 0.10
 TACTICAL_REFRESH_SECONDS = 1.0
 # Eight protocol-maximum exact paths can share only two of the four native
@@ -106,10 +101,11 @@ DETAIL_FAR_METRES = 350.0
 SLOPE_SAMPLE_METRES = (0.35, 1.50, 4.00)
 SLOPE_SAMPLE_RADIANS = (0.05, 0.15, 0.40)
 # Pitch/roll is presentation-only; centre support and copied longitudinal
-# physics remain live for every Bot every authority tick.  Countdown prewarm
-# removes the 29 * 4 start spike, while this full-roster limit guarantees that
-# every due visual hull target is refreshed in the same authority tick.
-MAX_SLOPE_POSE_SAMPLES_PER_FRAME = 29
+# physics remain live for every Bot every authority tick. Rotate the optional
+# four-point visual samples instead of issuing 116 extra native ground queries
+# in one full-roster step. At 10 Hz all 29 hull targets refresh within 0.6 s
+# and MatrixAnimation interpolates between accepted targets.
+MAX_SLOPE_POSE_SAMPLES_PER_FRAME = 5
 # Planner cadence multiplier per tier.
 DECISION_TIER_FACTOR = (1.0, 2.0, 4.0)
 # The #1513 production probe owns a 15 m low-speed / 20 m high-speed,
@@ -156,6 +152,25 @@ BOT_OVERTURN_WARNING_COSINE = vehicle_physics.OVERTURN_WARNING_COSINE
 BOT_OVERTURN_DANGER_COSINE = vehicle_physics.OVERTURN_DANGER_COSINE
 BOT_OVERTURN_DEATH_SECONDS = 30.0
 BOT_OVERTURN_DEATH_REASON = 7
+
+# Route groups lease these lateral lanes without moving an existing member.
+# A safety rejection may narrow a lane toward zero for one macro route leg,
+# but never crosses sides or upgrades again inside that leg.
+ROUTE_LANE_OFFSETS = (0.0, 5.0, -5.0, 10.0, -10.0)
+
+
+def _route_lane_fallbacks(offset):
+    """Narrow one preferred lane without ever crossing the centre line."""
+    offset = float(offset)
+    if offset >= 7.5:
+        return (10.0, 5.0, 0.0)
+    if offset <= -7.5:
+        return (-10.0, -5.0, 0.0)
+    if offset > 0.0:
+        return (5.0, 0.0)
+    if offset < 0.0:
+        return (-5.0, 0.0)
+    return (0.0,)
 
 
 def _cache_deadline(now, entity_id, interval, salt=0, stagger=False):
@@ -1734,8 +1749,7 @@ class BotRuntime(object):
                  motion_resolver=None, motion_report=None,
                  world_receipt_probe=None, probe_timing_seconds=0.0,
                  water_depth_probe=None, ram_contact_probe=None,
-                 bot_equipment_resolver=None, control_seconds=None,
-                 control_work_clock=None):
+                 bot_equipment_resolver=None, control_seconds=None):
         self.local_player_id = local_player_id
         self.descriptor_resolver = descriptor_resolver or (lambda unused: {})
         self.player_descriptor_resolver = player_descriptor_resolver
@@ -1810,9 +1824,6 @@ class BotRuntime(object):
         self._fixed_control = control_seconds is not None
         self._control_seconds = max(
             0.001, _number(control_seconds, PUBLICATION_SECONDS))
-        self._control_work_clock = (
-            control_work_clock if callable(control_work_clock) else None)
-        self._control_work_clock_failed = False
         self._water_depth_probe = (
             water_depth_probe if callable(water_depth_probe) else
             (lambda unused_position: -1.0))
@@ -5135,19 +5146,139 @@ class BotRuntime(object):
         return all(after[index] <= before[index] + 1.0e-6
                    for index in range(4))
 
+    def _route_lane_binding(self, bot_state, group_key):
+        """Lease the least-used stable lane without moving existing peers."""
+        if bot_state.get('_route_lane_group') == group_key:
+            return _number(bot_state.get('_route_lane_desired'))
+        counts = dict((offset, 0) for offset in ROUTE_LANE_OFFSETS)
+        for peer in self.states.values():
+            if (peer is bot_state or not peer.get('alive', True) or
+                    peer.get('_route_lane_group') != group_key):
+                continue
+            offset = _number(peer.get('_route_lane_desired'))
+            if offset in counts:
+                counts[offset] += 1
+        desired = min(
+            ROUTE_LANE_OFFSETS,
+            key=lambda offset: (counts[offset],
+                                ROUTE_LANE_OFFSETS.index(offset)))
+        bot_state['_route_lane_group'] = group_key
+        bot_state['_route_lane_desired'] = desired
+        bot_state.pop('_route_lane_segment', None)
+        bot_state.pop('_route_lane_offset', None)
+        return desired
+
+    def _route_lane_target(
+            self, bot_id, position, goal, selected, strategic, now):
+        """Offset one proved shared-route target through a stable safe lane."""
+        bot_state = self.states.get(int(bot_id))
+        grid = getattr(self.navigator, 'grid', None)
+        selected = tuple(selected)
+        dx = _number(selected[0]) - _number(position[0])
+        dz = _number(selected[2]) - _number(position[2])
+        if (bot_state is None or grid is None or
+                math.hypot(dx, dz) < 0.25):
+            return selected
+
+        group_key = (
+            int(bot_state.get('team', 0)),
+            str(strategic.get('route_id', 'direct')),
+        )
+        desired = self._route_lane_binding(bot_state, group_key)
+        segment_key = group_key + (
+            int(_number(strategic.get('route_index'), 0)),)
+        if bot_state.get('_route_lane_segment') != segment_key:
+            bot_state['_route_lane_segment'] = segment_key
+            bot_state['_route_lane_offset'] = desired
+
+        navigator_states = getattr(self.navigator, 'bot_states', {})
+        navigator_state = (
+            navigator_states.get(int(bot_id), {})
+            if isinstance(navigator_states, dict) else {})
+        if navigator_state.get('controlled_shallow_target') is not None:
+            bot_state['_route_lane_offset'] = 0.0
+            return selected
+
+        route_anchor = strategic.get('route_anchor')
+        try:
+            anchor_x = _number(route_anchor[0])
+            anchor_z = _number(route_anchor[2])
+        except (TypeError, IndexError, KeyError):
+            anchor_x = _number(_value(route_anchor, 'x', position[0]))
+            anchor_z = _number(_value(route_anchor, 'z', position[2]))
+        route_dx = _number(goal[0]) - anchor_x
+        route_dz = _number(goal[2]) - anchor_z
+        route_length = math.hypot(route_dx, route_dz)
+        if route_length < 0.25:
+            route_dx, route_dz = dx, dz
+            route_length = math.hypot(route_dx, route_dz)
+        if route_length < 0.25:
+            return selected
+        # Positive offsets are left of the authored route direction.
+        lateral_x = -route_dz / route_length
+        lateral_z = route_dx / route_length
+
+        ground = getattr(grid, '_ground', None)
+        segment_hazard = getattr(grid, 'segment_has_baked_hazard', None)
+        point_hazard = getattr(grid, 'point_has_baked_hazard', None)
+        dry_segment = getattr(grid, 'dry_segment_clear', None)
+        bot_edges_penalized = getattr(
+            self.navigator, 'bot_segment_penalized', None)
+        if not all(callable(value) for value in (
+                ground, segment_hazard, point_hazard, dry_segment)):
+            return selected
+        hazard_mask = BAKED_FATAL_HAZARDS | BAKED_SHALLOW_WATER
+        current_offset = _number(bot_state.get('_route_lane_offset'))
+        for offset in _route_lane_fallbacks(current_offset):
+            if abs(offset) < 1.0e-9:
+                bot_state['_route_lane_offset'] = 0.0
+                return selected
+            candidate_x = _number(selected[0]) + lateral_x * offset
+            candidate_z = _number(selected[2]) + lateral_z * offset
+            candidate_dx = candidate_x - _number(position[0])
+            candidate_dz = candidate_z - _number(position[2])
+            # A short local A* target can sit closer than the requested lane
+            # offset. Never turn that proved forward step into a point behind
+            # the hull or inside LocalDriver's arrival radius: either result
+            # would convert a distant macro route into a persistent nav_wait.
+            if (math.hypot(candidate_dx, candidate_dz) <=
+                    ai_driver.WAYPOINT_ARRIVAL_RADIUS + 1.0e-9 or
+                    dx * candidate_dx + dz * candidate_dz <= 1.0e-9):
+                continue
+            candidate_y = ground(
+                candidate_x, candidate_z, _number(selected[1]))
+            if candidate_y is None:
+                continue
+            candidate = (candidate_x, candidate_y, candidate_z)
+            try:
+                if ((callable(bot_edges_penalized) and
+                     bot_edges_penalized(
+                         bot_id, position, candidate, now)) or
+                        point_hazard(candidate, hazard_mask) or
+                        segment_hazard(position, candidate, hazard_mask) or
+                        not dry_segment(position, candidate, now)):
+                    continue
+            except Exception:
+                continue
+            travel_yaw = math.atan2(
+                candidate[0] - position[0],
+                candidate[2] - position[2])
+            overflow = self._baked_boundary_overflow(
+                bot_state, candidate, travel_yaw)
+            if (overflow is None or
+                    any(value > 1.0e-6 for value in overflow)):
+                continue
+            bot_state['_route_lane_offset'] = offset
+            return candidate
+        bot_state['_route_lane_offset'] = 0.0
+        return selected
+
     def _navigation_target(self, bot_id, position, goal, strategic, state):
         mode = strategic.get('combat_mode', 'route')
         stop_at_goal = mode not in ('route', 'advance')
         if self.navigator is None:
             state['navigation_stop_at_target'] = stop_at_goal
             return goal
-        if _distance(position, goal) <= 15.0:
-            grid = getattr(self.navigator, 'grid', None)
-            direct = getattr(grid, 'dry_segment_clear', None)
-            if callable(direct) and direct(
-                    position, goal, state.get('now', 0.0)):
-                state['navigation_stop_at_target'] = stop_at_goal
-                return goal
         route_index = int(_number(strategic.get('route_index'), 0))
         if mode == 'base_defense':
             path_key = (
@@ -5187,12 +5318,36 @@ class BotRuntime(object):
             cell_size * 2.0,
             abs(_number(state.get('speed'))) *
             BAKED_MOTION_LOOKAHEAD_SECONDS)
-        target = self.navigator.next_target(
-            bot_id, position, goal, path_key, state.get('now', 0.0),
-            anchor, avoid, lookahead_distance)
+        direct = getattr(grid, 'dry_segment_clear', None)
+        now = state.get('now', 0.0)
+        direct_close = _distance(position, goal) <= 15.0
+        bot_edges_penalized = getattr(
+            self.navigator, 'bot_segment_penalized', None)
+        direct_penalized = False
+        if direct_close and callable(bot_edges_penalized):
+            try:
+                direct_penalized = bool(bot_edges_penalized(
+                    bot_id, position, goal, now))
+            except Exception:
+                direct_penalized = True
+        direct_target = bool(
+            direct_close and callable(direct) and
+            not direct_penalized and direct(position, goal, now))
+        if direct_target:
+            target = tuple(goal)
+        else:
+            target = self.navigator.next_target(
+                bot_id, position, goal, path_key, now,
+                anchor, avoid, lookahead_distance)
         terminal = getattr(self.navigator, 'target_is_terminal', None)
         state['navigation_stop_at_target'] = bool(
-            stop_at_goal and callable(terminal) and terminal(bot_id))
+            stop_at_goal and
+            (direct_target or
+             (callable(terminal) and terminal(bot_id))))
+        if mode in ('route', 'advance') and anchor is None:
+            target = self._route_lane_target(
+                bot_id, position, goal, target, strategic,
+                now)
         return target
 
     @staticmethod
@@ -7637,15 +7792,14 @@ class BotRuntime(object):
         return result
 
     def update(self, dt, now, players=None, neighbours=None):
-        """Advance fixed-rate Bot control with bounded render catch-up.
+        """Advance Bot control without multiplying full-roster slow work.
 
-        Render callbacks only add elapsed debt. At most two configured fixed
-        control steps run in one callback, and a costly first step defers the
-        second, so a stall cannot immediately multiply all roster probes and
-        projections. Debt is retained, never discarded; healthy render
-        callbacks drain it later. Burst clocks still advance across the
-        complete processed step and enqueue every crossed physical round with
-        its exact due timestamp.
+        Fixed-control workers run at most once per render callback. That step
+        consumes the accumulated elapsed interval up to the reviewed 200 ms
+        physics bound, so a sustained 5-10 FPS worker keeps moving in real
+        time instead of adding 100 ms of permanent debt every frame. An armed
+        burst may shorten the step at its next physical round; the remainder
+        stays queued so no one-shot edge or frozen launch pose is skipped.
         """
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
@@ -7670,7 +7824,7 @@ class BotRuntime(object):
             elif self._accumulator + 1e-9 < self._control_seconds:
                 return []
             # Exact world-receipt work is capped per render callback, not per
-            # catch-up step. Do not open an empty receipt frame on intervening
+            # control step. Do not open an empty receipt frame on intervening
             # high-FPS callbacks: finishing one without a control step would
             # retire valid deferred requests as no longer eligible.
             self._begin_world_receipt_frame()
@@ -7687,57 +7841,14 @@ class BotRuntime(object):
                         outgoing.extend(self._update_once(
                             frame_step, step_now, players, neighbours))
                 else:
-                    steps = 0
-                    work_started = None
-                    if (self._control_work_clock is not None and
-                            not self._control_work_clock_failed and
-                            self._accumulator + 1e-9 >=
-                            self._control_seconds * 2.0):
-                        try:
-                            work_started = float(self._control_work_clock())
-                            if (math.isnan(work_started) or
-                                    math.isinf(work_started)):
-                                work_started = None
-                                self._control_work_clock_failed = True
-                        except Exception:
-                            work_started = None
-                            self._control_work_clock_failed = True
-                    while (steps < MAX_CONTROL_STEPS_PER_FRAME and
-                           self._accumulator + 1e-9 >=
-                           self._control_seconds):
-                        self._accumulator = max(
-                            0.0, self._accumulator - self._control_seconds)
-                        step_now = now - self._accumulator
-                        outgoing.extend(self._update_once(
-                            self._control_seconds, step_now,
-                            players, neighbours))
-                        steps += 1
-                        if (steps == 1 and
-                                self._accumulator + 1e-9 >=
-                                self._control_seconds and
-                                self._control_work_clock is not None):
-                            # A broken or regressing diagnostic clock fails to
-                            # the one-step path. It may delay catch-up, but it
-                            # can never discard debt or alter this completed
-                            # step's command and one-shot outcomes.
-                            if (self._control_work_clock_failed or
-                                    work_started is None):
-                                break
-                            try:
-                                work_finished = float(
-                                    self._control_work_clock())
-                                work_elapsed = work_finished - work_started
-                                if (math.isnan(work_elapsed) or
-                                        math.isinf(work_elapsed) or
-                                        work_elapsed < 0.0):
-                                    self._control_work_clock_failed = True
-                                    break
-                            except Exception:
-                                self._control_work_clock_failed = True
-                                break
-                            if (work_elapsed >=
-                                    CONTROL_CATCH_UP_WALL_BUDGET_SECONDS):
-                                break
+                    frame_step = min(
+                        self._accumulator, MAX_CONTROL_ELAPSED_SECONDS)
+                    frame_step = self._bounded_burst_step(frame_step)
+                    self._accumulator = max(
+                        0.0, self._accumulator - frame_step)
+                    step_now = now - self._accumulator
+                    outgoing.extend(self._update_once(
+                        frame_step, step_now, players, neighbours))
             finally:
                 if receipt_frame_open:
                     self._finish_world_receipt_frame()

@@ -1234,6 +1234,9 @@ class BattleDirector(object):
 			'route_id': agent['route'].get('id') if agent.get('route') else 'direct',
 			'route_index': int(agent.get('waypoint_index', 0)),
 			'route_anchor': self._route_anchor(agent, position),
+			'route_join': (
+				int(agent.get('route_join_index', -1)) ==
+				int(agent.get('waypoint_index', 0))),
 			'personality': personality,
 			'profile': profile,
 			'shell_index': 0,

@@ -8299,9 +8299,6 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             bot_runtime.WORKER_CONTROL_SECONDS,
             battle._bots._control_seconds)
-        self.assertIs(
-            battle_runtime_module._PROFILE_CLOCK,
-            battle._bots._control_work_clock)
 
     def test_player_identity_sync_rejects_arena_dp_mismatch(self):
         runtime = _runtime()

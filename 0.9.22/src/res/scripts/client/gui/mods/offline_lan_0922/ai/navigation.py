@@ -1019,6 +1019,10 @@ class TerrainNavigator(object):
 			edge in penalties
 			for edge in self.grid._edge_keys_for_segment(start, end)))
 
+	def bot_segment_penalized(self, bot_id, start, end, now):
+		"""Expose one Bot's live hard-contact edge veto to target admission."""
+		return self._bot_edges_penalized(bot_id, start, end, now)
+
 	def report_blocked_step(self, bot_id, current, target, now):
 		"""Escalate a repeated contact or planner veto into a bot-local replan."""
 		bot_id = int(bot_id)
