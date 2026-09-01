@@ -242,10 +242,15 @@ class AuthorityWorkerClientTests(unittest.TestCase):
 
     def test_missing_session_identity_never_blocks_startup(self):
         identity = port_config.session_identity(
-            'does-not-exist.json', environ={})
+            'does-not-exist.json', environ={
+                port_config.BUILD_SEMANTIC_VERSION_ENV: '0.6.1',
+                port_config.BUILD_IDENTITY_ENV: 'launcher-build',
+            })
 
         self.assertEqual('unknown', identity['semanticVersion'])
         self.assertEqual('unknown', identity['buildIdentity'])
+        self.assertEqual('0.6.1', identity['launcherSemanticVersion'])
+        self.assertEqual('launcher-build', identity['launcherBuildIdentity'])
 
     def test_player_hello_wire_shape_advertises_required_capabilities(self):
         client = LANClient(

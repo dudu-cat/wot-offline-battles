@@ -127,7 +127,7 @@ def session_identity(path=BUILD_IDENTITY_PATH, environ=None):
     )
     if None in launched:
         launched = None
-    effective = installed or launched or ('unknown', 'unknown')
+    effective = installed or ('unknown', 'unknown')
     return {
         'semanticVersion': effective[0],
         'buildIdentity': effective[1],

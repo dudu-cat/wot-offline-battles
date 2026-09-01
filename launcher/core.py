@@ -595,7 +595,11 @@ _CLIENT_INSTALL = {
         "replace": tuple(
             "mods/configs/offline_lan_0922/%s" % name
             for name in _DATASETS_0_9_22),
-        "prune": (("mods/0.9.22.0.1", "org.peng.offline_lan_0922*"),),
+        "prune": (
+            ("mods/0.9.22.0.1", "org.peng.offline_lan_0922*"),
+            ("mods/configs/offline_lan_0922",
+             BUILD_IDENTITY_FILENAME_0922),
+        ),
         "keep": ("mods/configs/offline_lan_0922/config.json",),
         "allowed": (
             "mods/0.9.22.0.1/",
@@ -608,7 +612,6 @@ _CLIENT_INSTALL = {
             "mods/configs/offline_lan_0922/%s/manifest.json" % name
             for name in _DATASETS_0_9_22) + (
             "mods/configs/offline_lan_0922/config.json",
-            BUILD_IDENTITY_RELATIVE_PATH_0922,
         ) + _CLIENT_RUNTIME_FILES_0_9_22,
         "owned_files": (
             (BUILD_IDENTITY_RELATIVE_PATH_0922,) +
@@ -954,11 +957,10 @@ def _payload_release(path, port_version):
 
     if port_version == PORT_0_9_22:
         identity = _archive_payload_identity(path, port_version)
-        if identity is None:
-            raise ValueError("the payload build identity is missing or invalid")
-        return "%s:%s:%s" % (
-            port_version, identity["semanticVersion"],
-            identity["buildIdentity"])
+        if identity is not None:
+            return "%s:%s:%s" % (
+                port_version, identity["semanticVersion"],
+                identity["buildIdentity"])
 
     with zipfile.ZipFile(path, "r") as archive:
         packages = sorted(
@@ -1085,12 +1087,11 @@ def _validate_archive(archive, game_root, port_version, layout):
         raise LauncherError(
             "The bundled %s baked data is incomplete." % port_version)
     if port_version == PORT_0_9_22:
-        if _decode_payload_identity(
-                archive.read(BUILD_IDENTITY_RELATIVE_PATH_0922)) is None:
-            raise LauncherError(
-                "The bundled 0.9.22 build identity is invalid.")
+        owned_files = set(layout["owned_files"])
+        if BUILD_IDENTITY_RELATIVE_PATH_0922 not in names:
+            owned_files.discard(BUILD_IDENTITY_RELATIVE_PATH_0922)
         expected = (inventory | set(layout["keep"]) | set(packages) |
-                    set(layout["owned_files"]))
+                    owned_files)
         if names != expected:
             raise LauncherError(
                 "The bundled 0.9.22 mod contains unexpected files.")
@@ -1265,8 +1266,17 @@ def install_client_mod(game_root, port_version, base_dir=None, force=False):
             "Installed 0.9.22 payload before installation: %s." %
             payload_identity_text(installed_identity),
         ))
+        if payload_identity is None:
+            identity_actions.append(
+                "The bundled diagnostic build identity is unavailable; "
+                "installation will continue and will not be treated as "
+                "current on the next launch.")
+    identity_current = (
+        port_version != PORT_0_9_22 or
+        (payload_identity is not None and
+         installed_identity == payload_identity))
     if (not force and installed_release(game_root, port_version) == release
-            and installed_identity == payload_identity
+            and identity_current
             and _installation_complete(game_root, port_version, layout)):
         if port_version == PORT_0_9_22:
             identity_actions.append(

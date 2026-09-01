@@ -1292,11 +1292,16 @@ class ClientInstallTest(unittest.TestCase):
         self.assertRaises(core.LauncherError, core.install_client_mod,
                           self.game, core.PORT_0_9_22, self.payload)
 
-    def test_a_malformed_build_identity_is_rejected_by_the_installer(self):
+    def test_a_malformed_build_identity_is_soft_and_forces_reinstall(self):
+        package = (
+            "mods/0.9.22.0.1/org.peng.offline_lan_0922_9.9.9.wotmod")
+        self._stage_0_9_22(content="first", build_identity="test-build-a")
+        core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
         archive_path = self._stage_0_9_22()
         with zipfile.ZipFile(archive_path, "r") as archive:
             members = {name: archive.read(name)
                        for name in archive.namelist()}
+        members[package] = "second"
         members[core.BUILD_IDENTITY_RELATIVE_PATH_0922] = json.dumps({
             "schema": 1,
             "semanticVersion": "0.6.1",
@@ -1304,9 +1309,35 @@ class ClientInstallTest(unittest.TestCase):
         })
         self._archive(core.PORT_0_9_22, members)
 
-        with self.assertRaisesRegex(core.LauncherError, "build identity"):
-            core.install_client_mod(
-                self.game, core.PORT_0_9_22, self.payload)
+        actions = core.install_client_mod(
+            self.game, core.PORT_0_9_22, self.payload)
+
+        self.assertEqual("second", self._read(package))
+        self.assertIsNone(core.installed_payload_identity(
+            self.game, core.PORT_0_9_22))
+        self.assertIn("build identity is unavailable", " ".join(actions))
+        self.assertIn("Install decision: reinstall", " ".join(actions))
+
+    def test_a_missing_build_identity_is_soft_and_removes_the_stale_one(self):
+        self._stage_0_9_22(content="first", build_identity="test-build-a")
+        core.install_client_mod(self.game, core.PORT_0_9_22, self.payload)
+        archive_path = self._stage_0_9_22(content="second")
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            members = {
+                name: archive.read(name) for name in archive.namelist()
+                if name != core.BUILD_IDENTITY_RELATIVE_PATH_0922
+            }
+        self._archive(core.PORT_0_9_22, members)
+
+        actions = core.install_client_mod(
+            self.game, core.PORT_0_9_22, self.payload)
+
+        self.assertFalse(os.path.exists(os.path.join(
+            self.game, *core.BUILD_IDENTITY_RELATIVE_PATH_0922.split("/"))))
+        self.assertIsNone(core.installed_payload_identity(
+            self.game, core.PORT_0_9_22))
+        self.assertIn("build identity is unavailable", " ".join(actions))
+        self.assertIn("Install decision: reinstall", " ".join(actions))
 
     def test_an_0_8_2_archive_missing_a_navgraph_is_rejected(self):
         archive_path = self._stage_0_8_2()
