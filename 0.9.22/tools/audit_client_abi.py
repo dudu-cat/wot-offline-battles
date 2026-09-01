@@ -573,6 +573,7 @@ EXPECTED_ABI = {
         'Vehicle.getAimParams': ('self',),
         'Vehicle.collideSegmentExt': ('self', 'startPoint', 'endPoint'),
         'Vehicle.drawEdge': ('self', 'forceSimpleEdge'),
+        'Vehicle.removeEdge': ('self', 'forceSimpleEdge'),
         'Vehicle.onHealthChanged': (
             'self', 'newHealth', 'attackerID', 'attackReasonID'),
     },
@@ -671,6 +672,13 @@ EXPECTED_ABI = {
         'CompoundAppearance.addDamageSticker': (
             'self', 'code', 'componentName', 'stickerID',
             'segStart', 'segEnd'),
+    },
+    'scripts/client/vehicle_systems/components/highlighter.pyc': {
+        'Highlighter.deactivate': ('self',),
+        'Highlighter.enabled': ('self',),
+        'Highlighter.highlight': (
+            'self', 'enable', 'forceSimpleEdge'),
+        'Highlighter.__doHighlightOperation': ('self', 'status', 'args'),
     },
     'scripts/client/VehicleStickers.pyc': {
         'VehicleStickers.addDamageSticker': (
@@ -1275,6 +1283,7 @@ EXPECTED_CODE_NAMES = {
         'Vehicle.collideSegmentExt': (
             '_Vehicle__collideSegment',),
         'Vehicle.drawEdge': ('appearance', 'highlighter', 'highlight'),
+        'Vehicle.removeEdge': ('appearance', 'highlighter', 'highlight'),
     },
     'scripts/client/AvatarInputHandler/gun_marker_ctrl.pyc': {
         '_CrosshairShotResults._getAllCollisionDetails': (
@@ -1546,6 +1555,20 @@ EXPECTED_CODE_NAMES = {
             'BigWorld', 'player', 'inputHandler',
             'removeVehicleFromCameraCollider', 'arena',
             'onPeriodChange', 'onCameraChanged'),
+    },
+    'scripts/client/vehicle_systems/components/highlighter.pyc': {
+        'Highlighter.deactivate': (
+            '_Highlighter__vehicle', '_Highlighter__highlightStatus',
+            'HIGHLIGHT_OFF', 'BigWorld', 'wgDelEdgeDetectEntity'),
+        'Highlighter.enabled': (
+            '_Highlighter__highlightStatus', 'HIGHLIGHT_OFF'),
+        'Highlighter.highlight': (
+            '_Highlighter__vehicle', '_Highlighter__highlightStatus',
+            'HIGHLIGHT_OFF', 'BigWorld', 'wgDelEdgeDetectEntity',
+            '_Highlighter__doHighlightOperation'),
+        'Highlighter.__doHighlightOperation': (
+            'HIGHLIGHT_OFF', 'BigWorld', 'wgAddEdgeDetectEntity',
+            '_Highlighter__vehicle', 'wgDelEdgeDetectEntity'),
     },
     'scripts/client/vehicle_systems/components/CrashedTracks.pyc': {
         'CrashedTrackController.__setupTrackAssembler': (

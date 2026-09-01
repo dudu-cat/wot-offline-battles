@@ -45,6 +45,27 @@ ORDERED_USES = (
         'appearance teardown removes all Avatar subscriptions in order',
     ),
     (
+        'scripts/client/vehicle_systems/CompoundAppearance.pyc',
+        'CompoundAppearance.__onModelsRefresh',
+        ('deactivate', 'False', '_CompoundAppearance__compoundModel',
+         '_CompoundAppearance__setupModels', 'setVehicle', 'activate'),
+        'damaged-model refresh deactivates the old compound before replacement',
+    ),
+    (
+        'scripts/client/vehicle_systems/components/highlighter.pyc',
+        'Highlighter.deactivate',
+        ('_Highlighter__highlightStatus', 'HIGHLIGHT_OFF', 'BigWorld',
+         'wgDelEdgeDetectEntity', 'HIGHLIGHT_OFF',
+         '_Highlighter__vehicle'),
+        'stock highlighter removes the edge before releasing its vehicle',
+    ),
+    (
+        'scripts/client/Vehicle.pyc',
+        'Vehicle.delModel',
+        ('enabled', 'highlight', 'False', 'delModel', 'highlight', 'True'),
+        'Vehicle model removal preserves an enabled stock highlighter',
+    ),
+    (
         'scripts/client/VehicleGunRotator.pyc',
         'VehicleGunRotator.update',
         ('_VehicleGunRotator__avatar',

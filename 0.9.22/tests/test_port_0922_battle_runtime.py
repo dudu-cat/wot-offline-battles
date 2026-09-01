@@ -570,6 +570,7 @@ class _Vehicle(object):
         self.appearance = types.SimpleNamespace(
             compoundModel=self.model, turretMatrix=_Matrix(),
             gunMatrix=_Matrix(),
+            highlighter=types.SimpleNamespace(enabled=False),
             waterSensor=None, isInWater=False, isUnderwater=False,
             onModelChanged=_Signal(),
             changeVisibility=change_visibility,
@@ -593,10 +594,20 @@ class _Vehicle(object):
         self.ammo_bay_effects = []
         self.shows = []
         self.draw_pass_visible = True
+        self.edge_draws = []
+        self.edge_removes = []
 
     def show(self, visible):
         self.shows.append(bool(visible))
         self.draw_pass_visible = bool(visible)
+
+    def drawEdge(self, force_simple_edge):
+        self.edge_draws.append(bool(force_simple_edge))
+        self.appearance.highlighter.enabled = True
+
+    def removeEdge(self, force_simple_edge):
+        self.edge_removes.append(bool(force_simple_edge))
+        self.appearance.highlighter.enabled = False
 
     def teleport(self, position, rotation):
         self.position = position
@@ -3693,6 +3704,68 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual([vehicle.bw_entity], runtime.bigworld.edge_removes)
         factory.destroy_all()
 
+    def test_native_target_outline_uses_stock_highlighter_lifecycle(self):
+        runtime, factory, unused_binding, vehicle_id, vehicle = \
+            self._ready_native_factory()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._avatar = runtime.bigworld.avatar
+        battle._remote_factory = factory
+        battle._records = {
+            'bot:11': {
+                'engine_id': vehicle_id, 'local': False, 'ready': True,
+                'native_remote': True, 'spot_visible': True,
+                'state': {'health': 500, 'alive': True}}}
+
+        with mock.patch.object(
+                battle_runtime_module, 'collide_vehicle_at_matrix',
+                return_value=(types.SimpleNamespace(dist=20.0),)):
+            battle._update_target_outline(1.0)
+
+        self.assertEqual([False], vehicle.edge_draws)
+        self.assertEqual([], runtime.bigworld.edge_adds)
+        original_model = vehicle.model
+        vehicle.appearance.highlighter.enabled = False
+        vehicle.model = _Model()
+        vehicle.appearance.compoundModel = vehicle.model
+
+        with mock.patch.object(
+                battle_runtime_module, 'collide_vehicle_at_matrix',
+                return_value=(types.SimpleNamespace(dist=20.0),)):
+            battle._update_target_outline(2.0)
+
+        self.assertIsNot(original_model, vehicle.model)
+        self.assertIs(vehicle.model, battle._outlined_model)
+        self.assertEqual([False, False], vehicle.edge_draws)
+        self.assertTrue(vehicle.appearance.highlighter.enabled)
+
+        self.assertTrue(battle._clear_target_outline())
+
+        self.assertEqual([False], vehicle.edge_removes)
+        self.assertEqual([], runtime.bigworld.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        factory.destroy_all()
+
+    def test_native_target_clear_skips_delete_after_stock_deactivation(self):
+        runtime, factory, unused_binding, vehicle_id, vehicle = \
+            self._ready_native_factory()
+        battle = BattleRuntime(runtime)
+        battle._remote_factory = factory
+        battle._outlined_engine_id = vehicle_id
+        battle._outlined_entity = vehicle
+        battle._outlined_vehicle = vehicle
+        battle._outlined_model = vehicle.model
+        # CompoundAppearance.deactivate has already removed the edge, reset
+        # Highlighter.enabled, and detached the model.
+        vehicle.appearance.highlighter.enabled = False
+        vehicle.model = None
+
+        self.assertTrue(battle._clear_target_outline())
+
+        self.assertEqual([], vehicle.edge_removes)
+        self.assertIsNone(battle._outlined_engine_id)
+        factory.destroy_all()
+
     def test_scenery_between_the_mouse_ray_and_enemy_blocks_the_outline(self):
         """The cursor ray, rather than the physical gun line, owns occlusion."""
         runtime = _runtime()
@@ -4299,11 +4372,12 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         battle._outlined_entity = vehicle
         battle._outlined_vehicle = vehicle
         battle._outlined_model = original_model
+        vehicle.appearance.highlighter.enabled = True
         order = []
 
-        def remove_edge(entity):
-            order.append(('edge', entity.model))
-            runtime.bigworld.edge_removes.append(entity)
+        def remove_edge(force_simple_edge):
+            self.assertFalse(force_simple_edge)
+            order.append(('edge', vehicle.model))
 
         def replace_model(health, attacker_id, reason_id):
             order.append(('health', vehicle.model))
@@ -4311,7 +4385,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
             vehicle.appearance.compoundModel = vehicle.model
             vehicle.health_change = (health, attacker_id, reason_id)
 
-        runtime.bigworld.wgDelEdgeDetectEntity = remove_edge
+        vehicle.removeEdge = remove_edge
         vehicle.onHealthChanged = replace_model
 
         battle._apply_health(record, {'health': 0, 'alive': False})
@@ -4319,7 +4393,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
         self.assertEqual(['edge', 'health'], [item[0] for item in order])
         self.assertIs(original_model, order[0][1])
         self.assertIs(original_model, order[1][1])
-        self.assertEqual([vehicle], runtime.bigworld.edge_removes)
+        self.assertEqual([], runtime.bigworld.edge_removes)
         self.assertIsNone(battle._outlined_engine_id)
         self.assertFalse(battle._outline_blocked)
         factory.destroy_all()
@@ -4344,9 +4418,11 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
                 battle._outlined_entity = vehicle
                 battle._outlined_vehicle = vehicle
                 battle._outlined_model = vehicle.model
+                vehicle.appearance.highlighter.enabled = True
                 order = []
-                runtime.bigworld.wgDelEdgeDetectEntity = (
-                    lambda entity: order.append(('edge', entity)))
+                vehicle.removeEdge = (
+                    lambda force_simple_edge: order.append(
+                        ('edge', force_simple_edge)))
                 original_destroy = factory.destroy
 
                 def destroy(entity_id):
@@ -4361,7 +4437,7 @@ class RemoteVehicleFactoryTests(unittest.TestCase):
                     battle._flush_tombstone(record)
 
                 self.assertEqual(
-                    [('edge', vehicle), ('destroy', vehicle_id)], order)
+                    [('edge', False), ('destroy', vehicle_id)], order)
                 self.assertIsNone(runtime.bigworld.entity(vehicle_id))
                 factory.destroy_all()
 

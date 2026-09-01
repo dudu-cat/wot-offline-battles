@@ -13092,6 +13092,8 @@ class BattleRuntime(object):
             dropped = (held_id, held_reason)
         self._report_target_outline(now, chosen, miss, decline, dropped)
         if chosen == held_id:
+            if chosen is not None:
+                self._refresh_native_target_outline()
             return
         if not self._clear_target_outline():
             return
@@ -13105,18 +13107,32 @@ class BattleRuntime(object):
         if vehicle is None or visual_entity is None:
             raise RuntimeError('outlined remote vehicle has no visual entity')
         color = 2 if int(vehicle.team) == int(self.client.team) else 1
-        add_edge = getattr(
-            self._runtime.bigworld, 'wgAddEdgeDetectEntity', None)
-        if not callable(add_edge):
-            raise RuntimeError('#1513 edge-detect add boundary is unavailable')
-        add_edge(visual_entity, color, 0, False)
-        self._report_edge('add id=%s colour=%d' % (chosen, color))
-        # Record the exact entity and compound the engine keyed the edge on.
-        # An untracked registration is never removed.
+        if native_remote:
+            add_edge = getattr(vehicle, 'drawEdge', None)
+            if not callable(add_edge):
+                raise RuntimeError(
+                    '#1513 native Vehicle.drawEdge boundary is unavailable')
+        else:
+            add_edge = getattr(
+                self._runtime.bigworld, 'wgAddEdgeDetectEntity', None)
+            if not callable(add_edge):
+                raise RuntimeError(
+                    '#1513 edge-detect add boundary is unavailable')
+        # Record the owner before crossing the native boundary.  The optional
+        # feature cleanup can then release a registration even when a later
+        # step in this transaction fails.
         self._outlined_engine_id = chosen
         self._outlined_entity = visual_entity
         self._outlined_vehicle = vehicle
         self._outlined_model = vehicle.model
+        if native_remote:
+            # Stock Highlighter owns the EdgeDrawer entry across
+            # CompoundAppearance refresh/deactivate.  A direct wgAdd call
+            # bypasses that owner and survives after the compound is retired.
+            add_edge(False)
+        else:
+            add_edge(visual_entity, color, 0, False)
+        self._report_edge('add id=%s colour=%d' % (chosen, color))
         set_candidate = getattr(
             self._runtime.compatibility, 'set_target_lock_candidate', None)
         if not callable(set_candidate):
@@ -13124,6 +13140,47 @@ class BattleRuntime(object):
                 '#1513 target-lock candidate boundary is unavailable')
         set_candidate(vehicle)
         self.monitor_vehicle_damaged_devices(chosen)
+
+    def _refresh_native_target_outline(self):
+        """Restore a held native outline after stock model replacement.
+
+        ``CompoundAppearance.__onModelsRefresh`` correctly deactivates its
+        Highlighter before replacing the compound, which removes the old
+        EdgeDrawer key and resets ``enabled``.  The stock component does not
+        remember that external targeting still wants the edge, so the next
+        targeting pass must re-register it against the new compound.
+        """
+        vehicle = self._outlined_vehicle
+        if not bool(getattr(vehicle, '_offlineNativeRemote', False)):
+            return False
+        highlighter = getattr(
+            getattr(vehicle, 'appearance', None), 'highlighter', None)
+        if highlighter is None or not hasattr(highlighter, 'enabled'):
+            raise RuntimeError(
+                '#1513 native Vehicle highlighter boundary is unavailable')
+        model = getattr(vehicle, 'model', None)
+        if model is None:
+            # A synchronous stock refresh can temporarily detach the model.
+            # Keep the old identity so a later pass retries after activation.
+            return False
+        if bool(highlighter.enabled):
+            # Vehicle.delModel preserves an enabled highlighter around its
+            # own model removal.  Trust that owner and only advance our
+            # diagnostic identity when the replacement is already outlined.
+            self._outlined_model = model
+            return False
+        add_edge = getattr(vehicle, 'drawEdge', None)
+        if not callable(add_edge):
+            raise RuntimeError(
+                '#1513 native Vehicle.drawEdge boundary is unavailable')
+        add_edge(False)
+        if not bool(highlighter.enabled):
+            # drawEdge is a documented no-op until Highlighter.setVehicle has
+            # completed.  Do not accept the new model identity; retry later.
+            return False
+        self._outlined_model = model
+        self._report_edge('refresh id=%s' % self._outlined_engine_id)
+        return True
 
     def _target_angular_radius(self, vehicle, distance, tight=False):
         """The half-angle this vehicle's own hull subtends at this range.
@@ -13338,22 +13395,16 @@ class BattleRuntime(object):
     def _clear_target_outline(self):
         """Remove the one edge this port owns.
 
-        ``wgDelEdgeDetectEntity`` resolves the drawer key from the entity's
-        current compound, so a removal issued after that compound changed
-        deletes nothing and leaves an entry no later call can reach.  Treat
-        that state as a lifecycle error; disabling later outlines cannot make
-        the already-stale native entry safe.
+        Native Vehicles delegate to their stock Highlighter.  That component
+        removes its EdgeDrawer entry from the old compound during
+        CompoundAppearance.deactivate, before an asynchronous damaged-model
+        refresh replaces the compound.  Synthetic remotes have no stock
+        highlighter, so their exact entity/model identity remains guarded here.
         """
         entity = self._outlined_entity
         vehicle = self._outlined_vehicle
         model = self._outlined_model
         engine_id = self._outlined_engine_id
-        self._outlined_engine_id = None
-        self._outlined_entity = None
-        self._outlined_vehicle = None
-        self._outlined_model = None
-        if engine_id is not None:
-            self.monitor_vehicle_damaged_devices(0)
         if entity is None and engine_id is None:
             return True
         set_candidate = getattr(
@@ -13366,22 +13417,55 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'outlined vehicle %s lost its entity before edge removal' %
                 engine_id)
-        visual_entity = (vehicle if bool(getattr(
-            vehicle, '_offlineNativeRemote', False)) else getattr(
-                vehicle, 'bw_entity', None))
-        if (vehicle is None or model is None or
-                visual_entity is not entity or
-                getattr(vehicle, 'model', None) is not model or
-                getattr(entity, 'model', None) is None):
+        native_remote = bool(getattr(
+            vehicle, '_offlineNativeRemote', False))
+        visual_entity = (vehicle if native_remote else getattr(
+            vehicle, 'bw_entity', None))
+        if vehicle is None or visual_entity is not entity:
             raise RuntimeError(
-                'outlined vehicle %s changed its compound before edge '
-                'removal' % engine_id)
-        remove_edge = getattr(
-            self._runtime.bigworld, 'wgDelEdgeDetectEntity', None)
-        if not callable(remove_edge):
-            raise RuntimeError(
-                '#1513 edge-detect remove boundary is unavailable')
-        remove_edge(entity)
+                'outlined vehicle %s changed its entity before edge removal' %
+                engine_id)
+        if native_remote:
+            highlighter = getattr(
+                getattr(vehicle, 'appearance', None), 'highlighter', None)
+            if highlighter is None or not hasattr(highlighter, 'enabled'):
+                raise RuntimeError(
+                    '#1513 native Vehicle highlighter boundary is '
+                    'unavailable')
+            remove_edge = getattr(vehicle, 'removeEdge', None)
+            if not callable(remove_edge):
+                raise RuntimeError(
+                    '#1513 native Vehicle.removeEdge boundary is unavailable')
+            # highlight(False) always crosses wgDelEdgeDetectEntity, even
+            # when the Highlighter is already OFF.  Only its enabled state is
+            # proof that this owner still has an edge to remove.  A refresh
+            # that already deactivated the old compound therefore needs no
+            # second native delete against a detached or replacement model.
+            if bool(highlighter.enabled):
+                if getattr(entity, 'model', None) is None:
+                    raise RuntimeError(
+                        'outlined vehicle %s lost its model before edge '
+                        'removal' % engine_id)
+                remove_edge(False)
+        else:
+            if (model is None or
+                    getattr(vehicle, 'model', None) is not model or
+                    getattr(entity, 'model', None) is None):
+                raise RuntimeError(
+                    'outlined vehicle %s changed its compound before edge '
+                    'removal' % engine_id)
+            remove_edge = getattr(
+                self._runtime.bigworld, 'wgDelEdgeDetectEntity', None)
+            if not callable(remove_edge):
+                raise RuntimeError(
+                    '#1513 edge-detect remove boundary is unavailable')
+            remove_edge(entity)
+        self._outlined_engine_id = None
+        self._outlined_entity = None
+        self._outlined_vehicle = None
+        self._outlined_model = None
+        if engine_id is not None:
+            self.monitor_vehicle_damaged_devices(0)
         self._report_edge('del id=%s' % engine_id)
         return True
 
@@ -13390,9 +13474,9 @@ class BattleRuntime(object):
         try:
             self._clear_target_outline()
         except Exception:
-            # _clear_target_outline clears its Python ownership fields before
-            # crossing either optional native boundary.  Never retry a stale
-            # entity or compound after one of those boundaries rejects it.
+            # Keep the exact owner fields for round teardown diagnostics.  A
+            # native Vehicle's Highlighter remains the final lifecycle owner;
+            # a synthetic compound cannot be guessed after identity changes.
             pass
         self._outline_blocked = True
         return True
