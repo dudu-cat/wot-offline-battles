@@ -22,6 +22,8 @@ SERVER_TEAM2_SIZE_ENV = "WOT_0922_TEAM2_SIZE"
 SERVER_BOT_LINEUP_ENV = "WOT_0922_BOT_LINEUP"
 SERVER_LOOPBACK_ONLY_ENV = "WOT_0922_LOOPBACK_ONLY"
 SERVER_VEHICLE_OVERLAY_ROOT_ENV = "WOT_0922_VEHICLE_OVERLAY_ROOT"
+BUILD_SEMANTIC_VERSION_ENV = "WOT_OFFLINE_SEMANTIC_VERSION"
+BUILD_IDENTITY_ENV = "WOT_OFFLINE_BUILD_IDENTITY"
 WINDOWS_FIREWALL_RULE_PREFIX = "WoT 0.9.22 LAN Server"
 # Get-NetFirewallRule can take many seconds on a busy machine.
 FIREWALL_QUERY_TIMEOUT_SECONDS = 60.0
@@ -227,10 +229,25 @@ def _vehicle_overlay_root_from_environment(environment=None):
     return str(root).strip()
 
 
+def _session_identity(environment=None):
+    """Return launcher-supplied diagnostic labels without validating peers."""
+    environment = os.environ if environment is None else environment
+    semantic_version = str(
+        environment.get(BUILD_SEMANTIC_VERSION_ENV, "unknown") or
+        "unknown").strip()
+    build_identity = str(
+        environment.get(BUILD_IDENTITY_ENV, "unknown") or
+        "unknown").strip()
+    return semantic_version, build_identity
+
+
 def main():
     loopback_only = _loopback_only_from_environment()
     server_host = SERVER_LOOPBACK_HOST if loopback_only else SERVER_HOST
+    semantic_version, build_identity = _session_identity()
     print("WoT 0.9.22 Offline LAN Server")
+    print("Session identity: version=%s build=%s role=server" % (
+        semantic_version, build_identity))
     if loopback_only:
         print("Listening on 127.0.0.1, port %d." % SERVER_PORT)
     else:

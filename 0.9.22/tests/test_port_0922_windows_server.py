@@ -13,6 +13,19 @@ import windows_server  # noqa: E402
 
 
 class WindowsServerLauncherTests(unittest.TestCase):
+    def test_session_identity_is_diagnostic_environment_only(self):
+        environment = {
+            windows_server.BUILD_SEMANTIC_VERSION_ENV: '0.6.1',
+            windows_server.BUILD_IDENTITY_ENV: 'test-build-a',
+        }
+
+        self.assertEqual(
+            ('0.6.1', 'test-build-a'),
+            windows_server._session_identity(environment))
+        self.assertEqual(
+            ('unknown', 'unknown'),
+            windows_server._session_identity({}))
+
     def test_double_click_entry_uses_fixed_zero_configuration_contract(self):
         run_server = mock.Mock()
         with mock.patch.object(
