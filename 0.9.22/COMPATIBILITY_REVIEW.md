@@ -344,13 +344,52 @@ required to release a projectile-synchronized native order.
 The complete streamed-slot boundary comes from the exact #1513 native path:
 `game.onChunkLoad(spaceID, chunkID, numDestructibles, isOutside)` writes
 `numDestructibles` into the active `DestructiblesManager`. Version 0.3.68 reads
-that manager count and enumerates every native index. It uses
-`wg_getChunkDestrFilenames` only for its available filename prefix; a short
-prefix no longer proves that later fragile, structure or falling slots do not
-exist. A filename disagreement is retained as a diagnostic while the unique
-matrix signature, exact native wire and native effect category remain the
-fail-closed identity boundary. A missing native count is retried after
-streaming rather than guessed.
+that manager count and enumerates every native index.
+
+`wg_getChunkDestrFilenames` is not a per-slot surface, and the earlier
+"filename prefix" reading of it was wrong. Read from the exact module
+(`WorldOfTanks.exe`, x86 PE timestamp `0x5a6edca4`, image size `0x206a000`,
+PE checksum `0x019a5229`), its implementation at `0x006b1a10` walks item
+indices `0 .. numDestructibles(chunk) - 1` and appends one name per item only
+when the item resolves, its native type owns a name handler, and that handler
+returns a non-NULL string. Every other item appends nothing: there is no
+branch that appends a blank placeholder. The returned list is therefore
+compacted in item order, and its positions are not native item indices.
+Indexing it by the item index returns another item's resource, which is what
+produced the reproducible `05_prohorovka` chunk `31875` item `70`
+`poplar.spt` versus `env014_Toilet.model` report.
+
+`wg_getDestructibleMatrix` (`0x006b2a90` through `0x006b3f90`) and
+`wg_getDestructibleEffectCategory` (`0x006b1f10`, module index below zero)
+resolve an item through the same provider entry (vtable `+0x10`) that the name
+loop uses, so matrix, per-item name and effect category share exactly one item
+index space of length `numDestructibles(chunk)`. That call fails for an
+unresolved item and returns `-1` through `or eax, 0xffffffff` at `0x006b20b8`
+for a resolved item whose native type owns no handler - precisely the two
+cases the name loop skips. Enumerating it therefore reconstructs the
+compaction, and the reconstruction is done per native type: an item is typed
+by its live effect category and a name by the client descriptor it resolves
+to, so a type whose item count equals its name count aligns one-to-one in item
+order. A type whose counts disagree, including the ordinary case where a whole
+type contributes no name, is declined and yields no name evidence; none is
+guessed. The result is derived from live data rather than assumed, so it does
+not depend on named items being contiguous.
+
+`wg_getDestructibleFilename` (`0x006b2580`) is deliberately not used as a
+per-item probe. It resolves the same item and returns `Py_None` for an
+unresolved one, but for a resolved item whose type owns no name handler it
+reaches `PyString_FromString(NULL)` at `0x006b270c` and faults natively, which
+no Python handler can contain.
+
+With an exact per-item name available, a live/catalog filename disagreement is
+real evidence rather than an alignment artefact. It is classified once: equal
+names match; a name that still resolves to the same destructible kind is the
+only accepted representation difference; anything else is a conflict, and the
+slot is isolated before any native descriptor, effect or destroy call. The
+unique matrix signature, the exact native wire and the native effect category
+remain the fail-closed identity boundary, and the exact wire is proved before
+the name is read. A missing native count is retried after streaming rather
+than guessed.
 
 For Windows verification, bounded `DESTR` lines report one aggregate for each
 newly scanned chunk plus each first distinct contact stage. The logger reuses
@@ -364,8 +403,11 @@ unchanged. Straight-line Windows driving remains the frame-pacing acceptance
 test; this source review cannot claim that the visible hitch is eliminated.
 
 The previous 0.3.65 schema-v2 catalog supplied transformed OBBs but joined
-runtime slots by native filename. That field exists for trees but is blank for
-many #1513 non-tree slots; schema v3 closes that identity gap.
+runtime slots by native filename taken from the compacted chunk list. No slot
+is ever "blank" in that list: an unnamed item is absent from it, which is why
+indexing it by the item index silently returned a neighbour's resource. Schema
+v3 closes that identity gap with the whole-map matrix signature, and the
+per-item name is now recovered from the reconstructed compaction instead.
 
 The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
 authority registry. Unspotted or dead synthetic vehicles remain private there;
