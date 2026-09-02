@@ -23397,7 +23397,10 @@ class UnusableVehicleTests(unittest.TestCase):
             direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
             baked_graph=_runtime().navigation_graph_loader('01_karelia'))
 
-        with contextlib.redirect_stdout(io.StringIO()) as log:
+        with mock.patch.object(
+                bot_runtime, '_bot_default_crew_factors',
+                side_effect=_plain_bot_factors), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
             bots.battle_start({
                 'round_id': 7, 'map': '01_karelia', 'bot_authority_id': 1,
                 'bots': roster})
