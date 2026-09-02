@@ -92,7 +92,7 @@ def _update_player_input(state, player_id, **changes):
     player = state.players[player_id]
     message = {
         'type': 'input', 'round_id': state.round_id,
-        'input_seq': player.input_seq + 1,
+        'input_seq': player.input_processed_seq + 1,
         'pose_time_us': state._logical_motion_time_us(),
         'forward': 0.0, 'turn': 0.0, 'speed': 0.0,
         'aim_yaw': player.aim_yaw, 'gun_pitch': player.gun_pitch,
@@ -174,7 +174,7 @@ def _launch_authority(state, message, before_launch=None):
     if 'fire_intent_seq' not in message:
         player_id = int(message['shooter_id'])
         player = state.players[player_id]
-        input_seq = player.input_seq + 1
+        input_seq = player.input_processed_seq + 1
         self_time = state._logical_motion_time_us()
         if not state.update_input(player_id, {
                 'type': 'input', 'round_id': state.round_id,
@@ -491,19 +491,25 @@ class ServerProjectileLedgerTests(unittest.TestCase):
     def test_modern_input_whitelist_rejects_before_state_advances(self):
         state = _state(players=1)
         player = state.players[1]
-        base = {
-            'type': 'input', 'round_id': state.round_id,
-            'input_seq': 1,
-            'pose_time_us': state._logical_motion_time_us(),
-            'forward': 0.75, 'turn': -0.25, 'speed': 0.0,
-            'aim_yaw': 0.2, 'gun_pitch': 0.05,
-            'x': player.x, 'y': player.y, 'z': player.z,
-            'yaw': player.yaw, 'pitch': player.pitch,
-            'roll': player.roll, 'fire_seq': 0,
-            'shell_index': 0, 'next_shell_index': 0,
-            'shell_change_pending': False,
-            'gun_checkpoint': _gun_checkpoint(),
-        }
+
+
+        def frame(**changes):
+            message = {
+                'type': 'input', 'round_id': state.round_id,
+                'input_seq': player.input_processed_seq + 1,
+                'pose_time_us': state._logical_motion_time_us(),
+                'forward': 0.75, 'turn': -0.25, 'speed': 0.0,
+                'aim_yaw': 0.2, 'gun_pitch': 0.05,
+                'x': player.x, 'y': player.y, 'z': player.z,
+                'yaw': player.yaw, 'pitch': player.pitch,
+                'roll': player.roll, 'fire_seq': 0,
+                'shell_index': 0, 'next_shell_index': 0,
+                'shell_change_pending': False,
+                'gun_checkpoint': _gun_checkpoint(),
+            }
+            message.update(changes)
+            return json.loads(json.dumps(message))
+
         before = (
             player.input_seq, dict(player.input_fingerprints),
             player.gun_checkpoint_seq, dict(player.gun_checkpoint),
@@ -515,26 +521,34 @@ class ServerProjectileLedgerTests(unittest.TestCase):
             ('reported_health', 0),
             ('automatic_equipment_response', {'equipment_id': 21}),
             ('destructible_verdict', {'destroyed': True}),
+            ('type', 'equipment_intent'),
         )
-        for field, value in forbidden:
+        for index, (field, value) in enumerate(forbidden):
             with self.subTest(field=field):
-                message = json.loads(json.dumps(base))
-                message[field] = value
-                self.assertFalse(state.update_input(1, message))
+                rejected_seq = player.input_processed_seq + 1
+                self.assertFalse(
+                    state.update_input(1, frame(**{field: value})))
+                # No applied state, and no gun checkpoint, from a frame that
+                # never passed the whitelist.
                 self.assertEqual(before, (
                     player.input_seq, dict(player.input_fingerprints),
                     player.gun_checkpoint_seq, dict(player.gun_checkpoint),
                     player.forward, player.turn, player.health, player.alive,
                 ))
+                # The terminal frontier still advances so the next legal frame
+                # is not stuck behind this rejected sequence forever.
+                self.assertEqual(index + 1, player.input_processed_seq)
+                self.assertEqual(
+                    'rejected',
+                    player.input_decisions[rejected_seq]['outcome'])
+                self.assertNotIn(rejected_seq, player.gun_checkpoints)
 
-        wrong_type = json.loads(json.dumps(base))
-        wrong_type['type'] = 'equipment_intent'
-        self.assertFalse(state.update_input(1, wrong_type))
-        self.assertEqual(0, player.input_seq)
-        self.assertTrue(state.update_input(1, base))
-        self.assertEqual((1, 1, 0.75, -0.25), (
+        recovered_seq = player.input_processed_seq + 1
+        self.assertTrue(state.update_input(1, frame()))
+        self.assertEqual((recovered_seq, recovered_seq, 0.75, -0.25), (
             player.input_seq, player.gun_checkpoint_seq,
             player.forward, player.turn))
+        self.assertEqual(recovered_seq, player.input_processed_seq)
 
     def test_modern_input_folds_inactive_player_frame_as_noop(self):
         for condition in ('waiting', 'loading', 'finished',

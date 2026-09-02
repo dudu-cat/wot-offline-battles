@@ -914,6 +914,26 @@ public shared feedback adaptor, active marker provider and real
 The ABI audit pins both the weak-proxy construction and the setup property's
 public forwarding chain.
 
+Ordered player input separates three concepts so one recoverable rejected
+frame cannot poison the rest of the round. The processed frontier is the
+contiguous sequence that reached an idempotent terminal decision, applied or
+not. The last applied input is the frame whose controls, pose, shell
+selection and gun checkpoint were committed, and it remains what a fire
+intent, pose sample, contact receipt and landing observation bind to. A
+per-sequence record keeps a bounded fingerprint plus the typed outcome, so an
+exact retry folds, a changed payload at the same sequence conflicts, a future
+gap consumes nothing, and an evicted sequence can never become new state. A
+recoverable validation failure records a rejected decision and advances only
+the processed frontier: no field is applied and no gun checkpoint is
+installed, so a fire intent bound to that sequence receives one typed
+terminal rejection rather than firing from stale muzzle state. A message that
+does not identify the current player, round or an exact sequence consumes no
+frontier at all. Both frontiers retire together on a round transition, and
+the snapshot publishes them so a reconnecting client resumes at the next
+eligible sequence. The shipping client canonicalizes the same envelope before
+queueing a frame, normalizing periodic yaw instead of clipping it, so normal
+#1513 values never produce an avoidable rejection.
+
 ## AI, room and round boundaries
 
 Humans take real team slots first. The first waiting 0.9.22 player owns map
