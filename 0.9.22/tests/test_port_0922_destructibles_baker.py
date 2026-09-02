@@ -2,6 +2,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import types
@@ -143,6 +144,48 @@ class DestructiblesBaker0922Tests(unittest.TestCase):
         self.assertEqual('0.9.22.0.1-cn-1513', self.baker.GAME_VERSION)
         self.assertEqual(73, self.baker.NORMAL_MATERIAL_KIND_MIN)
         self.assertEqual(1000, self.baker.LOCATOR_QUANTIZATION)
+
+    def test_every_catalog_version_pin_agrees(self):
+        """A half-updated pin ships two catalogs that disagree about identity.
+
+        The destructible and foliage batches derive their native wires from the
+        same WGDE enumeration, so their versions must move together.  Crossing a
+        pre-change foliage batch with a post-change destructible batch makes 29
+        native item indices claim both a destructible instance and a fallen
+        tree across the six maps that contain empty WGDE rows, which is exactly
+        the corruption these pins exist to prevent.
+        """
+        def pinned(path, name):
+            text = path.read_text(encoding='utf-8')
+            match = re.search(
+                r'(?m)^%s = (\d+)$' % re.escape(name), text)
+            self.assertIsNotNone(match, '%s in %s' % (name, path.name))
+            return int(match.group(1))
+
+        builder = ROOT / '0.9.22' / 'build_wotmod.py'
+        foliage_source = ROOT / '0.9.22' / 'tools' / 'bake_foliage_0922.py'
+        destructible_loader = (
+            CLIENT_SCRIPTS / 'gui' / 'mods' / 'offline_lan_0922' /
+            'prebaked_destructibles.py')
+        foliage_loader = (
+            CLIENT_SCRIPTS / 'gui' / 'mods' / 'offline_lan_0922' /
+            'prebaked_foliage.py')
+
+        self.assertEqual(
+            [self.baker.FORMAT_VERSION] * 3,
+            [pinned(destructible_loader, 'FORMAT_VERSION'),
+             pinned(builder, 'DESTRUCTIBLE_VERSION'),
+             json.loads((DATA_ROOT / 'manifest.json').read_text(
+                 encoding='utf-8'))['version']])
+
+        foliage_version = pinned(foliage_source, 'FORMAT_VERSION')
+        self.assertEqual(
+            [foliage_version] * 3,
+            [pinned(foliage_loader, 'FORMAT_VERSION'),
+             pinned(builder, 'FOLIAGE_VERSION'),
+             json.loads(
+                 (ROOT / '0.9.22' / 'foliage' / 'manifest.json').read_text(
+                     encoding='utf-8'))['version']])
 
     def test_locator_signature_is_world_origin_plus_basis_and_symmetric(self):
         transform = (
