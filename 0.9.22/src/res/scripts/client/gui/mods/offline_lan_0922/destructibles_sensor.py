@@ -385,10 +385,7 @@ def _diagnostic_chunk_1513(chunk_id, native_count, filenames, registry):
 		('chunk', int(chunk_id)),
 		('slots', int(native_count)),
 		('names', len(filenames)),
-		('named', sum(1 for slot in ordered if slot['raw'] == 'named')),
-		('blank', sum(1 for slot in ordered if slot['raw'] == 'blank')),
-		('name_mismatch', sum(
-			1 for slot in ordered if slot.get('raw_mismatch'))),
+		('unmapped', sum(1 for slot in ordered if slot['raw'] == 'unmapped')),
 		('v3_unique', signatures.count('unique')),
 		('v3_ambig', signatures.count('ambig')),
 		('v3_miss', signatures.count('miss')),
@@ -2955,6 +2952,14 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						detail='names=%s count=%s' %
 							(len(_dfn), _native_count))
 					continue
+				if any(not isinstance(_name, _STRING_TYPES) for _name in _dfn):
+					# The native helper emits only Python strings.  A malformed
+					# compacted entry cannot be assigned to any native item, so
+					# quarantine the chunk rather than inventing a slot identity.
+					_isolate_destructible_1513(
+						'filename_payload', cid,
+						detail='compacted list contains a non-string entry')
+					continue
 				registry = {
 					'bins': {}, 'extended_bins': {}, 'count': 0,
 					'native_count': _native_count,
@@ -2968,10 +2973,10 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					try:
 						if _destructible_isolated_1513(cid, _ti):
 							continue
-						# #1513's offline chunk list keeps the native item slots,
-						# but returns blank filenames for many non-tree items.  Read
-						# the item matrix first and recover the resource only through
-						# the checksum-pinned whole-map instance signature.
+						# #1513's offline chunk list is compacted rather than native-
+						# item-indexed. Read the item matrix first and recover the
+						# resource only through the checksum-pinned whole-map instance
+						# signature.
 						_is_active_falling = ((cid, _ti) in globals().setdefault(
 							'g_offh_destr_falling_active', {}))
 						_baked_slot = ((_destructible_catalog or {}).get(
@@ -2988,21 +2993,12 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							_isolate_destructible_1513(
 								'falling_matrix_query', cid, _ti, detail=error)
 							continue
-						_raw_filename = (
-							_dfn[_ti] if _ti < len(_dfn) else '')
-						if not isinstance(_raw_filename, _STRING_TYPES):
-							_isolate_destructible_1513(
-								'filename_slot', cid, _ti,
-								detail='expected string')
-							continue
-						_raw_normalized = _normalized_filename(_raw_filename)
 						_slot_diag = {
-							'raw': 'named' if _raw_normalized else 'blank',
+							'raw': 'unmapped',
 							'signature_state': 'none',
 							'effect_category': '-',
 							'result': 'pending',
 							'boxes': 0,
-							'raw_mismatch': False,
 						}
 						# Retained for the whole battle, one dict per native slot
 						# including every tree, so only keep it when a reader exists.
@@ -3041,10 +3037,13 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							if _signature in _destructible_catalog[
 									'ambiguous_instances']:
 								_slot_diag['signature_state'] = 'ambig'
-								_slot_diag['result'] = 'sig_ambig'
 								# Multiple native identities have exactly the same
-								# matrix. A blank slot cannot select one without
-								# guessing.
+								# matrix. The compacted names cannot select one without
+								# guessing, so keep every consumer behind the isolation gate.
+								_isolate_destructible_1513(
+									'native_identity_unavailable', cid, _ti,
+									detail='catalog matrix signature is ambiguous')
+								_slot_diag['result'] = 'isolated'
 								continue
 							_slot_diag['signature_state'] = (
 								'unique' if _located is not None else 'miss')
@@ -3055,13 +3054,10 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							# skips each unresolved item, each item whose native
 							# group owns no handler and each empty name, and appends
 							# only the survivors.  Its positions are therefore name
-							# order, so ``_dfn[_ti]`` names an unrelated item and can
-							# never confirm or contradict a catalog-located slot.
+							# order and can never confirm or contradict a catalog-located
+							# slot with the same numeric item index.
 							# The exact wire and the unique matrix signature below
 							# are the identity boundary for such a slot.
-							if _raw_normalized:
-								_slot_diag['raw_mismatch'] = (
-									_raw_normalized != _located['filename'])
 							if _located['wire'] != (int(cid), int(_ti)):
 								_live_wire = (int(cid), int(_ti))
 								_baked_wire = _located['wire']
@@ -3080,40 +3076,20 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							_filename = _catalog_record['filename']
 							_instance_box_index = _located['box_index']
 						else:
-							# No catalog placement matched this slot, so the only
-							# remaining evidence is the compacted name list above.
-							# Its position is name order rather than the item index,
-							# so this branch stays a vegetation-class heuristic and
-							# must never be used to identify a catalog-located
-							# destructible or to authorize a native destroy call on
-							# one.
-							_filename = _raw_filename
-							_catalog_record = None
-							if (_raw_normalized and
-									_destructible_catalog is not None):
-								_catalog_record = _destructible_catalog[
-									'resources'].get(_raw_normalized)
-								if (_catalog_record is not None and
-										_destructible_catalog.get(
-											'has_instance_index')):
-									# A v3 catalog resource without its exact placement
-									# signature is not this native item.
-									_slot_diag['result'] = 'sig_miss'
-									continue
+							# No catalog placement matched this native item.  A compacted
+							# name at the same numeric position could belong to a later
+							# item, so it cannot supply a descriptor or authorize a native
+							# destroy. Quarantine this unresolved wire so proximity,
+							# streamed shots and canonical replay share the same fail-closed
+							# gate while the unknown native object remains solid.
+							_isolate_destructible_1513(
+								'native_identity_unavailable', cid, _ti,
+								detail='no exact catalog placement or item name')
+							_slot_diag['result'] = 'isolated'
+							continue
 						desc = AreaDestructibles.g_cache.getDescByFilename(
 							_filename)
 						if desc is None:
-							# A non-empty raw name is the only safe evidence that this
-							# #1513 prefix slot is a tree. Quarantine that invalid tree;
-							# blank/later slots can be real non-tree objects and remain
-							# solid and available to catalog recovery.
-							if (_raw_normalized and
-									_catalog_record is None):
-								_isolate_destructible_1513(
-									'tree_descriptor', cid, _ti,
-									detail='named filename has no descriptor')
-								_slot_diag['result'] = 'isolated'
-								continue
 							_slot_diag['result'] = 'desc_missing'
 							continue
 						typ = desc['type']

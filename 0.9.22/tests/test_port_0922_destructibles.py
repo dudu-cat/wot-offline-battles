@@ -258,7 +258,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
         self.assertIs(original, area.encodeFallenTree)
 
-    def test_tree_descriptor_uses_nullable_chunk_list_not_scalar_wrapper(self):
+    def test_compacted_chunk_names_are_not_indexed_by_native_item(self):
         direct = mock.Mock(
             side_effect=AssertionError('unsafe scalar wrapper was called'))
         bigworld = types.ModuleType('BigWorld')
@@ -268,10 +268,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         logs = []
 
         class _Cache(object):
-            def getDescByFilename(self, filename):
-                if filename == 'tree-a':
-                    return {'type': 1, 'health': 10}
-                return None
+            getDescByFilename = mock.Mock(
+                side_effect=AssertionError(
+                    'compacted name was treated as item identity'))
 
         area = types.ModuleType('AreaDestructibles')
         area.ClientDestructiblesCache = _Cache
@@ -295,26 +294,29 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                               'DestructiblesCache': cache,
                               'BigWorld': bigworld}):
             destructibles_compat.install()
-            self.assertEqual(
-                10, instance.getDestructibleDesc(1, 22, 0)['health'])
-            # The descriptor survives a later chunk unload for the animator's
-            # delayed touchdown callback.
+            # Native item 0 may be an unnamed object before the one named entry;
+            # list position 0 therefore must not be borrowed for this wire.
+            self.assertIsNone(instance.getDestructibleDesc(1, 22, 0))
+            self.assertIsNone(instance.getDestructibleDesc(1, 22, 1))
             bigworld.wg_getChunkDestrFilenames.return_value = None
             self.assertEqual(
-                10, instance.getDestructibleDesc(1, 22, 0)['health'])
+                ('pending', None),
+                destructibles_compat.inspect_destructible_desc(
+                    instance, 1, 22, 0))
             area._printErrDescNotAvailable(1, 22, 9)
 
         direct.assert_not_called()
-        self.assertEqual(1, bigworld.wg_getChunkDestrFilenames.call_count)
+        instance.getDescByFilename.assert_not_called()
+        self.assertEqual(3, bigworld.wg_getChunkDestrFilenames.call_count)
         self.assertIn('chunk: 22, id: 9', logs[0])
 
-    def test_missing_tree_descriptor_stays_solid_before_native_destroy(self):
+    def test_shifted_tree_name_stays_solid_before_native_destroy(self):
         manager = _Manager()
         manager.space_id = 1
-        manager.set_chunk_count(22, 1)
+        manager.set_chunk_count(22, 2)
         area = _authority_environment(manager)
         destructibles_authority.BigWorld.wg_getChunkDestrFilenames = (
-            lambda *unused: ())
+            lambda *unused: ('tree',))
         fall_pitch = mock.Mock(
             side_effect=AssertionError('native fall query was called'))
         destructibles_authority.BigWorld.wg_getDestructibleFallPitchConstr = (
@@ -352,7 +354,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             {'tree_descriptor'},
             destructibles_sensor.g_offh_destr_isolation_logs)
 
-    def test_pending_tree_filename_list_retries_without_isolation(self):
+    def test_ready_compacted_tree_name_is_not_accepted_after_pending(self):
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 1)
@@ -369,13 +371,16 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 'g_offh_destr_isolated_slots', destructibles_sensor.__dict__)
             destructibles_authority.BigWorld.wg_getChunkDestrFilenames.return_value = (
                 'tree',)
-            self.assertTrue(
+            self.assertFalse(
                 destructibles_sensor.validate_tree_identity_1513(1, 22, 0))
 
-        self.assertNotIn(
-            'g_offh_destr_isolation_logs', destructibles_sensor.__dict__)
+        self.assertEqual(
+            {(22, 0)}, destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual(
+            {'tree_descriptor'},
+            destructibles_sensor.g_offh_destr_isolation_logs)
 
-    def test_registry_isolates_only_named_slots_without_descriptors(self):
+    def test_registry_isolates_slots_instead_of_assigning_compacted_name(self):
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 2)
@@ -386,11 +391,16 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.DESTR_TYPE_FRAGILE = 3
         area.DESTR_TYPE_STRUCTURE = 4
         area.chunkIDFromPosition = lambda unused: 22
+        descriptor_lookup = mock.Mock(
+            side_effect=AssertionError(
+                'compacted name was treated as item identity'))
         area.g_cache = types.SimpleNamespace(
-            getDescByFilename=lambda unused: None)
+            getDescByFilename=descriptor_lookup)
         bigworld = types.ModuleType('BigWorld')
+        # Item 0 is unnamed; the only compacted name belongs to item 1.  The
+        # native helper omits item 0 instead of retaining an empty placeholder.
         bigworld.wg_getChunkDestrFilenames = (
-            lambda *unused: ('missing-tree', ''))
+            lambda *unused: ('tree-for-item1',))
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=_Vector())
         bigworld.wg_getDestructibleMatrix = lambda *unused: _ItemMatrix()
@@ -410,11 +420,16 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_sensor._fell_trees_near(
                 1, _Vector(), 0.0, 6.0, descriptor)
 
+        descriptor_lookup.assert_not_called()
         self.assertEqual(
-            {(22, 0)}, destructibles_sensor.g_offh_destr_isolated_slots)
-        self.assertNotIn((22, 1),
-                         destructibles_sensor.g_offh_destr_isolated_slots)
+            {(22, 0), (22, 1)},
+            destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertEqual(
+            {'native_identity_unavailable'},
+            destructibles_sensor.g_offh_destr_isolation_logs)
         self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
+        self.assertEqual(
+            0, destructibles_sensor.g_offh_tree_state['chunks'][22]['count'])
 
     def test_sensor_publishes_normalized_client_report(self):
         events = []
@@ -2307,7 +2322,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             getDescByFilename=lambda value: (
                 {'type': 3, 'health': 5} if value == filename else None))
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        # The compacted native list omits an item whose group has no registered
+        # name handler; it does not preserve an empty placeholder for the slot.
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=_Vector())
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
@@ -2376,7 +2393,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             getDescByFilename=lambda value: (
                 {'type': 3, 'health': 5} if value == filename else None))
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        # The compacted list omits this unregistered item rather than retaining
+        # an empty native-slot placeholder.
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=_Vector())
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
@@ -2626,7 +2645,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     destructibles_authority.destroy_tree(
                         1, 22, 37, 0.0, 6.0, (10.0, 2.0, 20.0))
 
-    def test_proximity_failure_is_retryable_and_uses_object_world_position(self):
+    def test_shifted_compacted_tree_name_cannot_destroy_earlier_item(self):
         descriptor = {'type': 1, 'health': 10, 'mass': 20}
         type_descriptor = _Strict1513Component(
             hull=_Strict1513Component(
@@ -2635,35 +2654,37 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                     (1.6, 1.0, 3.6), None))))
         manager = _Manager()
         manager.space_id = 1
-        manager.set_chunk_count(22, 1)
+        manager.set_chunk_count(22, 2)
         area = types.ModuleType('AreaDestructibles')
         area.g_destructiblesManager = manager
         area.DESTR_TYPE_TREE = 1
         area.DESTR_TYPE_FALLING_ATOM = 2
         area.DESTR_TYPE_FRAGILE = 3
         area.chunkIDFromPosition = lambda unused: 22
+        descriptor_lookup = mock.Mock(return_value=descriptor)
         area.g_cache = types.SimpleNamespace(
-            getDescByFilename=lambda unused: descriptor)
+            getDescByFilename=descriptor_lookup)
         chunk_matrix = types.SimpleNamespace(translation=_Vector(100, 5, 200))
-        item_matrix = types.SimpleNamespace(translation=_Vector(2, 3, 4))
+        item_matrices = (
+            types.SimpleNamespace(translation=_Vector(2, 3, 4)),
+            types.SimpleNamespace(translation=_Vector(40, 3, 40)))
         bigworld = types.ModuleType('BigWorld')
+        # Native item 0 is unnamed.  The one compacted name belongs to item 1,
+        # so treating list position 0 as item 0 would destroy the wrong object.
         bigworld.wg_getChunkDestrFilenames = lambda *unused: ('tree',)
         bigworld.wg_getChunkMatrix = lambda *unused: chunk_matrix
-        bigworld.wg_getDestructibleMatrix = lambda *unused: item_matrix
+        bigworld.wg_getDestructibleMatrix = (
+            lambda unused_space, unused_chunk, index: item_matrices[index])
         math_module = types.ModuleType('Math')
         math_module.Vector3 = _Vector
         math_module.Matrix = lambda value: value
-        calls = []
-        accepted = [False, True]
-
-        def destroy_tree(*args):
-            calls.append(args)
-            return accepted.pop(0)
-
+        destroy_tree = mock.Mock(
+            side_effect=AssertionError('shifted item reached native destroy'))
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused: False,
             destroy_tree=destroy_tree)
         events = []
+        writes = []
         destructibles_sensor.xrange = range
         destructibles_sensor.set_event_sink(
             lambda event: events.append(event) or True)
@@ -2673,29 +2694,32 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                               'BigWorld': bigworld, 'Math': math_module}), \
                 mock.patch.object(
                     destructibles_sensor, '_get_destr_authority',
-                    return_value=authority):
-            with self.assertRaisesRegex(
-                    RuntimeError, 'native proximity destroy'):
-                destructibles_sensor._fell_trees_near(
-                    1, _Vector(102, 8, 200), 0.0, 6.0,
-                    type_descriptor)
-            self.assertNotIn(
-                (22, 0),
-                destructibles_sensor.g_offh_tree_state['felled'])
-
+                    return_value=authority), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
             destructibles_sensor._fell_trees_near(
                 1, _Vector(102, 8, 200), 0.0, 6.0,
                 type_descriptor)
 
-        object_position = calls[-1][-1]
-        self.assertEqual((102.0, 8.0, 204.0),
-                         (object_position.x, object_position.y,
-                          object_position.z))
-        self.assertIn((22, 0), destructibles_sensor.g_offh_tree_state['felled'])
-        self.assertEqual((102.0, 8.0, 204.0),
-                         (events[0]['x'], events[0]['y'], events[0]['z']))
+        descriptor_lookup.assert_not_called()
+        destroy_tree.assert_not_called()
+        self.assertEqual([], events)
+        self.assertEqual(
+            set(), destructibles_sensor.g_offh_tree_state['felled'])
+        self.assertEqual(
+            {(22, 0), (22, 1)},
+            destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertTrue(destructibles_sensor.is_isolated_1513(22, 0))
+        self.assertFalse(
+            destructibles_sensor.validate_tree_identity_1513(1, 22, 0))
+        self.assertEqual(1, len(writes))
+        self.assertIn(
+            'type=native_identity_unavailable scope=slot '
+            'map=unknown chunk=22 item=0', writes[0])
+        self.assertEqual(
+            0, destructibles_sensor.g_offh_tree_state['chunks'][22]['count'])
 
-    def test_ensk_catalog_boxes_register_without_proximity_destruction(self):
+    def test_legacy_catalog_names_do_not_register_without_exact_instances(self):
         short_fence = (
             'content/GatesAndFences/gaf010_Fence/normal/lod0/'
             'gaf010_FenceTile1.model')
@@ -2767,11 +2791,11 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 1, _Vector(), 0.0, 0.0, type_descriptor)
 
         self.assertEqual([], calls)
+        self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
         self.assertEqual(
-            [(22, 0), (22, 1)],
-            sorted(destructibles_sensor.g_offh_destr_instances))
+            0, destructibles_sensor.g_offh_tree_state['chunks'][22]['count'])
 
-    def test_blank_native_slots_use_unique_v3_matrix_identities(self):
+    def test_unnamed_native_slots_use_unique_v3_matrix_identities(self):
         fence = (
             'content/GatesAndFences/gaf022/normal/lod0/fence.model')
         pole = 'content/Environment/env414/normal/lod0/pole.model'
@@ -2812,7 +2836,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.g_cache = types.SimpleNamespace(
             getDescByFilename=lambda value: descriptors.get(value))
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('', '')
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=chunk_translation)
         bigworld.wg_getDestructibleMatrix = (
@@ -2846,7 +2870,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                          destructibles_sensor.g_offh_tree_state['chunks'][22][
                              'slot_diagnostics'][1]['result'])
 
-    def test_native_count_registers_unnamed_slots_after_named_tree_prefix(self):
+    def test_native_count_registers_catalog_slots_without_assigning_prefix(self):
         tree = 'content/Trees/tree/normal/lod0/tree.model'
         fence = 'content/GatesAndFences/fence/normal/lod0/fence.model'
         pole = 'content/Environment/pole/normal/lod0/pole.model'
@@ -2919,10 +2943,10 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual('fragile', instances[(22, 1)]['kind'])
         self.assertEqual('falling', instances[(22, 2)]['kind'])
         self.assertEqual(1, len(diagnostic_lines))
-        self.assertIn('chunk=22 slots=3 names=1 named=1 blank=2',
+        self.assertIn('chunk=22 slots=3 names=1 unmapped=3',
                       diagnostic_lines[0])
         self.assertIn('v3_unique=2', diagnostic_lines[0])
-        self.assertIn('registered=falling:1,fragile:1,tree:1',
+        self.assertIn('registered=falling:1,fragile:1',
                       diagnostic_lines[0])
         self.assertIn('boxes=2', diagnostic_lines[0])
 
@@ -3144,7 +3168,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(4, len(state['seen_pending']))
         self.assertEqual(24, len(state['seen_chunks']))
 
-    def test_blank_v3_ambiguous_or_wrong_type_slot_fails_closed(self):
+    def test_unnamed_v3_ambiguous_or_wrong_type_slot_fails_closed(self):
         unique = 'content/test/normal/lod0/unique.model'
         ambiguous = 'content/test/normal/lod0/ambiguous.model'
         chunk_translation = _Vector()
@@ -3183,7 +3207,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.g_cache = types.SimpleNamespace(
             getDescByFilename=lambda unused: {'type': 2, 'health': 18})
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=chunk_translation)
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
@@ -3202,6 +3226,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 type_descriptor)
 
         self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
+        self.assertEqual(
+            {(22, 0)}, destructibles_sensor.g_offh_destr_isolated_slots)
 
     def test_nonblank_filename_mismatch_defers_to_exact_instance_identity(self):
         expected = 'content/test/normal/lod0/expected.model'
@@ -3312,16 +3338,16 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_sensor._fell_trees_near(
                 1, _Vector(), 0.0, 6.0, type_descriptor)
 
-        self.assertEqual({(22, 0)},
-                         destructibles_sensor.g_offh_destr_isolated_slots)
-        self.assertEqual({'filename_slot'},
+        self.assertEqual({22},
+                         destructibles_sensor.g_offh_destr_isolated_chunks)
+        self.assertEqual({'filename_payload'},
                          destructibles_sensor.g_offh_destr_isolation_logs)
         self.assertEqual(1, len(writes))
-        self.assertIn('type=filename_slot scope=slot map=06_ensk chunk=22 item=0',
+        self.assertIn('type=filename_payload scope=chunk map=06_ensk chunk=22',
                       writes[0])
 
         destructibles_sensor.set_catalog(catalog)
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getDestructibleEffectCategory = (
             lambda *unused: (_ for _ in ()).throw(ValueError('bad ABI')))
         writes = []
@@ -3342,7 +3368,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                       writes[0])
         self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
 
-    def test_blank_v3_structure_keeps_all_module_boxes(self):
+    def test_unnamed_v3_structure_keeps_all_module_boxes(self):
         filename = 'content/Buildings/test/normal/lod0/house.model'
         matrix = _ItemMatrix(_Vector(3.0, 0.0, 4.0))
         math_module = types.ModuleType('Math')
@@ -3378,7 +3404,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             } if value == filename else None))
         category_calls = []
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=_Vector())
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
@@ -3508,7 +3534,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual((60000.0004, 0.0, -60000.0004), boxes[0][0])
         self.assertEqual((2.0, 0.0, 0.0), boxes[0][1][0])
 
-    def test_structure_catalog_registers_without_proximity_destruction(self):
+    def test_legacy_structure_names_do_not_register_without_exact_instances(self):
         little = (
             'content/Buildings/bld003_LittleWoodShed/normal/lod0/'
             'bld003_LittleWoodShed.model')
@@ -3581,13 +3607,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 1, _Vector(), 0.0, 6.0, type_descriptor)
 
         self.assertEqual([], calls)
-        self.assertIn((22, 0), destructibles_sensor.g_offh_destr_instances)
-        self.assertIn((22, 1), destructibles_sensor.g_offh_destr_instances)
-        self.assertAlmostEqual(
-            1.0,
-            destructibles_sensor.g_offh_destr_instances[(22, 0)][
-                'item_scale'])
-        self.assertTrue(destructibles_sensor.g_offh_destr_contact_bins)
+        self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
+        self.assertEqual({}, destructibles_sensor.g_offh_destr_contact_bins)
 
     def test_bld002_material_proof_disambiguates_without_distance_or_normal(self):
         filename = (
@@ -5456,7 +5477,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.g_cache = types.SimpleNamespace(
             getDescByFilename=lambda unused: {'type': 3, 'health': 15})
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=chunk_translation)
         bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
@@ -5564,12 +5585,20 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
 
     def test_scaled_instance_reaching_across_chunk_boundary_is_registered(self):
         filename = 'content/GatesAndFences/scaled/normal/lod0/fence.model'
+        chunk_translation = _Vector(100.0, 0.0, 0.0)
+        item_matrix = _ItemMatrix(
+            _Vector(1.0, 0.0, 0.0), scale=20.0)
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            item_matrix, chunk_translation, math_module, 1000)
         destructibles_sensor.set_catalog(_catalog({
             filename: {
                 'kind': 'fragile',
                 'boxes': [[-2.0, -0.1, -0.1, 2.0, 0.1, 0.1, None]],
             },
-        }))
+        }, [list(signature) + [filename, 0, 1, 0, 20.0]]))
         descriptor = {'type': 3, 'health': 100,
                       'kineticDamageCorrection': 1.0}
         type_descriptor = _Strict1513Component(
@@ -5602,14 +5631,12 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
                 (filename,) if chunk_id == 1 else ()))
         bigworld.wg_getChunkMatrix = (
             lambda unused_space, chunk_id: types.SimpleNamespace(
-                translation=_Vector(100.0, 0.0, 0.0)
+                translation=chunk_translation
                 if chunk_id == 1 else _Vector()))
         bigworld.wg_getDestructibleMatrix = (
             lambda unused_space, unused_chunk, unused_index:
-            _ItemMatrix(_Vector(1.0, 0.0, 0.0), scale=20.0))
-        math_module = types.ModuleType('Math')
-        math_module.Vector3 = _Vector
-        math_module.Matrix = lambda value: value
+            item_matrix)
+        bigworld.wg_getDestructibleEffectCategory = lambda *unused: 3
         authority = types.SimpleNamespace(
             is_destroyed=lambda *unused: False,
             destroy_fragile=lambda *unused: self.fail(
