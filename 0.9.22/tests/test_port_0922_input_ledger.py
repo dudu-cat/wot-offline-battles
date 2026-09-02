@@ -352,6 +352,32 @@ class OrderedInputLedgerTests(unittest.TestCase):
                 'envelope_numeric', player.last_input_reject['reason'])
             self.assertTrue(player.last_input_reject['consumed'])
 
+    def test_an_exact_rejected_retry_keeps_its_original_diagnostic(self):
+        state = _state(players=1)
+        player = self._admit_base_frame(state)
+        player.alive = False
+        player.health = 0
+        bad = _frame(
+            state,
+            ram_contacts=[_player_ram_contact(contact_x=True)])
+
+        self.assertFalse(state.update_input(1, bad))
+        first = dict(player.last_input_reject)
+        self.assertEqual('ram_contacts', first['field'])
+        self.assertFalse(first['active'])
+
+        # Lifecycle may move on before an exact transport retry arrives.  Its
+        # terminal identity still has to report the field and lifecycle state
+        # that caused the original decision, not relabel it as input_seq in
+        # the actor's current state.
+        player.alive = True
+        player.health = player.max_health
+        self.assertFalse(state.update_input(1, json.loads(json.dumps(bad))))
+        self.assertEqual(first['reason'], player.last_input_reject['reason'])
+        self.assertEqual(first['field'], player.last_input_reject['field'])
+        self.assertEqual(first['active'], player.last_input_reject['active'])
+        self.assertTrue(player.last_input_reject['consumed'])
+
     def test_an_exact_applied_retry_folds_without_reapplying(self):
         state = _state(players=1)
         player = self._admit_base_frame(state)
@@ -481,6 +507,7 @@ class OrderedInputLedgerTests(unittest.TestCase):
                 self.assertEqual(1, player.input_seq)
                 self.assertEqual(
                     'inactive', player.input_decisions[2]['outcome'])
+                self.assertFalse(player.input_decisions[2]['active'])
 
                 # A frame queued behind it is not stuck behind a gap.
                 self.assertTrue(state.update_input(1, _frame(state)))
@@ -788,7 +815,10 @@ class InputLedgerLifecycleTests(unittest.TestCase):
 
         self.assertFalse(state.update_input(1, message))
         self.assertEqual(1, player.input_processed_seq)
-        self.assertFalse(player.last_input_reject)
+        self.assertEqual(
+            'player_disconnected', player.last_input_reject['reason'])
+        self.assertFalse(player.last_input_reject['consumed'])
+        self.assertFalse(player.last_input_reject['active'])
 
         player.connected = True
         self.assertFalse(state.update_input(1, message))
@@ -801,11 +831,22 @@ class InputLedgerLifecycleTests(unittest.TestCase):
         player = state.players[1]
         self.assertTrue(state.update_input(1, _frame(state)))
 
+        # Seed an earlier same-round failure: the diagnostic for the early
+        # round fence must replace it rather than reusing this stale reason.
         self.assertFalse(state.update_input(
-            1, _frame(state, round_id=state.round_id + 1, aim_yaw=7.0)))
+            1, _frame(state, aim_yaw=7.0)))
+        self.assertEqual(
+            'envelope_numeric', player.last_input_reject['reason'])
 
-        self.assertEqual(1, player.input_processed_seq)
-        self.assertFalse(player.last_input_reject)
+        self.assertFalse(state.update_input(
+            1, _frame(
+                state, input_seq=3, round_id=state.round_id + 1,
+                aim_yaw=7.0)))
+
+        self.assertEqual(2, player.input_processed_seq)
+        self.assertEqual('round_mismatch', player.last_input_reject['reason'])
+        self.assertEqual('round_id', player.last_input_reject['field'])
+        self.assertFalse(player.last_input_reject['consumed'])
 
     def test_a_rejection_does_not_disturb_a_siege_transition(self):
         state = _state(players=1)

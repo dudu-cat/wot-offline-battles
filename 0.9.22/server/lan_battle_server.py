@@ -665,7 +665,7 @@ PLAYER_INPUT_FAULT_CLASSES = {
     "up_cosine": ("up_cosine", 1.5),
     "pose_clock": ("pose_time_us", 1.5),
     "fire_seq": ("fire_seq", True),
-    "shell_pair": ("next_shell_index", 9),
+    "shell_pair": ("next_shell_index", 10),
     "gun_checkpoint": ("gun_checkpoint", {"reload_time": 0.0}),
     "siege_state": ("siege_enabled", 1),
     "extra_field": ("damage", 1000),
@@ -8923,13 +8923,16 @@ class BattleState:
         return sequence, payload, digest
 
     def _record_player_input_decision(self, player, sequence, fingerprint,
-                                      outcome, reason=""):
+                                      outcome, reason="", field="",
+                                      active=True):
         """Advance only the terminal frontier and retain its typed outcome."""
         player.input_processed_seq = int(sequence)
         player.input_decisions[int(sequence)] = {
             "fingerprint": str(fingerprint),
             "outcome": str(outcome),
             "reason": str(reason),
+            "field": str(field),
+            "active": bool(active),
         }
         while len(player.input_decisions) > MAX_PLAYER_INPUT_DECISIONS:
             player.input_decisions.popitem(last=False)
@@ -8969,11 +8972,12 @@ class BattleState:
         self._note_player_input_rejection(
             player, sequence, reason, field, consumed=True, active=active)
         self._record_player_input_decision(
-            player, sequence, fingerprint, INPUT_OUTCOME_REJECTED, reason)
+            player, sequence, fingerprint, INPUT_OUTCOME_REJECTED, reason,
+            field, active)
         return False
 
     def _admit_applied_player_input(self, player, sequence, payload, digest):
-        """Commit one valid frame to both the terminal and applied frontier."""
+        """Reserve a validated frame on both ordered-input frontiers."""
         self._record_player_input_decision(
             player, sequence, digest, INPUT_OUTCOME_APPLIED, "")
         player.input_seq = int(sequence)
@@ -9245,11 +9249,29 @@ class BattleState:
         while the next well-formed frame can still advance automatically.
         """
         with self.lock:
-            if not self._message_round_matches(message):
-                return False
             player = self.players.get(player_id)
-            if player is None or not player.connected:
+            if player is None:
                 return False
+            inactive_modern = bool(
+                self.client_build == CLIENT_BUILD_0922 and (
+                    self.phase != "battle" or
+                    self.battle_result is not None or
+                    not player.participating or not player.alive))
+            submitted_sequence = None
+            if isinstance(message, dict) and "input_seq" in message:
+                try:
+                    submitted_sequence = _exact_int(
+                        message.get("input_seq"), 1, PROJECTILE_MAX_ID)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if not self._message_round_matches(message):
+                return self._note_player_input_rejection(
+                    player, submitted_sequence, "round_mismatch",
+                    "round_id", active=not inactive_modern)
+            if not player.connected:
+                return self._note_player_input_rejection(
+                    player, submitted_sequence, "player_disconnected",
+                    active=False)
             ledger = bool(
                 HUMAN_RAM_TIMELINE_CAPABILITY in player.capabilities)
             sequence = None
@@ -9275,7 +9297,9 @@ class BattleState:
                     if decision["outcome"] == INPUT_OUTCOME_REJECTED:
                         return self._note_player_input_rejection(
                             player, sequence, decision["reason"],
-                            "input_seq", consumed=True)
+                            decision.get("field", "input_seq"),
+                            consumed=True,
+                            active=decision.get("active", True))
                     return True
                 if sequence <= player.input_processed_seq:
                     # Evicted from the bounded ledger: safely rejected, and it
@@ -9298,12 +9322,6 @@ class BattleState:
                             sequence))
                     message = _injected_player_input_fault(
                         message, fault_class)
-            inactive_modern = False
-            if self.client_build == CLIENT_BUILD_0922:
-                inactive_modern = bool(
-                    self.phase != "battle" or
-                    self.battle_result is not None or
-                    not player.participating or not player.alive)
             (reason, field), parsed = self._player_input_frame_failure(
                 player, message, inactive_modern)
             if reason:
@@ -9329,9 +9347,14 @@ class BattleState:
                 if ledger:
                     self._record_player_input_decision(
                         player, sequence, digest,
-                        INPUT_OUTCOME_INACTIVE, "inactive")
+                        INPUT_OUTCOME_INACTIVE, "inactive", active=False)
                 return True
             if ledger:
+                # Every client-controlled validation path has returned above.
+                # Reserve the transport identity before projecting the
+                # prevalidated fields so an unexpected internal handler fault
+                # cannot recreate the original permanent sequence gap.  This
+                # is fault containment, not a general rollback transaction.
                 self._admit_applied_player_input(
                     player, sequence, payload, digest)
                 if gun_checkpoint is not None:

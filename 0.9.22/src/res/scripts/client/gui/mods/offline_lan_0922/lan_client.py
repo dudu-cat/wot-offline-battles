@@ -569,7 +569,7 @@ def _valid_bot_equipment_contract(state, required=False):
 
 
 def _valid_player_environment_contract(state, required=False):
-    """Validate the canonical pose and landing frontier in a player row."""
+    """Validate canonical pose, input and landing frontiers in a player row."""
     required_fields = {
         'input_seq', 'up_cosine', 'landing_observation_seq'}
     if not required_fields.issubset(state):
@@ -579,8 +579,14 @@ def _valid_player_environment_contract(state, required=False):
     landing_sequence = _projectile_int_range(
         state.get('landing_observation_seq'), 0, MAX_PROJECTILE_ID)
     up_cosine = _exact_finite_float(state.get('up_cosine'))
+    processed_sequence = input_sequence
+    if 'input_processed_seq' in state:
+        processed_sequence = _projectile_int_range(
+            state.get('input_processed_seq'), 0, MAX_PROJECTILE_ID)
     return bool(
         input_sequence is not None and landing_sequence is not None and
+        processed_sequence is not None and
+        processed_sequence >= input_sequence and
         up_cosine is not None and -1.0 <= up_cosine <= 1.0)
 
 
@@ -1865,6 +1871,11 @@ class LANClient(object):
             self._landing_observation_pending = None
             self._landing_observation_queue = []
         next_input_seq = self._input_seq + 1
+        if next_input_seq > MAX_PROJECTILE_ID:
+            # The server cannot represent another ordered identity in this
+            # round.  Do not queue MAX+1 and move the local frontier into a
+            # permanent sequence gap; the next round resets both sides.
+            return False
         parsed_fire_seq = _projectile_int_range(
             max(0, int(fire_seq or 0)), 0, MAX_PROJECTILE_ID)
         if parsed_fire_seq is None:

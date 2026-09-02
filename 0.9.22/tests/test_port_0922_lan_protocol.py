@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT / '0.9.22' / 'server'))
 from gui.mods.offline_lan_0922.lan_client import (
     HUMAN_RAM_TIMELINE_CAPABILITY, LANClient,
     LEAN_SNAPSHOT_MANIFEST_CAPABILITY, MAX_PROJECTILE_ID,
-    _strict_projectile_effect, project_bot_state)
+    _strict_projectile_effect, _valid_player_environment_contract,
+    project_bot_state)
 from gui.mods.offline_lan_0922.authority_worker import (
     AuthorityWorkerLANClient)
 from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
@@ -1397,6 +1398,16 @@ class ShippingClientInputContractTests(unittest.TestCase):
 
         self.assertEqual(committed, self.client._input_seq)
 
+    def test_an_exhausted_input_sequence_is_not_queued_or_advanced(self):
+        self.client._input_seq_round = self.client.round_id
+        self.client._input_seq = MAX_PROJECTILE_ID
+        sent = len(self.sent)
+
+        self.assertFalse(self._send())
+
+        self.assertEqual(sent, len(self.sent))
+        self.assertEqual(MAX_PROJECTILE_ID, self.client._input_seq)
+
     def test_the_client_resumes_from_the_server_terminal_frontier(self):
         self.client.round_id = 7
         self.client._input_seq_round = 7
@@ -1412,6 +1423,19 @@ class ShippingClientInputContractTests(unittest.TestCase):
         # A frontier that contradicts the applied sequence is not adopted.
         self.assertFalse(self.client._adopt_player_input_frontier([
             _snapshot_player(input_seq=8, input_processed_seq=6)]))
+
+    def test_snapshot_validation_covers_the_terminal_frontier_relation(self):
+        self.assertTrue(_valid_player_environment_contract(
+            _snapshot_player(input_seq=4), required=True))
+        self.assertTrue(_valid_player_environment_contract(
+            _snapshot_player(input_seq=4, input_processed_seq=6),
+            required=True))
+        self.assertFalse(_valid_player_environment_contract(
+            _snapshot_player(input_seq=4, input_processed_seq=3),
+            required=True))
+        self.assertFalse(_valid_player_environment_contract(
+            _snapshot_player(input_seq=4, input_processed_seq=True),
+            required=True))
 
     def test_the_server_publishes_both_input_frontiers(self):
         self.assertTrue(self._send())
@@ -1498,6 +1522,26 @@ class InputFaultInjectionTests(unittest.TestCase):
                     self.assertTrue(
                         self.state.update_input(1, self._frame()))
                     self.assertEqual(3, self.player.input_seq)
+
+    def test_shell_pair_fault_is_illegal_at_every_valid_shell_index(self):
+        for shell_index in range(10):
+            with self.subTest(shell_index=shell_index):
+                self.setUp()
+                frame = self._frame()
+                frame.update({
+                    'shell_index': shell_index,
+                    'next_shell_index': shell_index,
+                    'shell_change_pending': False,
+                })
+                with mock.patch.dict(
+                        os.environ,
+                        {PLAYER_INPUT_FAULT_ENV: 'shell_pair'}):
+                    self.assertFalse(self.state.update_input(1, frame))
+                self.assertEqual(1, self.player.input_processed_seq)
+                self.assertEqual(0, self.player.input_seq)
+                self.assertEqual(
+                    'shell_selection',
+                    self.player.last_input_reject['reason'])
 
 
 class OrderedEventVocabularyTests(unittest.TestCase):
