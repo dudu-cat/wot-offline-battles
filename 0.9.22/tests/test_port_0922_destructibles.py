@@ -2339,6 +2339,126 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertNotIn((22, 0), getattr(
             destructibles_sensor, 'g_offh_destr_instances', {}))
 
+    def test_unregistered_native_effect_category_keeps_the_exact_identity(self):
+        """Native -1 means the item resolved without a registered handler.
+
+        The reviewed #1513 entry point returns no object when the
+        (chunk, item, module) triple does not resolve, and returns exactly -1
+        when the resolved item's native group owns no effect handler.  So -1
+        leaves that one channel unverified; it is neither a kind match nor
+        evidence of a wrong wire, and isolating on it hid legal destructibles
+        on at least five standard maps.
+        """
+        filename = 'content/MilitaryEnvironment/mle011_GroupBoxes.model'
+        matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        destructibles_sensor.set_catalog(_catalog({
+            filename: {
+                'kind': 'fragile',
+                'boxes': [[-1.0, -1.0, -1.0,
+                           1.0, 2.0, 1.0, None]],
+            },
+        }, [list(signature) + [filename, 0, 22, 0, 1.0]]))
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        area.g_cache = types.SimpleNamespace(
+            getDescByFilename=lambda value: (
+                {'type': 3, 'health': 5} if value == filename else None))
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('',)
+        bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
+            translation=_Vector())
+        bigworld.wg_getDestructibleMatrix = lambda *unused: matrix
+        categories = []
+
+        def native_category(space_id, chunk_id, item_index, module_index):
+            categories.append((space_id, chunk_id, item_index, module_index))
+            return -1
+
+        bigworld.wg_getDestructibleEffectCategory = native_category
+        authority = types.SimpleNamespace(
+            is_destroyed=lambda *unused: False)
+
+        writes = []
+        with mock.patch.dict(
+                sys.modules, {'BigWorld': bigworld,
+                              'AreaDestructibles': area,
+                              'Math': math_module}), \
+                mock.patch.object(
+                    destructibles_sensor, '_get_destr_authority',
+                    return_value=authority), \
+                mock.patch.object(
+                    sys, 'stdout', types.SimpleNamespace(write=writes.append)):
+            result = destructibles_sensor._catalog_shot_intersection(
+                1, _Vector(), _Vector(0, 0, 20))
+
+        self.assertIsNotNone(result)
+        self.assertEqual([(1, 22, 0, -1)], categories)
+        self.assertEqual(
+            set(), getattr(destructibles_sensor,
+                           'g_offh_destr_isolated_slots', set()))
+        self.assertIn((22, 0), getattr(
+            destructibles_sensor, 'g_offh_destr_instances', {}))
+        self.assertEqual(1, len(writes))
+        self.assertIn(
+            'DESTR accepted_native_identity '
+            'type=effect_category_unregistered', writes[0])
+        self.assertIn('map=06_ensk chunk=22 item=0', writes[0])
+        self.assertIn('native=-1 wire=live_validated', writes[0])
+        self.assertIn('repeats=suppressed_for_battle', writes[0])
+
+    def test_unregistered_and_wrong_native_categories_are_separate(self):
+        """A real kind disagreement still isolates the slot and both wires."""
+        filename = 'content/MilitaryEnvironment/mle011_GroupBoxes.model'
+        matrix = _ItemMatrix(_Vector(0.0, 0.0, 5.0))
+        math_module = types.ModuleType('Math')
+        math_module.Vector3 = _Vector
+        math_module.Matrix = lambda value: value
+        signature = destructibles_sensor._locator_signature(
+            matrix, _Vector(), math_module, 1000)
+        area = types.ModuleType('AreaDestructibles')
+        area.DESTR_TYPE_TREE = 1
+        area.DESTR_TYPE_FALLING_ATOM = 2
+        area.DESTR_TYPE_FRAGILE = 3
+        area.DESTR_TYPE_STRUCTURE = 4
+        record = {'kind': 'fragile',
+                  'filename': filename,
+                  'boxes': ((-1.0, -1.0, -1.0, 1.0, 2.0, 1.0, None),)}
+        descriptor = {'type': 3, 'health': 5}
+        bigworld = types.ModuleType('BigWorld')
+
+        writes = []
+        for native_value, expected in ((-1, True), (4, False), (2, False)):
+            destructibles_sensor._clear_runtime_registry()
+            bigworld.wg_getDestructibleEffectCategory = (
+                lambda *unused, **ignored: native_value)
+            with mock.patch.object(
+                    sys, 'stdout',
+                    types.SimpleNamespace(write=writes.append)):
+                accepted = (
+                    destructibles_sensor.
+                    _validate_native_effect_categories_1513(
+                        bigworld, area, record, descriptor, 1, 22, 0))
+            self.assertEqual(expected, accepted, native_value)
+            isolated = getattr(
+                destructibles_sensor, 'g_offh_destr_isolated_slots', set())
+            if expected:
+                self.assertEqual(set(), isolated, native_value)
+            else:
+                self.assertEqual({(22, 0)}, isolated, native_value)
+        destructibles_sensor._clear_runtime_registry()
+
     def test_baked_broad_phase_covers_signature_quantization_at_bin_edge(self):
         filename = 'content/MilitaryEnvironment/mle008_Canisters.model'
         # The live origin still quantizes to 7.999, while this asymmetric box
@@ -2843,7 +2963,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual({'filename_prefix'},
                          destructibles_sensor.g_offh_destr_isolation_logs)
         self.assertEqual(1, len(writes))
-        self.assertIn('type=filename_prefix scope=chunk chunk=22', writes[0])
+        self.assertIn('type=filename_prefix scope=chunk map=unknown chunk=22', writes[0])
         self.assertIn('repeats=suppressed_for_battle', writes[0])
         self.assertEqual([], manager.orders)
 
@@ -3131,13 +3251,19 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             destructibles_sensor._fell_trees_near(
                 1, _Vector(), 0.0, 6.0, type_descriptor)
 
+        # ``wg_getChunkDestrFilenames`` is compacted, so position 0 names some
+        # other item in the chunk.  It is neither an alias nor a slot error, so
+        # the exact wire and unique matrix signature keep the catalog identity
+        # and nothing is logged or isolated for the disagreement.
         instance = destructibles_sensor.g_offh_destr_instances[(22, 0)]
         self.assertEqual(expected, instance['filename'])
-        self.assertEqual(1, len(writes))
-        self.assertIn(
-            'DESTR accepted_catalog_identity type=filename_mismatch',
-            writes[0])
-        self.assertIn('repeats=suppressed_for_battle', writes[0])
+        self.assertEqual([], writes)
+        self.assertEqual(
+            set(), getattr(destructibles_sensor,
+                           'g_offh_destr_isolated_slots', set()))
+        self.assertEqual(
+            set(), getattr(destructibles_sensor,
+                           'g_offh_destr_isolation_logs', set()))
 
     def test_v3_native_slot_and_effect_query_isolate_the_slot(self):
         filename = 'content/test/normal/lod0/fence.model'
@@ -3191,7 +3317,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual({'filename_slot'},
                          destructibles_sensor.g_offh_destr_isolation_logs)
         self.assertEqual(1, len(writes))
-        self.assertIn('type=filename_slot scope=slot chunk=22 item=0',
+        self.assertIn('type=filename_slot scope=slot map=06_ensk chunk=22 item=0',
                       writes[0])
 
         destructibles_sensor.set_catalog(catalog)
@@ -3212,7 +3338,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual({'effect_query'},
                          destructibles_sensor.g_offh_destr_isolation_logs)
         self.assertEqual(1, len(writes))
-        self.assertIn('type=effect_query scope=slot chunk=22 item=0',
+        self.assertIn('type=effect_query scope=slot map=06_ensk chunk=22 item=0',
                       writes[0])
         self.assertEqual({}, destructibles_sensor.g_offh_destr_instances)
 
