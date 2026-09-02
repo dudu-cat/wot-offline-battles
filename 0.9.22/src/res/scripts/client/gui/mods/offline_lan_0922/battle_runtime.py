@@ -9918,6 +9918,16 @@ class BattleRuntime(object):
                 meta['base_checked_ms'] = normalized['base_checked_ms']
                 meta['acked_distance'] = normalized['checked_distance']
                 meta['acked_piercing_loss'] = normalized['piercing_loss']
+                # The server rounds cumulative frontiers to its six-decimal
+                # wire contract. Preserve that canonical monotonic floor: a
+                # rounded-up acknowledgement must never make the next frozen
+                # terminal look as though distance or piercing loss regressed.
+                meta['checked_distance'] = max(
+                    _number(meta.get('checked_distance'), 0.0),
+                    normalized['checked_distance'])
+                meta['piercing_loss'] = max(
+                    _number(meta.get('piercing_loss'), 0.0),
+                    normalized['piercing_loss'])
                 pending = meta.get('progress_pending')
                 if (pending is not None and
                         normalized['base_checked_ms'] >=
@@ -10319,13 +10329,15 @@ class BattleRuntime(object):
                 'projectile visual launch', error)
             return False
 
-    def _projectile_explosion(self, projectile_id, impact):
+    def _projectile_explosion(self, projectile_id, impact, outcome='impact'):
         """Return ``(effectsDescr, effectMaterial, velocity)`` for a world hit.
 
         Returns None for a vehicle terminal and whenever the verdict is not
         ours to make, because an explosion added on top of the armour-hit
         effect would be a visible regression while a missing one is not.
         """
+        if outcome != 'impact':
+            return None
         meta = self._projectile_meta.get(projectile_id)
         if meta is None or meta.get('hit_vehicle') is not False:
             return None
@@ -10413,10 +10425,12 @@ class BattleRuntime(object):
         if impact is None:
             return False
         try:
+            outcome = (event.get('outcome')
+                       if isinstance(event, dict) else None)
             stopped = bool(self._remote_factory.stop_projectile_tracer(
                 projectile_id, impact,
                 explosion=self._projectile_explosion(
-                    projectile_id, impact)))
+                    projectile_id, impact, outcome)))
         except Exception as error:
             # Terminal authority has already been applied.  A native cosmetic
             # retirement failure must not poison the ordered event journal.
@@ -10628,6 +10642,14 @@ class BattleRuntime(object):
 
     def _prune_projectile_position_history(self, states=None):
         if not self._projectile_position_history or self._projectiles is None:
+            return
+        if self._projectile_is_authority():
+            # Canonical launches arrive after the server has assigned their
+            # launch tick, so a new projectile may legitimately start before
+            # every currently active cursor.  `_sample_projectile_positions`
+            # already applies the bounded protocol-lifetime cap; pruning the
+            # authority history to existing cursors destroys the left-hand
+            # pose endpoint needed by a delayed next launch.
             return
         if states is None:
             states = self._projectiles.snapshot()
@@ -11110,6 +11132,27 @@ class BattleRuntime(object):
 
     def _projectile_chord(self, state, start, end,
                           absolute_start, absolute_end):
+        try:
+            return self._projectile_chord_impl(
+                state, start, end, absolute_start, absolute_end)
+        except Exception as error:
+            manager_key = state.get('key')
+            projectile_id = (manager_key[0]
+                             if isinstance(manager_key, tuple) else
+                             manager_key)
+            meta = self._projectile_meta.get(projectile_id)
+            if meta is not None:
+                meta['terminal_failure_boundary'] = \
+                    'projectile_chord_exception'
+                try:
+                    meta['terminal_failure_error'] = '%s: %s' % (
+                        error.__class__.__name__, error)
+                except Exception:
+                    meta['terminal_failure_error'] = '<unprintable>'
+            raise
+
+    def _projectile_chord_impl(self, state, start, end,
+                               absolute_start, absolute_end):
         manager_key = state.get('key')
         projectile_id = (manager_key[0]
                          if isinstance(manager_key, tuple) else manager_key)
@@ -11157,6 +11200,8 @@ class BattleRuntime(object):
                     continue
                 record['projectile_collision_pose_boundary'] = \
                     'historic_pose_unavailable'
+                meta['terminal_failure_boundary'] = \
+                    'historic_pose_unavailable'
                 return {'reason': 'callback_error', 'fraction': 0.0}
             target_at_start = self._projectile_historic_pose(
                 key, absolute_start)
@@ -11170,6 +11215,8 @@ class BattleRuntime(object):
                 if target is None or not getattr(target, 'isStarted', False):
                     continue
                 record['projectile_collision_pose_boundary'] = \
+                    'historic_pose_unavailable'
+                meta['terminal_failure_boundary'] = \
                     'historic_pose_unavailable'
                 return {'reason': 'callback_error', 'fraction': 0.0}
             # This conservative coarse pass avoids constructing native target
@@ -11248,6 +11295,8 @@ class BattleRuntime(object):
             if sweep_fractions is None:
                 record['projectile_collision_pose_boundary'] = \
                     'angular_sweep_limit_exceeded'
+                meta['terminal_failure_boundary'] = \
+                    'angular_sweep_limit_exceeded'
                 return {'reason': 'callback_error', 'fraction': 0.0}
             candidate_segments = []
             for segment_index in range(len(sweep_fractions) - 1):
@@ -11273,6 +11322,8 @@ class BattleRuntime(object):
                         segment_target_end is None or
                         segment_target_contact is None):
                     record['projectile_collision_pose_boundary'] = \
+                        'historic_pose_unavailable'
+                    meta['terminal_failure_boundary'] = \
                         'historic_pose_unavailable'
                     return {'reason': 'callback_error', 'fraction': 0.0}
                 projectile_start = lerp3(start, end, start_fraction)
@@ -11314,6 +11365,9 @@ class BattleRuntime(object):
                     record, target, query_start, query_end,
                     segment_collision_pose)
                 if collisions is None:
+                    meta['terminal_failure_boundary'] = record.get(
+                        'projectile_collision_pose_boundary',
+                        'historic_component_matrix_unavailable')
                     return {'reason': 'callback_error', 'fraction': 0.0}
                 if not collisions:
                     continue
@@ -11726,7 +11780,95 @@ class BattleRuntime(object):
                 break
         return effects
 
+    def _report_projectile_terminal_failure(
+            self, meta, state, stage, reason, error=None):
+        """Write one bounded diagnostic for a projectile-local failure."""
+        try:
+            signature = (str(stage), str(reason))
+            reported = meta.setdefault(
+                'terminal_failures_reported', set())
+            if signature in reported:
+                return False
+            reported.add(signature)
+            boundary = meta.get('terminal_failure_boundary')
+            try:
+                detail = (error if isinstance(error, _STRING_TYPES) else
+                          repr(error) if error is not None else 'none')
+            except Exception:
+                detail = '<unprintable>'
+            detail = detail.replace('\r', ' ').replace('\n', ' ')[:160]
+            elapsed_ms = int(round(max(
+                0.0, _number(state.get('elapsed'))) * 1000.0))
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] PROJECTILE FAILURE '
+                'id=%s stage=%s reason=%s boundary=%s elapsed_ms=%d '
+                'error=%s\n'
+                % (meta.get('projectile_id'), stage, reason, boundary,
+                   elapsed_ms, detail))
+        except Exception:
+            # Diagnostics are best effort. A broken stdout stream or malformed
+            # exception representation must not become another lost terminal.
+            return False
+        return True
+
+    def _projectile_terminal_failure(self, state, terminal, error):
+        """Freeze an explicit no-effect terminal after local build failure."""
+        manager_key = state.get('key')
+        projectile_id = (manager_key[0]
+                         if isinstance(manager_key, tuple) else manager_key)
+        meta = self._projectile_meta.get(projectile_id)
+        if meta is None:
+            return False
+        if meta.get('pending_resolution') is not None:
+            if meta.get('awaiting_resolution'):
+                return True
+            return self._submit_projectile_resolution(meta)
+        if meta.get('pending_ricochet') is not None:
+            if meta.get('awaiting_ricochet'):
+                return True
+            return self._submit_projectile_ricochet(meta)
+        try:
+            impact = tuple(
+                state.get('position') or meta.get('origin') or
+                (0.0, 0.0, 0.0))
+        except Exception:
+            impact = (0.0, 0.0, 0.0)
+        self._projectile_terminal_data.pop(projectile_id, None)
+        meta['hit_vehicle'] = False
+        meta['pending_ricochet'] = None
+        meta['awaiting_ricochet'] = False
+        meta['awaiting_resolution'] = False
+        meta['pending_resolution'] = {
+            'state': state,
+            'outcome': 'expired',
+            'impact': impact,
+            'direct': None,
+            'splash': [],
+            'hit_vehicle': False,
+            'wreck_hit': None,
+        }
+        reason = (terminal.get('reason')
+                  if isinstance(terminal, dict) else 'unknown')
+        self._report_projectile_terminal_failure(
+            meta, state, 'terminal', reason, error)
+        try:
+            return self._submit_projectile_resolution(meta)
+        except Exception as submit_error:
+            self._report_projectile_terminal_failure(
+                meta, state, 'resolution_build', reason, submit_error)
+            return False
+
     def _projectile_terminal(self, state, terminal):
+        try:
+            return self._projectile_terminal_impl(state, terminal)
+        except Exception as error:
+            # InFlightProjectiles deliberately contains callback exceptions
+            # after removing the local state.  Convert every remaining build
+            # failure into one frozen terminal so the server ledger cannot be
+            # left active forever without a retryable outcome.
+            return self._projectile_terminal_failure(state, terminal, error)
+
+    def _projectile_terminal_impl(self, state, terminal):
         manager_key = state.get('key')
         projectile_id = (manager_key[0]
                          if isinstance(manager_key, tuple) else manager_key)
@@ -11735,6 +11877,10 @@ class BattleRuntime(object):
             return False
         data = self._projectile_terminal_data.pop(projectile_id, None)
         reason = terminal.get('reason')
+        if reason == 'callback_error':
+            self._report_projectile_terminal_failure(
+                meta, state, 'chord', reason,
+                meta.pop('terminal_failure_error', None))
         outcome = ('impact' if reason == 'impact' and data is not None else
                    'miss' if reason == 'max_distance' else 'expired')
         impact = tuple(state.get('position') or meta.get('origin'))
@@ -11747,10 +11893,12 @@ class BattleRuntime(object):
                 if meta.get('is_he'):
                     splash = self._projectile_splash_effects(
                         meta, impact, data.get('target_key'))
-        except Exception:
+        except Exception as error:
             # A malformed native collision/proposal cannot be allowed to
             # damage a different target. Retire the ledger entry without
             # effects so another authority never replays the same chord.
+            self._report_projectile_terminal_failure(
+                meta, state, 'effects', reason, error)
             outcome = 'expired'
             direct = None
             splash = []
@@ -11814,6 +11962,16 @@ class BattleRuntime(object):
                         'target_kind': target_kind,
                         'target_id': int(target_record.get('network_id')),
                     }
+        if hit_vehicle and direct is None and wreck_hit is None:
+            # A live vehicle impact must carry the exact armour proposal,
+            # including legal zero-damage ricochets and non-penetrations. If
+            # that proposal could not be produced, do not publish a visually
+            # convincing impact with no gameplay verdict.
+            self._report_projectile_terminal_failure(
+                meta, state, 'effects', 'missing_live_direct')
+            outcome = 'expired'
+            hit_vehicle = False
+            splash = []
         pending = {
             'state': state, 'outcome': outcome, 'impact': impact,
             'direct': direct, 'splash': splash,
@@ -11840,6 +11998,21 @@ class BattleRuntime(object):
             int(meta.get('segment_start_time_ms', 0)) +
             int(round(float(state.get('elapsed', 0.0)) * 1000.0)))
 
+    @staticmethod
+    def _projectile_checked_distance(meta, state):
+        """Return a distance no earlier than the canonical cursor."""
+        return max(
+            0.0, _number(state.get('distance'), 0.0),
+            _number(meta.get('checked_distance'), 0.0),
+            _number(meta.get('acked_distance'), 0.0))
+
+    @staticmethod
+    def _projectile_checked_piercing_loss(meta):
+        """Return accumulated loss no earlier than the canonical cursor."""
+        return max(
+            0.0, _number(meta.get('piercing_loss'), 0.0),
+            _number(meta.get('acked_piercing_loss'), 0.0))
+
     def _submit_projectile_ricochet(self, meta):
         pending = meta.get('pending_ricochet')
         if (pending is None or meta.get('progress_pending') is not None or
@@ -11849,39 +12022,57 @@ class BattleRuntime(object):
         sender = getattr(self.client, 'send_projectile_ricochet', None)
         if not callable(sender):
             return False
-        wire = pending.get('wire')
-        if wire is None:
-            state = pending['state']
-            wire = {
-                'authority_epoch': self._projectile_epoch,
-                'projectile_id': meta['projectile_id'],
-                'base_checked_ms': int(meta.get('base_checked_ms', 0)),
-                'resolved_time_ms': self._projectile_elapsed_ms(meta, state),
-                'impact': list(pending['impact']),
-                'segment_origin': list(pending['segment_origin']),
-                'segment_velocity': list(pending['segment_velocity']),
-                'base_penetration_multiplier': pending[
-                    'base_penetration_multiplier'],
-                'direct': copy.deepcopy(pending['direct']),
-                'checked_distance': float(state.get('distance', 0.0)),
-                'piercing_loss': float(meta.get('piercing_loss', 0.0)),
-                'penetration_factor': float(
-                    meta.get('penetration_factor', 1.0)),
-                'destructibles': copy.deepcopy(
-                    list(meta.get('destructibles_pending', ()))),
-            }
-            pending['wire'] = wire
-        sent = sender(
-            wire['authority_epoch'], wire['projectile_id'],
-            wire['base_checked_ms'], wire['resolved_time_ms'],
-            wire['impact'], wire['segment_origin'], wire['segment_velocity'],
-            wire['base_penetration_multiplier'], wire['direct'],
-            checked_distance=wire['checked_distance'],
-            piercing_loss=wire['piercing_loss'],
-            penetration_factor=wire['penetration_factor'],
-            destructibles=wire['destructibles'])
+        try:
+            wire = pending.get('wire')
+            if wire is None:
+                state = pending['state']
+                wire = {
+                    'authority_epoch': self._projectile_epoch,
+                    'projectile_id': meta['projectile_id'],
+                    'base_checked_ms': int(meta.get('base_checked_ms', 0)),
+                    'resolved_time_ms': self._projectile_elapsed_ms(
+                        meta, state),
+                    'impact': list(pending['impact']),
+                    'segment_origin': list(pending['segment_origin']),
+                    'segment_velocity': list(pending['segment_velocity']),
+                    'base_penetration_multiplier': pending[
+                        'base_penetration_multiplier'],
+                    'direct': copy.deepcopy(pending['direct']),
+                    'checked_distance': self._projectile_checked_distance(
+                        meta, state),
+                    'piercing_loss': self._projectile_checked_piercing_loss(
+                        meta),
+                    'penetration_factor': float(
+                        meta.get('penetration_factor', 1.0)),
+                    'destructibles': copy.deepcopy(
+                        list(meta.get('destructibles_pending', ()))),
+                }
+                pending['wire'] = wire
+        except Exception as error:
+            self._report_projectile_terminal_failure(
+                meta, pending.get('state', {}), 'ricochet_build',
+                'exception', error)
+            return False
+        try:
+            sent = sender(
+                wire['authority_epoch'], wire['projectile_id'],
+                wire['base_checked_ms'], wire['resolved_time_ms'],
+                wire['impact'], wire['segment_origin'],
+                wire['segment_velocity'],
+                wire['base_penetration_multiplier'], wire['direct'],
+                checked_distance=wire['checked_distance'],
+                piercing_loss=wire['piercing_loss'],
+                penetration_factor=wire['penetration_factor'],
+                destructibles=wire['destructibles'])
+        except Exception as error:
+            self._report_projectile_terminal_failure(
+                meta, pending['state'], 'ricochet_send', 'exception', error)
+            return False
         if sent:
             meta['awaiting_ricochet'] = True
+        else:
+            self._report_projectile_terminal_failure(
+                meta, pending['state'], 'ricochet_send', 'rejected')
         return bool(sent)
 
     def _submit_projectile_resolution(self, meta):
@@ -11893,42 +12084,58 @@ class BattleRuntime(object):
         sender = getattr(self.client, 'send_projectile_resolve', None)
         if not callable(sender):
             return False
-        wire = pending.get('wire')
-        if wire is None:
-            state = pending['state']
-            base_checked_ms = int(meta.get('base_checked_ms', 0))
-            elapsed_ms = self._projectile_elapsed_ms(meta, state)
-            wire = {
-                'authority_epoch': self._projectile_epoch,
-                'projectile_id': meta['projectile_id'],
-                'base_checked_ms': base_checked_ms,
-                'outcome': pending['outcome'],
-                'resolved_time_ms': elapsed_ms,
-                'impact': (list(pending['impact'])
-                           if pending['outcome'] == 'impact' else None),
-                'direct': copy.deepcopy(pending['direct']),
-                'splash': copy.deepcopy(pending['splash']),
-                'checked_distance': float(state.get('distance', 0.0)),
-                'piercing_loss': float(meta.get('piercing_loss', 0.0)),
-                'penetration_factor': float(
-                    meta.get('penetration_factor', 1.0)),
-                'hit_vehicle': bool(pending.get('hit_vehicle')),
-                'wreck_hit': copy.deepcopy(pending.get('wreck_hit')),
-                'destructibles': copy.deepcopy(
-                    list(meta.get('destructibles_pending', ()))),
-            }
-            pending['wire'] = wire
-        sent = sender(
-            wire['authority_epoch'], wire['projectile_id'],
-            wire['base_checked_ms'], wire['outcome'],
-            wire['resolved_time_ms'], wire['impact'], wire['direct'],
-            wire['splash'], checked_distance=wire['checked_distance'],
-            piercing_loss=wire['piercing_loss'],
-            penetration_factor=wire['penetration_factor'],
-            hit_vehicle=wire['hit_vehicle'], wreck_hit=wire['wreck_hit'],
-            destructibles=wire['destructibles'])
+        try:
+            wire = pending.get('wire')
+            if wire is None:
+                state = pending['state']
+                base_checked_ms = int(meta.get('base_checked_ms', 0))
+                elapsed_ms = self._projectile_elapsed_ms(meta, state)
+                wire = {
+                    'authority_epoch': self._projectile_epoch,
+                    'projectile_id': meta['projectile_id'],
+                    'base_checked_ms': base_checked_ms,
+                    'outcome': pending['outcome'],
+                    'resolved_time_ms': elapsed_ms,
+                    'impact': (list(pending['impact'])
+                               if pending['outcome'] == 'impact' else None),
+                    'direct': copy.deepcopy(pending['direct']),
+                    'splash': copy.deepcopy(pending['splash']),
+                    'checked_distance': self._projectile_checked_distance(
+                        meta, state),
+                    'piercing_loss': self._projectile_checked_piercing_loss(
+                        meta),
+                    'penetration_factor': float(
+                        meta.get('penetration_factor', 1.0)),
+                    'hit_vehicle': bool(pending.get('hit_vehicle')),
+                    'wreck_hit': copy.deepcopy(pending.get('wreck_hit')),
+                    'destructibles': copy.deepcopy(
+                        list(meta.get('destructibles_pending', ()))),
+                }
+                pending['wire'] = wire
+        except Exception as error:
+            self._report_projectile_terminal_failure(
+                meta, pending.get('state', {}), 'resolution_build',
+                'exception', error)
+            return False
+        try:
+            sent = sender(
+                wire['authority_epoch'], wire['projectile_id'],
+                wire['base_checked_ms'], wire['outcome'],
+                wire['resolved_time_ms'], wire['impact'], wire['direct'],
+                wire['splash'], checked_distance=wire['checked_distance'],
+                piercing_loss=wire['piercing_loss'],
+                penetration_factor=wire['penetration_factor'],
+                hit_vehicle=wire['hit_vehicle'], wreck_hit=wire['wreck_hit'],
+                destructibles=wire['destructibles'])
+        except Exception as error:
+            self._report_projectile_terminal_failure(
+                meta, pending['state'], 'resolution_send', 'exception', error)
+            return False
         if sent:
             meta['awaiting_resolution'] = True
+        else:
+            self._report_projectile_terminal_failure(
+                meta, pending['state'], 'resolution_send', 'rejected')
         return bool(sent)
 
     def _flush_pending_projectile_resolutions(self):
@@ -11972,8 +12179,9 @@ class BattleRuntime(object):
                 'base_checked_ms': base_checked,
                 'checked_through_ms': min(
                     meta['max_time_ms'], checked),
-                'checked_distance': float(state.get('distance', 0.0)),
-                'piercing_loss': float(meta.get('piercing_loss', 0.0)),
+                'checked_distance': self._projectile_checked_distance(
+                    meta, state),
+                'piercing_loss': self._projectile_checked_piercing_loss(meta),
                 'penetration_factor': float(
                     meta.get('penetration_factor', 1.0)),
                 'destructibles': [dict(value) for value in
@@ -12630,6 +12838,15 @@ class BattleRuntime(object):
                 next_boundary = _PROFILE_CLOCK()
                 stages['prewarm'] = max(0.0, next_boundary - boundary)
                 boundary = next_boundary
+            if (not self._battle_live and
+                    self._projectile_is_authority() and
+                    self._projectiles is not None):
+                # The first canonical launch is stamped on an earlier server
+                # tick. Record real ready-barrier/countdown poses before combat
+                # so its initial chord has a genuine interpolation left
+                # endpoint; never backfill from the receipt-time pose.
+                self._sample_projectile_positions(
+                    now, self._projectile_record_poses())
             if (not self._battle_live and
                     self._prebattle_transition_ready(now)):
                 live_edge = float(self._prebattle_deadline)

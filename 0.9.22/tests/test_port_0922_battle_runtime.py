@@ -22455,13 +22455,59 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._flush_pending_entities = mock.Mock()
         battle._drain_event_journal = mock.Mock()
         battle._maybe_send_battle_ready = mock.Mock()
+        battle._projectile_record_poses = mock.Mock()
         battle._schedule = mock.Mock()
 
         battle._frame()
 
         battle.client.send_bot_manifest.assert_called_once_with([])
         battle._bots.update.assert_not_called()
+        battle._projectile_record_poses.assert_not_called()
         battle._schedule.assert_called_once_with(0.0, battle._frame)
+
+    def test_worker_prebattle_frame_records_real_projectile_pose_history(self):
+        runtime = _runtime()
+        runtime.bigworld.now = 0.95
+        payload = {'type': 'bot_manifest', 'bots': []}
+        battle = BattleRuntime(runtime)
+        battle.state = 'running'
+        battle._worker_mode = True
+        battle._battle_live = False
+        battle._prebattle_deadline = None
+        battle._last_frame_time = 0.9
+        battle._frame_diagnostics = None
+        battle._start_message = {'round_id': 7}
+        battle._bots = self._pending_manifest_outbox(payload)
+        battle._bots.update = mock.Mock(return_value=[])
+        battle.client = types.SimpleNamespace(
+            round_id=7, authority_epoch=3,
+            is_bot_authority=lambda: True,
+            send_bot_manifest=mock.Mock(return_value=True))
+        battle._projectiles = battle_runtime_module.InFlightProjectiles(
+            initial_time=0.0)
+        battle._projectile_position_history = []
+        pose = battle._projectile_plain_pose((4.0, 5.0, 6.0))
+        battle._projectile_record_poses = mock.Mock(return_value={
+            'player:7': pose})
+        battle._flush_pending_bot_create = mock.Mock()
+        battle._flush_pending_entities = mock.Mock()
+        battle._drain_event_journal = mock.Mock()
+        battle._maybe_send_battle_ready = mock.Mock()
+        battle._schedule = mock.Mock()
+
+        battle._frame()
+        runtime.bigworld.now = 1.0
+        battle._frame()
+
+        self.assertEqual(2, battle._projectile_record_poses.call_count)
+        self.assertEqual(
+            [0.95, 1.0],
+            [row[0] for row in battle._projectile_position_history])
+        self.assertEqual(
+            4.0, battle._projectile_position_history[0][1][
+                'player:7']['x'])
+        battle._bots.update.assert_not_called()
+        self.assertEqual(0, len(battle._projectiles))
 
     def test_bot_manifest_retry_is_fenced_by_lifecycle_change(self):
         mutations = (
