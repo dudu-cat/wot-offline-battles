@@ -337,20 +337,10 @@ def _player_dynamic_spotting(snapshot, state):
 
 def _player_spotting_perk(snapshot, state, wanted):
     """Return whether a living projected crewman carries one finished perk."""
-    wanted = str(wanted).lower()
     critical = state.get('critical')
     critical = critical if isinstance(critical, dict) else {}
-    knocked_out = set(str(name) for name in
-                      (critical.get('crew_ko') or ()))
-    for member in (snapshot.get('crew') or {}).get('members') or ():
-        if str(member.get('instance')) in knocked_out:
-            continue
-        for skill in member.get('skills') or ():
-            if (str(skill.get('name')).lower() == wanted and
-                    skill.get('active') is True and
-                    _number(skill.get('level')) >= 100.0):
-                return True
-    return False
+    return bool(effective_params.living_skill_count(
+        snapshot, str(wanted).lower(), critical))
 
 
 def _forward_speed(descriptor):
@@ -363,12 +353,25 @@ def _forward_speed(descriptor):
     return max(4.0, min(value, 35.0))
 
 
+def _bot_default_crew_factors(descriptor):
+    """Return #1513's native factors for the target's plain 100% crew."""
+    factors = loadout.attribute_factors(descriptor, crew=None)
+    if factors is None:
+        raise RuntimeError(
+            'bot default crew attribute factors are unavailable')
+    return factors
+
+
 def _bot_profile(descriptor):
     """Spotting inputs for a vehicle whose crew is the #1513 default crew."""
     return loadout.spotting_profile(
-        descriptor, None, factors=loadout.attribute_factors(descriptor))
+        descriptor, None, factors=_bot_default_crew_factors(descriptor))
 
 
+def _bot_physics_params(descriptor):
+    """Physics for the target vehicle with its plain 100% default crew."""
+    return vehicle_physics.derive_params(
+        descriptor, factors=_bot_default_crew_factors(descriptor))
 
 
 def _view_range(descriptor, still_seconds=0.0):
@@ -884,7 +887,7 @@ class _BotGunState(object):
     def __init__(self, descriptor, fire_seq=0, dispersion_factor=1.0):
         gun = _value(descriptor, 'gun', {}) or {}
         gun_modifiers = loadout.modifiers(
-            descriptor, factors=loadout.attribute_factors(descriptor))
+            descriptor, factors=_bot_default_crew_factors(descriptor))
         self.loadout = dict(gun_modifiers)
         raw_dispersion = _value(gun, 'shotDispersionAngle')
         try:
@@ -2378,6 +2381,21 @@ class BotRuntime(object):
             return abs(_number(result.get('slope', 0.0))) <= 0.55
         return bool(result)
 
+    def _physics_params_for(self, bot_id):
+        """Return one Bot's installed physics, rebuilding only its cache."""
+        bot_id = int(bot_id)
+        params = self._physics_params.get(bot_id)
+        if params is not None:
+            return params
+        descriptor = self._descriptors.get(bot_id)
+        if descriptor is None or (isinstance(descriptor, dict) and
+                                  not descriptor):
+            params = vehicle_physics.derive_params({})
+        else:
+            params = _bot_physics_params(descriptor)
+        self._physics_params[bot_id] = params
+        return params
+
     def _install_bot_descriptor(self, bot_id, state, siege_state):
         """Install one bot's active immutable mode descriptor."""
         bot_id = int(bot_id)
@@ -2389,8 +2407,7 @@ class BotRuntime(object):
         self._descriptors[bot_id] = descriptor
         if previous is descriptor:
             return False
-        self._physics_params[bot_id] = vehicle_physics.derive_params(
-            descriptor)
+        self._physics_params[bot_id] = _bot_physics_params(descriptor)
         self._gun_yaw_limits[bot_id] = ai_driver.gun_yaw_limits(descriptor)
         gun_state = self._gun_states.get(bot_id)
         if gun_state is not None:
@@ -2850,8 +2867,7 @@ class BotRuntime(object):
                         raw.get('clip'), raw.get('clip_size'))
             else:
                 self._gun_states[bot_id].adopt_descriptor(descriptor)
-            self._physics_params[bot_id] = vehicle_physics.derive_params(
-                descriptor)
+            self._physics_params[bot_id] = _bot_physics_params(descriptor)
             self._turn_speeds[bot_id] = 0.0
             if isinstance(raw.get('profile'), dict):
                 self.adapter.director.register_profile(bot_id, raw.get('team', 1),
@@ -3893,7 +3909,7 @@ class BotRuntime(object):
         if cached is None:
             cached = loadout.modifiers(
                 descriptor,
-                factors=loadout.attribute_factors(descriptor))[
+                factors=_bot_default_crew_factors(descriptor))[
                     'repair_factor']
             passive = self._equipment_passives.get(int(bot_id), {})
             cached *= 1.0 + max(0.0, _number(
@@ -8555,7 +8571,7 @@ class BotRuntime(object):
                 expected_mode = (
                     server_order.get('combat_mode', 'route')
                     if isinstance(server_order, dict) else None)
-                physics_params = self._physics_params.get(state['id'])
+                physics_params = self._physics_params_for(state['id'])
                 if (physics_params is not None and
                         abs(_number(state.get('speed'))) > 0.35 and
                         expected_mode not in ('route', 'advance')):
@@ -9056,10 +9072,7 @@ class BotRuntime(object):
             state['rotation_dir'] = steer_dir
             self._log_direction_flip(state, path_clear, motion_probe, now)
             if not self.native_motion:
-                params = self._physics_params.get(state['id'])
-                if params is None:
-                    params = vehicle_physics.derive_params({})
-                    self._physics_params[state['id']] = params
+                params = self._physics_params_for(state['id'])
                 # The selected corridor's ground sample is also the copied
                 # physics slope.  A second native probe here used to double the
                 # render-thread work for every moving bot.

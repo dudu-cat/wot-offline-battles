@@ -73,8 +73,13 @@ def effective_params():
             'shot_factor': 0.25,
         },
         'skills': {
+            'sixth_sense': False,
+            'expert': False,
             'deadeye': False,
             'intuition_chances': 0,
+            'controlled_impact': False,
+            'designated_target': False,
+            'last_effort': False,
         },
         'crew': {
             'members': [{

@@ -216,6 +216,21 @@ def _effective_params_snapshot(mass=25000.0, base_moving=0.171,
                                base_still=0.228, shot_factor=0.10,
                                ramming_bonus=0.0,
                                spall_coefficient=1.0):
+    crew_members = [{
+        'instance': 'commander', 'roles': ['commander'], 'skills': [],
+    }]
+    controlled_impact_level = max(
+        0.0, float(ramming_bonus) / 0.0015)
+    if controlled_impact_level > 0.0:
+        crew_members.append({
+            'instance': 'driver', 'roles': ['driver'],
+            'skills': [{
+                'name': 'driver_rammingmaster',
+                'level': controlled_impact_level,
+                'active': True, 'enabled': True,
+            }],
+        })
+    crew_names = [member['instance'] for member in crew_members]
     return {
         'version': 1,
         'loadout': {
@@ -265,14 +280,16 @@ def _effective_params_snapshot(mass=25000.0, base_moving=0.171,
             'base_still': float(base_still),
             'shot_factor': float(shot_factor),
         },
-        'skills': {'deadeye': False, 'intuition_chances': 0},
+        'skills': {
+            'sixth_sense': False, 'expert': False,
+            'deadeye': False, 'intuition_chances': 0,
+            'controlled_impact': controlled_impact_level >= 100.0,
+            'designated_target': False, 'last_effort': False,
+        },
         'crew': {
-            'members': [{
-                'instance': 'commander', 'roles': ['commander'],
-                'skills': [],
-            }],
+            'members': crew_members,
             'dynamic_spotting': {
-                'crew': ['commander'],
+                'crew': crew_names,
                 'states': dict(
                     ('%d:%d' % (mask, fire), {
                         'vision': 1.0, 'signal': 1.0,
@@ -282,7 +299,8 @@ def _effective_params_snapshot(mass=25000.0, base_moving=0.171,
                         'invisibility_moving': [0.0, 1.0],
                         'invisibility_still': [0.0, 1.0],
                     })
-                    for mask in (0, 1) for fire in (0, 1)),
+                    for mask in range(1 << len(crew_members))
+                    for fire in (0, 1)),
             },
         },
         'gun': {
@@ -1349,6 +1367,31 @@ class BotRuntimeTests(unittest.TestCase):
         self._modules = dict((key, value) for key, value in sys.modules.items()
                              if key == 'gui' or key.startswith('gui.'))
         self.module = _load(); self.adapters = []
+        self._native_attribute_factors = self.module.loadout.attribute_factors
+        crew_factor = 0.57 + 0.0043 * 110.0
+        crew_multiplier = 1.0 / crew_factor
+
+        def test_attribute_factors(unused_descriptor, crew=None):
+            self.assertIsNone(crew)
+            return {
+                'turret/rotationSpeed': crew_factor,
+                'gun/rotationSpeed': crew_factor,
+                'gun/reloadTime': crew_multiplier,
+                'gun/aimingTime': crew_multiplier,
+                'shotDispersion': (crew_multiplier,),
+                'repairSpeed': 0.57,
+                'vehicle/rotationSpeed': 1.0,
+                'engine/power': 1.0,
+                'chassis/terrainResistance': (1.0, 1.0, 1.0),
+                'radio/distance': 1.0,
+                'circularVisionRadius': 1.0,
+                'camouflage': 0.57,
+            }
+
+        # The pure-Python harness has no #1513 client modules. Supply the exact
+        # plain-crew baseline so Bot tests exercise the required native-factor
+        # contract instead of the newly forbidden missing-factor fallback.
+        self.module.loadout.attribute_factors = test_attribute_factors
         def factory(*args):
             adapter = _Adapter(*args); self.adapters.append(adapter); return adapter
         self.runtime = self.module.BotRuntime(
@@ -1363,10 +1406,128 @@ class BotRuntimeTests(unittest.TestCase):
                       'bots': [{'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot'}]}
 
     def tearDown(self):
+        self.module.loadout.attribute_factors = self._native_attribute_factors
         for key in list(sys.modules):
             if key == 'gui' or key.startswith('gui.'):
                 sys.modules.pop(key, None)
         sys.modules.update(self._modules)
+
+    def test_bot_physics_uses_plain_default_crew_factors(self):
+        descriptor = _combat_descriptor()
+        expected_factors = object()
+        expected_params = object()
+        missing = object()
+        factor_calls = []
+        physics_calls = []
+        original_factors = self.module.loadout.attribute_factors
+        original_derive = self.module.vehicle_physics.derive_params
+
+        def factors(actual, crew=missing):
+            factor_calls.append((actual, crew))
+            return expected_factors
+
+        def derive(actual, factors=missing):
+            physics_calls.append((actual, factors))
+            return expected_params
+
+        self.module.loadout.attribute_factors = factors
+        self.module.vehicle_physics.derive_params = derive
+        try:
+            result = self.module._bot_physics_params(descriptor)
+        finally:
+            self.module.loadout.attribute_factors = original_factors
+            self.module.vehicle_physics.derive_params = original_derive
+
+        self.assertIs(expected_params, result)
+        self.assertEqual(1, len(factor_calls))
+        self.assertIs(descriptor, factor_calls[0][0])
+        self.assertIsNone(factor_calls[0][1])
+        self.assertEqual(1, len(physics_calls))
+        self.assertIs(descriptor, physics_calls[0][0])
+        self.assertIs(expected_factors, physics_calls[0][1])
+
+    def test_every_bot_consumer_rejects_missing_default_crew_factors(self):
+        descriptor = _combat_descriptor()
+        original_factors = self.module.loadout.attribute_factors
+        self.module.loadout.attribute_factors = lambda unused, crew=None: None
+        self.runtime._repair_factors = {}
+        try:
+            consumers = (
+                ('spotting', lambda: self.module._bot_profile(descriptor)),
+                ('physics', lambda: self.module._bot_physics_params(descriptor)),
+                ('gun', lambda: self.module._BotGunState(descriptor)),
+                ('repair', lambda: self.runtime._bot_repair_factor(
+                    11, descriptor)),
+            )
+            for name, consumer in consumers:
+                with self.subTest(consumer=name):
+                    with self.assertRaisesRegex(
+                            RuntimeError,
+                            'bot default crew attribute factors are unavailable'):
+                        consumer()
+        finally:
+            self.module.loadout.attribute_factors = original_factors
+
+    def test_missing_physics_cache_rebuilds_from_installed_descriptor(self):
+        descriptor = _combat_descriptor()
+        expected = object()
+        fallback = object()
+        bot_calls = []
+        fallback_calls = []
+        original_bot = self.module._bot_physics_params
+        original_derive = self.module.vehicle_physics.derive_params
+
+        def bot_physics(actual):
+            bot_calls.append(actual)
+            return expected
+
+        def derive(actual, factors=None):
+            fallback_calls.append((actual, factors))
+            return fallback
+
+        runtime = self.module.BotRuntime(1)
+        runtime._descriptors[11] = descriptor
+        runtime._descriptors[12] = {}
+        self.module._bot_physics_params = bot_physics
+        self.module.vehicle_physics.derive_params = derive
+        try:
+            self.assertIs(expected, runtime._physics_params_for(11))
+            self.assertIs(expected, runtime._physics_params_for(11))
+            self.assertIs(fallback, runtime._physics_params_for(12))
+        finally:
+            self.module._bot_physics_params = original_bot
+            self.module.vehicle_physics.derive_params = original_derive
+
+        self.assertEqual([descriptor], bot_calls)
+        self.assertEqual([({}, None)], fallback_calls)
+
+    def test_decision_and_copied_motion_reuse_installed_physics(self):
+        self.runtime.battle_start(self.start)
+        installed = self.runtime._physics_params[11]
+        self.runtime.states[11]['speed'] = 2.0
+        decision_calls = []
+        motion_calls = []
+        original_longitudinal = \
+            self.module.vehicle_physics.longitudinal_step
+
+        self.runtime._cached_traffic_stopping_distance = (
+            lambda unused_state, unused_command, params:
+                decision_calls.append(params) or 0.0)
+
+        def longitudinal(params, *args, **kwargs):
+            motion_calls.append(params)
+            return original_longitudinal(params, *args, **kwargs)
+
+        self.module.vehicle_physics.longitudinal_step = longitudinal
+        try:
+            self.runtime.update(0.04, 1.0)
+        finally:
+            self.module.vehicle_physics.longitudinal_step = \
+                original_longitudinal
+
+        self.assertEqual([installed], decision_calls)
+        self.assertTrue(motion_calls)
+        self.assertTrue(all(params is installed for params in motion_calls))
 
     def test_probe_totals_count_only_real_query_seams_and_are_pull_only(self):
         runtime = self.module.BotRuntime(
@@ -4336,6 +4497,44 @@ class BotRuntimeTests(unittest.TestCase):
             self.assertEqual({}, runtime._physics_params)
             self.assertFalse(runtime._manifest_sent)
             self.assertIsNone(runtime.adapter)
+
+    def test_initial_and_restored_manifests_share_physics_installation(self):
+        descriptor = _combat_descriptor()
+        expected = self.module.vehicle_physics.derive_params(descriptor)
+        expected = dict(expected, mass=43210.0)
+        calls = []
+        original = self.module._bot_physics_params
+
+        def bot_physics(actual):
+            calls.append(actual)
+            return dict(expected)
+
+        def new_runtime():
+            return self.module.BotRuntime(
+                1, descriptor_resolver=lambda unused: descriptor,
+                adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+                direction_probe=lambda *unused: {
+                    'clear': True, 'slope': 0.0},
+                ground_probe=lambda *unused: 0.0,
+                physics_ground_probe=lambda *unused: 0.0,
+                spawn_resolver=_spawn_resolver, baked_graph=_graph())
+
+        self.module._bot_physics_params = bot_physics
+        try:
+            initial = new_runtime()
+            manifest = initial.battle_start(self.start)[0]['bots'][0]
+            restored = new_runtime()
+            restored.battle_start(dict(
+                self.start, bots=[], bot_manifest=[manifest]))
+        finally:
+            self.module._bot_physics_params = original
+
+        self.assertEqual(2, len(calls))
+        self.assertTrue(all(value is descriptor for value in calls))
+        self.assertEqual(expected, initial._physics_params[11])
+        self.assertEqual(expected, restored._physics_params[11])
+        self.assertEqual(43210.0, initial.states[11]['mass'])
+        self.assertEqual(43210.0, restored.states[11]['mass'])
 
     def test_worker_donates_sorted_client_effective_collision_profiles(self):
         descriptor = _combat_descriptor()
@@ -8225,6 +8424,48 @@ class BotRuntimeTests(unittest.TestCase):
                         for launch in launches],
                 })
 
+    def test_siege_descriptor_switch_recomputes_default_crew_physics(self):
+        travel = _combat_descriptor()
+        siege = _combat_descriptor()
+        composite = types.SimpleNamespace(
+            hasSiegeMode=True, defaultVehicleDescr=travel,
+            siegeVehicleDescr=siege)
+        base_params = self.module.vehicle_physics.derive_params(travel)
+        calls = []
+        original = self.module._bot_physics_params
+
+        def bot_physics(descriptor):
+            calls.append(descriptor)
+            mass = 31000.0 if descriptor is travel else 32000.0
+            return dict(base_params, mass=mass)
+
+        self.module._bot_physics_params = bot_physics
+        try:
+            runtime = self.module.BotRuntime(
+                1, descriptor_resolver=lambda unused: composite,
+                adapter_factory=lambda *args, **kwargs: _Adapter(*args),
+                direction_probe=lambda *unused: {
+                    'clear': True, 'slope': 0.0},
+                ground_probe=lambda *unused: 0.0,
+                physics_ground_probe=lambda *unused: 0.0,
+                spawn_resolver=_spawn_resolver, baked_graph=_graph())
+            start = dict(self.start, bots=[dict(
+                self.start['bots'][0],
+                vehicle='sweden:S10_Strv_103_0_Series')])
+            runtime.battle_start(start)
+            state = runtime.states[11]
+
+            self.assertIs(travel, runtime._descriptors[11])
+            self.assertEqual(31000.0, state['mass'])
+            runtime._set_bot_siege_state(
+                state, self.module.siege_mechanics.ENABLED)
+
+            self.assertIs(siege, runtime._descriptors[11])
+            self.assertEqual(32000.0, state['mass'])
+            self.assertEqual([travel, siege], calls)
+        finally:
+            self.module._bot_physics_params = original
+
     def test_siege_transition_edge_locks_pose_in_its_starting_tick(self):
         self.runtime.battle_start(self.start)
         state = self.runtime.states[11]
@@ -8461,7 +8702,8 @@ class BotRuntimeTests(unittest.TestCase):
         original_attribute_factors = self.module.loadout.attribute_factors
         original_modifiers = self.module.loadout.modifiers
 
-        def attribute_factors(value):
+        def attribute_factors(value, crew=None):
+            self.assertIsNone(crew)
             factor_calls.append(value)
             return {'source': '1513-default-crew'}
 
@@ -11573,9 +11815,10 @@ class BotRuntimeTests(unittest.TestCase):
             'instance': 'gunner', 'roles': ['gunner'],
             'skills': [{
                 'name': 'gunner_rancorous',
-                'active': True, 'level': 100.0,
+                'active': True, 'enabled': True, 'level': 100.0,
             }],
         }]
+        snapshot['skills']['designated_target'] = True
         source = {
             'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0,
             'aim_yaw': 0.0, 'critical': {'crew_ko': []},
@@ -11590,6 +11833,11 @@ class BotRuntimeTests(unittest.TestCase):
             10.0, self.module.BotRuntime._designated_spot_duration(
                 source, target, snapshot))
         source['aim_yaw'] = 0.0
+        snapshot['crew']['members'][0]['skills'][0]['enabled'] = False
+        self.assertEqual(
+            10.0, self.module.BotRuntime._designated_spot_duration(
+                source, target, snapshot))
+        snapshot['crew']['members'][0]['skills'][0]['enabled'] = True
         source['critical'] = {'crew_ko': ['gunner']}
         self.assertEqual(
             10.0, self.module.BotRuntime._designated_spot_duration(
@@ -11601,9 +11849,10 @@ class BotRuntimeTests(unittest.TestCase):
             'instance': 'radioman', 'roles': ['radioman'],
             'skills': [{
                 'name': 'radioman_lasteffort',
-                'active': True, 'level': 100.0,
+                'active': True, 'enabled': True, 'level': 100.0,
             }],
         }]
+        params['skills']['last_effort'] = True
         params['crew']['dynamic_spotting']['crew'] = ['radioman']
         runtime = self.module.BotRuntime(
             1, descriptor_resolver=lambda unused: _combat_descriptor(),

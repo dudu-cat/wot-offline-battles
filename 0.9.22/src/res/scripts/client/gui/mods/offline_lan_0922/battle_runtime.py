@@ -1158,55 +1158,6 @@ def _load_runtime():
     return runtime
 
 
-def _selected_vehicle_has_sixth_sense():
-    """Read the selected #1513 crew before the lobby Account is retired."""
-    try:
-        from CurrentVehicle import g_currentVehicle
-        item = getattr(g_currentVehicle, 'item', None)
-        for entry in (getattr(item, 'crew', ()) or ()):
-            tankman = (entry[1] if isinstance(entry, tuple) and
-                       len(entry) == 2 else entry)
-            if tankman is None:
-                continue
-            skills = getattr(tankman, 'skills', None)
-            if skills is None:
-                skills = getattr(
-                    getattr(tankman, 'descriptor', None), 'skills', ())
-            for skill in (skills or ()):
-                name = str(getattr(skill, 'name', skill)).lower()
-                if 'sixthsense' in name:
-                    return True
-    except Exception:
-        pass
-    return False
-
-
-def _crew_has_finished_skill(crew, wanted):
-    """Return whether one mounted crewman has a finished active perk."""
-    wanted = str(wanted).lower()
-    for entry in (crew or ()):
-        member = (entry[1] if isinstance(entry, tuple) and len(entry) == 2
-                  else entry)
-        if member is None:
-            continue
-        skills = getattr(member, 'skills', None)
-        if skills is None:
-            skills = getattr(
-                getattr(member, 'descriptor', None), 'skills', ())
-        for skill in (skills or ()):
-            if str(getattr(skill, 'name', skill)).lower() != wanted:
-                continue
-            if not bool(getattr(skill, 'isActive', True)):
-                continue
-            try:
-                level = float(getattr(skill, 'level', 100.0))
-            except (TypeError, ValueError):
-                level = 0.0
-            if level >= 100.0:
-                return True
-    return False
-
-
 class _LANInputSender(object):
 
     def __init__(self, owner):
@@ -1500,7 +1451,6 @@ class BattleRuntime(object):
         self._native_ram_contact_failures = set()
         self._native_ram_event_seq = 0
         self._local_ram_episode_contacts = frozenset()
-        self._local_ram_profile_cache = None
         self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
@@ -1570,6 +1520,7 @@ class BattleRuntime(object):
         self._equipment_revision = -1
         self._local_loadout_cache = None
         self._garage_loadout = None
+        self._local_effective_params = None
         self._offframe_seconds = 0.0
         self._effect_reports = 0
         self._decal_probe = None
@@ -1741,9 +1692,7 @@ class BattleRuntime(object):
         self._optional_failures_reported = set()
         self._disabled_optional_features = set()
         self._sixth_sense = None
-        self._has_sixth_sense = (
-            False if self._worker_mode else
-            _selected_vehicle_has_sixth_sense())
+        self._has_sixth_sense = False
         self._has_expert = False
         self._has_deadeye = False
         self._expert_visibility_enabled = False
@@ -1782,7 +1731,6 @@ class BattleRuntime(object):
         self._local_ram_receipts = collections.OrderedDict()
         self._local_ram_admitted_seq = 0
         self._local_ram_episode_contacts = frozenset()
-        self._local_ram_profile_cache = None
         self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
@@ -1852,13 +1800,13 @@ class BattleRuntime(object):
         self._equipment_revision = -1
         self._local_loadout_cache = None
         self._garage_loadout = None
+        self._local_effective_params = None
         self._offframe_seconds = 0.0
         self._effect_reports = 0
         self._spotted_signature = None
         self._local_spotting_cache = None
         self._local_factors_cache = None
         self._remote_spotting_cache = {}
-        self._local_ram_profile_cache = None
         self._remote_ram_profile_cache = {}
         self._local_still_since = None
         self._published_vision_radius = None
@@ -2005,13 +1953,16 @@ class BattleRuntime(object):
                 int(local_identity.get('team', self.client.team)),
                 arena_type_id=getattr(arena_type, 'id', 0))
             lobby_boundary = self._preflight_lobby_retirement()
-            garage_loadout = self._garage_loadout_snapshot()
-            self._has_expert = (
-                not self._worker_mode and _crew_has_finished_skill(
-                    garage_loadout.get('crew'), 'commander_expert'))
-            self._has_deadeye = (
-                not self._worker_mode and _crew_has_finished_skill(
-                    garage_loadout.get('crew'), 'gunner_sniper'))
+            # Freeze every lobby-owned item before the Account is retired.
+            self._garage_loadout_snapshot()
+            self._local_effective_params = (
+                None if self._worker_mode else
+                self._local_player_effective_snapshot(local_identity))
+            if self._local_effective_params is not None:
+                skills = self._local_effective_params['skills']
+                self._has_sixth_sense = bool(skills['sixth_sense'])
+                self._has_expert = bool(skills['expert'])
+                self._has_deadeye = bool(skills['deadeye'])
             self._install_battle_gui_guard()
             self._enter_battle_loading()
             self._retire_lobby_entities(lobby_boundary)
@@ -3077,7 +3028,10 @@ class BattleRuntime(object):
                     self._runtime.bigworld.callback,
                     self._runtime.bigworld.cancelCallback,
                     lambda: self._generation,
-                    lambda: self._has_sixth_sense,
+                    lambda: (
+                        self._has_sixth_sense and
+                        self._local_skill_count(
+                            'commander_sixthsense') > 0),
                     lambda: (self.local_health() or 0) > 0,
                     lambda: self.state == 'running' and self._battle_live,
                     VehicleStatePresenter(provider, vehicle_view_state))
@@ -3984,6 +3938,72 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'player effective vehicle parameters are unavailable')
         return snapshot
+
+    def _local_player_effective_snapshot(self, state):
+        """Freeze the server-accepted parameters for the local human tank.
+
+        ``LANClient.effective_params`` is optimistic vehicle-selection state:
+        it changes when a message merely enters the local send queue.  A
+        battle must instead use the server-published row, or the server-echo
+        cache when a recovery snapshot omits an unchanged player field.
+        """
+        source = (state or {}).get('effective_params')
+        if source is None:
+            published = getattr(
+                self.client, '_published_player_effective_params', None)
+            if isinstance(published, dict):
+                source = published.get(getattr(self.client, 'player_id', None))
+        return self._player_effective_snapshot({
+            'effective_params': source})
+
+    def _local_crew_critical(self):
+        """Return the current physical crew-KO set for the local vehicle."""
+        if self._server is not None:
+            entity = self._server_entity(self._server.vehicle_id)
+            if entity is not None:
+                crew_ko = getattr(entity, '_crew_ko', None)
+                if crew_ko is not None:
+                    return {'crew_ko': sorted(str(name)
+                                              for name in crew_ko)}
+        if self.client is not None:
+            record = self._records.get(
+                'player:%s' % getattr(self.client, 'player_id', ''))
+            if record is not None:
+                critical = (record.get('critical_state') or
+                            (record.get('state') or {}).get('critical'))
+                if isinstance(critical, dict):
+                    return critical
+        return {'crew_ko': []}
+
+    def _accepted_local_effective_params(self):
+        """Return the immutable server-published row, resolving it once."""
+        if self._worker_mode:
+            return None
+        if self._local_effective_params is None and self.client is not None:
+            record = self._records.get(
+                'player:%s' % getattr(self.client, 'player_id', ''))
+            state = {} if record is None else (record.get('state') or {})
+            self._local_effective_params = (
+                self._local_player_effective_snapshot(state))
+        return self._local_effective_params
+
+    def _local_skill_count(self, skill_name):
+        """Count conscious carriers in the accepted round snapshot."""
+        snapshot = self._accepted_local_effective_params()
+        if snapshot is None:
+            return 0
+        return effective_params.living_skill_count(
+            snapshot, skill_name,
+            self._local_crew_critical())
+
+    def _local_skill_level(self, skill_name):
+        """Return the best conscious carrier's accepted skill level."""
+        snapshot = self._accepted_local_effective_params()
+        if snapshot is None:
+            return 0.0
+        return effective_params.living_skill_level(
+            snapshot, skill_name,
+            self._local_crew_critical())
 
     def _prepare_vehicle_descriptor(self, vehicle_name):
         descriptor = self._runtime.vehicles.VehicleDescr(
@@ -5637,8 +5657,10 @@ class BattleRuntime(object):
             if previous:
                 self._hide_expert_devices(previous)
             return True
-        if not self._has_expert or self.state not in (
-                'creating_map', 'running'):
+        if (not self._has_expert or
+                self._local_skill_count('commander_expert') <= 0 or
+                self.state not in (
+                    'creating_map', 'running')):
             return False
         record = None
         for candidate in self._records.values():
@@ -5679,7 +5701,9 @@ class BattleRuntime(object):
     def _tick_expert_target(self, now):
         """Publish canonical module phases after Expert's four-second delay."""
         vehicle_id = int(self._expert_target_id or 0)
-        if (not self._has_expert or vehicle_id <= 0 or
+        if (not self._has_expert or
+                self._local_skill_count('commander_expert') <= 0 or
+                vehicle_id <= 0 or
                 float(now) < self._expert_target_due):
             return False
         record = None
@@ -5844,11 +5868,17 @@ class BattleRuntime(object):
         return True
 
     def _garage_item(self):
-        """Return the lobby's current vehicle item, or None outside a garage.
+        """Return the visible client's mounted item, never the worker's item.
 
         The mounted consumables and the crew live on the garage item, not on
-        the battle descriptor, exactly as in the 0.8.2 law.
+        the battle descriptor, exactly as in the 0.8.2 law.  A hidden worker
+        has its own unrelated garage Account, though: reading that item would
+        combine one vehicle's crew, ammunition and equipment with the room's
+        target descriptor.  Worker loadouts therefore come only from the
+        target descriptor or a human player's donated effective parameters.
         """
+        if self._worker_mode:
+            return None
         try:
             from CurrentVehicle import g_currentVehicle
         except ImportError:
@@ -6009,6 +6039,9 @@ class BattleRuntime(object):
         profile = self._spotting_profile(descriptor, local=True)
         loadout = self._local_loadout(descriptor)
         snapshot = self._garage_loadout_snapshot()
+        effective_skills = (
+            {} if self._local_effective_params is None else
+            self._local_effective_params['skills'])
         # computeBaseInvisibility returns (moving, still), in that order.
         moving, still = self._base_invisibility(
             descriptor, profile, snapshot['camouflage_id'])
@@ -6064,13 +6097,16 @@ class BattleRuntime(object):
             '[Offline LAN 0.9.22] PARAMS crew=%.1f/%.1f recon=%.1f '
             'camo_crew=%.1f camo_factor=%.4f vision_factor=%.4f '
             'net=%.3f paint=%s rammer=%s vents=%s brothers=%s '
-            'rations=%s\n' % (
+            'rations=%s intuition=%d deadeye=%s sixth=%s expert=%s\n' % (
                 loadout['crew_level'], loadout['effective_crew_level'],
                 profile['recon_level'], profile['camouflage_level'],
                 profile['camouflage_factor'], profile['vision_factor'],
                 still_add, snapshot['camouflage_id'],
                 loadout['has_rammer'], loadout['has_ventilation'],
-                loadout['has_brotherhood'], loadout['has_rations']))
+                loadout['has_brotherhood'], loadout['has_rations'],
+                int(effective_skills.get('intuition_chances', 0)),
+                self._has_deadeye, self._has_sixth_sense,
+                self._has_expert))
         return True
 
     def _log_local_ammo(self, state):
@@ -6512,16 +6548,29 @@ class BattleRuntime(object):
         return True
 
     def _roll_loader_intuition(self):
-        """Roll the finished ``loader_intuition`` perk for one shell swap.
+        """Roll the round-frozen ``loader_intuition`` chances for one swap.
 
         The #1513 skill text stacks two loaders, so each finished perk rolls
-        its own ``INTUITION_CHANCE``.
+        its own ``INTUITION_CHANCE``.  The garage client already validated and
+        froze that count before joining; rereading lobby objects here would
+        create a second skill truth after the Account has been retired.
         """
-        chances = loadout_law.intuition_chances(
-            self._garage_loadout_snapshot()['crew'])
-        for unused_index in range(chances):
+        if self._worker_mode:
+            return False
+        if self._local_effective_params is None:
+            raise RuntimeError(
+                'player effective parameters are unavailable for intuition')
+        chances = self._local_skill_count('loader_intuition')
+        for chance_index in range(chances):
             if random.random() < loadout_law.INTUITION_CHANCE:
+                sys.stdout.write(
+                    '[Offline LAN 0.9.22] INTUITION chances=%d '
+                    'result=triggered attempt=%d\n' % (
+                        chances, chance_index + 1))
                 return True
+        sys.stdout.write(
+            '[Offline LAN 0.9.22] INTUITION chances=%d result=miss\n' %
+            chances)
         return False
 
     def _present_loader_intuition(self):
@@ -14773,6 +14822,11 @@ class BattleRuntime(object):
             shape = state.get('collision_shape')
             if shape is None:
                 shape = self._collision_shape(descriptor)
+            ram_profile = (
+                self._player_ram_profile(
+                    player_effective, state.get('critical') or {})
+                if player_effective is not None else
+                self._ram_profile(descriptor))
             result.append({
                 'id': 1000000 + int(record.get('engine_id', 0)),
                 'network_id': int(record.get('network_id', 0)),
@@ -14797,10 +14851,7 @@ class BattleRuntime(object):
                 'yaw': yaw,
                 'mass': _number(mass, 25000.0),
                 'shape': shape,
-                'ram_profile': (
-                    dict(player_effective['ramming'])
-                    if player_effective is not None else
-                    self._ram_profile(descriptor)),
+                'ram_profile': ram_profile,
                 'vx': _number(
                     state.get('ram_vx'), math.sin(yaw) * speed),
                 'vy': _number(state.get(
@@ -16761,8 +16812,16 @@ class BattleRuntime(object):
                 self._reject_player_fire_intent(key, 'gun_not_ready')
                 continue
             try:
-                source_shot = effective['gun']['shots'][
-                    shell_index]['source_shot']
+                source_shot = dict(effective['gun']['shots'][
+                    shell_index]['source_shot'])
+                # A shot freezes the perk state of its physical gunner at
+                # the accepted fire edge.  The immutable round snapshot owns
+                # skill affiliation; the current critical state owns whether
+                # that carrier is conscious for this shot.
+                source_shot['deadeye'] = bool(
+                    effective_params.living_skill_count(
+                        effective, 'gunner_sniper',
+                        state.get('critical') or {}))
                 speed = float(source_shot['speed'])
                 gravity = float(source_shot['gravity'])
                 maximum = float(source_shot['maxDistance'])
@@ -17974,16 +18033,24 @@ class BattleRuntime(object):
                 equipments) or False
         return self._local_factors_cache or None
 
+    @staticmethod
+    def _player_ram_profile(snapshot, critical=None):
+        """Return accepted equipment plus the conscious driver's perk."""
+        profile = dict(snapshot['ramming'])
+        profile['ramming_bonus'] = (
+            effective_params.living_skill_level(
+                snapshot, 'driver_rammingmaster', critical or {}) * 0.0015)
+        return profile
+
     def _ram_profile(self, descriptor, local=False):
         """Return the #1513 ram inputs for one mounted descriptor."""
         if local:
-            if self._local_ram_profile_cache is None:
-                snapshot = self._garage_loadout_snapshot()
-                bonus = loadout_law.ramming_bonus(snapshot.get('crew'))
-                self._local_ram_profile_cache = (
-                    tank_collision.descriptor_ram_profile(
-                        descriptor, bonus))
-            return self._local_ram_profile_cache
+            snapshot = self._accepted_local_effective_params()
+            if snapshot is None:
+                raise RuntimeError(
+                    'player effective ramming parameters are unavailable')
+            return self._player_ram_profile(
+                snapshot, self._local_crew_critical())
         key = (_field(descriptor, 'name', ''),
                loadout_law.device_names(descriptor))
         profile = self._remote_ram_profile_cache.get(key)
@@ -19074,7 +19141,10 @@ class BattleRuntime(object):
             target, entity.typeDescriptor, target_collisions,
             trace_start, trace_end,
             damage, result, entity.id, shell_index,
-            burst_position=impact, deadeye=self._has_deadeye)
+            burst_position=impact,
+            deadeye=bool(
+                self._has_deadeye and
+                self._local_skill_count('gunner_sniper') > 0))
         critical_contract = self._critical_proposal_contract(
             target_record, critical, hull_damage, critical_delta)
         if target_record.get('kind') == 'bot':
@@ -19863,6 +19933,7 @@ class BattleRuntime(object):
         self._equipment_revision = -1
         self._local_loadout_cache = None
         self._garage_loadout = None
+        self._local_effective_params = None
         self._offframe_seconds = 0.0
         self._effect_reports = 0
         self._spotted_signature = None

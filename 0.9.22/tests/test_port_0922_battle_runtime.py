@@ -20,13 +20,12 @@ from gui.mods.offline_lan_0922.battle_runtime import (
     BattleRuntime, ENGINE_MODE_IDLE, ENGINE_MODE_OFF, ENGINE_MODE_RUNNING,
     FRAME_SECONDS, _FrameDiagnostics, _LANInputSender,
     _MOVEMENT_BACKWARD, _MOVEMENT_ROTATE_LEFT, _MOVEMENT_ROTATE_RIGHT,
-    _engine_rotation,
-    _selected_vehicle_has_sixth_sense)
+    _engine_rotation)
 from gui.mods.offline_lan_0922 import battle_runtime as \
     battle_runtime_module
 from gui.mods.offline_lan_0922 import bot_runtime, combat_rules, \
-    critical_damage, equipment_mechanics, gun_mechanics, tank_collision, \
-    vehicle_physics
+    critical_damage, equipment_mechanics, gun_mechanics, loadout, \
+    tank_collision, vehicle_physics
 from gui.mods.offline_lan_0922.entities.remote_vehicle import \
     RemoteVehicle, RemoteVehicleFactory, _RemoteFilter, \
     collide_vehicle_at_matrix
@@ -1544,6 +1543,9 @@ class _Client(object):
         self.name = 'Player'
         self.vehicle = 'ussr:R11_MS-1'
         self.vehicle_compact_descr = 'dGVzdA=='
+        self.effective_params = _effective_params_snapshot()
+        self._published_player_effective_params = {
+            self.player_id: self.effective_params}
         self.team = 1
         self.slot = 0
         self.max_health = 500
@@ -1587,8 +1589,46 @@ class _Client(object):
 
 
 def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
-                               ammo=None, deadeye=False):
+                               ammo=None, deadeye=False,
+                               intuition_chances=0, sixth_sense=False,
+                               expert=False, controlled_impact=0.0,
+                               designated_target=False,
+                               last_effort=False):
     ammo_rows = [[101, 40]] if ammo is None else list(ammo)
+    members = [{
+        'instance': 'commander', 'roles': ['commander'], 'skills': []}]
+
+    def add_skill(instance, role, name, level=100.0):
+        member = next((entry for entry in members
+                       if entry['instance'] == instance), None)
+        if member is None:
+            member = {
+                'instance': instance, 'roles': [role], 'skills': []}
+            members.append(member)
+        member['skills'].append({
+            'name': name, 'level': float(level),
+            'active': True, 'enabled': True,
+        })
+
+    if sixth_sense:
+        add_skill('commander', 'commander', 'commander_sixthsense')
+    if expert:
+        add_skill('commander', 'commander', 'commander_expert')
+    if deadeye:
+        add_skill('gunner', 'gunner', 'gunner_sniper')
+    if designated_target:
+        add_skill('gunner', 'gunner', 'gunner_rancorous')
+    for index in range(int(intuition_chances)):
+        add_skill(
+            'loader' if index == 0 else 'loader%d' % index,
+            'loader', 'loader_intuition')
+    controlled_level = float(controlled_impact)
+    if controlled_level > 0.0:
+        add_skill(
+            'driver', 'driver', 'driver_rammingmaster', controlled_level)
+    if last_effort:
+        add_skill('radioman', 'radioman', 'radioman_lasteffort')
+    instances = [member['instance'] for member in members]
     return {
         'version': 1,
         'loadout': {
@@ -1607,7 +1647,7 @@ def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
             'has_ventilation': False, 'has_stabiliser': False,
             'has_rations': False, 'has_brotherhood': False,
             'has_snap_shot': False, 'has_smooth_ride': False,
-            'has_sixth_sense': False,
+            'has_sixth_sense': bool(sixth_sense),
         },
         'physics': {
             'mass': float(mass), 'powerW': 500000.0,
@@ -1628,22 +1668,28 @@ def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
             'invisibility_still': [0.0, 1.0],
             'from_client_factors': True,
         },
-        'ramming': {'spall_coefficient': 1.0, 'ramming_bonus': 0.0},
+        'ramming': {
+            'spall_coefficient': 1.0,
+            'ramming_bonus': controlled_level * 0.0015,
+        },
         'ammo': ammo_rows,
         'camouflage': {
             'camouflage_id': None, 'base_moving': 0.171,
             'base_still': 0.228, 'shot_factor': 0.1,
         },
         'skills': {
-            'deadeye': bool(deadeye), 'intuition_chances': 0,
+            'sixth_sense': bool(sixth_sense),
+            'expert': bool(expert),
+            'deadeye': bool(deadeye),
+            'intuition_chances': int(intuition_chances),
+            'controlled_impact': controlled_level > 0.0,
+            'designated_target': bool(designated_target),
+            'last_effort': bool(last_effort),
         },
         'crew': {
-            'members': [{
-                'instance': 'commander', 'roles': ['commander'],
-                'skills': [],
-            }],
+            'members': members,
             'dynamic_spotting': {
-                'crew': ['commander'],
+                'crew': instances,
                 'states': dict(
                     ('%d:%d' % (mask, fire), {
                         'vision': 1.0, 'signal': 1.0,
@@ -1652,8 +1698,8 @@ def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
                         'base_still': 0.228,
                         'invisibility_moving': [0.0, 1.0],
                         'invisibility_still': [0.0, 1.0],
-                    })
-                    for mask in (0, 1) for fire in (0, 1)),
+                    }) for mask in range(1 << len(instances))
+                    for fire in (0, 1)),
             },
         },
         'equipment': [],
@@ -1663,7 +1709,7 @@ def _effective_params_snapshot(mass=25000.0, reload_factor=1.0,
                 'regen_hp': 50.0,
             }],
             'activation_targets': [],
-            'crew_roster': ['commander'],
+            'crew_roster': instances,
         },
         'gun': {
             'clip_size': 1,
@@ -1720,6 +1766,26 @@ def _mounted_current_vehicle_module():
             equipment=None,
             crew=()))
     return current_vehicle
+
+
+def _plain_bot_factors(unused_descriptor):
+    """Exact-client factor shape for unrelated pure-Python startup tests."""
+    crew_factor = 0.57 + 0.0043 * 110.0
+    crew_multiplier = 1.0 / crew_factor
+    return {
+        'turret/rotationSpeed': crew_factor,
+        'gun/rotationSpeed': crew_factor,
+        'gun/reloadTime': crew_multiplier,
+        'gun/aimingTime': crew_multiplier,
+        'shotDispersion': (crew_multiplier,),
+        'repairSpeed': 0.57,
+        'vehicle/rotationSpeed': 1.0,
+        'engine/power': 1.0,
+        'chassis/terrainResistance': (1.0, 1.0, 1.0),
+        'radio/distance': 1.0,
+        'circularVisionRadius': 1.0,
+        'camouflage': 0.57,
+    }
 
 
 def _runtime():
@@ -4870,6 +4936,11 @@ class BattleRuntimeContractTests(unittest.TestCase):
             {'CurrentVehicle': _mounted_current_vehicle_module()})
         self._current_vehicle_patch.start()
         self.addCleanup(self._current_vehicle_patch.stop)
+        self._bot_factors_patch = mock.patch.object(
+            bot_runtime, '_bot_default_crew_factors',
+            side_effect=_plain_bot_factors)
+        self._bot_factors_patch.start()
+        self.addCleanup(self._bot_factors_patch.stop)
 
     def test_local_state_falls_back_before_roster_publishes_the_player(self):
         battle = BattleRuntime(_runtime())
@@ -5120,6 +5191,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_local_tank_contact_uses_copied_separation_and_impulse(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._local_effective_params = _effective_params_snapshot()
         battle._avatar = runtime.bigworld.avatar
         local = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
                          {'health': 500})
@@ -5834,6 +5906,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_native_ram_callbacks_dedupe_one_sustained_contact_episode(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._local_effective_params = _effective_params_snapshot()
         battle._server = types.SimpleNamespace(vehicle_id=10)
         battle._local_position = (0.0, 0.0, 0.0)
         battle._local_yaw = 0.0
@@ -6248,6 +6321,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
         def run_for_one_second(frame_rate):
             runtime = _runtime()
             battle = BattleRuntime(runtime)
+            battle._local_effective_params = _effective_params_snapshot()
             battle._avatar = runtime.bigworld.avatar
             battle._records = {}
             battle._local_physics = {'mass': 25000.0}
@@ -6281,6 +6355,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_local_tank_contact_cannot_push_hull_through_world_geometry(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._local_effective_params = _effective_params_snapshot()
         battle._avatar = runtime.bigworld.avatar
         local = _Vehicle(10, _Descriptor(), _Vector(), (0, 0, 0),
                          {'health': 500})
@@ -6329,16 +6404,71 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'test_active_exception_prints_original_traceback_before_cleanup',
             rendered)
 
-    def test_selected_commander_sixth_sense_is_read_before_lobby_retire(self):
-        tankman = types.SimpleNamespace(skills=(
-            types.SimpleNamespace(name='commander_sixthSense'),))
-        current_vehicle = types.ModuleType('CurrentVehicle')
-        current_vehicle.g_currentVehicle = types.SimpleNamespace(
-            item=types.SimpleNamespace(crew=((0, tankman),)))
+    def test_player_discrete_skills_are_detached_in_the_round_snapshot(self):
+        source = _effective_params_snapshot(
+            deadeye=True, intuition_chances=2, sixth_sense=True)
 
-        with mock.patch.dict(sys.modules, {
-                'CurrentVehicle': current_vehicle}):
-            self.assertTrue(_selected_vehicle_has_sixth_sense())
+        frozen = BattleRuntime._player_effective_snapshot(
+            {'effective_params': source})
+        source['loadout']['has_sixth_sense'] = False
+        source['skills']['deadeye'] = False
+        source['skills']['intuition_chances'] = 0
+
+        self.assertTrue(frozen['loadout']['has_sixth_sense'])
+        self.assertTrue(frozen['skills']['deadeye'])
+        self.assertEqual(2, frozen['skills']['intuition_chances'])
+
+    def test_local_round_snapshot_ignores_unacknowledged_optimistic_params(self):
+        battle = BattleRuntime(_runtime())
+        acknowledged = _effective_params_snapshot(
+            intuition_chances=1, sixth_sense=True)
+        optimistic = _effective_params_snapshot(
+            intuition_chances=0, sixth_sense=False)
+        battle.client = types.SimpleNamespace(
+            player_id=1, effective_params=optimistic,
+            _published_player_effective_params={1: acknowledged})
+
+        frozen = battle._local_player_effective_snapshot({'id': 1})
+
+        self.assertEqual(1, frozen['skills']['intuition_chances'])
+        self.assertTrue(frozen['loadout']['has_sixth_sense'])
+
+    def test_local_skill_carriers_follow_current_physical_crew_health(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle.client = _Client()
+        battle._local_effective_params = _effective_params_snapshot(
+            sixth_sense=True, intuition_chances=1)
+        entity = types.SimpleNamespace(_crew_ko=set())
+        runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+
+        self.assertEqual(
+            1, battle._local_skill_count('commander_sixthsense'))
+        self.assertEqual(
+            1, battle._local_skill_count('loader_intuition'))
+        entity._crew_ko = set(('loader',))
+        self.assertEqual(0, battle._local_skill_count('loader_intuition'))
+        self.assertEqual(
+            1, battle._local_skill_count('commander_sixthsense'))
+        entity._crew_ko.clear()
+        self.assertEqual(
+            1, battle._local_skill_count('loader_intuition'))
+
+    def test_controlled_impact_uses_only_a_conscious_driver(self):
+        snapshot = _effective_params_snapshot(controlled_impact=100.0)
+
+        healthy = BattleRuntime._player_ram_profile(
+            snapshot, {'crew_ko': []})
+        knocked_out = BattleRuntime._player_ram_profile(
+            snapshot, {'crew_ko': ['driver']})
+        restored = BattleRuntime._player_ram_profile(
+            snapshot, {'crew_ko': []})
+
+        self.assertAlmostEqual(0.15, healthy['ramming_bonus'])
+        self.assertEqual(0.0, knocked_out['ramming_bonus'])
+        self.assertAlmostEqual(0.15, restored['ramming_bonus'])
+        self.assertEqual(1.0, healthy['spall_coefficient'])
 
     def test_battle_ammo_reads_the_mounted_1513_garage_items(self):
         # #1513 gui_items.Vehicle carries Shell items and a VehicleEquipment,
@@ -6622,6 +6752,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def _shell_change_battle(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._local_effective_params = _effective_params_snapshot()
         state = gun_mechanics.GunState(
             _two_shell_descriptor(), ammo_layout={101: 20, 102: 10})
         state.reload_time = 0.0
@@ -6900,6 +7031,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
     def test_second_press_mid_reload_restarts_the_native_hud_cycle(self):
         runtime = _runtime()
         battle = BattleRuntime(runtime)
+        battle._local_effective_params = _effective_params_snapshot()
         descriptor = _two_shell_descriptor()
         state = gun_mechanics.GunState(
             descriptor, ammo_layout={101: 20, 102: 10})
@@ -7352,11 +7484,59 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
     def test_an_unfinished_intuition_perk_never_rolls(self):
         battle, unused_state, unused_settings = self._shell_change_battle()
-        battle._garage_loadout_snapshot = lambda: {'crew': (
-            types.SimpleNamespace(skills=(types.SimpleNamespace(
-                name='loader_intuition', level=42.0, isActive=True),)),)}
+        battle._local_effective_params = _effective_params_snapshot(
+            intuition_chances=0)
 
-        self.assertFalse(battle._roll_loader_intuition())
+        with mock.patch.object(
+                battle_runtime_module.random, 'random') as roll, \
+                mock.patch.object(battle_runtime_module.sys.stdout, 'write'):
+            self.assertFalse(battle._roll_loader_intuition())
+
+        roll.assert_not_called()
+
+    def test_intuition_roll_uses_the_round_snapshot_not_late_garage_state(self):
+        battle, unused_state, unused_settings = self._shell_change_battle()
+        battle._local_effective_params = _effective_params_snapshot(
+            intuition_chances=1)
+        battle._garage_loadout_snapshot = mock.Mock(return_value={'crew': ()})
+
+        with mock.patch.object(
+                battle_runtime_module.random, 'random', return_value=0.1), \
+                mock.patch.object(battle_runtime_module.sys.stdout, 'write'):
+            self.assertTrue(battle._roll_loader_intuition())
+
+        battle._garage_loadout_snapshot.assert_not_called()
+
+    def test_intuition_uses_only_conscious_loader_carriers(self):
+        battle, unused_state, unused_settings = self._shell_change_battle()
+        battle._local_effective_params = _effective_params_snapshot(
+            intuition_chances=1)
+        battle.client = _Client()
+        entity = types.SimpleNamespace(_crew_ko=set(('loader',)))
+        battle._runtime.bigworld.entities[10] = entity
+        battle._server = types.SimpleNamespace(vehicle_id=10)
+
+        with mock.patch.object(
+                battle_runtime_module.random, 'random', return_value=0.1
+                ) as roll, mock.patch.object(
+                    battle_runtime_module.sys.stdout, 'write'):
+            self.assertFalse(battle._roll_loader_intuition())
+            roll.assert_not_called()
+            entity._crew_ko.clear()
+            self.assertTrue(battle._roll_loader_intuition())
+            roll.assert_called_once_with()
+
+    def test_worker_never_rolls_a_visible_players_intuition(self):
+        battle, unused_state, unused_settings = self._shell_change_battle()
+        battle._worker_mode = True
+        battle._local_effective_params = _effective_params_snapshot(
+            intuition_chances=2)
+
+        with mock.patch.object(
+                battle_runtime_module.random, 'random') as roll:
+            self.assertFalse(battle._roll_loader_intuition())
+
+        roll.assert_not_called()
 
     def test_an_unknown_shell_descriptor_is_refused(self):
         battle, state, settings = self._shell_change_battle()
@@ -11244,17 +11424,24 @@ class BattleRuntimeContractTests(unittest.TestCase):
 
     def test_expert_is_only_enabled_for_a_finished_active_perk(self):
         finished = types.SimpleNamespace(
-            name='commander_expert', level=100.0, isActive=True)
+            name='commander_expert', level=100.0, isActive=True,
+            isEnable=True)
         unfinished = types.SimpleNamespace(
-            name='commander_expert', level=99.0, isActive=True)
+            name='commander_expert', level=99.0, isActive=True,
+            isEnable=True)
         inactive = types.SimpleNamespace(
-            name='commander_expert', level=100.0, isActive=False)
+            name='commander_expert', level=100.0, isActive=False,
+            isEnable=True)
+        disabled = types.SimpleNamespace(
+            name='commander_expert', level=100.0, isActive=True,
+            isEnable=False)
 
-        self.assertTrue(battle_runtime_module._crew_has_finished_skill(
+        self.assertEqual(1, loadout.finished_skill_count(
             [types.SimpleNamespace(skills=(finished,))],
             'commander_expert'))
-        self.assertFalse(battle_runtime_module._crew_has_finished_skill(
-            [types.SimpleNamespace(skills=(unfinished, inactive))],
+        self.assertEqual(0, loadout.finished_skill_count(
+            [types.SimpleNamespace(
+                skills=(unfinished, inactive, disabled))],
             'commander_expert'))
 
     def test_expert_visibility_uses_exact_misc_status_boundary(self):
@@ -11280,6 +11467,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle.state = 'running'
         battle._avatar = runtime.bigworld.avatar
         battle._has_expert = True
+        battle._local_effective_params = _effective_params_snapshot(
+            expert=True)
         clock = [10.0]
         battle._clock = lambda: clock[0]
         fire = types.SimpleNamespace(name='fire')
@@ -19117,7 +19306,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             11, _Descriptor(), _Vector(50.0, 0.0, 50.0), (0, 0, 0),
             {'health': 500})
         runtime.bigworld.entities[11] = entity
-        effective = _effective_params_snapshot(ammo=[[101, 40]])
+        effective = _effective_params_snapshot(
+            ammo=[[101, 40]], deadeye=True)
         donated_shot = effective['gun']['shots'][0]['source_shot']
         donated_shot['speed'] = 625.0
         donated_shot['gravity'] = 17.0
@@ -19130,6 +19320,7 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'state': {
                 'alive': True, 'shell_index': 0, 'speed': 0.0,
                 'turn': 0.0, 'effective_params': effective,
+                'critical': {'crew_ko': ['gunner']},
             },
         }}
         gun = gun_mechanics.GunState(
@@ -19175,6 +19366,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
                          call.kwargs['source_shot']['piercingPower'])
         self.assertEqual([390.0, 165.0],
                          call.kwargs['source_shot']['shell']['damage'])
+        self.assertFalse(call.kwargs['source_shot']['deadeye'])
+        self.assertTrue(donated_shot['deadeye'])
 
     def test_worker_promotes_the_queued_shell_at_the_shot_boundary(self):
         runtime = _runtime()
