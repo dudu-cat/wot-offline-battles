@@ -5176,6 +5176,63 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(
             proved['result'], runtime._motion_probe_cache[11]['result'])
 
+    def test_deferred_new_heading_drops_stale_cache_and_freezes_pose(self):
+        """A proof for another heading cannot authorize catch-up motion."""
+        command = self._stationary_command()
+        command.update({
+            'target_yaw': math.pi / 2.0,
+            'throttle': 1.0,
+            'combat_mode': 'route',
+            'move_position': (100.0, 0.0, 0.0),
+            'recovery_mode': 'drive',
+            'movement_intent': True,
+        })
+        direction_calls = []
+        motion_calls = []
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: direction_calls.append(1) or {
+                'clear': True, 'collision': False, 'slope': 0.0,
+                'deferred': True},
+            motion_resolver=lambda *unused: motion_calls.append(1) or 'clear',
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.battle_start(self.start)
+        runtime.navigator = None
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=math.pi / 2.0,
+                     speed=8.0, grounded_once=True)
+        runtime._motion_probe_cache[11] = {
+            'result': {
+                'clear': True, 'collision': False, 'slope': 0.0},
+            'position': (0.0, 0.0, 0.0),
+            'yaw': 0.0,
+            'maximum_distance': None,
+            'probe_distance': 20.0,
+            'probe_leading': 3.5,
+            'deadline': 999.0,
+        }
+        original_decision_seconds = self.module.DECISION_SECONDS
+        original_pose_safe = self.module.prebaked_navigation.pose_is_safe
+        self.module.DECISION_SECONDS = 2.0
+        self.module.prebaked_navigation.pose_is_safe = (
+            lambda *unused, **unused_kwargs: True)
+        try:
+            runtime.update(1.0, 1.0)
+        finally:
+            self.module.DECISION_SECONDS = original_decision_seconds
+            self.module.prebaked_navigation.pose_is_safe = original_pose_safe
+
+        self.assertEqual(2, len(direction_calls))
+        self.assertEqual([], motion_calls)
+        self.assertEqual((0.0, 0.0), (state['x'], state['z']))
+        self.assertEqual(0, state['movement_dir'])
+        self.assertLess(state['speed'], 8.0)
+        self.assertNotIn(11, runtime._motion_probe_cache)
+
     def test_low_fps_catchup_keeps_hull_momentum(self):
         """A slow callback must not restart acceleration from standstill.
 

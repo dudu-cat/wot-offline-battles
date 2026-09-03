@@ -8893,6 +8893,15 @@ class BotRuntime(object):
                     ignore_deadline=not refresh_control))
             cached_motion_result = (
                 (cached_motion_probe or {}).get('result') or {})
+            cached_motion_geometry_reusable = bool(
+                isinstance(cached_motion_result, dict) and
+                self._probe_is_clear(cached_motion_result) and
+                self._motion_probe_covers_distance(
+                    cached_motion_probe, maximum_probe_distance) and
+                self._motion_probe_reusable(
+                    cached_motion_probe, position, travel_yaw,
+                    state.get('speed', 0.0), now, settled_motion, step,
+                    ignore_deadline=True))
             catchup_motion_reprobe = bool(
                 not refresh_control and not motion_probe_reusable and
                 isinstance(cached_motion_probe, dict) and
@@ -9002,9 +9011,10 @@ class BotRuntime(object):
                             })
                         elif isinstance(receipt, dict):
                             motion_probe['world_receipt'] = receipt
-                if (motion_probe is not None and
-                        not (isinstance(motion_probe, dict) and
-                             motion_probe.get('deferred', False))):
+                probe_was_deferred = bool(
+                    isinstance(motion_probe, dict) and
+                    motion_probe.get('deferred', False))
+                if motion_probe is not None and not probe_was_deferred:
                     receipt_pending = bool(
                         isinstance(motion_probe, dict) and
                         motion_probe.get('_world_receipt_pending', False))
@@ -9029,19 +9039,36 @@ class BotRuntime(object):
                                 now, state['id'],
                                 cached_motion_probe is None)),
                     }
-                elif not (isinstance(motion_probe, dict) and
-                          motion_probe.get('deferred', False)):
+                elif probe_was_deferred:
+                    if cached_motion_geometry_reusable:
+                        # The expired proof still contains this exact motion
+                        # ray. Use it for this callback while the fair recast
+                        # budget catches up on a later refresh.
+                        motion_probe = cached_motion_result
+                    else:
+                        # A proof for another pose, heading or shorter target
+                        # cannot license the newly selected corridor. Retiring
+                        # it makes the remaining catch-up slices hold without
+                        # repeating the same deferred native probe.
+                        self._motion_probe_cache.pop(state['id'], None)
+                        if cached_motion_probe is not None:
+                            # Preserve the established no-cache behaviour: an
+                            # exact resolver may still admit this first slice.
+                            # Only the stale proof introduced by this change
+                            # must not grant motion in its unrelated corridor.
+                            throttle = 0.0
+                            turn = 0.0
+                            pose_frozen = True
+                else:
                     old_result = ((cached_motion_probe or {}).get(
                         'result') or {})
                     if not isinstance(old_result.get(
                             'world_receipt'), dict):
                         self._motion_probe_cache.pop(state['id'], None)
                 # A deferred sample only means the shared soft-static recast
-                # budget was exhausted this callback. ``_motion_probe_reusable``
-                # already documents that a deferral proves neither a wall nor a
-                # soft path, so the still-geometrically-valid cached corridor is
-                # kept and its own containment test decides the next slice.
-                # Evicting it turned a budget shortage into a catch-up hold.
+                # budget was exhausted this callback. It proves neither a wall
+                # nor a new clear corridor, so only an old clear proof which
+                # still geometrically contains the requested motion may remain.
             else:
                 motion_probe = cached_motion_probe['result']
             probe_deferred = bool(
