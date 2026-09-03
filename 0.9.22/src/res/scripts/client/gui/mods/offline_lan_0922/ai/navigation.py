@@ -1269,6 +1269,16 @@ class TerrainNavigator(object):
 
 	def _path(self, path_key, start, goal, now, avoid_points):
 		key = self._cache_key(path_key, goal)
+		owner = self._path_owner(path_key)
+		if owner is not None:
+			# Join and continuation keys include the Bot's current cell. A
+			# pending safe-local fallback can therefore move into a new cell
+			# and request a replacement before the old job finishes. Keep only
+			# that Bot's current private request so stale jobs cannot divide the
+			# navigator-wide expansion budget. Shared route searches and other
+			# Bots' work remain independent. Do this before a cached-path return:
+			# revisiting a cached cell still supersedes a pending job elsewhere.
+			self._cancel_bot_searches(owner, keep_key=key)
 		if key in self.paths:
 			path = self.paths[key]
 			# A probe can fail while distant chunks are still streaming. Successful
@@ -1287,15 +1297,6 @@ class TerrainNavigator(object):
 				self.grid.clear_negative_cache()
 		search = self.searches.get(key)
 		if search is None:
-			owner = self._path_owner(path_key)
-			if owner is not None:
-				# Join and continuation keys include the Bot's current cell. A
-				# pending safe-local fallback can therefore move into a new cell
-				# and request a replacement before the old job finishes. Keep only
-				# that Bot's current private request so stale jobs cannot divide the
-				# navigator-wide expansion budget. Shared route searches and other
-				# Bots' work remain independent.
-				self._cancel_bot_searches(owner, keep_key=key)
 			edge_penalties = self._active_bot_edge_penalties(owner, now)
 			penalized_direct = bool(
 				edge_penalties and any(

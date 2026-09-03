@@ -817,6 +817,37 @@ class BotAiPortTests(unittest.TestCase):
         navigator.next_target(7, current, goal, route_key, now)
         self.assertEqual(first_join_steps, first_join.steps)
 
+    def test_cached_private_path_cancels_superseded_pending_search(self):
+        """A cached current join still retires another cell's private job."""
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._baked_graph(6, 3))
+        start = (14.0, 0.0, 24.0)
+        goal = (30.0, 0.0, 24.0)
+        stale_path_key = ('join', 7, (0, 1), 'route', 1, 'lane')
+        current_path_key = ('join', 7, (1, 1), 'route', 1, 'lane')
+        stale_key = navigator._cache_key(stale_path_key, goal)
+        current_key = navigator._cache_key(current_path_key, goal)
+        shared_key = (('route', 2, 'shared-lane'),
+                      navigator.grid.cell_for(goal))
+        stale_search = _PendingSearch()
+        shared_search = _PendingSearch()
+        navigator.searches[stale_key] = stale_search
+        navigator.searches[shared_key] = shared_search
+        navigator.search_times[stale_key] = 1.0
+        navigator.search_times[shared_key] = 1.0
+        cached_path = (start, goal)
+        navigator.paths[current_key] = cached_path
+        navigator.path_times[current_key] = 1.0
+
+        selected_key, selected_path = navigator._path(
+            current_path_key, start, goal, 2.0, None)
+
+        self.assertEqual(current_key, selected_key)
+        self.assertEqual(cached_path, selected_path)
+        self.assertNotIn(stale_key, navigator.searches)
+        self.assertNotIn(stale_key, navigator.search_times)
+        self.assertIs(shared_search, navigator.searches[shared_key])
+
     def test_failed_shallow_search_keeps_reactive_local_recovery(self):
         graph = self._baked_graph(3, 1)
         graph['hazards'] = [0, 4, 0]
