@@ -13,14 +13,16 @@ CLIENT_SCRIPTS = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
-from gui.mods.offline_lan_0922.ai import cover, maps, reviewed_routes_20260811
+from gui.mods.offline_lan_0922.ai import (
+    cover, maps, navigation, reviewed_routes_20260811,
+)
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
 from gui.mods.offline_lan_0922.ai.driver import LocalDriver
 from gui.mods.offline_lan_0922.ai.planner import (
     BattleDirector, build_vehicle_profile,
 )
 from gui.mods.offline_lan_0922.ai.navigation import (
-    BAKED_FATAL_HAZARDS, BAKED_SHALLOW_WATER,
+    BAKED_FATAL_HAZARDS, BAKED_SHALLOW_WATER, _distance_2d,
     MAX_SEARCH_EXPANSIONS_PER_CATCH_UP_FRAME,
     MAX_SEARCH_EXPANSIONS_PER_FRAME, SEARCH_EXPANSIONS_PER_SECOND,
     TerrainGrid, TerrainNavigator,
@@ -671,6 +673,206 @@ class BotAiPortTests(unittest.TestCase):
             current, goal, selected, minimum_request_distance=5.0))
         self.assertFalse(navigator.controlled_shallow_step(
             7, current, math.pi * 0.5))
+
+    def _pending_navigator(self):
+        """A navigator whose global search never finishes this frame."""
+        graph = self._baked_graph(9, 3)
+        hazards = [0] * 27
+        for row in range(3):
+            hazards[row * 9 + 5] = BAKED_SHALLOW_WATER
+        graph['hazards'] = hazards
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        navigator._path = lambda *unused: (('search-result',), None)
+        return navigator
+
+    def test_pending_search_holds_only_for_a_bounded_grace(self):
+        """A queued search must not park the hull for the whole search.
+
+        The room shares one expansion budget, so a pending job can outlive
+        several seconds of real time. Holding briefly avoids a pointless creep
+        when the job finishes in a frame or two; holding forever is a parked
+        tank that the driver reads as arrival and the order adapter refuses to
+        steer at all.
+        """
+        navigator = self._pending_navigator()
+        current = (10.0, 0.0, 24.0)
+        goal = (42.0, 0.0, 24.0)
+        path_key = ('route_join', 7, 1, 'lane', 1)
+
+        held = navigator.next_target(7, current, goal, path_key, 1.0)
+        self.assertEqual(current, held)
+        self.assertEqual('pending', navigator.fallback_modes[7])
+
+        moved = navigator.next_target(
+            7, current, goal, path_key,
+            1.0 + navigation.PENDING_PROGRESS_SECONDS)
+
+        self.assertNotEqual(current, moved)
+        self.assertLess(_distance_2d(moved, goal), _distance_2d(current, goal))
+        self.assertFalse(navigator.grid.segment_has_baked_hazard(
+            current, moved, BAKED_FATAL_HAZARDS | BAKED_SHALLOW_WATER))
+        self.assertTrue(navigator.grid.segment_clear(current, moved))
+        self.assertFalse(TerrainNavigator.navigation_paused(
+            current, goal, moved, minimum_request_distance=5.0))
+
+    def test_pending_search_still_holds_when_no_safe_step_exists(self):
+        """Bounded progress never invents a step the probes did not prove."""
+        navigator = self._pending_navigator()
+        navigator.grid.safe_local_target = lambda *unused: None
+        current = (10.0, 0.0, 24.0)
+        goal = (42.0, 0.0, 24.0)
+        path_key = ('route_join', 7, 1, 'lane', 1)
+
+        navigator.next_target(7, current, goal, path_key, 1.0)
+        held = navigator.next_target(
+            7, current, goal, path_key,
+            1.0 + navigation.PENDING_PROGRESS_SECONDS)
+
+        self.assertEqual(current, held)
+        self.assertEqual('pending', navigator.fallback_modes[7])
+
+    def test_completed_route_target_restarts_the_pending_grace(self):
+        """A real routed target ends the episode; a probed step does not."""
+        navigator = self._pending_navigator()
+        current = (10.0, 0.0, 24.0)
+        goal = (42.0, 0.0, 24.0)
+        path_key = ('route_join', 7, 1, 'lane', 1)
+
+        navigator.next_target(7, current, goal, path_key, 1.0)
+        state = navigator.bot_states[7]
+        self.assertIn('pending_since', state)
+
+        navigator._set_fallback_mode(7, None)
+        self.assertNotIn('pending_since', state)
+
+    def test_pending_join_replaces_stale_search_after_fallback_moves(self):
+        """Cross-cell progress keeps one private job and its fair share."""
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._baked_graph(20, 3))
+        current = (10.0, 0.0, 24.0)
+        goal = (78.0, 0.0, 24.0)
+        route_key = ('route', 1, 'blocked-join')
+        route_cache_key = navigator._cache_key(route_key, goal)
+        navigator.paths[route_cache_key] = (current, goal)
+        navigator.path_times[route_cache_key] = 1.0
+
+        shared_key = (('route', 2, 'shared-lane'),
+                      navigator.grid.cell_for(goal))
+        shared_search = _PendingSearch()
+        navigator.searches[shared_key] = shared_search
+        navigator.search_times[shared_key] = 1.0
+        created = []
+
+        def begin_plan(*unused_args, **unused_kwargs):
+            search = _PendingSearch()
+            created.append(search)
+            return search
+
+        navigator.grid.begin_plan = begin_plan
+        navigator.grid.dry_segment_clear = lambda *unused: False
+        navigator.grid.segment_clear = lambda *unused: False
+        navigator.grid.safe_local_target = lambda point, *unused: (
+            point[0] + navigator.grid.cell_size + 0.1,
+            point[1], point[2])
+
+        now = 1.0
+        selected = navigator.next_target(
+            7, current, goal, route_key, now)
+        self.assertEqual(current, selected)
+        self.assertEqual(2, len(navigator.searches))
+        self.assertIn(shared_key, navigator.searches)
+        self.assertEqual(1, len(created))
+
+        # The grace expiry supplies one safe local step without replacing the
+        # still-current join. The next request starts from another cell and
+        # must replace that private job instead of adding a third fair-share
+        # participant.
+        frame_share = MAX_SEARCH_EXPANSIONS_PER_CATCH_UP_FRAME // 2
+        now += navigation.PENDING_PROGRESS_SECONDS + 0.01
+        before_shared = shared_search.steps
+        selected = navigator.next_target(7, current, goal, route_key, now)
+        self.assertEqual(frame_share, shared_search.steps - before_shared)
+        first_join = created[0]
+        current = selected
+
+        for unused in range(5):
+            before_shared = shared_search.steps
+            now += navigation.PENDING_PROGRESS_SECONDS + 0.01
+            selected = navigator.next_target(
+                7, current, goal, route_key, now)
+            self.assertEqual(frame_share, shared_search.steps - before_shared)
+            self.assertEqual(2, len(navigator.searches))
+            self.assertIn(shared_key, navigator.searches)
+            owned = [
+                search for key, search in navigator.searches.items()
+                if navigator._path_owner(key[0]) == 7]
+            self.assertEqual(1, len(owned))
+            current = selected
+
+        self.assertEqual(6, len(created))
+        self.assertNotIn(first_join, navigator.searches.values())
+        first_join_steps = first_join.steps
+        now += navigation.PENDING_PROGRESS_SECONDS + 0.01
+        navigator.next_target(7, current, goal, route_key, now)
+        self.assertEqual(first_join_steps, first_join.steps)
+
+    def test_cached_private_path_cancels_superseded_pending_search(self):
+        """A cached current join still retires another cell's private job."""
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._baked_graph(6, 3))
+        start = (14.0, 0.0, 24.0)
+        goal = (30.0, 0.0, 24.0)
+        stale_path_key = ('join', 7, (0, 1), 'route', 1, 'lane')
+        current_path_key = ('join', 7, (1, 1), 'route', 1, 'lane')
+        stale_key = navigator._cache_key(stale_path_key, goal)
+        current_key = navigator._cache_key(current_path_key, goal)
+        shared_key = (('route', 2, 'shared-lane'),
+                      navigator.grid.cell_for(goal))
+        stale_search = _PendingSearch()
+        shared_search = _PendingSearch()
+        navigator.searches[stale_key] = stale_search
+        navigator.searches[shared_key] = shared_search
+        navigator.search_times[stale_key] = 1.0
+        navigator.search_times[shared_key] = 1.0
+        cached_path = (start, goal)
+        navigator.paths[current_key] = cached_path
+        navigator.path_times[current_key] = 1.0
+
+        selected_key, selected_path = navigator._path(
+            current_path_key, start, goal, 2.0, None)
+
+        self.assertEqual(current_key, selected_key)
+        self.assertEqual(cached_path, selected_path)
+        self.assertNotIn(stale_key, navigator.searches)
+        self.assertNotIn(stale_key, navigator.search_times)
+        self.assertIs(shared_search, navigator.searches[shared_key])
+
+    def test_cached_private_parent_keeps_pending_child_search(self):
+        """One live request may read a route_join while its join is pending."""
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._baked_graph(6, 3))
+        start = (14.0, 0.0, 24.0)
+        goal = (30.0, 0.0, 24.0)
+        parent_path_key = ('route_join', 7, 1, 'lane', 1)
+        child_path_key = (('join', 7, navigator.grid.cell_for(start)) +
+                          parent_path_key)
+        parent_key = navigator._cache_key(parent_path_key, goal)
+        child_key = navigator._cache_key(child_path_key, goal)
+        cached_path = (start, goal)
+        child_search = _PendingSearch()
+        navigator.paths[parent_key] = cached_path
+        navigator.path_times[parent_key] = 1.0
+        navigator.searches[child_key] = child_search
+        navigator.search_times[child_key] = 1.0
+
+        selected_key, selected_path = navigator._path(
+            parent_path_key, start, goal, 2.0, None)
+
+        self.assertEqual(parent_key, selected_key)
+        self.assertEqual(cached_path, selected_path)
+        self.assertIs(child_search, navigator.searches[child_key])
+        self.assertEqual(1.0, navigator.search_times[child_key])
 
     def test_failed_shallow_search_keeps_reactive_local_recovery(self):
         graph = self._baked_graph(3, 1)
