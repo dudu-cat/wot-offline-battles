@@ -343,14 +343,22 @@ required to release a projectile-synchronized native order.
 
 The complete streamed-slot boundary comes from the exact #1513 native path:
 `game.onChunkLoad(spaceID, chunkID, numDestructibles, isOutside)` writes
-`numDestructibles` into the active `DestructiblesManager`. Version 0.3.68 reads
-that manager count and enumerates every native index. It uses
-`wg_getChunkDestrFilenames` only for its available filename prefix; a short
-prefix no longer proves that later fragile, structure or falling slots do not
-exist. A filename disagreement is retained as a diagnostic while the unique
-matrix signature, exact native wire and native effect category remain the
-fail-closed identity boundary. A missing native count is retried after
-streaming rather than guessed.
+`numDestructibles` into the active `DestructiblesManager`. The runtime reads
+that manager count and enumerates every native index. `wg_getChunkDestrFilenames`
+is not a parallel index space: the reviewed entry point of the exact client
+executable walks the provider's whole item array and appends a name only for an
+item that resolves, whose native group owns an effect handler and whose name is
+not empty, with no blank placeholder. Its positions are therefore name order and
+never an item index, so it is not an identity channel for a catalog-located
+slot; the unique matrix signature and the exact native wire are. The same
+provider lookup backs `wg_getDestructibleMatrix`, the per-item name and the
+no-module effect category, so those three share one item index space.
+`wg_getDestructibleEffectCategory` raises when the triple does not resolve and
+returns exactly -1 when the resolved item's native group owns no handler, so -1
+is one unregistered channel rather than a kind disagreement.
+`wg_getDestructibleFilename` is not used: for a resolved item without a handler
+it builds a Python string from a null pointer. A missing native count is retried
+after streaming rather than guessed.
 
 For Windows verification, bounded `DESTR` lines report one aggregate for each
 newly scanned chunk plus each first distinct contact stage. The logger reuses

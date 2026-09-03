@@ -36,6 +36,26 @@ _SHOT_THROUGH_MIN_REDUCTION_1513 = 25.0
 _SHOT_AP_KINDS_1513 = frozenset((
 	'ARMOR_PIERCING', 'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
 
+# Exact pinned #1513 native contract for
+# ``BigWorld.wg_getDestructibleEffectCategory(spaceID, chunk, item, module)``,
+# read from the reviewed x86 entry point of the exact client executable
+# (PE timestamp 0x5a6edca4, checksum 0x019a5229):
+#
+# * a negative ``module`` selects the no-module resolve, a non-negative one the
+#   per-module resolve; both then share the same post-processing;
+# * when the (chunk, item[, module]) triple does not resolve, the entry returns
+#   no object at all, which reaches Python as an error rather than a value;
+# * when it does resolve, the category comes from the effect handler registered
+#   for that item's native group.  If no handler is registered for the group the
+#   entry returns exactly -1.
+#
+# So -1 proves the native item resolved and only says that the effect-category
+# channel is unregistered for it; it carries no destructible kind.  It is
+# neither a kind match nor evidence of a wrong wire, and the offline client
+# legitimately leaves handler groups unregistered.  Treat it as one unverified
+# identity channel, never as a wildcard.
+_NATIVE_EFFECT_CATEGORY_UNREGISTERED_1513 = -1
+
 # Exact constants from pinned #1513 ``constants.DESTRUCTIBLE_MATKIND``.
 # ``NORMAL_MAX`` is an exclusive sentinel: DestructiblesCache allocates
 # structure modules from 73 through 85 and maps 87 through 99 to damaged BSP
@@ -183,10 +203,12 @@ def _log_destructible_validation_1513(
 			pass
 		return
 	logged.add(key)
+	catalog = _destructible_catalog or {}
 	parts = [
 		'[Offline LAN 0.9.22] DESTR %s' % action,
 		'type=%s' % failure_type,
 		'scope=%s' % ('chunk' if item_index is None else 'slot'),
+		'map=%s' % (catalog.get('map') or 'unknown'),
 		'chunk=%s' % chunk_id,
 	]
 	if item_index is not None:
@@ -226,11 +248,13 @@ def _isolate_destructible_1513(
 def _native_chunk_destructible_count_1513(manager, chunk_id):
 	"""Read the count written by ``game.wg_onChunkLoad`` on pinned #1513.
 
-	``wg_getChunkDestrFilenames`` is not a slot-count API: the offline client can
-	return only the named SpeedTree prefix while fragile, structure and falling
-	atoms remain addressable at later native indices.  The manager's private map
-	is populated from the engine callback's ``numDestructibles`` argument and is
-	the only exact streamed-slot boundary available to Python.
+	``wg_getChunkDestrFilenames`` is not a slot-count API.  The pinned entry
+	point walks the provider's whole item array and appends a name only for an
+	item that resolves, whose native group owns a handler and whose name is not
+	empty, so its length is a lower bound and its positions are name order.  The
+	manager's private map is populated from the engine callback's
+	``numDestructibles`` argument and is the only exact streamed-slot boundary
+	available to Python.
 	"""
 	loaded = getattr(
 		manager, '_DestructiblesManager__loadedChunkIDs', None)
@@ -361,10 +385,7 @@ def _diagnostic_chunk_1513(chunk_id, native_count, filenames, registry):
 		('chunk', int(chunk_id)),
 		('slots', int(native_count)),
 		('names', len(filenames)),
-		('named', sum(1 for slot in ordered if slot['raw'] == 'named')),
-		('blank', sum(1 for slot in ordered if slot['raw'] == 'blank')),
-		('name_mismatch', sum(
-			1 for slot in ordered if slot.get('raw_mismatch'))),
+		('unmapped', sum(1 for slot in ordered if slot['raw'] == 'unmapped')),
 		('v3_unique', signatures.count('unique')),
 		('v3_ambig', signatures.count('ambig')),
 		('v3_miss', signatures.count('miss')),
@@ -703,6 +724,7 @@ def set_catalog(catalog):
 					'ambiguous destructible candidate is invalid')
 		ambiguous_signatures.add(signature)
 	_destructible_catalog = {
+		'map': catalog.get('map'),
 		'resources': prepared, 'quantization': quantization,
 		'max_radius': max_radius, 'instances': instance_index,
 		'ambiguous_instances': ambiguous_signatures,
@@ -1124,21 +1146,41 @@ def _validate_native_effect_categories_1513(
 			return False
 		module_indices = tuple(
 			raw_material - normal_min for raw_material in raw_materials)
+	descriptor_type = descriptor.get('type') if isinstance(
+		descriptor, dict) else None
+	identity = 'catalog=%s catalog_kind=%s descriptor_type=%r' % (
+		record['filename'], expected_kind, descriptor_type)
 	for module_index in module_indices:
 		try:
 			native_type = bigworld.wg_getDestructibleEffectCategory(
 				spaceID, chunk_id, item_index, module_index)
 		except Exception as error:
+			# The pinned entry point reports an unresolved (chunk, item, module)
+			# triple as an error, so this is a real identity failure.
 			_isolate_destructible_1513(
 				'effect_query', chunk_id, item_index,
-				detail='module=%s error=%s' % (module_index, error))
+				detail='operation=effect_category module=%s %s error=%s' % (
+					module_index, identity, error))
 			return False
+		if native_type == _NATIVE_EFFECT_CATEGORY_UNREGISTERED_1513:
+			# The item resolved but its native effect group has no handler, so
+			# this channel cannot confirm or contradict the catalog kind.  The
+			# exact wire and the unique matrix signature already agreed, and
+			# isolating here would hide legal #1513 destructibles.
+			_log_destructible_validation_1513(
+				'effect_category_unregistered', 'accepted_native_identity',
+				chunk_id, item_index,
+				detail='operation=effect_category module=%s %s '
+					'native=-1 wire=live_validated' % (
+						module_index, identity))
+			continue
 		if _catalog_kind_for_type_1513(
 				area_destructibles, native_type) != expected_kind:
 			_isolate_destructible_1513(
 				'effect_category', chunk_id, item_index,
-				detail='module=%s expected=%s native=%r' % (
-					module_index, expected_kind, native_type))
+				detail='operation=effect_category module=%s %s '
+					'native=%r wire=live_validated' % (
+						module_index, identity, native_type))
 			return False
 	return True
 
@@ -1198,12 +1240,8 @@ def _stream_baked_shot_instance_1513(spaceID, identity):
 			'filename_prefix', chunk_id,
 			detail='names=%s count=%s' % (len(filenames), native_count))
 		return None
-	if item_index < len(filenames) and not isinstance(
-			filenames[item_index], _STRING_TYPES):
-		_isolate_destructible_1513(
-			'filename_slot', chunk_id, item_index,
-			detail='expected string')
-		return None
+	# The name list is compacted, so no position in it belongs to this item and
+	# only its length remains a usable sanity bound.
 	chunk_matrix = BigWorld.wg_getChunkMatrix(spaceID, chunk_id)
 	chunk_translation = getattr(chunk_matrix, 'translation', None)
 	if chunk_translation is None:
@@ -2914,6 +2952,14 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						detail='names=%s count=%s' %
 							(len(_dfn), _native_count))
 					continue
+				if any(not isinstance(_name, _STRING_TYPES) for _name in _dfn):
+					# The native helper emits only Python strings.  A malformed
+					# compacted entry cannot be assigned to any native item, so
+					# quarantine the chunk rather than inventing a slot identity.
+					_isolate_destructible_1513(
+						'filename_payload', cid,
+						detail='compacted list contains a non-string entry')
+					continue
 				registry = {
 					'bins': {}, 'extended_bins': {}, 'count': 0,
 					'native_count': _native_count,
@@ -2927,10 +2973,10 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					try:
 						if _destructible_isolated_1513(cid, _ti):
 							continue
-						# #1513's offline chunk list keeps the native item slots,
-						# but returns blank filenames for many non-tree items.  Read
-						# the item matrix first and recover the resource only through
-						# the checksum-pinned whole-map instance signature.
+						# #1513's offline chunk list is compacted rather than native-
+						# item-indexed. Read the item matrix first and recover the
+						# resource only through the checksum-pinned whole-map instance
+						# signature.
 						_is_active_falling = ((cid, _ti) in globals().setdefault(
 							'g_offh_destr_falling_active', {}))
 						_baked_slot = ((_destructible_catalog or {}).get(
@@ -2947,21 +2993,12 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							_isolate_destructible_1513(
 								'falling_matrix_query', cid, _ti, detail=error)
 							continue
-						_raw_filename = (
-							_dfn[_ti] if _ti < len(_dfn) else '')
-						if not isinstance(_raw_filename, _STRING_TYPES):
-							_isolate_destructible_1513(
-								'filename_slot', cid, _ti,
-								detail='expected string')
-							continue
-						_raw_normalized = _normalized_filename(_raw_filename)
 						_slot_diag = {
-							'raw': 'named' if _raw_normalized else 'blank',
+							'raw': 'unmapped',
 							'signature_state': 'none',
 							'effect_category': '-',
 							'result': 'pending',
 							'boxes': 0,
-							'raw_mismatch': False,
 						}
 						# Retained for the whole battle, one dict per native slot
 						# including every tree, so only keep it when a reader exists.
@@ -3000,27 +3037,27 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							if _signature in _destructible_catalog[
 									'ambiguous_instances']:
 								_slot_diag['signature_state'] = 'ambig'
-								_slot_diag['result'] = 'sig_ambig'
 								# Multiple native identities have exactly the same
-								# matrix. A blank slot cannot select one without
-								# guessing.
+								# matrix. The compacted names cannot select one without
+								# guessing, so keep every consumer behind the isolation gate.
+								_isolate_destructible_1513(
+									'native_identity_unavailable', cid, _ti,
+									detail='catalog matrix signature is ambiguous')
+								_slot_diag['result'] = 'isolated'
 								continue
 							_slot_diag['signature_state'] = (
 								'unique' if _located is not None else 'miss')
 						_instance_box_index = None
 						if _located is not None:
-							if (_raw_normalized and
-									_raw_normalized != _located['filename']):
-								# This helper is only a partial diagnostic prefix in
-								# #1513. The checksum-pinned unique matrix signature,
-								# exact native wire and effect category below are the
-								# authoritative identity boundary.
-								_slot_diag['raw_mismatch'] = True
-								_log_destructible_validation_1513(
-									'filename_mismatch', 'accepted_catalog_identity',
-									cid, _ti,
-									detail='native=%s catalog=%s' % (
-										_raw_normalized, _located['filename']))
+							# ``wg_getChunkDestrFilenames`` is compacted, not
+							# item-indexed: the pinned entry point walks every item,
+							# skips each unresolved item, each item whose native
+							# group owns no handler and each empty name, and appends
+							# only the survivors.  Its positions are therefore name
+							# order and can never confirm or contradict a catalog-located
+							# slot with the same numeric item index.
+							# The exact wire and the unique matrix signature below
+							# are the identity boundary for such a slot.
 							if _located['wire'] != (int(cid), int(_ti)):
 								_live_wire = (int(cid), int(_ti))
 								_baked_wire = _located['wire']
@@ -3039,33 +3076,20 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 							_filename = _catalog_record['filename']
 							_instance_box_index = _located['box_index']
 						else:
-							_filename = _raw_filename
-							_catalog_record = None
-							if (_raw_normalized and
-									_destructible_catalog is not None):
-								_catalog_record = _destructible_catalog[
-									'resources'].get(_raw_normalized)
-								if (_catalog_record is not None and
-										_destructible_catalog.get(
-											'has_instance_index')):
-									# A v3 catalog resource without its exact placement
-									# signature is not this native item.
-									_slot_diag['result'] = 'sig_miss'
-									continue
+							# No catalog placement matched this native item.  A compacted
+							# name at the same numeric position could belong to a later
+							# item, so it cannot supply a descriptor or authorize a native
+							# destroy. Quarantine this unresolved wire so proximity,
+							# streamed shots and canonical replay share the same fail-closed
+							# gate while the unknown native object remains solid.
+							_isolate_destructible_1513(
+								'native_identity_unavailable', cid, _ti,
+								detail='no exact catalog placement or item name')
+							_slot_diag['result'] = 'isolated'
+							continue
 						desc = AreaDestructibles.g_cache.getDescByFilename(
 							_filename)
 						if desc is None:
-							# A non-empty raw name is the only safe evidence that this
-							# #1513 prefix slot is a tree. Quarantine that invalid tree;
-							# blank/later slots can be real non-tree objects and remain
-							# solid and available to catalog recovery.
-							if (_raw_normalized and
-									_catalog_record is None):
-								_isolate_destructible_1513(
-									'tree_descriptor', cid, _ti,
-									detail='named filename has no descriptor')
-								_slot_diag['result'] = 'isolated'
-								continue
 							_slot_diag['result'] = 'desc_missing'
 							continue
 						typ = desc['type']

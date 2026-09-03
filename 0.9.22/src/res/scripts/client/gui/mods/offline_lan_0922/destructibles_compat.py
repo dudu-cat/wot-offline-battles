@@ -7,7 +7,9 @@ The authority module retains the 0.8.2 law with explicit #1513 ABI fixes.
 replaces one unsafe #1513 tree-descriptor lookup: the stock method passes the
 nullable result of ``wg_getDestructibleFilename`` straight to
 ``PyString_FromString``.  The chunk-list helper returns ``None`` to Python
-normally and is therefore the safe boundary for offline tree animation.
+normally, but its result is compacted and cannot identify a native item by
+position.  Until an exact item-name resolver is available, loaded tree
+operations therefore fail closed instead of borrowing another item's name.
 """
 
 
@@ -30,13 +32,13 @@ def reset_safe_descriptor_cache(space_id=None):
 def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
     """Inspect one streamed descriptor without the nullable scalar wrapper.
 
-    On pinned #1513 ``wg_getChunkDestrFilenames`` is a named SpeedTree prefix,
-    not the native slot count.  That is exactly sufficient for the only two
-    stock callers of ``getDestructibleDesc``: tree fracture/touchdown effects
-    and the tree animator.  Non-tree identities keep their existing native
-    paths and are deliberately not inferred here. ``pending`` is reserved for
-    the legal stream boundary where the chunk list is not available yet;
-    malformed, unnamed and unresolved entries are definitively ``invalid``.
+    On pinned #1513 ``wg_getChunkDestrFilenames`` appends only names that
+    resolve through a registered native handler.  An unnamed item before a
+    named tree shifts every later position, so no list position proves the
+    requested native item's identity.  The list remains useful only as a
+    nullable stream-readiness probe here.  ``pending`` is reserved for that
+    legal stream boundary; once the list is available the unresolved identity
+    is definitively ``invalid`` and the native tree operation stays blocked.
     """
     import BigWorld
 
@@ -45,8 +47,7 @@ def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
     item_index = int(item_index)
     if _SAFE_DESC_SPACE[0] != space_id:
         reset_safe_descriptor_cache(space_id)
-    key = (chunk_id, item_index)
-    cached = _SAFE_DESC_BY_WIRE.get(key)
+    cached = _SAFE_DESC_BY_WIRE.get((chunk_id, item_index))
     if cached is not None:
         return 'resolved', cached
     filenames = BigWorld.wg_getChunkDestrFilenames(space_id, chunk_id)
@@ -54,15 +55,11 @@ def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
         return 'pending', None
     if not isinstance(filenames, (list, tuple)):
         return 'invalid', None
-    if item_index < 0 or item_index >= len(filenames):
-        return 'invalid', None
-    filename = filenames[item_index]
-    if not isinstance(filename, _STRING_TYPES) or not filename:
-        return 'invalid', None
-    desc = cache.getDescByFilename(filename)
-    if desc is not None:
-        _SAFE_DESC_BY_WIRE[key] = desc
-        return 'resolved', desc
+    # This compacted list has no per-item positional contract.  Neither a range
+    # check nor a descriptor lookup can make the same numeric list position
+    # belong to this native item.  Keep the cache hook for the exact resolver
+    # that will replace this boundary, but never populate it from ambiguous
+    # positions.
     return 'invalid', None
 
 
