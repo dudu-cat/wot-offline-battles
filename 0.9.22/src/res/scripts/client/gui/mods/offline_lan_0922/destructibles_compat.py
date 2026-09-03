@@ -42,9 +42,10 @@ def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
     the only two stock callers of ``getDestructibleDesc`` need: tree
     fracture/touchdown effects and the tree animator.  Non-tree identities keep
     their existing native paths and are deliberately not inferred here.
-    ``pending`` is reserved for the legal stream boundary; an item with no
-    exact name, an unaligned chunk and an unresolved descriptor are all
-    definitively ``invalid`` rather than another item's resource.
+    ``pending`` covers the legal stream boundary and a bounded alignment still
+    advancing across render ticks.  An item with no exact name, a terminally
+    unaligned chunk and an unresolved descriptor are all definitively
+    ``invalid`` rather than another item's resource.
     """
     from gui.mods.offline_lan_0922 import destructibles_sensor
 
@@ -54,6 +55,9 @@ def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
     if _SAFE_DESC_SPACE[0] != space_id:
         reset_safe_descriptor_cache(space_id)
     key = (chunk_id, item_index)
+    if destructibles_sensor.is_isolated_1513(chunk_id, item_index):
+        _SAFE_DESC_BY_WIRE.pop(key, None)
+        return 'invalid', None
     cached = _SAFE_DESC_BY_WIRE.get(key)
     if cached is not None:
         return 'resolved', cached
@@ -65,10 +69,20 @@ def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
         return 'invalid', None
     if not isinstance(filename, _STRING_TYPES) or not filename:
         return 'invalid', None
-    desc = cache.getDescByFilename(filename)
-    if desc is not None:
+    try:
+        desc = cache.getDescByFilename(filename)
+    except Exception as error:
+        _SAFE_DESC_BY_WIRE.pop(key, None)
+        destructibles_sensor.isolate_destructible_1513(
+            'descriptor_cache', chunk_id, item_index, detail=error)
+        return 'invalid', None
+    if isinstance(desc, dict) and 'type' in desc:
         _SAFE_DESC_BY_WIRE[key] = desc
         return 'resolved', desc
+    destructibles_sensor.isolate_destructible_1513(
+        'tree_descriptor', chunk_id, item_index,
+        detail='exact native filename has invalid descriptor payload=%s' %
+            type(desc).__name__)
     return 'invalid', None
 
 
