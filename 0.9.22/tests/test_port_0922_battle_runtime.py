@@ -18215,8 +18215,9 @@ class BattleRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             [mock.call(3, 9), mock.call(3, 9)],
             battle._foliage.activate_fallen_tree.call_args_list)
-        battle._destructibles.note_destroyed.assert_called_once_with(
-            'tree', 3, 9, None, runtime.bigworld.now)
+        self.assertEqual(
+            [mock.call('tree', 3, 9, None, runtime.bigworld.now)] * 2,
+            battle._destructibles.note_destroyed.call_args_list)
 
     def test_fallen_tree_foliage_follows_native_direction_and_angle(self):
         class NativeTreeMatrix(object):

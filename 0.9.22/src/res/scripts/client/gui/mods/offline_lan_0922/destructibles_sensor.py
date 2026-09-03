@@ -2446,6 +2446,17 @@ def _native_hide_delay():
 
 def note_destroyed(kind, chunkID, itemIndex, matKind=None, now=None):
 	"""Track native hide or falling-matrix collision after destruction."""
+	if kind == 'tree':
+		space_id = globals().get('g_offh_destr_runtime_space')
+		state = globals().setdefault('g_offh_tree_state', {
+			'chunks': {}, 'felled': set(), 'spaceID': space_id})
+		if state.get('spaceID') is None:
+			state['spaceID'] = space_id
+		state = _tree_runtime_state_1513(space_id)
+		if state is None:
+			return False
+		state['native_committed'].add((int(chunkID), int(itemIndex)))
+		return True
 	if kind not in ('fragile', 'module', 'column'):
 		return False
 	if _destructible_isolated_1513(chunkID, itemIndex):
@@ -2806,27 +2817,37 @@ def _motion_travel_reach(vel, dt):
 	return max(0.4, abs(float(vel)) * max(0.0, float(dt)) + 0.2)
 
 
-def _broken_collision_filter(members):
-	"""Filter exact broken or locally predicted identities in ``members``."""
-	if not members:
-		return None
-	authority = _get_destr_authority()
-	# The production authority always exposes its accepted-key ledger.  Keep
-	# injected compatibility/test seams fail-closed instead of guessing from an
-	# ``is_destroyed`` result that cannot enumerate structure materials.
-	if not callable(getattr(authority, 'destroyed_keys', None)):
+def _accepted_tree_collision_keys_1513():
+	"""Return exact trees whose native destruction has been accepted locally."""
+	state = globals().get('g_offh_tree_state')
+	if not isinstance(state, dict):
+		return ()
+	keys = state.get('native_committed', state.get('felled', ()))
+	return keys if isinstance(keys, (set, frozenset)) else ()
+
+
+def _broken_collision_filter(members, accepted_trees=()):
+	"""Filter exact broken catalog skins and accepted native trees."""
+	if not members and not accepted_trees:
 		return None
 	member_ids = set((int(chunk_id), int(item_index))
-		for chunk_id, item_index in members)
+		for chunk_id, item_index in members or ())
 	broken = set()
-	for chunk_id, item_index in member_ids:
-		for mat_kind in _broken_item_materials_1513(
-				authority, chunk_id).get(int(item_index), ()):
-			broken.add((int(chunk_id), int(item_index), mat_kind))
-	broken.update(key for key in
-		globals().get('g_offh_destr_speculative', set())
-		if key[:2] in member_ids)
-	if not broken:
+	if member_ids:
+		authority = _get_destr_authority()
+		# The production authority always exposes its accepted-key ledger.  Keep
+		# injected compatibility/test seams fail-closed instead of guessing from an
+		# ``is_destroyed`` result that cannot enumerate structure materials.
+		if callable(getattr(authority, 'destroyed_keys', None)):
+			for chunk_id, item_index in member_ids:
+				for mat_kind in _broken_item_materials_1513(
+						authority, chunk_id).get(int(item_index), ()):
+					broken.add((int(chunk_id), int(item_index), mat_kind))
+			broken.update(key for key in
+				globals().get('g_offh_destr_speculative', set())
+				if key[:2] in member_ids)
+	accepted_trees = accepted_trees or ()
+	if not broken and not accepted_trees:
 		return None
 
 	def reject_broken_skin(*hit):
@@ -2837,7 +2858,8 @@ def _broken_collision_filter(members):
 			identity = (int(hit[3]), int(hit[2]))
 		except (IndexError, TypeError, ValueError, OverflowError):
 			return True
-		if (identity + (hit[0],)) not in broken and (
+		if identity not in accepted_trees and (
+				identity + (hit[0],)) not in broken and (
 				identity + (None,)) not in broken:
 			return True
 		globals()['g_offh_destr_ground_skips'] = globals().get(
@@ -2855,15 +2877,16 @@ def ground_collision_filter(x, z):
 	the engine skips that surface and reports the next real one.  A broken item
 	is not part of the vehicle's collision in retail, so the suspension and the
 	drive slope must not sample its skin while the model waits to hide.
-	``None`` keeps the native fast path where no broken item covers this column.
+	Catalog skins retain the column-local fast path.  Accepted SpeedTrees use
+	their exact native identity because their crowns have no catalog footprint.
 	"""
-	if _destructible_catalog is None:
+	accepted_trees = _accepted_tree_collision_keys_1513()
+	if _destructible_catalog is None and not accepted_trees:
 		return None
 	contact_bins = globals().get('g_offh_destr_contact_bins')
-	if not contact_bins:
-		return None
-	members = contact_bins.get(_destructible_bin_key(x, z))
-	return _broken_collision_filter(members)
+	members = (contact_bins.get(_destructible_bin_key(x, z))
+		if contact_bins else ())
+	return _broken_collision_filter(members, accepted_trees)
 
 
 def horizontal_collision_filter(start, end):
@@ -2871,13 +2894,13 @@ def horizontal_collision_filter(start, end):
 
 	The native callback is safer than treating a 0.2-second hide window as a
 	blanket pass: the engine skips only the accepted ``(chunk, item, material)``
-	and immediately returns an unrelated prop or backing wall on the same ray.
+	or exact accepted tree, then immediately returns an unrelated prop or backing
+	wall on the same ray.
 	"""
-	if _destructible_catalog is None:
+	accepted_trees = _accepted_tree_collision_keys_1513()
+	if _destructible_catalog is None and not accepted_trees:
 		return None
 	contact_bins = globals().get('g_offh_destr_contact_bins')
-	if not contact_bins:
-		return None
 	try:
 		keys = _bin_keys_for_bounds(
 			min(float(start.x), float(end.x)),
@@ -2887,9 +2910,10 @@ def horizontal_collision_filter(start, end):
 	except (AttributeError, TypeError, ValueError):
 		return None
 	members = set()
-	for key in keys:
-		members.update(contact_bins.get(key, ()))
-	return _broken_collision_filter(members)
+	if contact_bins:
+		for key in keys:
+			members.update(contact_bins.get(key, ()))
+	return _broken_collision_filter(members, accepted_trees)
 
 
 def _broken_item_materials_1513(authority, chunkID):

@@ -8266,6 +8266,14 @@ class BattleRuntime(object):
                     return None
                 raise RuntimeError(
                     '#1513 failed to apply canonical destructible event')
+        note_destroyed = getattr(
+            self._destructibles, 'note_destroyed', None)
+        if kind == 'tree' and callable(note_destroyed):
+            # An accepted tree is no longer vehicle support even while its
+            # native fall presentation is still queued or settling.  Canonical
+            # echoes repair this exact collision receipt after any local reset.
+            note_destroyed(
+                kind, chunk_id, item_index, mat_kind, self._clock())
         presentation_status = None
         if kind == 'tree':
             ensure_presentation = getattr(
@@ -8286,9 +8294,7 @@ class BattleRuntime(object):
             return None
         if already_destroyed:
             return foliage_changed
-        note_destroyed = getattr(
-            self._destructibles, 'note_destroyed', None)
-        if callable(note_destroyed):
+        if kind != 'tree' and callable(note_destroyed):
             note_destroyed(
                 kind, chunk_id, item_index, mat_kind, self._clock())
         return True

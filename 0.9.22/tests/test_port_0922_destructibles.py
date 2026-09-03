@@ -7235,6 +7235,25 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertTrue(collision_filter(75, 0, 38, 22))
         self.assertTrue(collision_filter(75, 0, 37, 23))
 
+    def test_collision_filters_hide_accepted_tree_without_catalog_bins(self):
+        destructibles_sensor.set_catalog(None)
+        destructibles_sensor.g_offh_destr_runtime_space = 1
+        self.assertTrue(destructibles_sensor.note_destroyed(
+            'tree', 22, 37, None, 5.0))
+
+        ground_filter = destructibles_sensor.ground_collision_filter(
+            80.0, 80.0)
+        horizontal_filter = destructibles_sensor.horizontal_collision_filter(
+            _Vector(-50.0, 0.6, -50.0), _Vector(50.0, 0.6, 50.0))
+
+        self.assertIsNotNone(ground_filter)
+        self.assertIsNotNone(horizontal_filter)
+        for collision_filter in (ground_filter, horizontal_filter):
+            self.assertFalse(collision_filter(75, 0, 37, 22))
+            self.assertTrue(collision_filter(75, 0, 38, 22))
+            self.assertTrue(collision_filter(75, 0, 37, 23))
+            self.assertTrue(collision_filter(75, 0, None, None))
+
     def test_stationary_multi_module_structure_crushes_each_module(self):
         detail, authority, unused_descriptor = (
             self._stationary_contact_status([{
