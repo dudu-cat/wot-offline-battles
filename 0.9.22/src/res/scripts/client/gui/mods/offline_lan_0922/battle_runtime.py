@@ -1512,6 +1512,8 @@ class BattleRuntime(object):
         self._player_fire_intent_history = collections.OrderedDict()
         self._player_fire_launch_pending = {}
         self._local_fire_intent = None
+        self._fire_intent_reject_round = None
+        self._fire_intent_reject_counts = {}
         self._ammo_signature = None
         self._targeting_signature = None
         self._reload_event = None
@@ -1792,6 +1794,8 @@ class BattleRuntime(object):
         self._player_fire_intent_history = collections.OrderedDict()
         self._player_fire_launch_pending = {}
         self._local_fire_intent = None
+        self._fire_intent_reject_round = None
+        self._fire_intent_reject_counts = {}
         self._ammo_signature = None
         self._targeting_signature = None
         self._reload_event = None
@@ -7293,9 +7297,23 @@ class BattleRuntime(object):
                 sequence != int(pending.get('intent_seq', 0))):
             return False
         reason = str(message.get('reason', 'rejected') or 'rejected')
-        sys.stdout.write(
-            '[Offline LAN 0.9.22] FIRE INTENT rejected intent=%d reason=%s\n'
-            % (sequence, reason))
+        # One typed terminal per reason is the root cause; the repeats behind
+        # it are the same cause observed again.  Report the first occurrence
+        # immediately and then only a bounded running count, so a cascade
+        # never reads as twenty independent failures.
+        round_id = message.get('round_id')
+        if self._fire_intent_reject_round != round_id:
+            self._fire_intent_reject_round = round_id
+            self._fire_intent_reject_counts = {}
+        counts = self._fire_intent_reject_counts
+        if reason not in counts and len(counts) >= 32:
+            counts.clear()
+        seen = counts.get(reason, 0)
+        counts[reason] = seen + 1
+        if seen == 0 or (seen + 1) % 20 == 0:
+            sys.stdout.write(
+                '[Offline LAN 0.9.22] FIRE INTENT rejected intent=%d '
+                'reason=%s repeats=%d\n' % (sequence, reason, seen + 1))
         deferred_shell = pending.get('deferred_current_shell_index')
         deferred_partial_reload = bool(
             pending.get('deferred_partial_clip_reload'))
@@ -20143,6 +20161,8 @@ class BattleRuntime(object):
         self._player_fire_intent_history = collections.OrderedDict()
         self._player_fire_launch_pending = {}
         self._local_fire_intent = None
+        self._fire_intent_reject_round = None
+        self._fire_intent_reject_counts = {}
         self._ammo_signature = None
         self._targeting_signature = None
         self._equipment_state = None
