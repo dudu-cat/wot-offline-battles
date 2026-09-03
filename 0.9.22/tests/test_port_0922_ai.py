@@ -960,6 +960,49 @@ class BotAiPortTests(unittest.TestCase):
             self.assertFalse(navigator.controlled_shallow_step(
                 7, current, bearing + sign * offsets[2]))
 
+    def test_commit_gate_admits_the_lagging_hull_yaw_into_its_own_ford(self):
+        """The integrated hull yaw lags the candidate the planner chose.
+
+        ``controlled_shallow_step`` is a cone around the ford bearing sized for
+        the driver's candidate fan. Applying it to the post-turn hull yaw
+        refused the very rotation the planner asked for, banned that heading
+        for five seconds and deleted the decision, so the bot turned away from
+        a ford it had legitimately selected and re-selected it on the next
+        tactical update.
+        """
+        navigator, current, unused_goal = self._planned_ford()
+        bearing = math.pi * 0.5
+        lagging = bearing + 0.48
+
+        self.assertFalse(
+            navigator.controlled_shallow_step(7, current, lagging))
+        self.assertTrue(
+            navigator.controlled_shallow_committed(7, current, lagging))
+        self.assertTrue(
+            navigator.controlled_shallow_committed(7, current, bearing))
+
+    def test_commit_gate_refuses_a_hull_travelling_away_from_the_ford(self):
+        """Commitment is closing on the armed ford, not merely having one."""
+        navigator, current, unused_goal = self._planned_ford()
+        away = math.pi * 0.5 + math.pi
+
+        self.assertFalse(
+            navigator.controlled_shallow_committed(7, current, away))
+        self.assertFalse(
+            navigator.controlled_shallow_committed(7, current, math.pi))
+
+    def test_commit_gate_needs_an_armed_ford(self):
+        """No planner-selected ford means no shallow admission at all."""
+        graph = self._baked_graph(3, 1)
+        graph['hazards'] = [0, BAKED_SHALLOW_WATER, 0]
+        navigator = TerrainNavigator(lambda *unused: None, baked_graph=graph)
+
+        self.assertFalse(navigator.controlled_shallow_committed(
+            7, (10.0, 0.0, 20.0), math.pi * 0.5))
+        navigator.bot_states[7] = {}
+        self.assertFalse(navigator.controlled_shallow_committed(
+            7, (10.0, 0.0, 20.0), math.pi * 0.5))
+
     def test_fallback_drops_a_ford_target_behind_deep_water(self):
         graph = self._baked_graph(3, 1, blocked=((1, 0),))
         graph['hazards'] = [0, 1, 0]

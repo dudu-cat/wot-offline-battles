@@ -8528,6 +8528,8 @@ class BotRuntime(object):
                     position, BAKED_SHALLOW_WATER))
             controlled_shallow = getattr(
                 self.navigator, 'controlled_shallow_step', None)
+            controlled_shallow_commit = getattr(
+                self.navigator, 'controlled_shallow_committed', None)
 
             def sample_clear(sample_yaw):
                 advisory = self._planner_corridor_clear(
@@ -9175,16 +9177,27 @@ class BotRuntime(object):
                     candidate_hull_yaw if travel_sign > 0.0 else
                     candidate_hull_yaw + math.pi)
                 attempted_yaws[state['id']] = committed_travel_yaw
+                committed_wet_escape = bool(
+                    baked_shallow_escape or
+                    _number(state.get('_water_depth'), -1.0) >
+                    BOT_WATER_AVOID_DEPTH)
+                # The planner cone belongs to the candidate fan, where the
+                # sampled yaw is the intended heading. The committed hull yaw
+                # lags that candidate by one traverse step, so it also needs
+                # the commitment test: is this hull still closing on the ford
+                # A* selected?
+                committed_shallow_admitted = bool(
+                    (callable(controlled_shallow) and
+                     controlled_shallow(
+                         state['id'], position, committed_travel_yaw)) or
+                    (callable(controlled_shallow_commit) and
+                     controlled_shallow_commit(
+                         state['id'], position, committed_travel_yaw)))
                 committed_corridor = self._planner_corridor_clear(
                     position, committed_travel_yaw,
                     state.get('speed', 0.0),
-                    wet_escape=(baked_shallow_escape or
-                                _number(state.get('_water_depth'), -1.0) >
-                                BOT_WATER_AVOID_DEPTH),
-                    allow_shallow=(callable(controlled_shallow) and
-                                   controlled_shallow(
-                                       state['id'], position,
-                                       committed_travel_yaw)),
+                    wet_escape=committed_wet_escape,
+                    allow_shallow=committed_shallow_admitted,
                     hazard_only=True)
                 if committed_corridor is False:
                     # Copied physics integrates the post-turn hull yaw, while
@@ -9195,8 +9208,21 @@ class BotRuntime(object):
                     path_clear = False
                     throttle = 0.0
                     state['movement_dir'] = 0
-                    self._invalidate_realised_motion(
-                        state['id'], committed_travel_yaw)
+                    committed_fatal = (
+                        committed_corridor if committed_shallow_admitted else
+                        self._planner_corridor_clear(
+                            position, committed_travel_yaw,
+                            state.get('speed', 0.0),
+                            wet_escape=committed_wet_escape,
+                            allow_shallow=True, hazard_only=True))
+                    if committed_fatal is False:
+                        self._invalidate_realised_motion(
+                            state['id'], committed_travel_yaw)
+                    # A shallow-only veto withholds this pose and applies the
+                    # existing safety damping below, but does not invalidate
+                    # the approach. Banning it for five seconds and deleting
+                    # the decision made the hull turn away from a ford it had
+                    # legitimately chosen, which caused shoreline dithering.
                 previous_speed = _number(state.get('speed'))
                 speed = (0.0 if siege_motion_locked else
                     vehicle_physics.longitudinal_step(

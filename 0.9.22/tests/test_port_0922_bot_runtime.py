@@ -1770,6 +1770,61 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(math.pi / 2.0, state['yaw'])
         self.assertEqual((0.0, 0.0), (state['x'], state['z']))
         self.assertEqual(0, state['movement_dir'])
+        # The step is withheld, but a shallow-water veto is not a realised
+        # physical failure: it must not ban the approach heading for five
+        # seconds nor delete the decision, or the hull turns away from a ford
+        # it may legitimately take and re-selects it on the next tactical
+        # update. Only a fatal hazard escalates - see the deep-water test
+        # below. The cached corridor also survives: it proves the pre-turn
+        # travel yaw, which the shallow veto never disputed.
+        self.assertIn(11, runtime._decision_cache)
+        self.assertIn(11, runtime._motion_probe_cache)
+
+    def test_post_turn_travel_yaw_into_deep_water_still_escalates(self):
+        """A fatal hazard keeps the full realised-motion invalidation."""
+        graph = _graph()
+        graph['hazards'] = (0, self.module.BAKED_FATAL_HAZARDS & 1, 0)
+        graph['bake'] = {
+            'max_grade': 0.30,
+            'vehicle_half_width': 2.15,
+            'edge_clearance_radii': (3.0,),
+        }
+        command = self._stationary_command()
+        command.update({
+            'target_yaw': math.pi / 2.0,
+            'throttle': 1.0,
+            'turn': 1.0,
+            'combat_mode': 'route',
+            'move_position': (100.0, 0.0, 0.0),
+            'recovery_mode': 'drive',
+            'movement_intent': True,
+        })
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {'clear': True, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=graph)
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=8.0,
+                     grounded_once=True)
+        original_traverse = self.module.vehicle_physics.traverse_step
+        original_longitudinal = self.module.vehicle_physics.longitudinal_step
+        self.module.vehicle_physics.traverse_step = (
+            lambda *unused, **kwargs: math.pi / (2.0 * 0.04))
+        self.module.vehicle_physics.longitudinal_step = (
+            lambda *unused, **kwargs: 8.0)
+        try:
+            runtime.update(0.04, 1.0)
+        finally:
+            self.module.vehicle_physics.traverse_step = original_traverse
+            self.module.vehicle_physics.longitudinal_step = (
+                original_longitudinal)
+
+        self.assertEqual((0.0, 0.0), (state['x'], state['z']))
+        self.assertEqual(0, state['movement_dir'])
         self.assertNotIn(11, runtime._decision_cache)
         self.assertNotIn(11, runtime._motion_probe_cache)
 
@@ -10769,6 +10824,149 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(requested))
         self.assertAlmostEqual(expected_reach, requested[0])
         self.assertEqual((0.0, 0.0), (state['x'], state['z']))
+
+    @staticmethod
+    def _ford_graph(size=5, shallow_column=2):
+        """An open baked square whose middle column is shallow water."""
+        directions = ((-1, -1), (0, -1), (1, -1),
+                      (-1, 0), (1, 0),
+                      (-1, 1), (0, 1), (1, 1))
+        links = []
+        for row in range(size):
+            for column in range(size):
+                mask = 0
+                for index, (dx, dz) in enumerate(directions):
+                    if (0 <= column + dx < size and 0 <= row + dz < size):
+                        mask |= 1 << index
+                links.append(mask)
+        hazards = [4 if column == shallow_column else 0
+                   for unused_row in range(size) for column in range(size)]
+        graph = dict(_graph())
+        graph.update({
+            'width': size, 'height': size,
+            'bounds': (0, 0, (size - 1) * 4.0, (size - 1) * 4.0),
+            'heights_mm': tuple([0] * (size * size)),
+            'links': tuple(links), 'hazards': tuple(hazards),
+            'bake': {'max_grade': 0.30, 'vehicle_half_width': 2.15,
+                     'edge_clearance_radii': (3.0, 6.0)},
+        })
+        return graph
+
+    def _ford_runtime(self):
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=self._ford_graph())
+        runtime.battle_start(self.start)
+        return runtime
+
+    def test_shallow_corridor_mask_depends_on_admission(self):
+        """The baked mask is the same query; only admission differs."""
+        runtime = self._ford_runtime()
+        approach = (4.0, 0.0, 4.0)
+        toward_ford = math.pi * 0.5
+
+        self.assertFalse(runtime._planner_corridor_clear(
+            approach, toward_ford, 0.0, allow_shallow=False,
+            hazard_only=True))
+        self.assertTrue(runtime._planner_corridor_clear(
+            approach, toward_ford, 0.0, allow_shallow=True,
+            hazard_only=True))
+
+    def test_commit_gate_admits_a_lagging_hull_closing_on_its_ford(self):
+        """The post-turn hull yaw lags the candidate the planner chose.
+
+        The planner cone is sized for the driver's candidate fan. Re-deriving
+        admission from the integrated hull yaw vetoed the rotation the planner
+        had asked for, so the commit side now asks the navigator whether this
+        hull is still closing on the ford A* armed.
+        """
+        runtime = self._ford_runtime()
+        runtime.navigator.bot_states.setdefault(11, {})[
+            'controlled_shallow_target'] = (8.0, 0.0, 4.0)
+        approach = (4.0, 0.0, 4.0)
+        lagging = math.pi * 0.5 + 0.48
+
+        self.assertFalse(runtime.navigator.controlled_shallow_step(
+            11, approach, lagging))
+        admitted = runtime.navigator.controlled_shallow_committed(
+            11, approach, lagging)
+        self.assertTrue(admitted)
+        self.assertFalse(runtime._planner_corridor_clear(
+            approach, lagging, 0.0, allow_shallow=False, hazard_only=True))
+        self.assertTrue(runtime._planner_corridor_clear(
+            approach, lagging, 0.0, allow_shallow=admitted,
+            hazard_only=True))
+
+    def test_commit_gate_cannot_enter_shallow_beside_the_astar_step(self):
+        """Closing on a ford cannot authorize a different shallow cell."""
+        command = self._stationary_command()
+        command.update({
+            'target_yaw': math.pi * 0.5, 'throttle': 1.0, 'turn': 0.0,
+            'combat_mode': 'route', 'move_position': (8.0, 0.0, 4.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        })
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=self._ford_graph())
+        runtime.battle_start(self.start)
+        planning_start = (4.0, 0.0, 4.0)
+        goal = (16.0, 0.0, 4.0)
+        route_key = ('route', 1, 'only-ford')
+        runtime.navigator.next_target(
+            11, planning_start, goal, route_key, 1.0)
+        selected = runtime.navigator.next_target(
+            11, planning_start, goal, route_key, 1.1)
+        self.assertEqual((8.0, 0.0, 4.0), selected)
+
+        # Before the next plan, a realised pose near the cell corner makes
+        # even the old tight candidate cone point into an adjacent shallow cell
+        # that A* did not select.
+        approach = (2.6, 0.0, 3.0)
+        bearing = math.atan2(
+            selected[0] - approach[0], selected[2] - approach[2])
+        lagging = bearing + 0.449
+        self.assertLess(abs(lagging - bearing), 0.45)
+        self.assertGreater(math.cos(lagging - bearing), 0.5)
+        planned_cells = runtime.navigator.grid._baked_segment_cells(
+            approach, selected)
+        distance = runtime.navigator.grid.cell_size
+        committed_end = (
+            approach[0] + math.sin(lagging) * distance,
+            approach[1],
+            approach[2] + math.cos(lagging) * distance)
+        committed_cells = runtime.navigator.grid._baked_segment_cells(
+            approach, committed_end)
+        self.assertEqual(((1, 1), (2, 1)), planned_cells)
+        self.assertEqual(((1, 1), (2, 0)), committed_cells)
+        self.assertFalse(runtime.navigator.controlled_shallow_step(
+            11, approach, lagging))
+        self.assertFalse(runtime.navigator.controlled_shallow_committed(
+            11, approach, lagging))
+
+        state = runtime.states[11]
+        state.update(x=approach[0], y=approach[1], z=approach[2],
+                     yaw=lagging, speed=8.0, grounded_once=True)
+        runtime.update(0.04, 1.2)
+
+        self.assertEqual((approach[0], approach[2]),
+                         (state['x'], state['z']))
+        self.assertEqual(0, state['movement_dir'])
+        self.assertLess(state['speed'], 2.0)
+        self.assertEqual(selected, runtime.navigator.bot_states[11][
+            'controlled_shallow_target'])
 
     def test_reverse_probe_pitch_is_stored_in_hull_coordinates(self):
         command = self._stationary_command()
