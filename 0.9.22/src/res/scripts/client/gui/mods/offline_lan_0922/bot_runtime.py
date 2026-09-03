@@ -6583,7 +6583,7 @@ class BotRuntime(object):
                 break
         return reports
 
-    def _apply_traffic_wait_lease(self):
+    def _apply_traffic_wait_lease(self, elapsed):
         """Suppress the stuck timer while another hull owns the blockage.
 
         LocalDriver's stuck detector measures translation. A tank held in place
@@ -6594,7 +6594,9 @@ class BotRuntime(object):
         when the predictive headway controller was removed from the call path,
         while the stuck timer it protected stayed. A genuine deadlock is still
         detected, because the lease expires after
-        ``TRAFFIC_WAIT_LEASE_SECONDS``.
+        ``TRAFFIC_WAIT_LEASE_SECONDS`` of real time - which is why the lease is
+        paid with the callback's own elapsed rather than the driver's decision
+        interval, a value that is only refreshed when the planner runs.
         """
         contacted = self._contact_lease_ids
         if not contacted:
@@ -6606,7 +6608,7 @@ class BotRuntime(object):
             return
         for bot_id in contacted:
             try:
-                wait(bot_id)
+                wait(bot_id, elapsed)
             except Exception:
                 continue
 
@@ -8370,7 +8372,7 @@ class BotRuntime(object):
                 # would spend the bounded wait several times faster than real
                 # time, which is worst at exactly the low frame rates where the
                 # jam lasts longest.
-                self._apply_traffic_wait_lease()
+                self._apply_traffic_wait_lease(elapsed_input)
             finally:
                 if visibility_frame_open:
                     self._finish_visibility_frame()

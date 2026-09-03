@@ -156,14 +156,22 @@ class LocalDriver(object):
 	def forget(self, bot_id):
 		self.states.pop(bot_id, None)
 
-	def wait_for_traffic(self, bot_id):
-		"""Suppress brief right-of-way waits without masking a deadlock forever."""
+	def wait_for_traffic(self, bot_id, elapsed=None):
+		"""Suppress brief right-of-way waits without masking a deadlock forever.
+
+		``elapsed`` is the real interval this lease covers. Callers that grant it
+		once per render callback must supply it: ``last_step`` is the planner's
+		decision interval and is only refreshed when ``drive`` actually runs, so
+		re-using it on every callback spends the bounded wait far faster than
+		real time at high frame rates.
+		"""
 		state = self.states.get(bot_id)
 		if state is None:
 			return False
 		state['traffic_waiting'] = True
-		state['traffic_wait_time'] += max(
-			0.0, float(state.get('last_step', 0.0)))
+		if elapsed is None:
+			elapsed = state.get('last_step', 0.0)
+		state['traffic_wait_time'] += max(0.0, float(elapsed))
 		if state['traffic_wait_time'] <= TRAFFIC_WAIT_LEASE_SECONDS:
 			state['stuck_time'] = 0.0
 			state['recovery_time'] = 0.0

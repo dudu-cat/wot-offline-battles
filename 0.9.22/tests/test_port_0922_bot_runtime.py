@@ -10508,12 +10508,17 @@ class BotRuntimeTests(unittest.TestCase):
         waited = []
         runtime = self._two_bot_runtime()
         runtime.adapter.driver = type('_Driver', (object,), {
-            'wait_for_traffic': staticmethod(waited.append)})()
+            'wait_for_traffic': staticmethod(
+                lambda bot_id, elapsed: waited.append((bot_id, elapsed)))})()
         runtime._contact_lease_ids = set([11, 12])
 
-        runtime._apply_traffic_wait_lease()
+        runtime._apply_traffic_wait_lease(0.25)
 
-        self.assertEqual([11, 12], sorted(waited))
+        # The lease is paid with the callback's own elapsed. last_step is the
+        # planner's decision interval and is only refreshed when drive() runs,
+        # so at high frame rates it would spend the bounded wait roughly ten
+        # times faster than real time.
+        self.assertEqual([(11, 0.25), (12, 0.25)], sorted(waited))
         self.assertEqual(set(), runtime._contact_lease_ids)
 
     def test_overlapping_hulls_record_a_contact_lease(self):

@@ -15,7 +15,9 @@ sys.path.insert(0, str(CLIENT_SCRIPTS))
 
 from gui.mods.offline_lan_0922.ai import cover, maps, reviewed_routes_20260811
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
-from gui.mods.offline_lan_0922.ai.driver import LocalDriver
+from gui.mods.offline_lan_0922.ai.driver import (
+    LocalDriver, TRAFFIC_WAIT_LEASE_SECONDS,
+)
 from gui.mods.offline_lan_0922.ai.planner import (
     BattleDirector, build_vehicle_profile,
 )
@@ -1431,6 +1433,30 @@ class BotAiPortTests(unittest.TestCase):
             modes.add(order['recovery_mode'])
 
         self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
+
+    def test_traffic_lease_is_paid_in_real_time_not_decision_steps(self):
+        """One lease per render callback must cost one callback of wait.
+
+        LocalDriver.drive only runs on a decision callback, so last_step holds
+        the planner's decision interval, not the render interval. A caller that
+        grants the lease every callback and lets it default to last_step spends
+        TRAFFIC_WAIT_LEASE_SECONDS about ten times faster than real time at a
+        high frame rate, which silently restores the recovery this lease exists
+        to suppress.
+        """
+        driver = LocalDriver()
+        driver.drive(
+            41, (0.0, 0.0, 0.0), 0.0, 0.0, 0.15,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+        state = driver.states[41]
+        self.assertAlmostEqual(0.15, state['last_step'])
+
+        for unused in range(9):
+            driver.wait_for_traffic(41, 1.0 / 60.0)
+
+        self.assertAlmostEqual(9.0 / 60.0, state['traffic_wait_time'])
+        self.assertLess(state['traffic_wait_time'],
+                        TRAFFIC_WAIT_LEASE_SECONDS)
 
     def test_wedged_hull_never_reverses_into_the_tank_behind_it(self):
         """direction_clear answers for terrain, not for the queue behind.
