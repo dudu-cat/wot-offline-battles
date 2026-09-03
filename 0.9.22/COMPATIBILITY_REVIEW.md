@@ -281,12 +281,32 @@ living ally and cleanup revokes the exposure. Windows #1513 remains required
 to accept the native switch controls, camera continuity and repeated-round
 teardown.
 
-The 0.3.68 destructible boundary is pinned to a schema-v3 catalog baked from
-all 41 exact #1513 map packages. A checksum-pinned whole-map directory maps
+The 0.3.68 destructible boundary is pinned to a shipped schema-v7 destructible
+catalog and schema-v4 foliage catalog baked from all 41 exact #1513 map
+packages; the exact-instance runtime shape starts at schema version 4. A
+checksum-pinned whole-map directory maps
 61,625 unique world-matrix signatures to fragile, falling and structure-module
 resources plus transformed BSMO bounds. This recovers identity for native
-chunk slots whose filename is blank while preserving the engine's chunk/item
-index. Eleven ambiguous signatures covering 28 candidates fail closed.
+chunk slots whose name is absent from the compacted native list while
+preserving the engine's chunk/item index. Eleven ambiguous signatures covering
+28 candidates fail closed.
+
+The baker follows the exact WGDE row contract. Table 1 partitions table 2 into
+per-chunk ranges and resets the native item index for each chunk. Each non-empty
+table-2 row owns an inclusive table-3 reference span; an authored empty span
+references no scene instance and does not consume a native index. SpeedTree and
+BSMI references share that one index sequence. Multiple references in one row
+collapse structure modules into one item, while a referenced BSMO entry whose
+effect type the gameplay baker ignores still consumes the row's native index.
+Correcting the old empty-row count changed 1,455 destructible wires and 357
+foliage wires across the only six affected maps: `07_lakeville`,
+`11_murovanka`, `18_cliff`, `23_westfeld`, `34_redshire` and
+`36_fishing_bay`; the other 35 map censuses and wires are unchanged.
+
+Live #1513 matrix/signature reports pin the corrected non-empty-row reading at
+Murovanka `(32124, 7)`, Cliff `(32893, 6)` and Redshire `(33148, 58)`, with
+Karelia `(31610, 0)` as a control that is identical under either reading.
+Lakeville, Westfield and Fishing Bay still require exact-Windows confirmation.
 Local-player movement does not infer a dynamic prop from a nearby pivot: its
 swept OBB must intersect the exact item OBB, then the stock mass/speed/health
 kinetic gate decides whether native destruction may be requested. Native
@@ -343,27 +363,126 @@ required to release a projectile-synchronized native order.
 
 The complete streamed-slot boundary comes from the exact #1513 native path:
 `game.onChunkLoad(spaceID, chunkID, numDestructibles, isOutside)` writes
-`numDestructibles` into the active `DestructiblesManager`. The runtime reads
-that manager count and enumerates every native index. `wg_getChunkDestrFilenames`
-is not a parallel index space: the reviewed entry point of the exact client
-executable walks the provider's whole item array and appends a name only for an
-item that resolves, whose native group owns an effect handler and whose name is
-not empty, with no blank placeholder. Its positions are therefore name order and
-never an item index, so it is not an identity channel for a catalog-located
-slot; the unique matrix signature and the exact native wire are. The same
-provider lookup backs `wg_getDestructibleMatrix`, the per-item name and the
-no-module effect category, so those three share one item index space.
-`wg_getDestructibleEffectCategory` raises when the triple does not resolve and
-returns exactly -1 when the resolved item's native group owns no handler, so -1
-is one unregistered channel rather than a kind disagreement.
-`wg_getDestructibleFilename` is not used: for a resolved item without a handler
-it builds a Python string from a null pointer. A missing native count is retried
-after streaming rather than guessed.
+`numDestructibles` into the active `DestructiblesManager`. Version 0.3.68 reads
+that manager count and enumerates every native index.
+
+`wg_getChunkDestrFilenames` is not a per-slot surface, and the earlier
+"filename prefix" reading of it was wrong. Read from the exact module
+(`WorldOfTanks.exe`, x86 PE timestamp `0x5a6edca4`, image size `0x206a000`,
+PE checksum `0x019a5229`), its implementation at `0x006b1a10` walks item
+indices `0 .. numDestructibles(chunk) - 1` and appends one name per item only
+when the item resolves, its native type owns a name handler, and that handler
+returns a non-NULL string. Every other item appends nothing: there is no
+branch that appends a blank placeholder. The returned list is therefore
+compacted in item order, and its positions are not native item indices.
+Indexing it by the item index can therefore return another item's resource.
+The two old `05_prohorovka` reports captured only that direct lookup at list
+position `70`, not the complete name list and per-item categories needed for
+reconstruction. They prove the old lookup was unsound; they do not prove that
+the reconstructed native name of chunk `31875` item `70` is `poplar.spt`, or
+that the live item truly conflicts with `env014_Toilet.model`. The unit
+regression using those two filenames is consequently a generic synthetic
+conflict test. The real Prokhorovka `(31875, 70)` identity and its crash
+correlation remain a bounded exact-Windows diagnostic boundary. The retained
+`+0x6bb0aa` crash site is consistent with an engine-side null read in a
+`(uint32, uint8)` keyed lookup whose sibling entry point checks for a missing
+record, but static executable review does not prove which gameplay object
+caused that miss or that the old misindexed name caused the crash.
+
+`wg_getDestructibleMatrix` (`0x006b2a90` through `0x006b3f90`) and
+`wg_getDestructibleEffectCategory` (`0x006b1f10`, module index below zero)
+resolve an item through the same provider entry (vtable `+0x10`) that the name
+loop uses, so matrix, per-item name and effect category share exactly one item
+index space of length `numDestructibles(chunk)`. That call fails for an
+unresolved item and returns `-1` through `or eax, 0xffffffff` at `0x006b20b8`
+for a resolved item whose native type owns no handler - precisely the two
+cases the name loop skips. Enumerating it therefore reconstructs the
+compaction per native type: an item is typed by its live effect category and a
+name by the client descriptor it resolves to, then both filtered sequences are
+paired in item order. This is sound only under the pinned-client bridge that a
+descriptor's `type` is the same native category returned for that item, and
+only after every resolvable native item has been enumerated. A whole category
+with zero emitted names is known to be unnamed. A nonzero unequal name/item
+count is only a partial alignment, however, so the complete chunk is isolated;
+no otherwise aligned category is admitted from it. An unknown or malformed
+name descriptor and a malformed category result also isolate the complete
+chunk. A category-query exception is the native resolver's skipped-item case:
+that exact slot is isolated before any matrix, effect or destruction call,
+while other resolvable slots may finish alignment. Native category `-1` is a
+resolved handlerless item, not that exception case: alignment leaves it
+resolved and unnamed and does not isolate it. Filename reconstruction does
+not reinterpret `-1` as a category mismatch. A registered native effect
+category must match the exact admitted descriptor; `-1` leaves only that
+effect channel unverified, so admission still requires the exact live matrix
+and wire plus the exact native filename when one is present.
+
+`wg_getDestructibleFilename` (`0x006b2580`) is deliberately not used as a
+per-item probe. It resolves the same item and returns `Py_None` for an
+unresolved one, but for a resolved item whose type owns no name handler it
+reaches `PyString_FromString(NULL)` at `0x006b270c` and faults natively, which
+no Python handler can contain.
+
+The reconstruction is incremental and cached by `(space, chunk)` plus the
+native count/name-list fingerprint. `wg_getChunkDestrFilenames` itself walks
+the complete native chunk, so the first call is not constant-time; one
+validated list snapshot is shared by all human, Bot and streamed-shot callers
+until unload or a known native mutation invalidates it. Those callers then
+share one battle-local allowance of at most 16 category probes for each exact
+`BigWorld.time()` value. One focused incomplete chunk consumes the allowance;
+completion or a terminal result releases it, and an abandoned focus becomes
+replaceable after an intervening tick. Exhaustion returns
+`pending_alignment`; the whole chunk stays solid and outside every registry
+until a later tick completes it. The LRU cache prefers evicting completed
+entries but can evict the oldest abandoned incomplete entry, so a full cache
+cannot permanently starve a newly active chunk. A changed fingerprint
+restarts reconstruction and a completed mapping is reused. This adds bounded
+native category traffic; it does not support the earlier claim that ordinary
+catalog matching adds none. Exact Windows observation still has to confirm that
+all Python callers in one render tick observe the same `BigWorld.time()` value,
+and measure both the first whole-chunk name snapshot and bounded category-probe
+cost under real streaming load.
+
+With an exact per-item name available, a live/catalog filename disagreement is
+real evidence rather than an alignment artefact. Equal normalized names match;
+an unnamed item has no filename evidence. Every different exact filename is a
+conflict by default, even when both descriptors share the same broad kind,
+because kind equality does not prove identical geometry, modules or health.
+There is currently no data-proven alias allowlist. A conflict is isolated
+before native effect or destroy calls. The unique matrix signature, exact
+native wire, exact filename when present and native effect category remain the
+fail-closed identity boundary. A missing native count or an incomplete shared-
+budget alignment is retried after streaming rather than guessed. Direct
+material-hit and shell paths cannot bypass that admission with a globally
+known same-kind resource; a structure hit must also name a material module
+present in that exact admitted instance.
+
+The matrix boundary is contained at the scope of its evidence. A thrown chunk-
+matrix query isolates that chunk, while a successfully returned matrix whose
+translation is temporarily `None` remains solid and retries after streaming.
+Once the chunk transform exists, an item-matrix, signature, OBB or scale
+failure isolates only that exact slot. Ambiguous signatures, unnamed misses in
+an exact-instance catalog, catalog-governed named non-tree placement misses,
+named non-tree resources absent from the catalog, and non-empty native
+filenames without a descriptor are terminal slot evidence. A legal exact-named
+tree absent from the catalog may continue through the native tree path. An
+empty filename is different: #1513 can legally return an anonymous
+destructible material, so it remains solid until an exact registered
+matrix/wire can supply identity.
+
+Contact and shell descriptor reads use the same slot-local boundary. An
+exception or malformed descriptor for a non-empty native filename isolates
+that exact wire; an anonymous lookup failure remains retryable. If a second
+descriptor/health read fails after native destruction was already accepted,
+the typed shell result conservatively stops at that destructible instead of
+escaping the projectile callback.
 
 For Windows verification, bounded `DESTR` lines report one aggregate for each
-newly scanned chunk plus each first distinct contact stage. The logger reuses
-the same enumeration/contact result, adds no BigWorld query, caps chunk/contact
-identities per battle and emits at most one line every 0.25 seconds. Frame
+newly scanned chunk plus each first distinct contact stage. The logger itself
+reuses the same enumeration/contact result; the reconstruction queries are
+separately constrained by the shared per-tick budget above. Logging caps
+chunk/contact identities per battle and emits at most one line every 0.25
+seconds. Isolation lines also include the catalog map and the first divergent
+operation, wire, resource/kind and native result when those fields exist. Frame
 diagnostics retain callback-stage timing and logical probe counts, but version
 0.3.68 does not install the optional per-query Bot probe clock. Removing those
 two clock calls per native probe is behavior-preserving: the probe sequence,
@@ -372,8 +491,13 @@ unchanged. Straight-line Windows driving remains the frame-pacing acceptance
 test; this source review cannot claim that the visible hitch is eliminated.
 
 The previous 0.3.65 schema-v2 catalog supplied transformed OBBs but joined
-runtime slots by native filename. That field exists for trees but is blank for
-many #1513 non-tree slots; schema v3 closes that identity gap.
+runtime slots by native filename taken from the compacted chunk list. No slot
+is ever "blank" in that list: an unnamed item is absent from it, which is why
+indexing it by the item index silently returned a neighbour's resource. The
+exact-instance runtime shape introduced at schema v4 closes that identity gap
+with the whole-map matrix signature, and the per-item name is now recovered
+from the reconstructed compaction instead. The coherent shipped batches are
+destructible format v7 and foliage format v4.
 
 The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
 authority registry. Unspotted or dead synthetic vehicles remain private there;
