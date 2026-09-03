@@ -544,6 +544,24 @@ class ServerBotTacticsTests(unittest.TestCase):
         self.assertEqual(3, index)
         self.assertEqual({'x': 430.0, 'y': 0.0, 'z': -98.0}, point)
 
+    def test_reverse_recovery_keeps_the_nearest_connector_after_reset(self):
+        """Negative speed is recovery, not a strategic travel heading."""
+        planner = BotPlanner()
+        bot = self._malinovka_east_hill_bot(6.0)
+        unused_route, first_index, unused_point, unused_anchor, unused_join = \
+            planner._route(bot, 1.0)
+        self.assertEqual(3, first_index)
+
+        planner._route_states.pop(bot['id'])
+        bot['state']['speed'] = -6.0
+        route_id, index, point, unused_anchor, route_join = planner._route(
+            bot, 2.0)
+
+        self.assertEqual('east_hill_loop', route_id)
+        self.assertEqual(1, index)
+        self.assertEqual({'x': 234.0, 'y': 0.0, 'z': -282.0}, point)
+        self.assertTrue(route_join)
+
     def test_route_corridor_does_not_accept_lateral_or_distant_bypasses(self):
         route = _route('bounded-corridor', [
             (0, -20, False), (0, 0, False), (12, 0, False),

@@ -1678,7 +1678,10 @@ class BotPlanner(object):
             # straight at a farther macro point instead of down the reviewed
             # lane. Turning in place is cheap; leaving the authored egress is
             # not.
-            if abs(_number(bot["state"].get("speed"))) > 0.5:
+            # Positive longitudinal speed proves that hull yaw is the current
+            # route direction. Negative speed is a temporary reverse recovery,
+            # not a request to abandon the nearest connector behind that yaw.
+            if _number(bot["state"].get("speed")) > 0.5:
                 yaw = _number(bot["state"].get("yaw"))
                 while index < route_limit:
                     point = waypoints[index]
