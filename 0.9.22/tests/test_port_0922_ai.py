@@ -848,6 +848,32 @@ class BotAiPortTests(unittest.TestCase):
         self.assertNotIn(stale_key, navigator.search_times)
         self.assertIs(shared_search, navigator.searches[shared_key])
 
+    def test_cached_private_parent_keeps_pending_child_search(self):
+        """One live request may read a route_join while its join is pending."""
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=self._baked_graph(6, 3))
+        start = (14.0, 0.0, 24.0)
+        goal = (30.0, 0.0, 24.0)
+        parent_path_key = ('route_join', 7, 1, 'lane', 1)
+        child_path_key = (('join', 7, navigator.grid.cell_for(start)) +
+                          parent_path_key)
+        parent_key = navigator._cache_key(parent_path_key, goal)
+        child_key = navigator._cache_key(child_path_key, goal)
+        cached_path = (start, goal)
+        child_search = _PendingSearch()
+        navigator.paths[parent_key] = cached_path
+        navigator.path_times[parent_key] = 1.0
+        navigator.searches[child_key] = child_search
+        navigator.search_times[child_key] = 1.0
+
+        selected_key, selected_path = navigator._path(
+            parent_path_key, start, goal, 2.0, None)
+
+        self.assertEqual(parent_key, selected_key)
+        self.assertEqual(cached_path, selected_path)
+        self.assertIs(child_search, navigator.searches[child_key])
+        self.assertEqual(1.0, navigator.search_times[child_key])
+
     def test_failed_shallow_search_keeps_reactive_local_recovery(self):
         graph = self._baked_graph(3, 1)
         graph['hazards'] = [0, 4, 0]
