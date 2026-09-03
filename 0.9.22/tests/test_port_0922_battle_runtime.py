@@ -10417,6 +10417,51 @@ class BattleRuntimeContractTests(unittest.TestCase):
         battle._show_shot.assert_called_once_with(
             message['events'][0], update_state=False)
 
+    def test_pending_tree_does_not_block_later_events_and_retries(self):
+        runtime = _runtime()
+        battle = BattleRuntime(runtime)
+        battle._avatar = runtime.bigworld.avatar
+        battle.state = 'running'
+        battle._destructibles = mock.Mock()
+        battle._destructibles.is_isolated_1513.return_value = False
+        battle._destructibles.validate_tree_identity_1513.side_effect = [
+            False, True]
+        tree = {
+            'event_id': '1:7:0', 'kind': 'destructible',
+            'destructible_kind': 'tree',
+            'chunk_id': 3, 'item_index': 9,
+            'x': 1.0, 'y': 2.0, 'z': 3.0,
+            'fall_yaw': 0.75, 'speed': 2.0,
+            'is_shot': False}
+        result = {
+            'event_id': '1:8:0', 'kind': 'battle_result', 'winner': 2,
+            'reason': 'team_eliminated'}
+        authority = types.ModuleType(
+            'gui.mods.offline_lan_0922.destructibles_authority')
+        authority.is_destroyed = mock.Mock(return_value=False)
+        authority.destroy_tree = mock.Mock(return_value=True)
+        authority.ensure_tree_presentation = mock.Mock(
+            return_value='presented')
+        package = sys.modules['gui.mods.offline_lan_0922']
+
+        with mock.patch.dict(sys.modules, {
+                'gui.mods.offline_lan_0922.destructibles_authority':
+                authority}), mock.patch.object(
+                    package, 'destructibles_authority', authority,
+                    create=True):
+            self.assertTrue(battle.on_events({'events': [tree, result]}))
+            self.assertEqual(1, len(runtime.bigworld.avatar.round_finished))
+            self.assertEqual([tree], battle._event_journal)
+            self.assertNotIn('1:7:0', battle._applied_event_ids)
+            self.assertIn('1:8:0', battle._applied_event_ids)
+
+            self.assertTrue(battle.on_events({'events': [tree, result]}))
+
+        self.assertEqual([], battle._event_journal)
+        self.assertIn('1:7:0', battle._applied_event_ids)
+        authority.destroy_tree.assert_called_once()
+        authority.ensure_tree_presentation.assert_called_once()
+
     def test_pending_combat_merges_state_before_native_presentation(self):
         battle = BattleRuntime(_runtime())
         battle._records = {'player:1': {
@@ -18145,6 +18190,8 @@ class BattleRuntimeContractTests(unittest.TestCase):
             'gui.mods.offline_lan_0922.destructibles_authority')
         authority.is_destroyed = mock.Mock(side_effect=[False, True])
         authority.destroy_tree = mock.Mock(return_value=True)
+        authority.ensure_tree_presentation = mock.Mock(
+            return_value='presented')
         package = sys.modules['gui.mods.offline_lan_0922']
 
         with mock.patch.dict(sys.modules, {
@@ -18156,6 +18203,10 @@ class BattleRuntimeContractTests(unittest.TestCase):
             self.assertFalse(battle._apply_destructible_event(event))
 
         authority.destroy_tree.assert_called_once()
+        self.assertEqual(
+            [mock.call(7, 3, 9, 0.75, 2.0, mock.ANY),
+             mock.call(7, 3, 9, 0.75, 2.0, mock.ANY)],
+            authority.ensure_tree_presentation.call_args_list)
         args = authority.destroy_tree.call_args[0]
         self.assertEqual((7, 3, 9), args[:3])
         self.assertEqual(0.75, args[3])

@@ -7835,7 +7835,10 @@ class BattleRuntime(object):
                 raise RuntimeError('stun event has no ready target')
             self._apply_stun_state(target, target.get('state') or {})
         elif kind == 'destructible':
-            self._apply_destructible_event(event)
+            if self._apply_destructible_event(event) is None:
+                # A streamed tree descriptor may settle on the next frame.
+                # Keep that one event retryable without losing later events.
+                return False
         elif kind == 'projectile_ricochet':
             self._apply_projectile_ricochet_event(event)
         elif kind == 'projectile_impact':
@@ -7849,6 +7852,7 @@ class BattleRuntime(object):
         else:
             raise RuntimeError(
                 'ordered LAN event kind is unsupported: %s' % kind)
+        return True
 
     def _collection_counts(self):
         """Return the per-round collection sizes a leak would grow.
@@ -8057,7 +8061,12 @@ class BattleRuntime(object):
         return True
 
     def _drain_event_journal(self):
-        while self._event_journal:
+        # A transient tree-stream boundary must not freeze unrelated combat
+        # events behind it.  Give every event present at entry one attempt;
+        # rotate only a deliberately retryable destructible to the tail.
+        attempts_remaining = len(self._event_journal)
+        while self._event_journal and attempts_remaining > 0:
+            attempts_remaining -= 1
             event = self._event_journal[0]
             try:
                 ready = self._event_is_ready(event)
@@ -8074,17 +8083,21 @@ class BattleRuntime(object):
             if not ready:
                 return False
             try:
-                self._apply_ordered_event(event)
+                applied = self._apply_ordered_event(event)
             except Exception as error:
                 self._ignore_live_payload('events', error, {
                     'round_id': (self._start_message or {}).get('round_id'),
                     'event_id': event.get('event_id'),
                     'event_kind': event.get('kind'),
                 })
+                applied = True
+            if not applied:
+                self._event_journal.append(self._event_journal.pop(0))
+                continue
             event_id = str(event['event_id'])
             self._applied_event_ids.add(event_id)
             self._event_journal.pop(0)
-        return True
+        return not self._event_journal
 
     def _pending_combat_for_record(self, record):
         for event in self._event_journal:
@@ -8100,6 +8113,24 @@ class BattleRuntime(object):
                     self._event_entity_key(event, 'attacker') == key):
                 return True
         return False
+
+    def _retry_tree_presentations(self):
+        """Finish accepted tree orders whose native call gave no receipt."""
+        if self._destructibles is None:
+            return 0
+        from gui.mods.offline_lan_0922 import destructibles_authority
+        retry = getattr(
+            destructibles_authority, 'retry_tree_presentations', None)
+        if not callable(retry):
+            return 0
+        try:
+            return retry()
+        except Exception as error:
+            # One bad native tree is local to that presentation attempt.  The
+            # accepted contact and the rest of the round remain live.
+            self._warn_optional_failure(
+                'tree presentation retry', error, disable=False)
+            return 0
 
     def _report_destructible(self, event):
         context = self._projectile_destructible_context
@@ -8192,18 +8223,21 @@ class BattleRuntime(object):
             return False
         self._clear_local_destructible_prediction(
             ((chunk_id, item_index, mat_kind),))
-        validate_tree = getattr(
-            self._destructibles, 'validate_tree_identity_1513', None)
-        if (kind == 'tree' and callable(validate_tree) and
-                not validate_tree(
-                    self._avatar.spaceID, chunk_id, item_index)):
-            # The native object remains solid.  A nullable tree identity is a
-            # local streamed-data boundary, not a fatal LAN protocol failure.
-            return False
         already_destroyed = destructibles_authority.is_destroyed(
             chunk_id, item_index, mat_kind)
         position = self._vector((x, y, z))
         space_id = self._avatar.spaceID
+        validate_tree = getattr(
+            self._destructibles, 'validate_tree_identity_1513', None)
+        if (kind == 'tree' and not already_destroyed and
+                callable(validate_tree) and
+                not validate_tree(space_id, chunk_id, item_index)):
+            # Exact invalid identities are terminally isolated.  A descriptor
+            # that is merely still streaming must remain retryable.
+            if callable(is_isolated) and is_isolated(
+                    chunk_id, item_index):
+                return False
+            return None
         applied = False
         if not already_destroyed:
             if kind == 'tree':
@@ -8226,13 +8260,30 @@ class BattleRuntime(object):
                 if (kind == 'tree' and callable(validate_tree) and
                         not validate_tree(
                             space_id, chunk_id, item_index)):
-                    return False
+                    if callable(is_isolated) and is_isolated(
+                            chunk_id, item_index):
+                        return False
+                    return None
                 raise RuntimeError(
                     '#1513 failed to apply canonical destructible event')
+        presentation_status = None
+        if kind == 'tree':
+            ensure_presentation = getattr(
+                destructibles_authority, 'ensure_tree_presentation', None)
+            if callable(ensure_presentation):
+                presentation_status = ensure_presentation(
+                    space_id, chunk_id, item_index,
+                    fall_yaw, speed, position)
+                if presentation_status not in (
+                        'presented', 'queued', 'pending'):
+                    raise RuntimeError(
+                        '#1513 tree presentation returned an invalid status')
         foliage_changed = False
         if kind == 'tree':
             foliage_changed = self._activate_fallen_tree_foliage(
                 chunk_id, item_index)
+        if presentation_status == 'pending':
+            return None
         if already_destroyed:
             return foliage_changed
         note_destroyed = getattr(
@@ -13045,6 +13096,7 @@ class BattleRuntime(object):
             self._flush_pending_bot_create(now)
             self._flush_pending_entities(now)
             self._drain_event_journal()
+            self._retry_tree_presentations()
             self._run_optional_feature(
                 'foliage camouflage',
                 self._refresh_fallen_tree_foliage, (now,))

@@ -116,6 +116,7 @@ class _Manager(object):
     def __init__(self):
         self.space_id = None
         self._DestructiblesManager__loadedChunkIDs = {}
+        self._DestructiblesManager__destructiblesWaitDestroy = {}
         self.orders = []
         self.attempts = []
         self.fail = False
@@ -154,6 +155,11 @@ def _authority_environment(manager):
     area._DAMAGE_TYPE_FRAGILE = 3
     area._DAMAGE_TYPE_MODULE = 4
     area.DESTR_TYPE_TREE = 1
+    area.g_destructiblesAnimator = types.SimpleNamespace(
+        _DestructiblesAnimator__bodies=[],
+        _DestructiblesAnimator__isUpdating=False,
+        _DestructiblesAnimator__updateCallbackID=None,
+        _DestructiblesAnimator__startUpdate=lambda: None)
     area.g_cache = types.SimpleNamespace(
         getDescByFilename=lambda filename: (
             {'type': 1, 'health': 10} if filename == 'tree' else None))
@@ -163,10 +169,14 @@ def _authority_environment(manager):
     area.encodeDestructibleModule = lambda *args: ('module',) + args
     bigworld = types.SimpleNamespace(
         createEntity=lambda *unused: 900,
-        wg_getChunkDestrFilenames=lambda *unused: ('tree',) * 256,
+        wg_getChunkDestrFilenames=lambda unused_space, chunk: (
+            ('tree',) * manager._DestructiblesManager__loadedChunkIDs.get(
+                int(chunk), 0)),
         wg_getDestructibleEffectCategory=lambda *unused: 1,
+        wg_getDestructibleMatrix=lambda *unused: _ItemMatrix(),
         wg_getDestructibleFallPitchConstr=lambda *unused: (None, 0))
-    math_module = types.SimpleNamespace(Vector3=_Vector)
+    math_module = types.SimpleNamespace(Vector3=_Vector,
+                                        Matrix=lambda value: value)
     destructibles_authority.BigWorld = bigworld
     destructibles_authority.Math = math_module
     destructibles_authority.reset()
@@ -1612,6 +1622,127 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(2, len(manager.attempts))
         self.assertEqual(1, len(manager.orders))
         self.assertTrue(destructibles_authority.is_destroyed(22, 37))
+
+    def test_tree_presentation_void_native_order_is_redriven(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = _authority_environment(manager)
+        matrix = _ItemMatrix(_Vector(2.0, 3.0, 4.0))
+        destructibles_authority.BigWorld.wg_getDestructibleMatrix = (
+            lambda *unused: matrix)
+
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area,
+                'BigWorld': destructibles_authority.BigWorld,
+                'Math': destructibles_authority.Math}):
+            self.assertTrue(destructibles_authority.destroy_tree(
+                1, 22, 0, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            self.assertEqual('pending',
+                destructibles_authority.ensure_tree_presentation(
+                    1, 22, 0, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            self.assertEqual(0,
+                             destructibles_authority.retry_tree_presentations())
+
+        self.assertEqual(3, len(manager.orders))
+        chunk = destructibles_authority._state['chunks'][22]
+        self.assertEqual(1, len(chunk['fallenTrees']))
+        self.assertEqual({(0, None)}, chunk['keys'])
+        entry = chunk['treePresentations'][0]
+        self.assertEqual(manager.orders[0][2], entry['data'])
+        self.assertEqual((10.0, 2.0, 20.0), entry['pos'])
+        self.assertEqual('pending', entry['status'])
+
+    def test_tree_presentation_body_is_receipt_and_repairs_lost_callback(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = _authority_environment(manager)
+        animator = area.g_destructiblesAnimator
+        start_states = []
+
+        def start_update():
+            start_states.append(
+                animator._DestructiblesAnimator__isUpdating)
+            animator._DestructiblesAnimator__isUpdating = True
+            animator._DestructiblesAnimator__updateCallbackID = 71
+
+        animator._DestructiblesAnimator__startUpdate = start_update
+        destructibles_authority.BigWorld.wg_getDestructibleMatrix = (
+            lambda *unused: _ItemMatrix(_Vector(2.0, 3.0, 4.0)))
+
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area,
+                'BigWorld': destructibles_authority.BigWorld,
+                'Math': destructibles_authority.Math}):
+            self.assertTrue(destructibles_authority.destroy_tree(
+                1, 22, 0, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            animator._DestructiblesAnimator__bodies.append({
+                'spaceID': 1, 'chunkID': 22, 'destrIndex': 0})
+            animator._DestructiblesAnimator__isUpdating = True
+            animator._DestructiblesAnimator__updateCallbackID = None
+            self.assertEqual('presented',
+                destructibles_authority.ensure_tree_presentation(
+                    1, 22, 0, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            self.assertEqual(0,
+                             destructibles_authority.retry_tree_presentations())
+
+        self.assertEqual([False], start_states)
+        self.assertEqual(1, len(manager.orders))
+
+    def test_tree_presentation_matrix_change_is_counted_once(self):
+        manager = _Manager()
+        manager.space_id = 1
+        manager.set_chunk_count(22, 1)
+        area = _authority_environment(manager)
+        current = [_ItemMatrix(_Vector(2.0, 3.0, 4.0))]
+        destructibles_authority.BigWorld.wg_getDestructibleMatrix = (
+            lambda *unused: current[0])
+        native_order = manager.orderDestructibleDestroy
+
+        def move_matrix_during_native_order(*args):
+            native_order(*args)
+            current[0] = _ItemMatrix(_Vector(2.0, 3.0, 4.5))
+
+        manager.orderDestructibleDestroy = move_matrix_during_native_order
+
+        with mock.patch.dict(sys.modules, {
+                'AreaDestructibles': area,
+                'BigWorld': destructibles_authority.BigWorld,
+                'Math': destructibles_authority.Math}):
+            self.assertTrue(destructibles_authority.destroy_tree(
+                1, 22, 0, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            self.assertEqual(1,
+                             destructibles_authority.retry_tree_presentations())
+            self.assertEqual('presented',
+                destructibles_authority.ensure_tree_presentation(
+                    1, 22, 0, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            self.assertEqual(0,
+                             destructibles_authority.retry_tree_presentations())
+
+        self.assertEqual(1, len(manager.orders))
+
+    def test_tree_presentation_exact_wait_order_is_not_duplicated(self):
+        manager = _Manager()
+        manager.space_id = 1
+        area = _authority_environment(manager)
+
+        with mock.patch.dict(sys.modules, {'AreaDestructibles': area}):
+            self.assertTrue(destructibles_authority.destroy_tree(
+                1, 22, 37, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            ordered = manager.orders[0]
+            manager._DestructiblesManager__destructiblesWaitDestroy[22] = [
+                (ordered[1], ordered[2], ordered[3])]
+            self.assertEqual('queued',
+                destructibles_authority.ensure_tree_presentation(
+                    1, 22, 37, 0.25, 8.0, (10.0, 2.0, 20.0)))
+            self.assertEqual(0,
+                             destructibles_authority.retry_tree_presentations())
+
+        self.assertEqual(1, len(manager.orders))
+        self.assertEqual('queued',
+            destructibles_authority._state['chunks'][22][
+                'treePresentations'][37]['status'])
 
     def test_controller_contact_uses_one_native_order_without_setter(self):
         class Controller(object):

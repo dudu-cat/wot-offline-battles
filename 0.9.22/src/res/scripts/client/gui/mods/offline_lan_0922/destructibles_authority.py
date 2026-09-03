@@ -28,6 +28,8 @@ _applies_reported = [0]
 _CHUNK_REPORT_LIMIT = 24
 _chunks_reported = [0]
 
+_TREE_PRESENTATION_REDRIVE_LIMIT = 3
+
 _PROP_BY_KIND = {
 	'tree': 'fallenTrees',
 	'column': 'fallenColumns',
@@ -97,8 +99,14 @@ def _chunk(chunkID):
 	_ensure_shape()
 	c = _state['chunks'].get(chunkID)
 	if c is None:
-		c = {'fallenTrees': [], 'fallenColumns': [], 'destroyedFragiles': [], 'destroyedModules': [], 'keys': set()}
+		c = {
+			'fallenTrees': [], 'fallenColumns': [],
+			'destroyedFragiles': [], 'destroyedModules': [],
+			'keys': set(), 'treePresentations': {},
+		}
 		_state['chunks'][chunkID] = c
+	elif not isinstance(c.get('treePresentations'), dict):
+		c['treePresentations'] = {}
 	return c
 
 
@@ -274,6 +282,138 @@ def _apply(spaceID, chunkID, pos, kind, destrData, dedupKey,
 	return True
 
 
+def _tree_matrix_signature(spaceID, chunkID, itemIndex):
+	"""Return a value signature for one native destructible transform."""
+	matrix = Math.Matrix(BigWorld.wg_getDestructibleMatrix(
+		spaceID, chunkID, itemIndex))
+	translation = matrix.translation
+	values = [translation.x, translation.y, translation.z]
+	for axis in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+			(0.0, 0.0, 1.0)):
+		vector = matrix.applyVector(Math.Vector3(*axis))
+		values.extend((vector.x, vector.y, vector.z))
+	return tuple(float(value) for value in values)
+
+
+def _tree_matrix_changed(before, after):
+	return (len(before) == len(after) and
+		any(abs(left - right) > 1.0e-5
+			for left, right in zip(before, after)))
+
+
+def _tree_wait_ordered(manager, chunkID, destrData):
+	waiting = getattr(
+		manager, '_DestructiblesManager__destructiblesWaitDestroy', None)
+	if not isinstance(waiting, dict):
+		return False
+	for order in waiting.get(chunkID, ()):
+		if (isinstance(order, (tuple, list)) and len(order) == 3 and
+				order[0] == _tree_damage_type() and order[1] == destrData):
+			return True
+	return False
+
+
+def _tree_damage_type():
+	import AreaDestructibles
+	return AreaDestructibles._DAMAGE_TYPE_TREE
+
+
+def _tree_body_present(spaceID, chunkID, itemIndex):
+	import AreaDestructibles
+	animator = AreaDestructibles.g_destructiblesAnimator
+	bodies = getattr(animator, '_DestructiblesAnimator__bodies')
+	for body in bodies:
+		if (body.get('spaceID') != spaceID or
+				body.get('chunkID') != chunkID or
+				body.get('destrIndex') != itemIndex):
+			continue
+		# ``__startUpdate`` is the stock idempotent entry point.  Its only
+		# unrecoverable state is a non-empty body list which still claims to be
+		# updating after its callback id disappeared.  Repair just that stable
+		# lost-callback state, then let the normal method decide whether to start.
+		is_updating = getattr(
+			animator, '_DestructiblesAnimator__isUpdating')
+		callback_id = getattr(
+			animator, '_DestructiblesAnimator__updateCallbackID')
+		if bodies and is_updating and callback_id is None:
+			setattr(animator, '_DestructiblesAnimator__isUpdating', False)
+		getattr(animator, '_DestructiblesAnimator__startUpdate')()
+		return True
+	return False
+
+
+def _tree_presentation_state(spaceID, chunkID, itemIndex, entry,
+		redrive):
+	"""Observe one accepted tree order and optionally redrive it once."""
+	import AreaDestructibles
+	manager = AreaDestructibles.g_destructiblesManager
+	if _tree_body_present(spaceID, chunkID, itemIndex):
+		entry['status'] = 'presented'
+		return 'presented'
+	loaded = manager.isChunkLoaded(chunkID)
+	if loaded and entry['initialMatrixSignature'] is not None:
+		try:
+			current_signature = _tree_matrix_signature(
+				spaceID, chunkID, itemIndex)
+		except Exception:
+			current_signature = None
+		if (current_signature is not None and _tree_matrix_changed(
+				entry['initialMatrixSignature'], current_signature)):
+			entry['status'] = 'presented'
+			return 'presented'
+	if _tree_wait_ordered(manager, chunkID, entry['data']):
+		entry['status'] = 'queued'
+		return 'queued'
+	entry['status'] = 'pending'
+	if (not loaded or not redrive or
+			entry.get('redrives', 0) >= _TREE_PRESENTATION_REDRIVE_LIMIT):
+		return 'pending'
+	entry['redrives'] = entry.get('redrives', 0) + 1
+	manager.orderDestructibleDestroy(
+		chunkID, _tree_damage_type(), entry['data'], True, False)
+	# The loaded native path is synchronous in #1513.  Re-read all three
+	# receipts after the retry so callers can observe success immediately.
+	return _tree_presentation_state(
+		spaceID, chunkID, itemIndex, entry, False)
+
+
+def ensure_tree_presentation(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
+	"""Return ``presented``, ``queued`` or ``pending`` for an accepted tree.
+
+	A loaded ``pending`` tree is re-driven exactly once by each invocation.
+	The fall arguments are retained in this public signature so callers can use
+	the same identity tuple as ``destroy_tree``; retries deliberately use the
+	original accepted encoded data instead of recomputing it.
+	"""
+	spaceID = int(spaceID); chunkID = int(chunkID); itemIndex = int(itemIndex)
+	_reset_if_new_space(spaceID)
+	c = _chunk(chunkID)
+	entry = c['treePresentations'].get(itemIndex)
+	if entry is None or (itemIndex, None) not in c['keys']:
+		return 'pending'
+	return _tree_presentation_state(
+		spaceID, chunkID, itemIndex, entry, True)
+
+
+def retry_tree_presentations():
+	"""Retry accepted tree orders lacking a native presentation receipt."""
+	_ensure_shape()
+	spaceID = _state['spaceID']
+	if spaceID is None:
+		return 0
+	newly_presented = 0
+	for chunkID, c in list(_state['chunks'].items()):
+		presentations = c.get('treePresentations', {})
+		for itemIndex, entry in list(presentations.items()):
+			if (entry.get('status') == 'presented' or
+					(itemIndex, None) not in c['keys']):
+				continue
+			if _tree_presentation_state(
+					spaceID, chunkID, itemIndex, entry, True) == 'presented':
+				newly_presented += 1
+	return newly_presented
+
+
 def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 	import AreaDestructibles
 	from gui.mods.offline_lan_0922 import destructibles_compat
@@ -311,7 +451,25 @@ def destroy_tree(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
 		pitch = pitchConstr
 	speed = max(1, min(3, int(abs(speed))))
 	data = AreaDestructibles.encodeFallenTree(itemIndex, fallYaw, pitch, speed)
-	return _apply(spaceID, chunkID, pos, 'tree', data, (itemIndex, None))
+	initial_signature = None
+	if mgr.isChunkLoaded(chunkID):
+		try:
+			initial_signature = _tree_matrix_signature(
+				spaceID, chunkID, itemIndex)
+		except Exception:
+			# Matrix observation is a receipt, not a prerequisite for the stock
+			# destroy call.  The animator body remains the primary evidence.
+			initial_signature = None
+	accepted = _apply(
+		spaceID, chunkID, pos, 'tree', data, (itemIndex, None))
+	if accepted:
+		_chunk(chunkID)['treePresentations'][itemIndex] = {
+			'data': data,
+			'pos': (float(pos[0]), float(pos[1]), float(pos[2])),
+			'initialMatrixSignature': initial_signature,
+			'status': 'pending', 'redrives': 0,
+		}
+	return accepted
 
 
 def destroy_column(spaceID, chunkID, itemIndex, fallYaw, speed, pos):
