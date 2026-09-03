@@ -281,14 +281,32 @@ living ally and cleanup revokes the exposure. Windows #1513 remains required
 to accept the native switch controls, camera continuity and repeated-round
 teardown.
 
-The 0.3.68 destructible boundary is pinned to a schema-v6 catalog baked from
-all 41 exact #1513 map packages; the exact-instance runtime shape requires
-schema version 4 or newer. A checksum-pinned whole-map directory maps
+The 0.3.68 destructible boundary is pinned to a shipped schema-v7 destructible
+catalog and schema-v4 foliage catalog baked from all 41 exact #1513 map
+packages; the exact-instance runtime shape starts at schema version 4. A
+checksum-pinned whole-map directory maps
 61,625 unique world-matrix signatures to fragile, falling and structure-module
 resources plus transformed BSMO bounds. This recovers identity for native
 chunk slots whose name is absent from the compacted native list while
 preserving the engine's chunk/item index. Eleven ambiguous signatures covering
 28 candidates fail closed.
+
+The baker follows the exact WGDE row contract. Table 1 partitions table 2 into
+per-chunk ranges and resets the native item index for each chunk. Each non-empty
+table-2 row owns an inclusive table-3 reference span; an authored empty span
+references no scene instance and does not consume a native index. SpeedTree and
+BSMI references share that one index sequence. Multiple references in one row
+collapse structure modules into one item, while a referenced BSMO entry whose
+effect type the gameplay baker ignores still consumes the row's native index.
+Correcting the old empty-row count changed 1,455 destructible wires and 357
+foliage wires across the only six affected maps: `07_lakeville`,
+`11_murovanka`, `18_cliff`, `23_westfeld`, `34_redshire` and
+`36_fishing_bay`; the other 35 map censuses and wires are unchanged.
+
+Live #1513 matrix/signature reports pin the corrected non-empty-row reading at
+Murovanka `(32124, 7)`, Cliff `(32893, 6)` and Redshire `(33148, 58)`, with
+Karelia `(31610, 0)` as a control that is identical under either reading.
+Lakeville, Westfield and Fishing Bay still require exact-Windows confirmation.
 Local-player movement does not infer a dynamic prop from a nearby pivot: its
 swept OBB must intersect the exact item OBB, then the stock mass/speed/health
 kinetic gate decides whether native destruction may be requested. Native
@@ -364,8 +382,12 @@ reconstruction. They prove the old lookup was unsound; they do not prove that
 the reconstructed native name of chunk `31875` item `70` is `poplar.spt`, or
 that the live item truly conflicts with `env014_Toilet.model`. The unit
 regression using those two filenames is consequently a generic synthetic
-conflict test. The real Prokhorovka mapping and its crash correlation remain a
-bounded exact-Windows diagnostic boundary.
+conflict test. The real Prokhorovka `(31875, 70)` identity and its crash
+correlation remain a bounded exact-Windows diagnostic boundary. The retained
+`+0x6bb0aa` crash site is consistent with an engine-side null read in a
+`(uint32, uint8)` keyed lookup whose sibling entry point checks for a missing
+record, but static executable review does not prove which gameplay object
+caused that miss or that the old misindexed name caused the crash.
 
 `wg_getDestructibleMatrix` (`0x006b2a90` through `0x006b3f90`) and
 `wg_getDestructibleEffectCategory` (`0x006b1f10`, module index below zero)
@@ -415,8 +437,10 @@ entries but can evict the oldest abandoned incomplete entry, so a full cache
 cannot permanently starve a newly active chunk. A changed fingerprint
 restarts reconstruction and a completed mapping is reused. This adds bounded
 native category traffic; it does not support the earlier claim that ordinary
-catalog matching adds none. Exact Windows observation still has to confirm
-the frame-level timing and cost of the first native list snapshot.
+catalog matching adds none. Exact Windows observation still has to confirm that
+all Python callers in one render tick observe the same `BigWorld.time()` value,
+and measure both the first whole-chunk name snapshot and bounded category-probe
+cost under real streaming load.
 
 With an exact per-item name available, a live/catalog filename disagreement is
 real evidence rather than an alignment artefact. Equal normalized names match;
@@ -470,9 +494,10 @@ The previous 0.3.65 schema-v2 catalog supplied transformed OBBs but joined
 runtime slots by native filename taken from the compacted chunk list. No slot
 is ever "blank" in that list: an unnamed item is absent from it, which is why
 indexing it by the item index silently returned a neighbour's resource. The
-current schema-v6 catalog closes that identity gap with the whole-map matrix
-signature, and the per-item name is now recovered from the reconstructed
-compaction instead.
+exact-instance runtime shape introduced at schema v4 closes that identity gap
+with the whole-map matrix signature, and the per-item name is now recovered
+from the reconstructed compaction instead. The coherent shipped batches are
+destructible format v7 and foliage format v4.
 
 The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
 authority registry. Unspotted or dead synthetic vehicles remain private there;

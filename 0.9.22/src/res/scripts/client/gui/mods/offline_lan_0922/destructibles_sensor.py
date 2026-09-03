@@ -42,10 +42,24 @@ _SHOT_THROUGH_MIN_REDUCTION_1513 = 25.0
 _SHOT_AP_KINDS_1513 = frozenset((
 	'ARMOR_PIERCING', 'ARMOR_PIERCING_HE', 'ARMOR_PIERCING_CR'))
 
-# The pinned native entry point raises when a wire/module does not resolve,
-# but returns -1 when it resolves and its group owns no registered effect
-# handler.  That leaves only this one channel unverified; it is not evidence
-# of a kind disagreement and is never used as a wildcard.
+# Exact pinned #1513 native contract for
+# ``BigWorld.wg_getDestructibleEffectCategory(spaceID, chunk, item, module)``,
+# read from the reviewed x86 entry point of the exact client executable
+# (PE timestamp 0x5a6edca4, checksum 0x019a5229):
+#
+# * a negative ``module`` selects the no-module resolve, a non-negative one the
+#   per-module resolve; both then share the same post-processing;
+# * when the (chunk, item[, module]) triple does not resolve, the entry returns
+#   no object at all, which reaches Python as an error rather than a value;
+# * when it does resolve, the category comes from the effect handler registered
+#   for that item's native group.  If no handler is registered for the group the
+#   entry returns exactly -1.
+#
+# So -1 proves the native item resolved and only says that the effect-category
+# channel is unregistered for it; it carries no destructible kind.  It is
+# neither a kind match nor evidence of a wrong wire, and the offline client
+# legitimately leaves handler groups unregistered.  Treat it as one unverified
+# identity channel, never as a wildcard.
 _NATIVE_EFFECT_CATEGORY_UNREGISTERED_1513 = -1
 
 # Exact constants from pinned #1513 ``constants.DESTRUCTIBLE_MATKIND``.
@@ -1613,15 +1627,18 @@ def _validate_native_effect_categories_1513(
 			native_type = bigworld.wg_getDestructibleEffectCategory(
 				spaceID, chunk_id, item_index, module_index)
 		except Exception as error:
+			# The pinned entry point reports an unresolved (chunk, item, module)
+			# triple as an error, so this is a real identity failure.
 			_isolate_destructible_1513(
 				'effect_query', chunk_id, item_index,
 				detail='operation=effect_category module=%s %s error=%s' % (
 					module_index, identity, error))
 			return False
 		if native_type == _NATIVE_EFFECT_CATEGORY_UNREGISTERED_1513:
-			# The exact wire and unique matrix signature already agreed.  A
-			# resolved group without an effect handler cannot confirm or contradict
-			# that identity, so preserve it as an explicitly unverified channel.
+			# The item resolved but its native effect group has no handler, so
+			# this channel cannot confirm or contradict the catalog kind.  The
+			# exact wire and the unique matrix signature already agreed, and
+			# isolating here would hide legal #1513 destructibles.
 			_log_destructible_validation_1513(
 				'effect_category_unregistered', 'accepted_native_identity',
 				chunk_id, item_index,
