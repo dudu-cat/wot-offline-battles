@@ -1815,6 +1815,10 @@ class BotRuntime(object):
              unused_shell, unused_receipt: True))
         self.artillery_launch_cancel = artillery_launch_cancel
         self.spawn_resolver = spawn_resolver
+        # Contact time is accumulated per physical slice and drained at the
+        # end of the render callback. A callback can contain no slice at high
+        # FPS or several bounded catch-up slices at low FPS.
+        self._contact_lease_elapsed = {}
         self._injected_baked_graph = baked_graph
         self.baked_graph = None
         self._navigation_map_name = None
@@ -2690,6 +2694,7 @@ class BotRuntime(object):
             self._ram_seq = 0
             self._human_ram_receipt_seq = {}
             self._human_ram_report_cache = {}
+            self._contact_lease_elapsed = {}
             self.adapter = None
             self.finished = False
             self._visibility_cache = {}
@@ -3643,6 +3648,7 @@ class BotRuntime(object):
             self.finished = True
             self._clear_artillery_intents()
             self._friendly_repositions = {}
+            self._contact_lease_elapsed = {}
         server_tick = message.get('server_tick')
         if server_tick is not None:
             try:
@@ -5808,21 +5814,24 @@ class BotRuntime(object):
                 now)
         return target
 
-    @staticmethod
-    def _player_neighbours(players):
+    def _player_neighbours(self, players):
         result = []
         for raw in players or ():
-            if (not isinstance(raw, dict) or raw.get('id') is None or
-                    not raw.get('alive', True)):
+            if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
             yaw = _number(raw.get('yaw'))
-            speed = _number(raw.get('speed'))
+            alive = bool(raw.get('alive', True))
+            speed = _number(raw.get('speed')) if alive else 0.0
+            shape = self._player_collision_profile(raw)['shape']
             result.append({
                 'id': HUMAN_TARGET_ID_BASE + int(raw['id']),
                 'position': _position(raw),
                 'team': int(_number(raw.get('team'))), 'yaw': yaw,
+                'alive': alive,
                 'velocity': (math.sin(yaw) * speed, 0.0,
                              math.cos(yaw) * speed),
+                'half_length': _number(shape[1]),
+                'half_width': _number(shape[0]),
             })
         return result
 
@@ -6341,9 +6350,17 @@ class BotRuntime(object):
         state['push_z'] = push_z * push_decay
 
     def _resolve_human_ram_receipts(self, players, now, step=None,
-                                    processed_pairs=None):
-        """Recompute client-observed contact against its canonical bot body."""
+                                    processed_pairs=None,
+                                    contacted_bot_ids=None):
+        """Recompute client-observed contact against its canonical bot body.
+
+        Contact responders share the caller's per-slice set when provided, so
+        one Bot pays at most once even if several hulls respond in that slice.
+        """
         reports = []
+        owns_contacted_bot_ids = contacted_bot_ids is None
+        if owns_contacted_bot_ids:
+            contacted_bot_ids = set()
         receipt_players = {}
         for raw in players or ():
             if not isinstance(raw, dict) or raw.get('id') is None:
@@ -6561,10 +6578,26 @@ class BotRuntime(object):
                                 response = tank_collision.resolve_tank(
                                     bot, (player,), now=None)
                                 if step is not None:
+                                    before_response = (
+                                        _number(current.get('speed')),
+                                        _number(current.get('push_x')),
+                                        _number(current.get('push_z')))
                                     self._apply_tank_contact_response(
                                         current, response, step,
                                         advance_push=False,
                                         apply_correction=False)
+                                    after_response = (
+                                        _number(current.get('speed')),
+                                        _number(current.get('push_x')),
+                                        _number(current.get('push_z')))
+                                    if any(abs(after - before) > 0.0001
+                                           for before, after in zip(
+                                               before_response,
+                                               after_response)):
+                                        # This pair is excluded from the main
+                                        # current-pose solver, but shares its
+                                        # one-lease-per-slice collector.
+                                        contacted_bot_ids.add(bot_id)
                                 event = {
                                     'self_id': bot['id'],
                                     'other_id': player['id'],
@@ -6600,7 +6633,49 @@ class BotRuntime(object):
                 # One unresolved transaction per player preserves ledger
                 # order even when transport retries or snapshots coalesce.
                 break
+        if owns_contacted_bot_ids and step is not None:
+            for bot_id in sorted(contacted_bot_ids):
+                self._record_traffic_wait_contact(bot_id, step)
         return reports
+
+    def _record_traffic_wait_contact(self, bot_id, elapsed):
+        """Accumulate one Bot's actual contact-response slice."""
+        elapsed = max(0.0, _number(elapsed))
+        if elapsed <= 0.0:
+            return
+        bot_id = int(bot_id)
+        self._contact_lease_elapsed[bot_id] = (
+            self._contact_lease_elapsed.get(bot_id, 0.0) + elapsed)
+
+    def _apply_traffic_wait_lease(self):
+        """Suppress the stuck timer while another hull owns the blockage.
+
+        LocalDriver's stuck detector measures translation. A tank held in place
+        by the simultaneous contact solver is not translating, but it is also
+        not wedged against terrain, and its recovery is a blind reverse into
+        whatever is behind it. ``wait_for_traffic`` grants a bounded
+        right-of-way lease for exactly this case; it lost its only producer
+        when the predictive headway controller was removed from the call path,
+        while the stuck timer it protected stayed. A genuine deadlock is still
+        detected, because the lease expires after
+        ``TRAFFIC_WAIT_LEASE_SECONDS`` of physical contact time. Charge each
+        Bot only for slices in which it actually received a contact response:
+        high-FPS callbacks may consume no slice, while a late callback can
+        contain several bounded slices with different contact results.
+        """
+        contacted = self._contact_lease_elapsed
+        self._contact_lease_elapsed = {}
+        if not contacted:
+            return
+        driver = getattr(self.adapter, 'driver', None)
+        wait = getattr(driver, 'wait_for_traffic', None)
+        if not callable(wait):
+            return
+        for bot_id in sorted(contacted):
+            try:
+                wait(bot_id, contacted[bot_id])
+            except Exception:
+                continue
 
     def _resolve_tank_contacts(self, players, now, step):
         """Apply current 0.8.2 chassis OBB response and report rams."""
@@ -6673,8 +6748,10 @@ class BotRuntime(object):
         collision_index = tank_collision.build_spatial_index(
             collision_bodies, maximum_radius * 2.0 + 4.0)
         receipt_pairs = set()
+        contacted_bot_ids = set()
         reports = self._resolve_human_ram_receipts(
-            players, now, step=step, processed_pairs=receipt_pairs)
+            players, now, step=step, processed_pairs=receipt_pairs,
+            contacted_bot_ids=contacted_bot_ids)
         previous_ram_contacts = self._ram_contacts
         current_ram_contacts = set()
         frame_ram_armors = {}
@@ -6729,9 +6806,17 @@ class BotRuntime(object):
                 own, others, **resolve_kwargs)
             self._ram_cooldowns = result['cooldowns']
             current_ram_contacts.update(result['contacts'])
+            if (any(abs(_number(value)) > 0.0001
+                    for value in result['delta_velocity']) or
+                    any(abs(_number(value)) > 0.0001
+                        for value in result['correction'])):
+                # Another hull owns this tank's lack of progress this tick.
+                contacted_bot_ids.add(int(state['id']))
             self._apply_tank_contact_response(state, result, step)
             reports.extend(self._ram_reports(
                 state, result['ram_events']))
+        for bot_id in sorted(contacted_bot_ids):
+            self._record_traffic_wait_contact(bot_id, step)
         self._ram_contacts = frozenset(current_ram_contacts)
         return reports
 
@@ -8286,6 +8371,9 @@ class BotRuntime(object):
         """
         self._last_update_control_steps = 0
         self._last_update_max_control_step = 0.0
+        # Contact leases never cross render callbacks or round teardown. Any
+        # entry below is produced by a physical slice in this update only.
+        self._contact_lease_elapsed = {}
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
             return []
@@ -8351,6 +8439,9 @@ class BotRuntime(object):
                             frame_step, step_now, players, neighbours,
                             refresh_control, publish_step))
                         refresh_control = False
+                # Deliver once per render callback, after every bounded
+                # physical slice has contributed only its own contact time.
+                self._apply_traffic_wait_lease()
             finally:
                 if visibility_frame_open:
                     self._finish_visibility_frame()

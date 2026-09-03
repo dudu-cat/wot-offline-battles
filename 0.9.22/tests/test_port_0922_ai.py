@@ -17,7 +17,9 @@ from gui.mods.offline_lan_0922.ai import (
     cover, maps, navigation, reviewed_routes_20260811,
 )
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
-from gui.mods.offline_lan_0922.ai.driver import LocalDriver
+from gui.mods.offline_lan_0922.ai.driver import (
+    LocalDriver, TRAFFIC_WAIT_LEASE_SECONDS,
+)
 from gui.mods.offline_lan_0922.ai.planner import (
     BattleDirector, build_vehicle_profile,
 )
@@ -1676,6 +1678,82 @@ class BotAiPortTests(unittest.TestCase):
             modes.add(order['recovery_mode'])
 
         self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
+
+    def test_traffic_lease_uses_explicit_time_not_decision_steps(self):
+        """An external lease producer must supply its physical interval.
+
+        LocalDriver.drive only runs on a decision callback, so last_step holds
+        the planner's decision interval. A physical contact producer cannot
+        default to that unrelated duration.
+        """
+        driver = LocalDriver()
+        driver.drive(
+            41, (0.0, 0.0, 0.0), 0.0, 0.0, 0.15,
+            (0.0, 0.0, 50.0), (), lambda unused_yaw: True)
+        state = driver.states[41]
+        self.assertAlmostEqual(0.15, state['last_step'])
+
+        for unused in range(9):
+            driver.wait_for_traffic(41, 1.0 / 60.0)
+
+        self.assertAlmostEqual(9.0 / 60.0, state['traffic_wait_time'])
+        self.assertLess(state['traffic_wait_time'],
+                        TRAFFIC_WAIT_LEASE_SECONDS)
+
+    def test_wedged_hull_never_reverses_into_the_tank_behind_it(self):
+        """direction_clear answers for terrain, not for the queue behind.
+
+        In a spawn line-up every tank reaches the stuck threshold at about the
+        same time, so an unchecked reverse recovery drives each hull into the
+        one behind it.
+        """
+        driver = LocalDriver()
+        behind = ({'position': (0.0, 0.0, -7.0), 'yaw': 0.0,
+                   'half_length': 3.5, 'half_width': 1.7},)
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                9, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, 50.0), behind, lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+
+        self.assertIn('pivot_recovery', modes)
+        self.assertNotIn('reverse_turn', modes)
+
+    def test_reverse_guard_checks_the_complete_reachable_hull_sweep(self):
+        """A blocker before the sampled endpoint is still in the sweep."""
+        driver = LocalDriver()
+        position = (0.0, 0.0, 0.0)
+        half_length = 2.0
+        half_width = 1.0
+        transverse = ({
+            'position': (0.0, 0.0, -0.5),
+            'yaw': math.pi / 2.0,
+            'half_length': 2.0,
+            'half_width': 0.5,
+        },)
+        endpoint = (0.0, 0.0, -half_length * 1.6)
+
+        self.assertFalse(driver._obb_overlap(
+            endpoint, 0.0, half_length, half_width,
+            transverse[0]['position'], transverse[0]['yaw'],
+            transverse[0]['half_length'], transverse[0]['half_width']))
+        self.assertTrue(driver._reverse_blocked_by_vehicle(
+            position, 0.0, transverse, half_length, half_width))
+
+    def test_wedged_hull_still_reverses_when_the_space_behind_is_free(self):
+        """The vehicle check must not disable reverse recovery generally."""
+        driver = LocalDriver()
+        far = ({'position': (0.0, 0.0, -40.0), 'yaw': 0.0,
+                'half_length': 3.5, 'half_width': 1.7},)
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                10, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, 50.0), far, lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+
+        self.assertIn('reverse_turn', modes)
 
     def test_brief_traffic_wait_does_not_trigger_reverse_recovery(self):
         driver = LocalDriver()
