@@ -30,6 +30,12 @@ BLOCKED_STEP_EDGE_TTL = 12.0
 BLOCKED_STEP_EDGE_PENALTY = 240.0
 # A controlled ford admits LocalDriver's first avoidance branch, and no wider.
 CONTROLLED_SHALLOW_YAW_WINDOW = FIRST_CANDIDATE_OFFSET + 0.03
+# The commit side sees an integrated hull yaw rather than the candidate the
+# planner chose, so it asks for a closing component instead of a cone. Half a
+# unit of cosine is sixty degrees: it covers the fan's realistic avoidance
+# branches around a ford (0, +/-0.42, +/-0.78) and still refuses a hull that
+# is drifting sideways into the water.
+CONTROLLED_SHALLOW_COMMIT_CLOSING = 0.5
 
 SEARCH_EXPANSIONS_PER_SECOND = 960.0
 MAX_SEARCH_EXPANSIONS_PER_FRAME = 96
@@ -1582,6 +1588,35 @@ class TerrainNavigator(object):
 		while difference < -math.pi:
 			difference += math.pi * 2.0
 		return abs(difference) <= max(0.0, float(maximum_yaw_error))
+
+	def controlled_shallow_committed(self, bot_id, current, travel_yaw):
+		"""Admit a realised step while the hull still closes on the ford.
+
+		``controlled_shallow_step`` exists for the planner's candidate fan,
+		where the sampled yaw *is* the intended heading, so a tight cone around
+		the ford bearing is the right question. The committed hull yaw is an
+		integrated pose that lags the chosen candidate by however much traverse
+		one step could deliver, so re-deriving admission from it vetoed the very
+		rotation the planner had just asked for: the step was refused, the
+		heading was banned, and the next tactical update selected the same ford
+		again. Once A* has armed a ford, the commit-side question is only
+		whether the hull is still travelling toward it. Fatal hazards are
+		unaffected; they are vetoed by the caller regardless of this answer.
+		"""
+		state = self.bot_states.get(int(bot_id))
+		if state is None:
+			return False
+		target = state.get('controlled_shallow_target')
+		if target is None:
+			return False
+		dx = float(target[0]) - float(current[0])
+		dz = float(target[2]) - float(current[2])
+		length = math.sqrt(dx * dx + dz * dz)
+		if length < 0.1:
+			return False
+		closing = (math.sin(float(travel_yaw)) * dx +
+		           math.cos(float(travel_yaw)) * dz) / length
+		return closing > CONTROLLED_SHALLOW_COMMIT_CLOSING
 
 	@staticmethod
 	def navigation_paused(current, requested_goal, selected_target,
