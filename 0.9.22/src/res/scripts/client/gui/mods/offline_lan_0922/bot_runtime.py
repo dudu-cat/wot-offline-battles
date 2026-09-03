@@ -2165,10 +2165,12 @@ class BotRuntime(object):
         except TypeError:
             return self.adapter_factory(map_name, round_id)
 
-    def _clear(self, position, yaw, speed=0.0, descriptor=None):
+    def _clear(self, position, yaw, speed=0.0, descriptor=None,
+               maximum_distance=None):
         """Treat collision, excessive slope and water as a failed local ray."""
         return self._probe_is_clear(
-            self._probe_direction(position, yaw, speed, descriptor))
+            self._probe_direction(
+                position, yaw, speed, descriptor, maximum_distance))
 
     def _probe_direction(self, position, yaw, speed=0.0, descriptor=None,
                          maximum_distance=None):
@@ -6305,8 +6307,18 @@ class BotRuntime(object):
         if move_distance > 0.0001:
             contact_yaw = math.atan2(move_x, move_z)
             contact_speed = move_distance / max(float(step), 1.0 / 120.0)
+            # Ask about the space this nudge actually enters, not about a
+            # travel corridor. The default probe looks 15-20 metres ahead
+            # because it ranks a driving direction; a contact response moves
+            # centimetres, so that default let a rock or wall well beyond the
+            # hull veto the separation and leave two tanks wedged together.
+            # The hull's leading half-length keeps the query meaningful.
+            separation_distance = max(
+                1.0,
+                move_distance + _number(state.get('half_length'), 3.5))
             if not self._clear(
-                    _position(state), contact_yaw, contact_speed, None):
+                    _position(state), contact_yaw, contact_speed, None,
+                    separation_distance):
                 # Tank separation is not permission to cross static world
                 # geometry. Let the other hull keep its inverse-mass share.
                 move_x = 0.0
