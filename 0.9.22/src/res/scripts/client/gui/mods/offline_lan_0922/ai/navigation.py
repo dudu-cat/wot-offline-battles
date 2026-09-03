@@ -24,6 +24,12 @@ BAKED_SHALLOW_WATER_PENALTY = 4.0
 BAKED_EDGE_CLEARANCE_WEIGHT = 0.20
 BAKED_FORMAT_NAME = 'offline-lan-0922-navgraph'
 BAKED_FORMAT_VERSION = 2
+# A bot whose global search is still queued holds briefly so a job that
+# finishes within a frame or two does not produce a pointless creep. Beyond
+# that grace it makes bounded, fully probed progress instead of standing
+# still: the room-wide expansion budget is shared, so "pending" can last
+# many seconds in a full room and an unbounded hold reads as a parked tank.
+PENDING_PROGRESS_SECONDS = 0.6
 BLOCKED_STEP_REPLAN_SECONDS = 1.0
 BLOCKED_STEP_REPLAN_VERDICTS = 4
 BLOCKED_STEP_EDGE_TTL = 12.0
@@ -880,6 +886,14 @@ class TerrainNavigator(object):
 		self.fallback_modes = {}
 
 	def _set_fallback_mode(self, bot_id, mode):
+		if mode is None or mode == 'safe_direct':
+			# A real routed target ends the pending episode. A safe-local or
+			# reactive step taken *while* a search is still queued must not,
+			# or the hold grace would restart after every short step and the
+			# bot would creep instead of driving.
+			state = self.bot_states.get(int(bot_id))
+			if state is not None:
+				state.pop('pending_since', None)
 		old_mode = self.fallback_modes.get(int(bot_id))
 		if old_mode == mode:
 			return
@@ -963,8 +977,20 @@ class TerrainNavigator(object):
 		self._set_fallback_mode(bot_id, 'reactive')
 		return tuple(goal)
 
-	def _pending_target(self, bot_id, current, now, state):
-		"""Continue a proved local edge, otherwise hold without arming recovery."""
+	def _pending_target(self, bot_id, current, goal, now, state,
+			avoid_points=None):
+		"""Continue a proved local edge, else make bounded probed progress.
+
+		Returning the hull's own position is a complete stop: the driver reads it
+		as arrival and the order adapter suppresses steering entirely, so nothing
+		times the wait out and nothing recovers from it. A queued global search is
+		not evidence that standing still is safe, only that the strategic route is
+		not known yet, so after a short grace this returns the same fully probed
+		short waypoint a conclusive search failure would use. Every candidate
+		still needs supported ground, a safe grade, no deep water, no static
+		collision and no remembered failed edge; ``None`` from that search still
+		means the only safe action is to hold.
+		"""
 		last_target = state.get('last_target')
 		if last_target is not None:
 			last_target = tuple(last_target)
@@ -980,6 +1006,21 @@ class TerrainNavigator(object):
 				state['target_is_terminal'] = False
 				self._set_fallback_mode(bot_id, 'pending')
 				return last_target
+		started = state.get('pending_since')
+		if started is None:
+			started = float(now)
+			state['pending_since'] = started
+		if (goal is not None and
+				float(now) - float(started) >= PENDING_PROGRESS_SECONDS):
+			fallback = self.grid.safe_local_target(
+				current, goal, now, avoid_points,
+				1.0 if (int(bot_id) % 2) else -1.0)
+			if fallback is not None:
+				state['last_target'] = tuple(fallback)
+				state['navigation_status'] = 'pending'
+				state['target_is_terminal'] = False
+				self._set_fallback_mode(bot_id, 'safe_local')
+				return tuple(fallback)
 		state['last_target'] = tuple(current)
 		state['navigation_status'] = 'pending'
 		state['target_is_terminal'] = False
@@ -1434,7 +1475,8 @@ class TerrainNavigator(object):
 				state['target_is_terminal'] = True
 				self._set_fallback_mode(bot_id, 'safe_direct')
 				return tuple(goal)
-			return self._pending_target(bot_id, current, now, state)
+			return self._pending_target(
+				bot_id, current, goal, now, state, avoid_points)
 		if not path:
 			if self.grid.dry_segment_clear(current, goal, now):
 				state.pop('controlled_shallow_target', None)
@@ -1479,7 +1521,8 @@ class TerrainNavigator(object):
 			join_key = ('join', bot_id, self.grid.cell_for(current)) + tuple(path_key)
 			key, joined_path = self._path(join_key, current, goal, now, avoid_points)
 			if joined_path is None:
-				return self._pending_target(bot_id, current, now, state)
+				return self._pending_target(
+				bot_id, current, goal, now, state, avoid_points)
 			if not joined_path:
 				# The cached strategic path is unusable from this hull's actual
 				# position and the join search has conclusively failed. Reuse the
@@ -1536,7 +1579,8 @@ class TerrainNavigator(object):
 				self._set_fallback_mode(bot_id, None)
 				return selected
 			if continued is None:
-				return self._pending_target(bot_id, current, now, state)
+				return self._pending_target(
+				bot_id, current, goal, now, state, avoid_points)
 			return self._fallback_target(
 				bot_id, current, goal, now, avoid_points, state, True)
 		selected = tuple(path[lookahead])

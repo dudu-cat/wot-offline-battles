@@ -13,14 +13,16 @@ CLIENT_SCRIPTS = PORT_ROOT / 'src' / 'res' / 'scripts' / 'client'
 sys.path.insert(0, str(PORT_ROOT / 'server'))
 sys.path.insert(0, str(CLIENT_SCRIPTS))
 
-from gui.mods.offline_lan_0922.ai import cover, maps, reviewed_routes_20260811
+from gui.mods.offline_lan_0922.ai import (
+    cover, maps, navigation, reviewed_routes_20260811,
+)
 from gui.mods.offline_lan_0922.ai.adapter import BotAdapter
 from gui.mods.offline_lan_0922.ai.driver import LocalDriver
 from gui.mods.offline_lan_0922.ai.planner import (
     BattleDirector, build_vehicle_profile,
 )
 from gui.mods.offline_lan_0922.ai.navigation import (
-    BAKED_FATAL_HAZARDS, BAKED_SHALLOW_WATER,
+    BAKED_FATAL_HAZARDS, BAKED_SHALLOW_WATER, _distance_2d,
     MAX_SEARCH_EXPANSIONS_PER_CATCH_UP_FRAME,
     MAX_SEARCH_EXPANSIONS_PER_FRAME, SEARCH_EXPANSIONS_PER_SECOND,
     TerrainGrid, TerrainNavigator,
@@ -671,6 +673,78 @@ class BotAiPortTests(unittest.TestCase):
             current, goal, selected, minimum_request_distance=5.0))
         self.assertFalse(navigator.controlled_shallow_step(
             7, current, math.pi * 0.5))
+
+    def _pending_navigator(self):
+        """A navigator whose global search never finishes this frame."""
+        graph = self._baked_graph(9, 3)
+        hazards = [0] * 27
+        for row in range(3):
+            hazards[row * 9 + 5] = BAKED_SHALLOW_WATER
+        graph['hazards'] = hazards
+        navigator = TerrainNavigator(
+            lambda *unused: None, baked_graph=graph)
+        navigator._path = lambda *unused: (('search-result',), None)
+        return navigator
+
+    def test_pending_search_holds_only_for_a_bounded_grace(self):
+        """A queued search must not park the hull for the whole search.
+
+        The room shares one expansion budget, so a pending job can outlive
+        several seconds of real time. Holding briefly avoids a pointless creep
+        when the job finishes in a frame or two; holding forever is a parked
+        tank that the driver reads as arrival and the order adapter refuses to
+        steer at all.
+        """
+        navigator = self._pending_navigator()
+        current = (10.0, 0.0, 24.0)
+        goal = (42.0, 0.0, 24.0)
+        path_key = ('route_join', 7, 1, 'lane', 1)
+
+        held = navigator.next_target(7, current, goal, path_key, 1.0)
+        self.assertEqual(current, held)
+        self.assertEqual('pending', navigator.fallback_modes[7])
+
+        moved = navigator.next_target(
+            7, current, goal, path_key,
+            1.0 + navigation.PENDING_PROGRESS_SECONDS)
+
+        self.assertNotEqual(current, moved)
+        self.assertLess(_distance_2d(moved, goal), _distance_2d(current, goal))
+        self.assertFalse(navigator.grid.segment_has_baked_hazard(
+            current, moved, BAKED_FATAL_HAZARDS | BAKED_SHALLOW_WATER))
+        self.assertTrue(navigator.grid.segment_clear(current, moved))
+        self.assertFalse(TerrainNavigator.navigation_paused(
+            current, goal, moved, minimum_request_distance=5.0))
+
+    def test_pending_search_still_holds_when_no_safe_step_exists(self):
+        """Bounded progress never invents a step the probes did not prove."""
+        navigator = self._pending_navigator()
+        navigator.grid.safe_local_target = lambda *unused: None
+        current = (10.0, 0.0, 24.0)
+        goal = (42.0, 0.0, 24.0)
+        path_key = ('route_join', 7, 1, 'lane', 1)
+
+        navigator.next_target(7, current, goal, path_key, 1.0)
+        held = navigator.next_target(
+            7, current, goal, path_key,
+            1.0 + navigation.PENDING_PROGRESS_SECONDS)
+
+        self.assertEqual(current, held)
+        self.assertEqual('pending', navigator.fallback_modes[7])
+
+    def test_completed_route_target_restarts_the_pending_grace(self):
+        """A real routed target ends the episode; a probed step does not."""
+        navigator = self._pending_navigator()
+        current = (10.0, 0.0, 24.0)
+        goal = (42.0, 0.0, 24.0)
+        path_key = ('route_join', 7, 1, 'lane', 1)
+
+        navigator.next_target(7, current, goal, path_key, 1.0)
+        state = navigator.bot_states[7]
+        self.assertIn('pending_since', state)
+
+        navigator._set_fallback_mode(7, None)
+        self.assertNotIn('pending_since', state)
 
     def test_failed_shallow_search_keeps_reactive_local_recovery(self):
         graph = self._baked_graph(3, 1)
