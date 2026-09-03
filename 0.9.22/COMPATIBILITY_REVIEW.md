@@ -402,8 +402,10 @@ unresolved item and returns `-1` through `or eax, 0xffffffff` at `0x006b20b8`
 for a resolved item whose native type owns no handler - precisely the two
 cases the name loop skips. Enumerating it reconstructs the name list after
 every live item is typed. A full-width list is aligned by position, while each
-non-empty name's descriptor type must still equal that slot's live effect
-category. For a shorter list, empty strings carry no descriptor evidence and
+usable non-empty name's descriptor type must still equal that slot's live
+effect category. A slot-local catalog, matrix, or descriptor quarantine stays
+local when that mapping is rebuilt; its neighbours retain their positional
+proof. For a shorter list, empty strings carry no descriptor evidence and
 the remaining names are reconstructed per native type: an item is typed by
 its live effect category and a name by the client descriptor it resolves to,
 then both filtered sequences are paired in item order. This is sound only

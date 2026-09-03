@@ -298,14 +298,17 @@ def _native_chunk_destructible_count_1513(manager, chunk_id):
 	return int(count)
 
 
-def _native_name_groups_1513(area_destructibles, names):
+def _native_name_groups_1513(area_destructibles, names, ignored_items=()):
 	"""Type non-empty entries from a possibly compacted native name list."""
 	try:
 		cache = area_destructibles.g_cache
 	except Exception:
 		return None, 'descriptor_cache'
+	ignored_items = set(int(value) for value in ignored_items)
 	names_by_type = {}
-	for name in names:
+	for item_index, name in enumerate(names):
+		if item_index in ignored_items:
+			continue
 		# The pinned helper can append a non-NULL pointer to an empty C string.
 		# That entry identifies no descriptor, but still occupies its emitted slot.
 		if not name:
@@ -325,7 +328,8 @@ def _native_name_groups_1513(area_destructibles, names):
 
 
 def _align_native_item_names_1513(
-		names_by_type, items_by_type, positional_names=None):
+		names_by_type, items_by_type, positional_names=None,
+		ignored_items=()):
 	"""Finish a fully enumerated native-name alignment without guessing.
 
 	When the helper emitted exactly one string per native item, cardinality and
@@ -334,6 +338,7 @@ def _align_native_item_names_1513(
 	and can only be reconstructed by the stricter per-type count alignment.
 	"""
 	if positional_names is not None:
+		ignored_items = set(int(value) for value in ignored_items)
 		item_types = {}
 		for native_type, item_list in items_by_type.items():
 			for item_index in item_list:
@@ -345,6 +350,8 @@ def _align_native_item_names_1513(
 		mapping = {}
 		anomalous = []
 		for item_index, name in enumerate(positional_names):
+			if item_index in ignored_items:
+				continue
 			if not name:
 				continue
 			descriptor_type = name_types.get(name)
@@ -547,8 +554,13 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 			if victim is None:
 				return None, 'pending_alignment', ()
 			cache.pop(victim, None)
+		ignored_items = set()
+		if len(names) == int(native_count):
+			ignored_items = set(item_index for chunk, item_index in
+				globals().get('g_offh_destr_isolated_slots', ())
+				if int(chunk) == int(chunk_id))
 		names_by_type, status = _native_name_groups_1513(
-			area_destructibles, names)
+			area_destructibles, names, ignored_items)
 		if names_by_type is None:
 			entry = {
 				'fingerprint': fingerprint,
@@ -559,6 +571,7 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 				'fingerprint': fingerprint,
 				'names_by_type': names_by_type,
 				'items_by_type': {},
+				'ignored_items': ignored_items,
 				'next_item': 0,
 				'result': None,
 			}
@@ -574,7 +587,8 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	if entry['next_item'] >= int(native_count):
 		entry['result'] = _align_native_item_names_1513(
 			entry['names_by_type'], entry['items_by_type'],
-			names if len(names) == int(native_count) else None)
+			names if len(names) == int(native_count) else None,
+			entry['ignored_items'])
 		_release_item_name_query_focus_1513(space_id, chunk_id)
 		return entry['result']
 	query = getattr(bigworld, 'wg_getDestructibleEffectCategory', None)
@@ -591,6 +605,14 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 				# The first null-safe resolver query already proved that the native
 				# name loop omits this slot.  Preserve that exact evidence across
 				# mapping eviction without ever touching the quarantined slot again.
+				continue
+			if len(names) == int(native_count):
+				# A full-width name list already proves every remaining slot by
+				# position.  A catalog/matrix/descriptor failure for one exact
+				# slot must stay slot-local when this mapping is rebuilt after a
+				# neighbouring item is destroyed; do not turn it into a chunk-wide
+				# outage.  The ignored slot itself remains quarantined everywhere.
+				entry['ignored_items'].add(item_index)
 				continue
 			entry['result'] = (None, 'isolated_item', ())
 			_release_item_name_query_focus_1513(space_id, chunk_id)
@@ -620,7 +642,8 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 		return None, 'pending_alignment', ()
 	entry['result'] = _align_native_item_names_1513(
 		entry['names_by_type'], entry['items_by_type'],
-		names if len(names) == int(native_count) else None)
+		names if len(names) == int(native_count) else None,
+		entry['ignored_items'])
 	_release_item_name_query_focus_1513(space_id, chunk_id)
 	return entry['result']
 

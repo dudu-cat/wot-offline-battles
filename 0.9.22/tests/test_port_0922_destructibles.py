@@ -7920,6 +7920,91 @@ class NativeItemNameContractTests(unittest.TestCase):
         self.assertEqual({0: first, 2: second}, mapping)
         self.assertIsNone(mapping.get(1))
 
+    def test_full_width_rebuild_keeps_a_slot_failure_local(self):
+        first = 'content/GatesAndFences/test/normal/lod0/fence-a.model'
+        tree = 'speedtree/test/oak.spt'
+        self.descriptors[first] = {'type': self.FRAGILE, 'health': 15}
+        self.descriptors[tree] = {'type': self.TREE, 'health': 10}
+        items = ((self.FRAGILE, first), (self.FRAGILE, ''),
+                 (self.TREE, tree))
+        names, unused_chunk_filenames, effect_category = (
+            _native_item_surface(items))
+        calls = []
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getDestructibleEffectCategory = (
+            lambda *args: calls.append(args[2]) or effect_category(*args))
+        area = self._area()
+
+        with mock.patch.object(sys, 'stdout', mock.Mock()):
+            first_result = destructibles_sensor._chunk_item_names_1513(
+                bigworld, area, 1, 22, len(items), names)
+            # This models a catalog/matrix failure found while the first
+            # registry was built.  Destroying its neighbour invalidates the
+            # native-name cache and forces the runtime regression path.
+            destructibles_sensor.g_offh_destr_isolated_slots = {(22, 1)}
+            destructibles_sensor._invalidate_chunk_native_names_1513(22)
+            rebuilt = destructibles_sensor._chunk_native_names_1513(
+                bigworld, area, 1, 22, len(items), names)
+
+        self.assertEqual(({0: first, 2: tree}, 'exact', ()), first_result)
+        self.assertEqual((first_result[0], first_result[1]), rebuilt)
+        self.assertEqual([0, 1, 2, 0, 2], calls)
+        self.assertEqual(
+            {(22, 1)}, destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertNotIn(
+            'g_offh_destr_isolated_chunks', destructibles_sensor.__dict__)
+
+    def test_full_width_named_isolated_slot_is_not_retyped_or_mapped(self):
+        first = 'content/GatesAndFences/test/normal/lod0/fence-a.model'
+        broken = 'content/GatesAndFences/test/normal/lod0/fence-b.model'
+        tree = 'speedtree/test/oak.spt'
+        self.descriptors[first] = {'type': self.FRAGILE, 'health': 15}
+        self.descriptors[broken] = {'type': self.FRAGILE, 'health': 15}
+        self.descriptors[tree] = {'type': self.TREE, 'health': 10}
+        items = ((self.FRAGILE, first), (self.FRAGILE, broken),
+                 (self.TREE, tree))
+        names, unused_chunk_filenames, effect_category = (
+            _native_item_surface(items))
+        calls = []
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getDestructibleEffectCategory = (
+            lambda *args: calls.append(args[2]) or effect_category(*args))
+        area = self._area()
+        destructibles_sensor.g_offh_destr_isolated_slots = {(22, 1)}
+        # A descriptor failure on the already quarantined wire must not be
+        # consulted again or poison the exact positional proof for neighbours.
+        self.descriptors.pop(broken)
+
+        with mock.patch.object(sys, 'stdout', mock.Mock()):
+            mapping, status = destructibles_sensor._chunk_native_names_1513(
+                bigworld, area, 1, 22, len(items), names)
+
+        self.assertEqual('exact', status)
+        self.assertEqual({0: first, 2: tree}, mapping)
+        self.assertNotIn(1, mapping)
+        self.assertEqual([0, 2], calls)
+        self.assertEqual(
+            {(22, 1)}, destructibles_sensor.g_offh_destr_isolated_slots)
+        self.assertNotIn(
+            'g_offh_destr_isolated_chunks', destructibles_sensor.__dict__)
+
+    def test_compacted_rebuild_with_unknown_isolated_slot_stays_unsafe(self):
+        tree = 'speedtree/test/oak.spt'
+        self.descriptors[tree] = {'type': self.TREE, 'health': 10}
+        names = (tree,)
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getDestructibleEffectCategory = lambda *unused: self.TREE
+        destructibles_sensor.g_offh_destr_isolated_slots = {(22, 0)}
+
+        with mock.patch.object(sys, 'stdout', mock.Mock()):
+            mapping, status, anomalous = (
+                destructibles_sensor._chunk_item_names_1513(
+                    bigworld, self._area(), 1, 22, 2, names))
+
+        self.assertIsNone(mapping)
+        self.assertEqual('isolated_item', status)
+        self.assertEqual((), anomalous)
+
     def test_short_list_with_empty_name_never_uses_list_positions(self):
         first = 'speedtree/test/first.spt'
         second = 'speedtree/test/second.spt'
