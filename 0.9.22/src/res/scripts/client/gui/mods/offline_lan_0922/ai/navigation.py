@@ -1150,7 +1150,7 @@ class TerrainNavigator(object):
 		else:
 			self.search_failed += 1
 
-	def _cancel_bot_searches(self, bot_id):
+	def _cancel_bot_searches(self, bot_id, keep_key=None):
 		"""Discard superseded private jobs without touching shared route plans."""
 		bot_id = int(bot_id)
 		for key in list(self.searches):
@@ -1162,7 +1162,7 @@ class TerrainNavigator(object):
 				         int(path_key[1]) == bot_id)
 			except Exception:
 				owned = False
-			if owned:
+			if owned and key != keep_key:
 				self.searches.pop(key, None)
 				self.search_times.pop(key, None)
 
@@ -1288,6 +1288,14 @@ class TerrainNavigator(object):
 		search = self.searches.get(key)
 		if search is None:
 			owner = self._path_owner(path_key)
+			if owner is not None:
+				# Join and continuation keys include the Bot's current cell. A
+				# pending safe-local fallback can therefore move into a new cell
+				# and request a replacement before the old job finishes. Keep only
+				# that Bot's current private request so stale jobs cannot divide the
+				# navigator-wide expansion budget. Shared route searches and other
+				# Bots' work remain independent.
+				self._cancel_bot_searches(owner, keep_key=key)
 			edge_penalties = self._active_bot_edge_penalties(owner, now)
 			penalized_direct = bool(
 				edge_penalties and any(
