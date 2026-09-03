@@ -770,7 +770,7 @@ class BotAiPortTests(unittest.TestCase):
         """
         navigator, current, unused_goal = self._planned_ford()
         bearing = math.pi * 0.5
-        lagging = bearing + 0.78
+        lagging = bearing + 0.48
 
         self.assertFalse(
             navigator.controlled_shallow_step(7, current, lagging))

@@ -9152,11 +9152,11 @@ class BotRuntime(object):
                     if committed_fatal is False:
                         self._invalidate_realised_motion(
                             state['id'], committed_travel_yaw)
-                    # A shallow-only veto withholds this slice and nothing
-                    # more. Banning the approach heading for five seconds and
-                    # deleting the decision made the hull turn away from a ford
-                    # it had legitimately chosen, which is the dithering seen at
-                    # a shoreline.
+                    # A shallow-only veto withholds this pose and applies the
+                    # existing safety damping below, but does not invalidate
+                    # the approach. Banning it for five seconds and deleting
+                    # the decision made the hull turn away from a ford it had
+                    # legitimately chosen, which caused shoreline dithering.
                 previous_speed = _number(state.get('speed'))
                 speed = (0.0 if siege_motion_locked else
                     vehicle_physics.longitudinal_step(

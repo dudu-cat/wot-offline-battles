@@ -32,9 +32,9 @@ BLOCKED_STEP_EDGE_PENALTY = 240.0
 CONTROLLED_SHALLOW_YAW_WINDOW = FIRST_CANDIDATE_OFFSET + 0.03
 # The commit side sees an integrated hull yaw rather than the candidate the
 # planner chose, so it asks for a closing component instead of a cone. Half a
-# unit of cosine is sixty degrees: it covers the fan's realistic avoidance
-# branches around a ford (0, +/-0.42, +/-0.78) and still refuses a hull that
-# is drifting sideways into the water.
+# unit of cosine is sixty degrees: it tolerates a lagging hull while still
+# refusing one that is drifting sideways. The independent cell check below
+# keeps either angular gate bound to the ford cells A* actually selected.
 CONTROLLED_SHALLOW_COMMIT_CLOSING = 0.5
 
 SEARCH_EXPANSIONS_PER_SECOND = 960.0
@@ -331,6 +331,25 @@ class TerrainGrid(object):
 					int(self._baked_hazards[index]) & int(hazard_mask)):
 				return True
 		return False
+
+	def baked_hazard_cells(self, start, end, hazard_mask):
+		"""Return entered hazard cells, or ``None`` for an invalid corridor."""
+		if (not self.prebaked or
+				self._baked_index(self.cell_for(start)) is None):
+			return None
+		cells = self._baked_segment_cells(start, end)
+		if not cells:
+			return None
+		result = []
+		# Match segment_has_baked_hazard: the occupied start cell is not a new
+		# entry, so a tank already in a ford remains able to leave it.
+		for cell in cells[1:]:
+			index = self._baked_index(cell)
+			if index is None:
+				return None
+			if int(self._baked_hazards[index]) & int(hazard_mask):
+				result.append(cell)
+		return tuple(result)
 
 	def point_has_baked_hazard(self, point, hazard_mask):
 		"""Return whether one realised pose occupies a baked hazard cell."""
@@ -1569,6 +1588,32 @@ class TerrainNavigator(object):
 		state = self.bot_states.get(int(bot_id))
 		return bool(state is not None and state.get('target_is_terminal'))
 
+	def _controlled_shallow_corridor_matches(self, current, target,
+			travel_yaw):
+		"""Keep a shallow exception inside the cells of the armed A* step."""
+		try:
+			distance = max(1.0, float(self.grid.cell_size))
+			end = (
+				float(current[0]) + math.sin(float(travel_yaw)) * distance,
+				float(current[1]),
+				float(current[2]) + math.cos(float(travel_yaw)) * distance,
+			)
+			planned_shallow = self.grid.baked_hazard_cells(
+				current, target, BAKED_SHALLOW_WATER)
+			committed_shallow = self.grid.baked_hazard_cells(
+				current, end, BAKED_SHALLOW_WATER)
+			if (not planned_shallow or committed_shallow is None or
+					self.grid.segment_has_baked_hazard(
+						current, target, BAKED_FATAL_HAZARDS) or
+					self.grid.segment_has_baked_hazard(
+						current, end, BAKED_FATAL_HAZARDS)):
+				return False
+			allowed = set(planned_shallow)
+			return all(cell in allowed for cell in committed_shallow)
+		except (AttributeError, IndexError, TypeError, ValueError,
+				OverflowError):
+			return False
+
 	def controlled_shallow_step(self, bot_id, current, sample_yaw,
 			maximum_yaw_error=CONTROLLED_SHALLOW_YAW_WINDOW):
 		"""Admit only headings toward the A*-selected ford into a shallow cell."""
@@ -1587,7 +1632,10 @@ class TerrainNavigator(object):
 			difference -= math.pi * 2.0
 		while difference < -math.pi:
 			difference += math.pi * 2.0
-		return abs(difference) <= max(0.0, float(maximum_yaw_error))
+		return (
+			abs(difference) <= max(0.0, float(maximum_yaw_error)) and
+			self._controlled_shallow_corridor_matches(
+				current, target, sample_yaw))
 
 	def controlled_shallow_committed(self, bot_id, current, travel_yaw):
 		"""Admit a realised step while the hull still closes on the ford.
@@ -1599,9 +1647,10 @@ class TerrainNavigator(object):
 		one step could deliver, so re-deriving admission from it vetoed the very
 		rotation the planner had just asked for: the step was refused, the
 		heading was banned, and the next tactical update selected the same ford
-		again. Once A* has armed a ford, the commit-side question is only
-		whether the hull is still travelling toward it. Fatal hazards are
-		unaffected; they are vetoed by the caller regardless of this answer.
+		again. Once A* has armed a ford, the commit side accepts a lagging hull
+		only while it still closes on the target and its realised corridor enters
+		no shallow cell outside that selected A* step. Fatal and invalid graph
+		corridors are never admitted.
 		"""
 		state = self.bot_states.get(int(bot_id))
 		if state is None:
@@ -1616,7 +1665,10 @@ class TerrainNavigator(object):
 			return False
 		closing = (math.sin(float(travel_yaw)) * dx +
 		           math.cos(float(travel_yaw)) * dz) / length
-		return closing > CONTROLLED_SHALLOW_COMMIT_CLOSING
+		return (
+			closing > CONTROLLED_SHALLOW_COMMIT_CLOSING and
+			self._controlled_shallow_corridor_matches(
+				current, target, travel_yaw))
 
 	@staticmethod
 	def navigation_paused(current, requested_goal, selected_target,

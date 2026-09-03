@@ -10598,7 +10598,7 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.navigator.bot_states.setdefault(11, {})[
             'controlled_shallow_target'] = (8.0, 0.0, 4.0)
         approach = (4.0, 0.0, 4.0)
-        lagging = math.pi * 0.5 + 0.78
+        lagging = math.pi * 0.5 + 0.48
 
         self.assertFalse(runtime.navigator.controlled_shallow_step(
             11, approach, lagging))
@@ -10610,6 +10610,70 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertTrue(runtime._planner_corridor_clear(
             approach, lagging, 0.0, allow_shallow=admitted,
             hazard_only=True))
+
+    def test_commit_gate_cannot_enter_shallow_beside_the_astar_step(self):
+        """Closing on a ford cannot authorize a different shallow cell."""
+        command = self._stationary_command()
+        command.update({
+            'target_yaw': math.pi * 0.5, 'throttle': 1.0, 'turn': 0.0,
+            'combat_mode': 'route', 'move_position': (8.0, 0.0, 4.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        })
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=self._ford_graph())
+        runtime.battle_start(self.start)
+        planning_start = (4.0, 0.0, 4.0)
+        goal = (16.0, 0.0, 4.0)
+        route_key = ('route', 1, 'only-ford')
+        runtime.navigator.next_target(
+            11, planning_start, goal, route_key, 1.0)
+        selected = runtime.navigator.next_target(
+            11, planning_start, goal, route_key, 1.1)
+        self.assertEqual((8.0, 0.0, 4.0), selected)
+
+        # Before the next plan, a realised pose near the cell corner makes
+        # even the old tight candidate cone point into an adjacent shallow cell
+        # that A* did not select.
+        approach = (2.6, 0.0, 3.0)
+        bearing = math.atan2(
+            selected[0] - approach[0], selected[2] - approach[2])
+        lagging = bearing + 0.449
+        self.assertLess(abs(lagging - bearing), 0.45)
+        self.assertGreater(math.cos(lagging - bearing), 0.5)
+        planned_cells = runtime.navigator.grid._baked_segment_cells(
+            approach, selected)
+        distance = runtime.navigator.grid.cell_size
+        committed_end = (
+            approach[0] + math.sin(lagging) * distance,
+            approach[1],
+            approach[2] + math.cos(lagging) * distance)
+        committed_cells = runtime.navigator.grid._baked_segment_cells(
+            approach, committed_end)
+        self.assertEqual(((1, 1), (2, 1)), planned_cells)
+        self.assertEqual(((1, 1), (2, 0)), committed_cells)
+        self.assertFalse(runtime.navigator.controlled_shallow_step(
+            11, approach, lagging))
+        self.assertFalse(runtime.navigator.controlled_shallow_committed(
+            11, approach, lagging))
+
+        state = runtime.states[11]
+        state.update(x=approach[0], y=approach[1], z=approach[2],
+                     yaw=lagging, speed=8.0, grounded_once=True)
+        runtime.update(0.04, 1.2)
+
+        self.assertEqual((approach[0], approach[2]),
+                         (state['x'], state['z']))
+        self.assertEqual(0, state['movement_dir'])
+        self.assertLess(state['speed'], 2.0)
+        self.assertEqual(selected, runtime.navigator.bot_states[11][
+            'controlled_shallow_target'])
 
     def test_reverse_probe_pitch_is_stored_in_hull_coordinates(self):
         command = self._stationary_command()
