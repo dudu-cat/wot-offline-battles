@@ -11223,10 +11223,18 @@ class BotRuntimeTests(unittest.TestCase):
             ground_probe=lambda *unused: 0.0,
             physics_ground_probe=lambda *unused: 0.0,
             spawn_resolver=_spawn_resolver, baked_graph=_graph())
-        runtime.battle_start(self.start)
+        runtime.battle_start(dict(self.start, bots=[
+            {'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot'},
+            {'id': 12, 'team': 2, 'slot': 1, 'name': 'Bot'},
+        ]))
         current = runtime.states[11]
         current.update(x=0.0, y=0.0, z=6.5, yaw=math.pi,
                        speed=0.0, push_x=0.0, push_z=0.0)
+        # A transverse friendly overlaps the same Bot in this physical slice.
+        # Its separate solver response must not charge the slice twice.
+        runtime.states[12].update(
+            x=2.5, y=0.0, z=10.0, yaw=math.pi,
+            speed=0.0, push_x=0.0, push_z=0.0)
         historical = dict(current)
         historical.update(ram_vx=0.0, ram_vz=0.0)
         player = {
@@ -11264,7 +11272,9 @@ class BotRuntimeTests(unittest.TestCase):
         # The same-frame current detector must not apply that impulse twice.
         expected_push = 8.0 * (0.90 ** (0.04 * 60.0))
         self.assertAlmostEqual(expected_push, current['push_z'], places=5)
-        self.assertEqual({11: 0.04}, runtime._contact_lease_elapsed)
+        self.assertNotEqual((0.0, 6.5), (current['x'], current['z']))
+        self.assertEqual({11: 0.04, 12: 0.04},
+                         runtime._contact_lease_elapsed)
 
     def test_human_ram_receipt_uses_obb_face_normal_for_side_scrape(self):
         descriptor = _combat_descriptor()

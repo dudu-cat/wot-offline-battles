@@ -6330,9 +6330,17 @@ class BotRuntime(object):
         state['push_z'] = push_z * push_decay
 
     def _resolve_human_ram_receipts(self, players, now, step=None,
-                                    processed_pairs=None):
-        """Recompute client-observed contact against its canonical bot body."""
+                                    processed_pairs=None,
+                                    contacted_bot_ids=None):
+        """Recompute client-observed contact against its canonical bot body.
+
+        Contact responders share the caller's per-slice set when provided, so
+        one Bot pays at most once even if several hulls respond in that slice.
+        """
         reports = []
+        owns_contacted_bot_ids = contacted_bot_ids is None
+        if owns_contacted_bot_ids:
+            contacted_bot_ids = set()
         receipt_players = {}
         for raw in players or ():
             if not isinstance(raw, dict) or raw.get('id') is None:
@@ -6566,12 +6574,10 @@ class BotRuntime(object):
                                            for before, after in zip(
                                                before_response,
                                                after_response)):
-                                        # This pair is excluded from the
-                                        # current-pose solver below. Preserve
-                                        # the lease for the receipt impulse
-                                        # actually applied in this slice.
-                                        self._record_traffic_wait_contact(
-                                            bot_id, step)
+                                        # This pair is excluded from the main
+                                        # current-pose solver, but shares its
+                                        # one-lease-per-slice collector.
+                                        contacted_bot_ids.add(bot_id)
                                 event = {
                                     'self_id': bot['id'],
                                     'other_id': player['id'],
@@ -6607,6 +6613,9 @@ class BotRuntime(object):
                 # One unresolved transaction per player preserves ledger
                 # order even when transport retries or snapshots coalesce.
                 break
+        if owns_contacted_bot_ids and step is not None:
+            for bot_id in sorted(contacted_bot_ids):
+                self._record_traffic_wait_contact(bot_id, step)
         return reports
 
     def _record_traffic_wait_contact(self, bot_id, elapsed):
@@ -6719,8 +6728,10 @@ class BotRuntime(object):
         collision_index = tank_collision.build_spatial_index(
             collision_bodies, maximum_radius * 2.0 + 4.0)
         receipt_pairs = set()
+        contacted_bot_ids = set()
         reports = self._resolve_human_ram_receipts(
-            players, now, step=step, processed_pairs=receipt_pairs)
+            players, now, step=step, processed_pairs=receipt_pairs,
+            contacted_bot_ids=contacted_bot_ids)
         previous_ram_contacts = self._ram_contacts
         current_ram_contacts = set()
         frame_ram_armors = {}
@@ -6780,10 +6791,12 @@ class BotRuntime(object):
                     any(abs(_number(value)) > 0.0001
                         for value in result['correction'])):
                 # Another hull owns this tank's lack of progress this tick.
-                self._record_traffic_wait_contact(state['id'], step)
+                contacted_bot_ids.add(int(state['id']))
             self._apply_tank_contact_response(state, result, step)
             reports.extend(self._ram_reports(
                 state, result['ram_events']))
+        for bot_id in sorted(contacted_bot_ids):
+            self._record_traffic_wait_contact(bot_id, step)
         self._ram_contacts = frozenset(current_ram_contacts)
         return reports
 
