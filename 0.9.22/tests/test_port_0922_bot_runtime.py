@@ -5091,6 +5091,128 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(0.0, runtime._accumulator)
         self.assertEqual(1, len(adapter.calls))
 
+    def _drive_runtime(self, direction_probe):
+        """One driving Bot whose only variable is the direction probe."""
+        command = self._stationary_command()
+        command.update({
+            'throttle': 1.0, 'combat_mode': 'route',
+            'move_position': (0.0, 0.0, 400.0),
+            'recovery_mode': 'drive', 'movement_intent': True,
+        })
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(command),
+            direction_probe=direction_probe,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph(),
+            control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.battle_start(self.start)
+        runtime.navigator = None
+        runtime.states[11].update(
+            x=0.0, y=0.0, z=0.0, yaw=0.0, speed=8.0, grounded_once=True)
+        return runtime
+
+    @staticmethod
+    def _recast_budget_probe(budget=4):
+        """Model the shared per-callback soft-static recast budget.
+
+        Production resets ``BOT_SOFT_RECAST_BUDGET`` once per render callback
+        and every direction probe that must recast past a proved-crushable OBB
+        consumes one token. Exhaustion returns a ``deferred`` sample, which
+        proves neither a wall nor a clear path.
+        """
+        tokens = [budget]
+
+        def probe(*unused):
+            sample = {'clear': True, 'collision': False, 'slope': 0.0}
+            if tokens[0] <= 0:
+                sample['deferred'] = True
+            else:
+                tokens[0] -= 1
+            return sample
+        probe.reset = lambda: tokens.__setitem__(0, budget)
+        return probe
+
+    def _drive_distance(self, frames, dt, probe):
+        runtime = self._drive_runtime(probe)
+        state = runtime.states[11]
+        original_decision_seconds = self.module.DECISION_SECONDS
+        original_pose_safe = self.module.prebaked_navigation.pose_is_safe
+        self.module.DECISION_SECONDS = 2.0
+        self.module.prebaked_navigation.pose_is_safe = (
+            lambda *unused, **unused_kwargs: True)
+        try:
+            for frame in range(frames):
+                probe.reset()
+                runtime.update(dt, 1.0 + (frame + 1) * dt)
+        finally:
+            self.module.DECISION_SECONDS = original_decision_seconds
+            self.module.prebaked_navigation.pose_is_safe = original_pose_safe
+        return state['z'], state
+
+    def test_deferred_probe_keeps_the_proved_corridor(self):
+        """A budget deferral is not evidence of a wall, so the cache stays."""
+        probe = self._recast_budget_probe()
+        runtime = self._drive_runtime(probe)
+        original_decision_seconds = self.module.DECISION_SECONDS
+        original_pose_safe = self.module.prebaked_navigation.pose_is_safe
+        self.module.DECISION_SECONDS = 2.0
+        self.module.prebaked_navigation.pose_is_safe = (
+            lambda *unused, **unused_kwargs: True)
+        try:
+            runtime.update(0.1, 1.1)
+            self.assertIn(11, runtime._motion_probe_cache)
+            proved = runtime._motion_probe_cache[11]
+            # Second callback: no tokens at all, so every sample is deferred.
+            probe.reset()
+            for unused in range(4):
+                probe(None)
+            runtime.update(0.1, 1.2)
+        finally:
+            self.module.DECISION_SECONDS = original_decision_seconds
+            self.module.prebaked_navigation.pose_is_safe = original_pose_safe
+        self.assertIn(11, runtime._motion_probe_cache)
+        self.assertEqual(
+            proved['result'], runtime._motion_probe_cache[11]['result'])
+
+    def test_low_fps_catchup_keeps_hull_momentum(self):
+        """A slow callback must not restart acceleration from standstill.
+
+        Both runs simulate the same two seconds against the same command and
+        the same per-callback probe budget; only the callback partitioning
+        differs. One token per callback is the interesting case: the refresh
+        slice spends it and every catch-up slice of the same callback is then
+        deferred. Withholding drive and freezing the pose is correct, but
+        deleting ``state['speed']`` made the low-rate run rebuild its velocity
+        from zero on every callback. Measured over 2.0 s at 10 Hz vs 2 Hz:
+        16.0 m either way when the budget is not exhausted; with one token the
+        2 Hz run travelled 5.5 m and ended at 3.7 m/s before this change and
+        9.2 m ending at 5.4 m/s after it.
+        """
+        fast, unused_fast_state = self._drive_distance(
+            20, 0.1, self._recast_budget_probe(1))
+        slow, slow_state = self._drive_distance(
+            4, 0.5, self._recast_budget_probe(1))
+        self.assertGreater(fast, 15.0)
+        self.assertGreater(slow, fast * 0.5)
+        self.assertGreater(abs(slow_state['speed']), 4.5)
+
+    def test_catchup_without_any_proved_corridor_still_stops(self):
+        """Preserving momentum must not license travel through unknown space.
+
+        With no recast tokens at all no corridor is ever proved, so the hull
+        must withhold drive and come to rest rather than coast on a corridor
+        the worker could not sample.
+        """
+        fast, unused_fast_state = self._drive_distance(
+            20, 0.1, self._recast_budget_probe(4))
+        stalled, stalled_state = self._drive_distance(
+            4, 0.5, self._recast_budget_probe(0))
+        self.assertGreater(fast, 15.0)
+        self.assertLess(stalled, fast * 0.35)
+        self.assertAlmostEqual(0.0, stalled_state['speed'], places=3)
+
     def test_worker_one_hz_holds_one_drive_plan_through_bounded_slices(self):
         command = self._stationary_command()
         command.update({

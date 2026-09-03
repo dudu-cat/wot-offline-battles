@@ -8874,6 +8874,11 @@ class BotRuntime(object):
                 # beyond that escape edge must not veto clear space at the rear.
                 maximum_probe_distance = reactive_horizon
             cached_motion_probe = self._motion_probe_cache.get(state['id'])
+            # A frozen pose keeps this slice's realised translation at zero
+            # without claiming that the corridor is blocked, so it must not
+            # arm the failed-yaw, blocked-step or contact escalations that
+            # ``path_clear`` owns.
+            pose_frozen = False
             settled_motion = bool(
                 abs(throttle) <= 0.01 and abs(turn) <= 0.01 and
                 abs(_number(state.get('speed'))) <= 0.02 and
@@ -8906,10 +8911,17 @@ class BotRuntime(object):
                 # turn a missing/deferred/blocked sample into motion. A valid
                 # command which merely consumed or turned beyond its old clear
                 # corridor re-probes below without re-entering the planner.
+                # Withhold drive and freeze the pose, but do not delete the
+                # hull's momentum: a slice that cannot prove its corridor has
+                # not proved that a forty-tonne tank stopped. Zeroing the speed
+                # made every catch-up slice of a slow callback restart
+                # acceleration from standstill, which is the visible
+                # walk-stop-walk motion at low worker frame rates. Copied
+                # physics still decelerates below because throttle is zero.
                 motion_probe = None
                 throttle = 0.0
                 turn = 0.0
-                state['speed'] = 0.0
+                pose_frozen = True
             elif not motion_probe_reusable:
                 # Planner ranking is intentionally unable to satisfy this
                 # gate.  Every newly selected travel corridor receives its own
@@ -9017,12 +9029,19 @@ class BotRuntime(object):
                                 now, state['id'],
                                 cached_motion_probe is None)),
                     }
-                else:
+                elif not (isinstance(motion_probe, dict) and
+                          motion_probe.get('deferred', False)):
                     old_result = ((cached_motion_probe or {}).get(
                         'result') or {})
                     if not isinstance(old_result.get(
                             'world_receipt'), dict):
                         self._motion_probe_cache.pop(state['id'], None)
+                # A deferred sample only means the shared soft-static recast
+                # budget was exhausted this callback. ``_motion_probe_reusable``
+                # already documents that a deferral proves neither a wall nor a
+                # soft path, so the still-geometrically-valid cached corridor is
+                # kept and its own containment test decides the next slice.
+                # Evicting it turned a budget shortage into a catch-up hold.
             else:
                 motion_probe = cached_motion_probe['result']
             probe_deferred = bool(
@@ -9155,8 +9174,12 @@ class BotRuntime(object):
                 contact_speed = _number(state.get(
                     'destructible_contact_speed'), speed)
                 contact_v0 = speed
-                if (path_clear and abs(speed) > 0.0001 and
+                if (path_clear and not pose_frozen and
+                        abs(speed) > 0.0001 and
                         callable(self.motion_resolver)):
+                    # A frozen catch-up slice realises no translation, so the
+                    # exact resolver must not sweep (and possibly crush) along
+                    # a corridor the hull is not travelling this slice.
                     resolved_motion = True
                     if self._probe_clock is None:
                         motion_status = self.motion_resolver(
@@ -9225,7 +9248,7 @@ class BotRuntime(object):
                         state['speed'] = speed
                 if contact_deflected:
                     state['x'], state['y'], state['z'] = contact_position
-                elif path_clear:
+                elif path_clear and not pose_frozen:
                     state['x'] += math.sin(state['yaw']) * speed * step
                     state['z'] += math.cos(state['yaw']) * speed * step
                     if abs(speed) > 0.0001:
