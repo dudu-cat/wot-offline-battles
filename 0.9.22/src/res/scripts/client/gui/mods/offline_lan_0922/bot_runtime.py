@@ -6312,10 +6312,18 @@ class BotRuntime(object):
             # because it ranks a driving direction; a contact response moves
             # centimetres, so that default let a rock or wall well beyond the
             # hull veto the separation and leave two tanks wedged together.
-            # The hull's leading half-length keeps the query meaningful.
+            # Reach past the current leading OBB support in the nudge
+            # direction. A diagonal response can lead with a corner farther
+            # from the centre than half_length; the three probe lanes share
+            # one axial endpoint and cannot recover that missing distance.
+            relative_yaw = contact_yaw - yaw
+            hull_support = (
+                max(0.5, _number(state.get('half_length'), 3.5)) *
+                abs(math.cos(relative_yaw)) +
+                max(0.3, _number(state.get('half_width'), 1.7)) *
+                abs(math.sin(relative_yaw)))
             separation_distance = max(
-                1.0,
-                move_distance + _number(state.get('half_length'), 3.5))
+                1.0, move_distance + hull_support)
             if not self._clear(
                     _position(state), contact_yaw, contact_speed, None,
                     separation_distance):

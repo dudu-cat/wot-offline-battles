@@ -10545,6 +10545,52 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual(0.0, state['x'])
         self.assertEqual(0.0, state['push_x'])
 
+    def test_tank_separation_probe_reaches_diagonal_leading_corner(self):
+        """An oblique nudge must probe past the OBB's leading corner."""
+        requested = []
+        wall_distance = 4.0
+
+        def probe(position, yaw, speed, descriptor, maximum_distance=None):
+            requested.append(maximum_distance)
+            # Model an infinite wall transverse to the nudge. All three
+            # lateral rays miss it when their common axial endpoint is short.
+            blocked = bool(maximum_distance is not None and
+                           float(maximum_distance) >= wall_distance)
+            return {'clear': not blocked, 'collision': blocked,
+                    'water': False, 'slope': 0.0}
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=probe,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        half_length = 3.5
+        half_width = 1.7
+        support = math.sqrt(
+            half_length * half_length + half_width * half_width)
+        nudge = 0.25
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0,
+                     half_length=half_length, half_width=half_width,
+                     grounded_once=True, push_x=0.0, push_z=0.0)
+
+        runtime._apply_tank_contact_response(
+            state, {'delta_velocity': (0.0, 0.0),
+                    'correction': (nudge * half_width / support,
+                                   nudge * half_length / support)}, 0.1)
+
+        old_axial_reach = half_length + nudge
+        expected_reach = support + nudge
+        self.assertLess(old_axial_reach, wall_distance)
+        self.assertLess(wall_distance, expected_reach)
+        self.assertEqual(1, len(requested))
+        self.assertAlmostEqual(expected_reach, requested[0])
+        self.assertEqual((0.0, 0.0), (state['x'], state['z']))
+
     def test_reverse_probe_pitch_is_stored_in_hull_coordinates(self):
         command = self._stationary_command()
         command.update({
