@@ -4981,6 +4981,71 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertEqual([0.12, 0.10], steps)
         self.assertAlmostEqual(0.0, runtime._accumulator)
 
+    def test_high_fps_contact_lease_pays_the_consumed_physical_time(self):
+        waited = []
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.authority_id = 1
+        runtime.adapter = types.SimpleNamespace(driver=type(
+            '_Driver', (object,), {
+                'wait_for_traffic': staticmethod(
+                    lambda bot_id, elapsed:
+                        waited.append((bot_id, elapsed))),
+            })())
+
+        def contact(step, *unused):
+            runtime._record_traffic_wait_contact(11, step)
+            return []
+
+        runtime._run_update_once = contact
+        for frame in range(60):
+            runtime.update(1.0 / 60.0, (frame + 1) / 60.0)
+
+        self.assertEqual(10, len(waited))
+        self.assertAlmostEqual(1.0, sum(
+            elapsed for unused_bot_id, elapsed in waited))
+
+    def test_low_fps_lease_pays_only_the_slice_that_made_contact(self):
+        waited = []
+        slices = []
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.authority_id = 1
+        runtime.adapter = types.SimpleNamespace(driver=type(
+            '_Driver', (object,), {
+                'wait_for_traffic': staticmethod(
+                    lambda bot_id, elapsed:
+                        waited.append((bot_id, elapsed))),
+            })())
+
+        def final_slice_contact(step, *unused):
+            slices.append(step)
+            if len(slices) == 3:
+                runtime._record_traffic_wait_contact(11, step)
+            return []
+
+        runtime._run_update_once = final_slice_contact
+        runtime.update(0.5, 0.5)
+
+        self.assertEqual(3, len(slices))
+        self.assertEqual(1, len(waited))
+        self.assertEqual(11, waited[0][0])
+        self.assertAlmostEqual(0.1, waited[0][1])
+
+    def test_contact_lease_cannot_cross_an_early_return_or_teardown(self):
+        runtime = self.module.BotRuntime(
+            1, control_seconds=self.module.WORKER_CONTROL_SECONDS)
+        runtime.authority_id = 1
+        runtime.adapter = object()
+        runtime._contact_lease_elapsed = {11: 0.1}
+
+        self.assertEqual([], runtime.update(0.01, 0.01))
+        self.assertEqual({}, runtime._contact_lease_elapsed)
+
+        runtime._contact_lease_elapsed = {11: 0.1}
+        runtime.apply_snapshot({'battle_result': {}})
+        self.assertEqual({}, runtime._contact_lease_elapsed)
+
     def test_worker_fixed_control_tracks_wall_time_from_five_to_one_fps(self):
         wall_seconds = 2
         for fps in (5, 4, 2, 1):
@@ -10510,16 +10575,12 @@ class BotRuntimeTests(unittest.TestCase):
         runtime.adapter.driver = type('_Driver', (object,), {
             'wait_for_traffic': staticmethod(
                 lambda bot_id, elapsed: waited.append((bot_id, elapsed)))})()
-        runtime._contact_lease_ids = set([11, 12])
+        runtime._contact_lease_elapsed = {11: 0.10, 12: 0.25}
 
-        runtime._apply_traffic_wait_lease(0.25)
+        runtime._apply_traffic_wait_lease()
 
-        # The lease is paid with the callback's own elapsed. last_step is the
-        # planner's decision interval and is only refreshed when drive() runs,
-        # so at high frame rates it would spend the bounded wait roughly ten
-        # times faster than real time.
-        self.assertEqual([(11, 0.25), (12, 0.25)], sorted(waited))
-        self.assertEqual(set(), runtime._contact_lease_ids)
+        self.assertEqual([(11, 0.10), (12, 0.25)], waited)
+        self.assertEqual({}, runtime._contact_lease_elapsed)
 
     def test_overlapping_hulls_record_a_contact_lease(self):
         """The lease is granted by the contact solver, not guessed."""
@@ -10530,11 +10591,34 @@ class BotRuntimeTests(unittest.TestCase):
                      grounded_once=True)
         second.update(x=0.0, y=0.0, z=2.0, yaw=0.0, speed=0.0,
                       grounded_once=True)
-        runtime._contact_lease_ids = set()
+        runtime._contact_lease_elapsed = {}
 
         runtime._resolve_tank_contacts([], 1.0, 0.1)
 
-        self.assertTrue(runtime._contact_lease_ids)
+        self.assertEqual({11: 0.1, 12: 0.1},
+                         runtime._contact_lease_elapsed)
+
+    def test_player_neighbours_keep_large_wreck_collision_dimensions(self):
+        descriptor = _combat_descriptor()
+        descriptor.chassis.hitTester = _HitTester1513(
+            (-2.0, -0.8, -6.0), (2.0, 0.8, 6.0))
+        runtime = self.module.BotRuntime(
+            1, player_descriptor_resolver=lambda unused: descriptor)
+        player = _admit_player({
+            'id': 2, 'team': 1, 'vehicle': 'test:large_tank',
+            'x': 0.0, 'y': 0.0, 'z': -8.5,
+            'yaw': 0.0, 'speed': -5.0, 'alive': False,
+        })
+
+        neighbours = runtime._player_neighbours([player])
+
+        self.assertEqual(1, len(neighbours))
+        self.assertEqual((6.0, 2.0), (
+            neighbours[0]['half_length'], neighbours[0]['half_width']))
+        self.assertEqual((0.0, 0.0, 0.0), neighbours[0]['velocity'])
+        driver = self.module.ai_driver.LocalDriver()
+        self.assertTrue(driver._reverse_blocked_by_vehicle(
+            (0.0, 0.0, 0.0), 0.0, neighbours, 2.0, 1.0))
 
     def test_production_adapter_exposes_a_lease_capable_driver(self):
         """The wiring above must reach the shipped adapter, not a double."""

@@ -159,11 +159,9 @@ class LocalDriver(object):
 	def wait_for_traffic(self, bot_id, elapsed=None):
 		"""Suppress brief right-of-way waits without masking a deadlock forever.
 
-		``elapsed`` is the real interval this lease covers. Callers that grant it
-		once per render callback must supply it: ``last_step`` is the planner's
-		decision interval and is only refreshed when ``drive`` actually runs, so
-		re-using it on every callback spends the bounded wait far faster than
-		real time at high frame rates.
+		``elapsed`` is the physical contact interval this lease covers. Callers
+		outside ``drive`` must supply it because ``last_step`` is refreshed only
+		when the planner runs.
 		"""
 		state = self.states.get(bot_id)
 		if state is None:
@@ -417,17 +415,22 @@ class LocalDriver(object):
 
 	def _reverse_blocked_by_vehicle(self, position, yaw, neighbours,
 			half_length, half_width):
-		"""Reject a blind reverse when a hull already occupies the space behind.
+		"""Reject a blind reverse whose reachable hull sweep is occupied.
 
 		``direction_clear`` answers for terrain and static world geometry only.
 		In a spawn line-up every tank reaches the stuck threshold within about a
 		second of every other one, so an unchecked reverse recovery drives each
 		hull straight into the one behind it and the whole formation grinds.
 		"""
-		behind = (
-			float(position[0]) - math.sin(float(yaw)) * half_length * 1.6,
+		reverse_distance = half_length * 1.6
+		# Translating an OBB along its longitudinal axis sweeps one exact longer
+		# OBB. Sampling only the final pose misses a hull at the current or an
+		# intermediate reachable position.
+		sweep = (
+			float(position[0]) - math.sin(float(yaw)) * reverse_distance * 0.5,
 			float(position[1]),
-			float(position[2]) - math.cos(float(yaw)) * half_length * 1.6)
+			float(position[2]) - math.cos(float(yaw)) * reverse_distance * 0.5)
+		sweep_length = half_length + reverse_distance * 0.5
 		for neighbour in neighbours or ():
 			other = self._neighbour_position(neighbour)
 			if other is None:
@@ -448,7 +451,7 @@ class LocalDriver(object):
 					neighbour.get('half_width', half_width) or half_width)
 			try:
 				if self._obb_overlap(
-						behind, float(yaw), half_length, half_width,
+						sweep, float(yaw), sweep_length, half_width,
 						other, other_yaw, other_length, other_width):
 					return True
 			except Exception:

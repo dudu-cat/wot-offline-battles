@@ -1815,7 +1815,10 @@ class BotRuntime(object):
              unused_shell, unused_receipt: True))
         self.artillery_launch_cancel = artillery_launch_cancel
         self.spawn_resolver = spawn_resolver
-        self._contact_lease_ids = set()
+        # Contact time is accumulated per physical slice and drained at the
+        # end of the render callback. A callback can contain no slice at high
+        # FPS or several bounded catch-up slices at low FPS.
+        self._contact_lease_elapsed = {}
         self._injected_baked_graph = baked_graph
         self.baked_graph = None
         self._navigation_map_name = None
@@ -2689,6 +2692,7 @@ class BotRuntime(object):
             self._ram_seq = 0
             self._human_ram_receipt_seq = {}
             self._human_ram_report_cache = {}
+            self._contact_lease_elapsed = {}
             self.adapter = None
             self.finished = False
             self._visibility_cache = {}
@@ -3642,6 +3646,7 @@ class BotRuntime(object):
             self.finished = True
             self._clear_artillery_intents()
             self._friendly_repositions = {}
+            self._contact_lease_elapsed = {}
         server_tick = message.get('server_tick')
         if server_tick is not None:
             try:
@@ -5807,21 +5812,24 @@ class BotRuntime(object):
                 now)
         return target
 
-    @staticmethod
-    def _player_neighbours(players):
+    def _player_neighbours(self, players):
         result = []
         for raw in players or ():
-            if (not isinstance(raw, dict) or raw.get('id') is None or
-                    not raw.get('alive', True)):
+            if not isinstance(raw, dict) or raw.get('id') is None:
                 continue
             yaw = _number(raw.get('yaw'))
-            speed = _number(raw.get('speed'))
+            alive = bool(raw.get('alive', True))
+            speed = _number(raw.get('speed')) if alive else 0.0
+            shape = self._player_collision_profile(raw)['shape']
             result.append({
                 'id': HUMAN_TARGET_ID_BASE + int(raw['id']),
                 'position': _position(raw),
                 'team': int(_number(raw.get('team'))), 'yaw': yaw,
+                'alive': alive,
                 'velocity': (math.sin(yaw) * speed, 0.0,
                              math.cos(yaw) * speed),
+                'half_length': _number(shape[1]),
+                'half_width': _number(shape[0]),
             })
         return result
 
@@ -6583,7 +6591,16 @@ class BotRuntime(object):
                 break
         return reports
 
-    def _apply_traffic_wait_lease(self, elapsed):
+    def _record_traffic_wait_contact(self, bot_id, elapsed):
+        """Accumulate one Bot's actual contact-response slice."""
+        elapsed = max(0.0, _number(elapsed))
+        if elapsed <= 0.0:
+            return
+        bot_id = int(bot_id)
+        self._contact_lease_elapsed[bot_id] = (
+            self._contact_lease_elapsed.get(bot_id, 0.0) + elapsed)
+
+    def _apply_traffic_wait_lease(self):
         """Suppress the stuck timer while another hull owns the blockage.
 
         LocalDriver's stuck detector measures translation. A tank held in place
@@ -6594,21 +6611,22 @@ class BotRuntime(object):
         when the predictive headway controller was removed from the call path,
         while the stuck timer it protected stayed. A genuine deadlock is still
         detected, because the lease expires after
-        ``TRAFFIC_WAIT_LEASE_SECONDS`` of real time - which is why the lease is
-        paid with the callback's own elapsed rather than the driver's decision
-        interval, a value that is only refreshed when the planner runs.
+        ``TRAFFIC_WAIT_LEASE_SECONDS`` of physical contact time. Charge each
+        Bot only for slices in which it actually received a contact response:
+        high-FPS callbacks may consume no slice, while a late callback can
+        contain several bounded slices with different contact results.
         """
-        contacted = self._contact_lease_ids
+        contacted = self._contact_lease_elapsed
+        self._contact_lease_elapsed = {}
         if not contacted:
             return
-        self._contact_lease_ids = set()
         driver = getattr(self.adapter, 'driver', None)
         wait = getattr(driver, 'wait_for_traffic', None)
         if not callable(wait):
             return
-        for bot_id in contacted:
+        for bot_id in sorted(contacted):
             try:
-                wait(bot_id, elapsed)
+                wait(bot_id, contacted[bot_id])
             except Exception:
                 continue
 
@@ -6744,7 +6762,7 @@ class BotRuntime(object):
                     any(abs(_number(value)) > 0.0001
                         for value in result['correction'])):
                 # Another hull owns this tank's lack of progress this tick.
-                self._contact_lease_ids.add(int(state['id']))
+                self._record_traffic_wait_contact(state['id'], step)
             self._apply_tank_contact_response(state, result, step)
             reports.extend(self._ram_reports(
                 state, result['ram_events']))
@@ -8302,6 +8320,9 @@ class BotRuntime(object):
         """
         self._last_update_control_steps = 0
         self._last_update_max_control_step = 0.0
+        # Contact leases never cross render callbacks or round teardown. Any
+        # entry below is produced by a physical slice in this update only.
+        self._contact_lease_elapsed = {}
         if (not self.is_authority() or self.adapter is None or
                 self.finished):
             return []
@@ -8367,12 +8388,9 @@ class BotRuntime(object):
                             frame_step, step_now, players, neighbours,
                             refresh_control, publish_step))
                         refresh_control = False
-                # One right-of-way lease per render callback, matching the one
-                # planner decision per callback. Granting it per catch-up slice
-                # would spend the bounded wait several times faster than real
-                # time, which is worst at exactly the low frame rates where the
-                # jam lasts longest.
-                self._apply_traffic_wait_lease(elapsed_input)
+                # Deliver once per render callback, after every bounded
+                # physical slice has contributed only its own contact time.
+                self._apply_traffic_wait_lease()
             finally:
                 if visibility_frame_open:
                     self._finish_visibility_frame()

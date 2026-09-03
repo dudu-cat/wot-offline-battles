@@ -1434,15 +1434,12 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
 
-    def test_traffic_lease_is_paid_in_real_time_not_decision_steps(self):
-        """One lease per render callback must cost one callback of wait.
+    def test_traffic_lease_uses_explicit_time_not_decision_steps(self):
+        """An external lease producer must supply its physical interval.
 
         LocalDriver.drive only runs on a decision callback, so last_step holds
-        the planner's decision interval, not the render interval. A caller that
-        grants the lease every callback and lets it default to last_step spends
-        TRAFFIC_WAIT_LEASE_SECONDS about ten times faster than real time at a
-        high frame rate, which silently restores the recovery this lease exists
-        to suppress.
+        the planner's decision interval. A physical contact producer cannot
+        default to that unrelated duration.
         """
         driver = LocalDriver()
         driver.drive(
@@ -1477,6 +1474,27 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertIn('pivot_recovery', modes)
         self.assertNotIn('reverse_turn', modes)
+
+    def test_reverse_guard_checks_the_complete_reachable_hull_sweep(self):
+        """A blocker before the sampled endpoint is still in the sweep."""
+        driver = LocalDriver()
+        position = (0.0, 0.0, 0.0)
+        half_length = 2.0
+        half_width = 1.0
+        transverse = ({
+            'position': (0.0, 0.0, -0.5),
+            'yaw': math.pi / 2.0,
+            'half_length': 2.0,
+            'half_width': 0.5,
+        },)
+        endpoint = (0.0, 0.0, -half_length * 1.6)
+
+        self.assertFalse(driver._obb_overlap(
+            endpoint, 0.0, half_length, half_width,
+            transverse[0]['position'], transverse[0]['yaw'],
+            transverse[0]['half_length'], transverse[0]['half_width']))
+        self.assertTrue(driver._reverse_blocked_by_vehicle(
+            position, 0.0, transverse, half_length, half_width))
 
     def test_wedged_hull_still_reverses_when_the_space_behind_is_free(self):
         """The vehicle check must not disable reverse recovery generally."""
