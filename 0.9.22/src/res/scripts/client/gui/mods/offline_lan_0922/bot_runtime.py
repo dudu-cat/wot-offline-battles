@@ -8874,6 +8874,11 @@ class BotRuntime(object):
                 # beyond that escape edge must not veto clear space at the rear.
                 maximum_probe_distance = reactive_horizon
             cached_motion_probe = self._motion_probe_cache.get(state['id'])
+            # A frozen pose keeps this slice's realised translation at zero
+            # without claiming that the corridor is blocked, so it must not
+            # arm the failed-yaw, blocked-step or contact escalations that
+            # ``path_clear`` owns.
+            pose_frozen = False
             settled_motion = bool(
                 abs(throttle) <= 0.01 and abs(turn) <= 0.01 and
                 abs(_number(state.get('speed'))) <= 0.02 and
@@ -8888,6 +8893,15 @@ class BotRuntime(object):
                     ignore_deadline=not refresh_control))
             cached_motion_result = (
                 (cached_motion_probe or {}).get('result') or {})
+            cached_motion_geometry_reusable = bool(
+                isinstance(cached_motion_result, dict) and
+                self._probe_is_clear(cached_motion_result) and
+                self._motion_probe_covers_distance(
+                    cached_motion_probe, maximum_probe_distance) and
+                self._motion_probe_reusable(
+                    cached_motion_probe, position, travel_yaw,
+                    state.get('speed', 0.0), now, settled_motion, step,
+                    ignore_deadline=True))
             catchup_motion_reprobe = bool(
                 not refresh_control and not motion_probe_reusable and
                 isinstance(cached_motion_probe, dict) and
@@ -8906,10 +8920,17 @@ class BotRuntime(object):
                 # turn a missing/deferred/blocked sample into motion. A valid
                 # command which merely consumed or turned beyond its old clear
                 # corridor re-probes below without re-entering the planner.
+                # Withhold drive and freeze the pose, but do not delete the
+                # hull's momentum: a slice that cannot prove its corridor has
+                # not proved that a forty-tonne tank stopped. Zeroing the speed
+                # made every catch-up slice of a slow callback restart
+                # acceleration from standstill, which is the visible
+                # walk-stop-walk motion at low worker frame rates. Copied
+                # physics still decelerates below because throttle is zero.
                 motion_probe = None
                 throttle = 0.0
                 turn = 0.0
-                state['speed'] = 0.0
+                pose_frozen = True
             elif not motion_probe_reusable:
                 # Planner ranking is intentionally unable to satisfy this
                 # gate.  Every newly selected travel corridor receives its own
@@ -8990,9 +9011,10 @@ class BotRuntime(object):
                             })
                         elif isinstance(receipt, dict):
                             motion_probe['world_receipt'] = receipt
-                if (motion_probe is not None and
-                        not (isinstance(motion_probe, dict) and
-                             motion_probe.get('deferred', False))):
+                probe_was_deferred = bool(
+                    isinstance(motion_probe, dict) and
+                    motion_probe.get('deferred', False))
+                if motion_probe is not None and not probe_was_deferred:
                     receipt_pending = bool(
                         isinstance(motion_probe, dict) and
                         motion_probe.get('_world_receipt_pending', False))
@@ -9017,12 +9039,36 @@ class BotRuntime(object):
                                 now, state['id'],
                                 cached_motion_probe is None)),
                     }
+                elif probe_was_deferred:
+                    if cached_motion_geometry_reusable:
+                        # The expired proof still contains this exact motion
+                        # ray. Use it for this callback while the fair recast
+                        # budget catches up on a later refresh.
+                        motion_probe = cached_motion_result
+                    else:
+                        # A proof for another pose, heading or shorter target
+                        # cannot license the newly selected corridor. Retiring
+                        # it makes the remaining catch-up slices hold without
+                        # repeating the same deferred native probe.
+                        self._motion_probe_cache.pop(state['id'], None)
+                        if cached_motion_probe is not None:
+                            # Preserve the established no-cache behaviour: an
+                            # exact resolver may still admit this first slice.
+                            # Only the stale proof introduced by this change
+                            # must not grant motion in its unrelated corridor.
+                            throttle = 0.0
+                            turn = 0.0
+                            pose_frozen = True
                 else:
                     old_result = ((cached_motion_probe or {}).get(
                         'result') or {})
                     if not isinstance(old_result.get(
                             'world_receipt'), dict):
                         self._motion_probe_cache.pop(state['id'], None)
+                # A deferred sample only means the shared soft-static recast
+                # budget was exhausted this callback. It proves neither a wall
+                # nor a new clear corridor, so only an old clear proof which
+                # still geometrically contains the requested motion may remain.
             else:
                 motion_probe = cached_motion_probe['result']
             probe_deferred = bool(
@@ -9155,8 +9201,12 @@ class BotRuntime(object):
                 contact_speed = _number(state.get(
                     'destructible_contact_speed'), speed)
                 contact_v0 = speed
-                if (path_clear and abs(speed) > 0.0001 and
+                if (path_clear and not pose_frozen and
+                        abs(speed) > 0.0001 and
                         callable(self.motion_resolver)):
+                    # A frozen catch-up slice realises no translation, so the
+                    # exact resolver must not sweep (and possibly crush) along
+                    # a corridor the hull is not travelling this slice.
                     resolved_motion = True
                     if self._probe_clock is None:
                         motion_status = self.motion_resolver(
@@ -9225,7 +9275,7 @@ class BotRuntime(object):
                         state['speed'] = speed
                 if contact_deflected:
                     state['x'], state['y'], state['z'] = contact_position
-                elif path_clear:
+                elif path_clear and not pose_frozen:
                     state['x'] += math.sin(state['yaw']) * speed * step
                     state['z'] += math.cos(state['yaw']) * speed * step
                     if abs(speed) > 0.0001:
