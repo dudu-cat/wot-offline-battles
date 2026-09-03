@@ -678,6 +678,12 @@ def resolve_native_item_name_1513(space_id, chunk_id, item_index):
 	manager = getattr(AreaDestructibles, 'g_destructiblesManager', None)
 	if manager is None:
 		return 'pending', None
+	try:
+		manager_space_id = manager.getSpaceID()
+	except Exception:
+		return 'pending', None
+	if manager_space_id != space_id:
+		return 'pending', None
 	native_count = _native_chunk_destructible_count_1513(manager, chunk_id)
 	if native_count is None:
 		return 'pending', None

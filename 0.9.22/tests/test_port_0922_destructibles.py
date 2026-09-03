@@ -320,6 +320,34 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         self.assertEqual(1, bigworld.wg_getChunkDestrFilenames.call_count)
         self.assertIn('chunk: 22, id: 9', logs[0])
 
+    def test_late_descriptor_callback_does_not_query_an_old_space(self):
+        manager = _Manager()
+        manager.space_id = 2
+        manager.set_chunk_count(22, 1)
+        area = types.ModuleType('AreaDestructibles')
+        area.g_destructiblesManager = manager
+        bigworld = types.ModuleType('BigWorld')
+        bigworld.wg_getChunkDestrFilenames = mock.Mock()
+        bigworld.wg_getDestructibleEffectCategory = mock.Mock()
+        cache = types.SimpleNamespace(getDescByFilename=mock.Mock())
+
+        destructibles_sensor._clear_runtime_registry()
+        with mock.patch.dict(
+                sys.modules, {'AreaDestructibles': area,
+                              'BigWorld': bigworld}):
+            self.assertEqual(
+                ('pending', None),
+                destructibles_compat.inspect_destructible_desc(
+                    cache, 1, 22, 0))
+
+        bigworld.wg_getChunkDestrFilenames.assert_not_called()
+        bigworld.wg_getDestructibleEffectCategory.assert_not_called()
+        cache.getDescByFilename.assert_not_called()
+        self.assertFalse(getattr(
+            destructibles_sensor, 'g_offh_destr_isolated_chunks', ()))
+        self.assertFalse(getattr(
+            destructibles_sensor, 'g_offh_destr_isolated_slots', ()))
+
     def test_safe_descriptor_cache_cannot_bypass_later_isolation(self):
         manager = _Manager()
         manager.space_id = 1
