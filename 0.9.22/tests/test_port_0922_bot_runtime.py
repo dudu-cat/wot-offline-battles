@@ -11202,6 +11202,7 @@ class BotRuntimeTests(unittest.TestCase):
         self.assertGreater(first[0]['damage_to_target'], 0)
         self.assertEqual(first, repeated)
         self.assertEqual(push_after_first, push_after_retry)
+        self.assertEqual({11: 0.04}, runtime._contact_lease_elapsed)
         self.assertEqual([], after_ack)
         self.assertEqual(1, len(replayed_distant))
         self.assertGreater(replayed_distant[0]['damage_to_target'], 0)
@@ -11263,6 +11264,7 @@ class BotRuntimeTests(unittest.TestCase):
         # The same-frame current detector must not apply that impulse twice.
         expected_push = 8.0 * (0.90 ** (0.04 * 60.0))
         self.assertAlmostEqual(expected_push, current['push_z'], places=5)
+        self.assertEqual({11: 0.04}, runtime._contact_lease_elapsed)
 
     def test_human_ram_receipt_uses_obb_face_normal_for_side_scrape(self):
         descriptor = _combat_descriptor()

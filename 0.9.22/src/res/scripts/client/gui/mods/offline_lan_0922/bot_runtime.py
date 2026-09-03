@@ -6550,10 +6550,28 @@ class BotRuntime(object):
                                 response = tank_collision.resolve_tank(
                                     bot, (player,), now=None)
                                 if step is not None:
+                                    before_response = (
+                                        _number(current.get('speed')),
+                                        _number(current.get('push_x')),
+                                        _number(current.get('push_z')))
                                     self._apply_tank_contact_response(
                                         current, response, step,
                                         advance_push=False,
                                         apply_correction=False)
+                                    after_response = (
+                                        _number(current.get('speed')),
+                                        _number(current.get('push_x')),
+                                        _number(current.get('push_z')))
+                                    if any(abs(after - before) > 0.0001
+                                           for before, after in zip(
+                                               before_response,
+                                               after_response)):
+                                        # This pair is excluded from the
+                                        # current-pose solver below. Preserve
+                                        # the lease for the receipt impulse
+                                        # actually applied in this slice.
+                                        self._record_traffic_wait_contact(
+                                            bot_id, step)
                                 event = {
                                     'self_id': bot['id'],
                                     'other_id': player['id'],
