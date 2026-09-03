@@ -85,6 +85,7 @@ MAX_PLAYER_INPUT_ATTITUDE = 0.61
 PLAYER_INPUT_WORLD_BOUNDS = (2000.0, 1000.0, 2000.0)
 MAX_PLAYER_RAM_CONTACTS = 16
 MAX_PLAYER_DESTRUCTIBLE_CONTACTS = 16
+MAX_PLAYER_DESTRUCTIBLE_CONTACT_TOKEN = 64
 MAX_PROJECTILE_PIERCING_LOSS = 100000.0
 MAX_CRITICAL_DEVICE_HP = effective_params_wire.MAX_CRITICAL_DEVICE_HP
 CRITICAL_DELTA_DEVICE_NAMES = frozenset((
@@ -2868,7 +2869,8 @@ class LANClient(object):
                 not self.is_bot_authority() or
                 not isinstance(accepted, bool) or
                 not isinstance(token, (list, tuple)) or
-                not 1 <= len(token) <= 16):
+                not 1 <= len(token) <=
+                MAX_PLAYER_DESTRUCTIBLE_CONTACT_TOKEN):
             return False
         parsed_player = _projectile_int_range(
             player_id, 1, MAX_PROJECTILE_ID)

@@ -97,6 +97,14 @@ OUTBOUND_STALL_TIMEOUT_SECONDS = 5.0
 MAX_PENDING_RAM_CONTACTS = 32
 MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS = 16
 MAX_PLAYER_DESTRUCTIBLE_REJECTIONS = 16
+MAX_PLAYER_DESTRUCTIBLE_CONTACT_TOKEN = 64
+MAX_PLAYER_DESTRUCTIBLE_INFLIGHT = 64
+# A 0.1-second copied-physics step can legitimately rotate a fast light tank
+# by several tenths of a radian.  This envelope is deliberately wider than
+# every #1513 descriptor while still bounding an untrusted swept-pose payload.
+MAX_PLAYER_DESTRUCTIBLE_ANGULAR_SPEED = 8.0
+MAX_PLAYER_DESTRUCTIBLE_VERTICAL_TRAVEL = 0.25
+MAX_PLAYER_DESTRUCTIBLE_LINEAR_SLOP = 0.25
 MAX_PLAYER_INPUT_FINGERPRINTS = 128
 MAX_PLAYER_INPUT_DECISIONS = 128
 MAX_PLAYER_INPUT_REJECT_REASONS = 32
@@ -1736,6 +1744,8 @@ class Player(_EndpointSendMixin):
     destructible_contact_resolved_seq: int = 0
     destructible_contacts: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
+    destructible_contact_resolutions: OrderedDict = field(
+        default_factory=OrderedDict, repr=False)
     destructible_contact_rejections: OrderedDict = field(
         default_factory=OrderedDict, repr=False)
     # ``input_seq`` is the last *applied* ordered input: the frame
@@ -2892,6 +2902,7 @@ class BattleState:
             player.destructible_contact_seq = 0
             player.destructible_contact_resolved_seq = 0
             player.destructible_contacts.clear()
+            player.destructible_contact_resolutions.clear()
             player.destructible_contact_rejections.clear()
             player.input_seq = 0
             player.input_fingerprints.clear()
@@ -3586,7 +3597,8 @@ class BattleState:
     @staticmethod
     def _destructible_contact_result_token(raw_token):
         if (not isinstance(raw_token, list) or
-                not 1 <= len(raw_token) <= 16):
+                not 1 <= len(raw_token) <=
+                MAX_PLAYER_DESTRUCTIBLE_CONTACT_TOKEN):
             return None
         token = set()
         for raw in raw_token:
@@ -3607,6 +3619,29 @@ class BattleState:
             return None
         return tuple(sorted(token, key=lambda row: (
             row[0], row[1], -1 if row[2] is None else row[2])))
+
+    @staticmethod
+    def _player_destructible_contact_is_resolved(player, seq):
+        return bool(
+            seq <= player.destructible_contact_resolved_seq or
+            seq in player.destructible_contact_resolutions)
+
+    @staticmethod
+    def _record_player_destructible_contact_resolution(
+            player, seq):
+        """Record one bounded terminal row and advance its contiguous prefix."""
+        if BattleState._player_destructible_contact_is_resolved(player, seq):
+            return
+        player.destructible_contact_resolutions[int(seq)] = True
+        next_seq = int(player.destructible_contact_resolved_seq) + 1
+        while next_seq in player.destructible_contact_resolutions:
+            player.destructible_contact_resolutions.pop(next_seq, None)
+            player.destructible_contact_resolved_seq = next_seq
+            next_seq += 1
+        if (len(player.destructible_contact_resolutions) >
+                MAX_PLAYER_DESTRUCTIBLE_INFLIGHT):
+            raise RuntimeError(
+                "destructible selective-ack window exceeded")
 
     def report_player_destructible_contact_result(self, player_id, message):
         """Consume one hidden-worker verdict for an admitted player sweep."""
@@ -3633,10 +3668,9 @@ class BattleState:
                 message.get("token"))
             if target is None or seq is None or token is None:
                 return False
-            if seq <= target.destructible_contact_resolved_seq:
+            if self._player_destructible_contact_is_resolved(target, seq):
                 return True
-            if (not target.destructible_contacts or
-                    seq != next(iter(target.destructible_contacts))):
+            if seq not in target.destructible_contacts:
                 return False
             pending = target.destructible_contacts[seq]
             expected = self._destructible_contact_result_token(
@@ -3649,7 +3683,7 @@ class BattleState:
                         known = any(
                             (kind, chunk_id, item_index, None) in
                             self.destructibles
-                            for kind in ("fragile", "column"))
+                            for kind in ("fragile", "column", "tree"))
                     else:
                         known = (
                             "module", chunk_id, item_index, mat_kind) in \
@@ -3658,7 +3692,8 @@ class BattleState:
                         return False
             target.destructible_contacts.pop(seq, None)
             if message["accepted"]:
-                target.destructible_contact_resolved_seq = seq
+                self._record_player_destructible_contact_resolution(
+                    target, seq)
             else:
                 self._reject_player_destructible_contact(
                     target, seq, pending)
@@ -3667,8 +3702,8 @@ class BattleState:
     def _reject_player_destructible_contact(
             self, player, seq, admitted_pose=None):
         """Publish one terminal rejection and retain a snapshot fallback."""
-        player.destructible_contact_resolved_seq = max(
-            player.destructible_contact_resolved_seq, seq)
+        self._record_player_destructible_contact_resolution(
+            player, seq)
         player.destructible_contact_rejections[seq] = True
         while (len(player.destructible_contact_rejections) >
                MAX_PLAYER_DESTRUCTIBLE_REJECTIONS):
@@ -8859,7 +8894,7 @@ class BattleState:
         if (not isinstance(raw_contact, dict) or
                 set(raw_contact) != {
                     "seq", "x", "y", "z", "yaw", "speed", "dt",
-                    "token"}):
+                    "end_x", "end_y", "end_z", "end_yaw", "token"}):
             return None
         try:
             seq = _exact_int(raw_contact.get("seq"), 1, PROJECTILE_MAX_ID)
@@ -8872,12 +8907,35 @@ class BattleState:
                 raw_contact.get("speed"), -200.0, 200.0)
             step = _bounded_float(
                 raw_contact.get("dt"), 0.0, 0.1, False)
+            end_x = _bounded_float(
+                raw_contact.get("end_x"), -2000.0, 2000.0)
+            end_y = _bounded_float(
+                raw_contact.get("end_y"), -1000.0, 1000.0)
+            end_z = _bounded_float(
+                raw_contact.get("end_z"), -2000.0, 2000.0)
+            end_yaw = _bounded_float(
+                raw_contact.get("end_yaw"),
+                -math.pi * 2.0, math.pi * 2.0)
         except (TypeError, ValueError, OverflowError):
             return None
         raw_token = raw_contact.get("token")
-        if (seq is None or not 0.001 <= abs(speed) or
+        if (seq is None or None in (end_x, end_y, end_z, end_yaw) or
                 not isinstance(raw_token, list) or
-                not 1 <= len(raw_token) <= 16):
+                not 1 <= len(raw_token) <=
+                MAX_PLAYER_DESTRUCTIBLE_CONTACT_TOKEN):
+            return None
+        move_x = end_x - x
+        move_y = end_y - y
+        move_z = end_z - z
+        move_distance = math.hypot(move_x, move_z)
+        yaw_delta = (end_yaw - yaw + math.pi) % (
+            2.0 * math.pi) - math.pi
+        if (abs(move_y) > MAX_PLAYER_DESTRUCTIBLE_VERTICAL_TRAVEL or
+                move_distance > abs(speed) * step +
+                MAX_PLAYER_DESTRUCTIBLE_LINEAR_SLOP or
+                abs(yaw_delta) >
+                MAX_PLAYER_DESTRUCTIBLE_ANGULAR_SPEED * step + 0.001 or
+                (move_distance <= 0.0001 and abs(yaw_delta) <= 0.00001)):
             return None
         token = set()
         for raw in raw_token:
@@ -8906,6 +8964,10 @@ class BattleState:
             "yaw": round(yaw, 5),
             "speed": round(speed, 4),
             "dt": round(step, 6),
+            "end_x": round(end_x, 4),
+            "end_y": round(end_y, 4),
+            "end_z": round(end_z, 4),
+            "end_yaw": round(end_yaw, 5),
             "token": [list(row) for row in ordered],
         }
 
@@ -9225,11 +9287,7 @@ class BattleState:
             if (abs(float(sample["x"]) - float(contact["x"])) > 0.02 or
                     abs(float(sample["y"]) - float(contact["y"])) > 0.05 or
                     abs(float(sample["z"]) - float(contact["z"])) > 0.02 or
-                    abs(yaw_delta) > 0.002 or
-                    abs(float(sample["speed"]) -
-                        float(contact["speed"])) > 5.0 or
-                    float(sample["forward"]) *
-                    float(contact["speed"]) <= 0.0):
+                    abs(yaw_delta) > 0.002):
                 continue
             return sample
         return None
@@ -9530,7 +9588,12 @@ class BattleState:
                             continue
                         if seq != player.destructible_contact_seq + 1:
                             break
-                        if player.destructible_contacts:
+                        if (seq >
+                                player.destructible_contact_resolved_seq +
+                                MAX_PLAYER_DESTRUCTIBLE_INFLIGHT):
+                            break
+                        if (len(player.destructible_contacts) >=
+                                MAX_PENDING_PLAYER_DESTRUCTIBLE_CONTACTS):
                             break
                         contact = (
                             None if seq in conflicting else
@@ -12108,6 +12171,9 @@ class BattleState:
             result["destructible_contacts"] = [
                 dict(value)
                 for value in player.destructible_contacts.values()]
+        if player.destructible_contact_resolutions:
+            result["destructible_contact_resolved_seqs"] = sorted(
+                player.destructible_contact_resolutions)
         if player.destructible_contact_rejections:
             result["destructible_contact_rejected_seqs"] = list(
                 player.destructible_contact_rejections)

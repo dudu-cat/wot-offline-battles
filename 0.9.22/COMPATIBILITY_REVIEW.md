@@ -403,20 +403,27 @@ for a resolved item whose native type owns no handler - precisely the two
 cases the name loop skips. Enumerating it reconstructs the name list after
 every live item is typed. A full-width list is aligned by position, while each
 usable non-empty name's descriptor type must still equal that slot's live
-effect category. A slot-local catalog, matrix, or descriptor quarantine stays
-local when that mapping is rebuilt; its neighbours retain their positional
-proof. For a shorter list, empty strings carry no descriptor evidence and
-the remaining names are reconstructed per native type: an item is typed by
-its live effect category and a name by the client descriptor it resolves to,
+effect category. Its positional proof also contains the first per-name
+descriptor lookup or shape failure, malformed per-item category, and
+descriptor/category mismatch to that exact slot; that slot is isolated while
+its neighbours finish alignment. A previously recorded slot-local catalog,
+matrix, or descriptor quarantine likewise stays local when the mapping is
+rebuilt. A missing shared descriptor-cache or category-query surface still
+invalidates the chunk contract. For a shorter list, empty strings carry no
+descriptor evidence and the remaining names are reconstructed per native
+type: an item is typed by its live effect category and a name by the client
+descriptor it resolves to,
 then both filtered sequences are paired in item order. This is sound only
 under the pinned-client bridge that a descriptor's `type` is the same native
 category returned for that item, and only after every resolvable native item
 has been enumerated. A whole category with zero non-empty names is known to be
 unnamed. A nonzero unequal name/item count is only a partial alignment,
 however, so the complete chunk is isolated; no otherwise aligned category is
-admitted from it. An unknown or malformed non-empty name descriptor and a
-malformed category result also isolate the complete chunk. A category-query
-exception is the native resolver's skipped-item case:
+admitted from it. Because a compacted name position has no item identity, an
+unknown or malformed non-empty name descriptor, per-name lookup exception,
+malformed category result, or descriptor/category disagreement also isolates
+the complete chunk. A category-query exception is the native resolver's
+skipped-item case:
 that exact slot is isolated before any matrix, effect or destruction call,
 while other resolvable slots may finish alignment. Native category `-1` is a
 resolved handlerless item, not that exception case: alignment leaves it

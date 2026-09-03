@@ -46,8 +46,9 @@ from gui.mods.offline_lan_0922.snapshot_sync import SnapshotSync
 from gui.mods.offline_lan_0922.spawn_planner import SpawnPlanner
 from gui.mods.offline_lan_0922 import (
     ballistics, combat_rules, critical_damage, descriptor_donation,
-    destructibles_compat, effective_params, equipment_mechanics, gun_mechanics,
-    hull_aiming, lan_client as lan_protocol,
+    destructibles_compat, device_damage, effective_params,
+    equipment_mechanics, gun_mechanics, hull_aiming,
+    lan_client as lan_protocol,
     loadout as loadout_law, prebaked_destructibles, prebaked_foliage,
     prebaked_navigation, native_mapping_mask, shot_geometry, spotting,
     tank_collision,
@@ -134,6 +135,17 @@ TARGET_OUTLINE_SECONDS = 0.05
 BOT_DESTRUCTIBLE_SECONDS = 0.10
 BOT_DESTRUCTIBLE_TRAVEL_METRES = 3.0
 BOT_SOFT_RECAST_BUDGET = 24
+# A turning rectangle does not share the fixed-orientation swept volume used
+# by longitudinal motion.  Cover each angular interval with the exact local
+# axis bounds of every hull pose in that interval, then translate that box
+# along the matching centre path.  Five-degree intervals keep the cover close
+# to the real hull without turning one render callback into dozens of native
+# catalog probes.
+DESTRUCTIBLE_POSE_MAX_ANGLE_STEP = math.pi / 36.0
+DESTRUCTIBLE_POSE_MAX_SWEEP_STEPS = 16
+DESTRUCTIBLE_CONTACT_TOKEN_LIMIT = 64
+DESTRUCTIBLE_CONTACT_WINDOW = 16
+DESTRUCTIBLE_CONTACT_INFLIGHT_LIMIT = 64
 # A bot already beyond the shared baked/native limit may still choose an
 # escape corridor below; otherwise the first wet sample traps it.
 BOT_WATER_ESCAPE_DEEPEN_EPSILON = 0.10
@@ -958,6 +970,70 @@ def _angle_delta(current, target):
     return (target - current + math.pi) % (2.0 * math.pi) - math.pi
 
 
+class _DestructibleSweepHitTester(object):
+    """Expose one conservative interval bbox through the pinned sensor ABI."""
+
+    def __init__(self, bbox):
+        self.bbox = bbox
+
+
+def _trig_interval_extrema(cosine_factor, sine_factor, start, end):
+    """Return exact extrema of ``a*cos(angle) + b*sin(angle)`` on an interval."""
+    start = float(start)
+    end = float(end)
+    if end < start:
+        start, end = end, start
+    values = [
+        cosine_factor * math.cos(start) + sine_factor * math.sin(start),
+        cosine_factor * math.cos(end) + sine_factor * math.sin(end),
+    ]
+    stationary = math.atan2(sine_factor, cosine_factor)
+    first = int(math.ceil((start - stationary) / math.pi))
+    last = int(math.floor((end - stationary) / math.pi))
+    for offset in range(first, last + 1):
+        angle = stationary + offset * math.pi
+        values.append(
+            cosine_factor * math.cos(angle) +
+            sine_factor * math.sin(angle))
+    return min(values), max(values)
+
+
+def _destructible_rotation_interval_bbox(bbox, half_angle):
+    """Enclose every rotation of ``bbox`` within ``[-half_angle,+half_angle]``.
+
+    The returned box is expressed in the midpoint hull frame.  Its horizontal
+    bounds are analytical extrema over all four original corners, so the cover
+    cannot open a gap between sampled yaws.  This is a swept-volume broadphase,
+    not a finite ray approximation.
+    """
+    minimum, maximum = bbox[:2]
+    half_angle = abs(float(half_angle))
+    horizontal_x = []
+    horizontal_z = []
+    for local_x in (float(minimum[0]), float(maximum[0])):
+        for local_z in (float(minimum[2]), float(maximum[2])):
+            low, high = _trig_interval_extrema(
+                local_x, local_z, -half_angle, half_angle)
+            horizontal_x.extend((low, high))
+            low, high = _trig_interval_extrema(
+                local_z, -local_x, -half_angle, half_angle)
+            horizontal_z.extend((low, high))
+    return (
+        (min(horizontal_x), float(minimum[1]), min(horizontal_z)),
+        (max(horizontal_x), float(maximum[1]), max(horizontal_z)),
+    )
+
+
+def _destructible_sweep_descriptor(descriptor, bbox):
+    """Retain kinetic inputs while replacing only the sensor's hull bbox."""
+    physics = (descriptor.get('physics') if isinstance(descriptor, dict) else
+               getattr(descriptor, 'physics', None))
+    return {
+        'physics': physics,
+        'hull': {'hitTester': _DestructibleSweepHitTester(bbox)},
+    }
+
+
 class _ProjectileCollisionAppearance(object):
     """Aim matrices frozen with one historical collision pose."""
 
@@ -1453,6 +1529,7 @@ class BattleRuntime(object):
         self._local_ram_episode_contacts = frozenset()
         self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
+        self._local_destructible_admitted_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
         self._local_destructible_safe_poses = collections.OrderedDict()
         self._ram_bot_history = {}
@@ -1735,6 +1812,7 @@ class BattleRuntime(object):
         self._local_ram_episode_contacts = frozenset()
         self._remote_ram_profile_cache = {}
         self._local_destructible_contact_seq = 0
+        self._local_destructible_admitted_seq = 0
         self._local_destructible_contacts = collections.OrderedDict()
         self._local_destructible_safe_poses = collections.OrderedDict()
         self._ram_bot_history = {}
@@ -3942,6 +4020,47 @@ class BattleRuntime(object):
             raise RuntimeError(
                 'player effective vehicle parameters are unavailable')
         return snapshot
+
+    @staticmethod
+    def _player_traverse_critical_factor(state, descriptor):
+        """Rebuild the live traverse factor from one canonical player row."""
+        critical = (state or {}).get('critical') or {}
+        if not isinstance(critical, dict):
+            raise RuntimeError('player critical state is unavailable')
+        devices = {}
+        destroyed = set(str(name)
+                        for name in (critical.get('destroyed') or ()))
+        damaged = set()
+        for row in critical.get('devices') or ():
+            if not isinstance(row, dict):
+                raise RuntimeError('player critical device state is invalid')
+            try:
+                name = str(row.get('name') or '')
+                devices[name] = float(row.get('hp'))
+            except (TypeError, ValueError, OverflowError):
+                raise RuntimeError('player critical device state is invalid')
+            if row.get('state') == 'destroyed':
+                destroyed.add(name)
+            elif row.get('state') == 'critical':
+                damaged.add(name)
+        return (
+            device_damage.crew_stat_factor(
+                critical.get('crew_ko') or (), 'traverse') *
+            device_damage.module_stat_factor(
+                devices, destroyed, descriptor, 'traverse', damaged))
+
+    @staticmethod
+    def _destructible_rotation_speed_cap(physics, critical_factor=1.0):
+        """Return the reachable chassis angular speed used only for crush law."""
+        if not isinstance(physics, dict) or physics.get('rotSpd') is None:
+            return None
+        try:
+            value = abs(float(physics['rotSpd'])) * float(critical_factor)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RuntimeError('player traverse speed cap is unavailable')
+        if math.isnan(value) or math.isinf(value) or value < 0.0:
+            raise RuntimeError('player traverse speed cap is invalid')
+        return value
 
     def _local_player_effective_snapshot(self, state):
         """Freeze the server-accepted parameters for the local human tank.
@@ -7261,11 +7380,10 @@ class BattleRuntime(object):
             server_pose = (values[:3], values[3])
         changed = self._apply_local_destructible_rejection(
             sequence, server_pose)
-        for seq in list(self._local_destructible_contacts):
-            if seq <= sequence:
-                self._local_destructible_contacts.pop(seq, None)
-                self._local_destructible_safe_poses.pop(seq, None)
-                changed = True
+        if sequence in self._local_destructible_contacts:
+            self._local_destructible_contacts.pop(sequence, None)
+            self._local_destructible_safe_poses.pop(sequence, None)
+            changed = True
         return changed
 
     def on_fire_intent_result(self, message):
@@ -12309,6 +12427,51 @@ class BattleRuntime(object):
                 self._live_local_player_state(self._local_state())))
         return players
 
+    def _prewarm_player_tree_registries(self, now):
+        """Register countdown tree identities near authoritative humans."""
+        prewarm = getattr(
+            self._destructibles, 'prewarm_tree_registry', None)
+        if not callable(prewarm):
+            return 0
+        poses = []
+        if self._worker_mode:
+            try:
+                players = self._authority_players()
+            except Exception:
+                players = ()
+            for state in players:
+                if not isinstance(state, dict):
+                    continue
+                try:
+                    position = (
+                        float(state.get('x')), float(state.get('y')),
+                        float(state.get('z')))
+                    yaw = float(state.get('yaw'))
+                    descriptor = self._resolve_player_descriptor(state)
+                except Exception:
+                    continue
+                poses.append((position, yaw, descriptor))
+        else:
+            descriptor = getattr(self, '_local_descriptor', None)
+            if descriptor is not None:
+                poses.append((tuple(self._local_position),
+                              float(self._local_yaw), descriptor))
+
+        ready = 0
+        for position, yaw, descriptor in poses:
+            try:
+                detail = prewarm(
+                    self._avatar.spaceID, self._vector(position), yaw,
+                    descriptor, now)
+            except Exception:
+                # One malformed or not-yet-streamed native item is local to
+                # this pose; keep warming the remaining human spawn areas.
+                continue
+            if (isinstance(detail, dict) and
+                    detail.get('status') == 'ready'):
+                ready += 1
+        return ready
+
     def _resolve_player_destructible_contacts(self, players, now):
         """Re-run player hull proposals in the hidden native authority."""
         if not self._worker_mode or self._destructibles is None:
@@ -12318,88 +12481,198 @@ class BattleRuntime(object):
         if not callable(sender):
             raise RuntimeError(
                 'worker destructible contact result boundary is unavailable')
-        resolved = 0
+        work = []
         for state in players or ():
+            if not isinstance(state, dict):
+                continue
             contacts = state.get('destructible_contacts')
             if not isinstance(contacts, list) or not contacts:
                 continue
-            contact = contacts[0]
-            if not isinstance(contact, dict):
-                continue
+            for contact in contacts[:DESTRUCTIBLE_CONTACT_WINDOW]:
+                if isinstance(contact, dict):
+                    work.append((state, contact))
+        resolved = 0
+        for state, contact in work:
             token = self._destructible_contact_token(contact.get('token'))
             try:
                 player_id = int(state.get('id'))
                 seq = int(contact.get('seq'))
                 speed = float(contact.get('speed'))
                 dt = float(contact.get('dt'))
-                forward = float(contact.get('forward'))
                 position = (
                     float(contact.get('x')), float(contact.get('y')),
                     float(contact.get('z')))
                 yaw = float(contact.get('yaw'))
+                end_position = (
+                    float(contact.get('end_x')), float(contact.get('end_y')),
+                    float(contact.get('end_z')))
+                end_yaw = float(contact.get('end_yaw'))
             except (TypeError, ValueError, OverflowError):
                 continue
             if (token is None or player_id <= 0 or seq <= 0 or
-                    not 0.0 < dt <= 0.1 or forward * speed <= 0.0):
+                    not 0.0 < dt <= 0.1):
                 continue
             descriptor = self._resolve_player_descriptor(state)
             params = self._player_effective_snapshot(state)['physics']
             limit_name = 'speedBwd' if speed < 0.0 else 'speedFwd'
             kinetic_speed = (-float(params[limit_name]) if speed < 0.0 else
                              float(params[limit_name]))
-            proposal = self._destructibles._catalog_motion_proposal(
-                self._avatar.spaceID, self._vector(position), yaw, speed,
-                descriptor, now, dt=dt, kinetic_speed=kinetic_speed)
-            actual_token = (
-                self._destructible_contact_token(proposal.get('token'))
-                if isinstance(proposal, dict) else None)
+            yaw_delta = _angle_delta(yaw, end_yaw)
+            pose_sweep = abs(yaw_delta) > 1.0e-8
+            move_x = end_position[0] - position[0]
+            move_z = end_position[2] - position[2]
+            move_distance = math.sqrt(move_x * move_x + move_z * move_z)
+            catalog_motion_yaw = None
+            rotation_speed_cap = None
+            if not pose_sweep and move_distance > 1.0e-8:
+                actual_motion_yaw = math.atan2(move_x, move_z)
+                expected_motion_yaw = (yaw if speed >= 0.0 else
+                                       yaw + math.pi)
+                if abs(_angle_delta(
+                        expected_motion_yaw, actual_motion_yaw)) > 0.02:
+                    catalog_motion_yaw = actual_motion_yaw
+            if pose_sweep:
+                rotation_speed_cap = self._destructible_rotation_speed_cap(
+                    params, self._player_traverse_critical_factor(
+                        state, descriptor))
+                catalog_proposal = self._destructible_pose_sweep(
+                    position, yaw, end_position, end_yaw, speed,
+                    descriptor, now, dt,
+                    rotation_speed_cap=rotation_speed_cap)
+            else:
+                catalog_proposal = self._destructibles._catalog_motion_proposal(
+                    self._avatar.spaceID, self._vector(position), yaw, speed,
+                    descriptor, now, dt=dt, kinetic_speed=kinetic_speed,
+                    motion_yaw=catalog_motion_yaw)
+            tree_proposal = self._tree_motion_proposal(
+                position, yaw, end_position, end_yaw, speed, descriptor,
+                now, dt)
+            proposal = self._merge_destructible_motion_proposals(
+                catalog_proposal, tree_proposal)
+            catalog_token = set(
+                self._destructible_contact_token(
+                    proposal.get('_catalog_token')) or ())
+            tree_token = set(
+                self._destructible_contact_token(
+                    proposal.get('_tree_token')) or ())
+            actual_token = self._destructible_contact_token(
+                proposal.get('token'))
             from gui.mods.offline_lan_0922 import destructibles_authority
             requested = set(token)
             unresolved = set(row for row in requested
                 if not destructibles_authority.is_destroyed(*row))
-            world_status = world_collision.check_horizontal_collision(
-                self._runtime.bigworld, self._runtime.math,
-                self._avatar.spaceID, self._vector(position), yaw, speed,
-                descriptor, False, dt, True, True, kinetic_speed,
-                commit_enabled=False)
-            if isinstance(world_status, bool):
-                world_status = 'hard' if world_status else 'clear'
-            # The visible endpoint streams only the identities intersecting
-            # its current hull bins.  The hidden worker can already have an
-            # adjacent tile from the same fence/prop cluster registered, so
-            # its exact native proposal may legitimately contain a strict
-            # superset.  The worker remains authoritative: every identity the
-            # visible endpoint requested must be present in its exact contact,
-            # and any hard member makes the whole proposal non-crushable.
-            proposal_status = (
-                proposal.get('status')
-                if isinstance(proposal, dict) else None)
+            actual = catalog_token | tree_token
+            if actual != set(actual_token or ()):
+                raise RuntimeError(
+                    'merged destructible proposal lost an identity')
             accepted = bool(
-                world_status in ('clear', 'kinetic') and (
-                    (not unresolved and
-                     proposal_status in ('clear', 'crushed')) or
-                    (proposal_status == 'crushed' and
-                     actual_token is not None and
-                     unresolved.issubset(set(actual_token)))))
-            commit_status = None
-            if accepted and bool(proposal.get('requires_commit', False)):
-                committed = self._destructibles._catalog_motion_blocked(
-                    self._avatar.spaceID, self._vector(position), yaw,
-                    speed, descriptor, now, dt=dt,
-                    kinetic_speed=kinetic_speed, return_detail=True,
-                    kinetic_commit=True, commit_enabled=True)
+                not unresolved or unresolved.issubset(actual))
+            if (proposal.get('_tree_status') == 'pending' and
+                    any(row[2] is None and row not in catalog_token
+                        for row in requested)):
+                # A locally felled tree may still be waiting for the native
+                # name registry.  An exact catalog token already proves that
+                # its own material-less identity is a fragile, not a tree.
+                continue
+            if (proposal.get('_catalog_pending', False) and
+                    requested.intersection(catalog_token) -
+                    requested.intersection(tree_token)):
+                # A native mutation may already be complete while its
+                # canonical event sink is backpressured.  Never turn that
+                # retryable publication state into a terminal rejection.
+                continue
+            if (unresolved and not accepted and
+                    (proposal.get('_catalog_pending', False) or
+                     proposal.get('_tree_pending', False))):
+                continue
+            # A checksum-pinned visible endpoint already made the irreversible
+            # native contact decision.  The worker validates the same swept
+            # identity and publishes it; a second native wall-ray opinion is
+            # neither an identity check nor grounds to roll back that event.
+            world_status = 'trusted_visible'
+            commit_statuses = []
+            deferred = False
+            if accepted:
+                # Tree publish is intentionally retried even when the native
+                # authority already marks it destroyed.  Its previous event
+                # sink call may have hit backpressure before the server stored
+                # the canonical event.
+                requested_trees = requested.intersection(tree_token)
+                requested_catalog = (
+                    requested.intersection(catalog_token) -
+                    requested_trees)
+                if (requested_trees and
+                        proposal.get('_tree_status') != 'crushed'):
+                    accepted = False
+                if (requested_catalog and
+                        proposal.get('_catalog_status') not in (
+                            'crushed', 'hard')):
+                    accepted = False
+            else:
+                requested_trees = set()
+                requested_catalog = set()
+            if accepted and requested_catalog:
+                if pose_sweep:
+                    committed = self._destructible_pose_sweep(
+                        position, yaw, end_position, end_yaw, speed,
+                        descriptor, now, dt, commit_enabled=True,
+                        rotation_speed_cap=rotation_speed_cap)
+                else:
+                    committed = self._destructibles._catalog_motion_blocked(
+                        self._avatar.spaceID, self._vector(position), yaw,
+                        speed, descriptor, now, dt=dt,
+                        kinetic_speed=kinetic_speed, return_detail=True,
+                        kinetic_commit=True, commit_enabled=True,
+                        motion_yaw=catalog_motion_yaw)
                 committed_token = (
                     self._destructible_contact_token(
                         committed.get('token'))
                     if isinstance(committed, dict) else None)
-                commit_status = (
+                catalog_commit_status = (
                     committed.get('status')
                     if isinstance(committed, dict) else 'invalid')
-                accepted = bool(
-                    isinstance(committed, dict) and
-                    committed.get('status') == 'crushed' and
-                    committed_token is not None and
-                    unresolved.issubset(set(committed_token)))
+                if (catalog_commit_status == 'pending' or
+                        (isinstance(committed, dict) and
+                         committed.get('_pending', False))):
+                    deferred = True
+                else:
+                    accepted = bool(
+                        isinstance(committed, dict) and
+                        committed.get('status') in ('crushed', 'hard') and
+                        committed_token is not None and
+                        requested_catalog.issubset(set(committed_token)))
+                commit_statuses.append('catalog:%s' % catalog_commit_status)
+            if accepted and requested_trees:
+                tree_committer = getattr(
+                    self._destructibles, 'commit_tree_contacts', None)
+                if not callable(tree_committer):
+                    raise RuntimeError(
+                        'worker tree contact commit boundary is unavailable')
+                committed = tree_committer(
+                    self._avatar.spaceID,
+                    tuple(sorted(requested_trees, key=lambda row: (
+                        row[0], row[1], -1 if row[2] is None else row[2]))),
+                    self._vector(position), yaw,
+                    self._vector(end_position), end_yaw, speed, descriptor,
+                    now, dt=dt, publish=True)
+                committed_token = (
+                    self._destructible_contact_token(committed.get('token'))
+                    if isinstance(committed, dict) else None)
+                tree_commit_status = (
+                    committed.get('status')
+                    if isinstance(committed, dict) else 'invalid')
+                if tree_commit_status == 'pending':
+                    deferred = True
+                else:
+                    accepted = bool(
+                        isinstance(committed, dict) and
+                        committed.get('status') == 'crushed' and
+                        committed_token is not None and
+                        requested_trees == set(committed_token))
+                commit_statuses.append('tree:%s' % tree_commit_status)
+            commit_status = ','.join(commit_statuses) or None
+            if deferred:
+                continue
             self._report_destructible_verdict(
                 'worker', seq, accepted, token, actual_token,
                 world_status, commit_status)
@@ -12852,6 +13125,15 @@ class BattleRuntime(object):
                         # callback must restore the unchanged live fail-closed
                         # path, not prevent the battle from starting.
                         pass
+            if (not self._battle_live and
+                    self._prebattle_deadline is not None and
+                    self._destructibles is not None):
+                try:
+                    self._prewarm_player_tree_registries(now)
+                except Exception:
+                    # Tree registration is likewise a countdown optimisation.
+                    # A broken native registry must not prevent battle start.
+                    pass
             if profiling:
                 next_boundary = _PROFILE_CLOCK()
                 stages['prewarm'] = max(0.0, next_boundary - boundary)
@@ -14055,11 +14337,431 @@ class BattleRuntime(object):
         self._local_last_pitch = pitch
         return pitch
 
+    def _tree_motion_proposal(
+            self, start_position, start_yaw, end_position, end_yaw,
+            speed, descriptor, now, dt):
+        """Return the sensor's exact continuous tree-contact proposal."""
+        clear = {
+            'status': 'clear', 'token': None, 'accepted_now': False,
+            'kinds': '-', 'requires_commit': False,
+        }
+        proposer = getattr(
+            self._destructibles, '_tree_motion_proposal', None)
+        if not callable(proposer):
+            # Narrow injected adapters do not model native falling columns.
+            return clear
+        detail = proposer(
+            self._avatar.spaceID, self._vector(start_position),
+            float(start_yaw), self._vector(end_position), float(end_yaw),
+            float(speed), descriptor, now, dt=float(dt))
+        if not isinstance(detail, dict):
+            # Keep legacy test seams inert.  The packaged sensor always
+            # returns the typed dictionary validated below.
+            return clear
+        status = detail.get('status')
+        if status not in ('clear', 'crushed', 'hard', 'pending'):
+            raise RuntimeError('tree motion proposal returned invalid status')
+        token = (self._destructible_contact_token(detail.get('token'))
+                 if detail.get('token') is not None else None)
+        requires_commit = bool(detail.get('requires_commit', False))
+        if (detail.get('token') is not None and token is None) or (
+                requires_commit and (status != 'crushed' or token is None)):
+            raise RuntimeError('tree motion proposal lost its exact token')
+        if token is not None and any(row[2] is not None for row in token):
+            raise RuntimeError('tree motion proposal has a material token')
+        if status in ('pending', 'hard') and not self._worker_mode:
+            # Missing, ambiguous or isolated tree registry evidence is not a
+            # hard-world contact.  The visible tank may keep moving while
+            # prewarming makes an exact identity available for a later frame.
+            return clear
+        return {
+            'status': status,
+            'token': token,
+            'accepted_now': bool(detail.get('accepted_now', False)),
+            'kinds': str(detail.get('kinds', 'tree')),
+            'requires_commit': requires_commit,
+        }
+
+    def _merge_destructible_motion_proposals(
+            self, catalog_detail, tree_detail):
+        """Merge catalog and tree identities without losing commit ownership."""
+        def component(detail, name):
+            if not isinstance(detail, dict):
+                detail = {
+                    'status': 'clear', 'token': None,
+                    'accepted_now': False, 'kinds': '-',
+                    'requires_commit': False,
+                }
+            status = detail.get('status')
+            if status not in (
+                    'clear', 'crushed', 'soft', 'hard', 'approach',
+                    'kinetic', 'pending'):
+                raise RuntimeError(
+                    '%s motion proposal returned invalid status' % name)
+            token = (self._destructible_contact_token(detail.get('token'))
+                     if detail.get('token') is not None else None)
+            requires_commit = bool(detail.get('requires_commit', False))
+            if (detail.get('token') is not None and token is None) or (
+                    requires_commit and token is None):
+                raise RuntimeError(
+                    '%s motion proposal lost its exact token' % name)
+            return detail, status, token, requires_commit
+
+        catalog, catalog_status, catalog_token, catalog_commit = component(
+            catalog_detail, 'catalog')
+        tree, tree_status, tree_token, tree_commit = component(
+            tree_detail, 'tree')
+        token = set(catalog_token or ())
+        token.update(tree_token or ())
+        if len(token) > DESTRUCTIBLE_CONTACT_TOKEN_LIMIT:
+            raise RuntimeError('destructible motion token exceeds its bound')
+        precedence = (
+            'hard', 'pending', 'kinetic', 'soft', 'crushed',
+            'approach', 'clear')
+        status = next(value for value in precedence
+                      if value in (catalog_status, tree_status))
+        kinds = set()
+        for raw in (catalog.get('kinds', '-'), tree.get('kinds', '-')):
+            kinds.update(value for value in str(raw).split(',')
+                         if value and value != '-')
+        result = {
+            'status': status,
+            'token': tuple(sorted(token, key=lambda row: (
+                row[0], row[1], -1 if row[2] is None else row[2]))) or None,
+            'accepted_now': bool(
+                catalog.get('accepted_now', False) or
+                tree.get('accepted_now', False)),
+            'used_kinetic_speed': bool(
+                catalog.get('used_kinetic_speed', False)),
+            'kinds': ','.join(sorted(kinds)) or '-',
+            'requires_commit': bool(catalog_commit or tree_commit),
+            '_catalog_token': catalog_token,
+            '_tree_token': tree_token,
+            '_catalog_status': catalog_status,
+            '_tree_status': tree_status,
+            '_catalog_pending': bool(
+                catalog.get('_pending', catalog_status == 'pending')),
+            '_tree_pending': bool(
+                tree.get('_pending', tree_status == 'pending')),
+        }
+        if 'impact_speed' in catalog:
+            result['impact_speed'] = catalog['impact_speed']
+        return result
+
+    def _commit_local_destructible_motion(
+            self, detail, start_position, start_yaw, end_position, end_yaw,
+            descriptor, speed, now, dt, catalog_speed=None):
+        """Apply exact visible mutations while retaining canonical ownership."""
+        tree_token = self._destructible_contact_token(
+            detail.get('_tree_token')) if detail.get('_tree_token') else None
+        if tree_token is not None:
+            committer = getattr(
+                self._destructibles, 'commit_local_tree_prediction', None)
+            if not callable(committer):
+                raise RuntimeError(
+                    'local tree prediction boundary is unavailable')
+            committed = committer(
+                self._avatar.spaceID, tree_token,
+                self._vector(start_position), float(start_yaw),
+                self._vector(end_position), float(end_yaw), float(speed),
+                descriptor, now, dt=float(dt), publish=False)
+            committed_token = (
+                self._destructible_contact_token(committed.get('token'))
+                if isinstance(committed, dict) else None)
+            if (isinstance(committed, dict) and
+                    committed.get('status') == 'pending'):
+                self._local_motion_status = 'pending'
+                return False
+            if (not isinstance(committed, dict) or
+                    committed.get('status') != 'crushed' or
+                    committed_token is None or
+                    set(tree_token) != set(committed_token)):
+                self._local_motion_status = 'hard'
+                return False
+
+        catalog_token = self._destructible_contact_token(
+            detail.get('_catalog_token')) \
+            if detail.get('_catalog_token') else None
+        if catalog_token is not None:
+            committer = getattr(
+                self._destructibles, 'commit_local_prediction', None)
+            predictor = getattr(
+                self._destructibles, 'begin_local_prediction', None)
+            if callable(committer):
+                committed = committer(
+                    self._avatar.spaceID, catalog_token,
+                    self._vector(start_position), float(start_yaw),
+                    float(speed if catalog_speed is None else
+                          catalog_speed))
+                if not committed:
+                    self._local_motion_status = 'hard'
+                    return False
+            elif callable(predictor):
+                predictor(catalog_token)
+        return True
+
+    def _queue_and_send_local_destructible_contact(
+            self, detail, start_position, start_yaw, speed, dt,
+            end_position, end_yaw):
+        """Put exact contact before its pose and request an immediate send."""
+        previous_seq = self._local_destructible_contact_seq
+        if not self._queue_local_destructible_contact(
+                detail, start_position, start_yaw, speed, dt,
+                end_position=end_position, end_yaw=end_yaw):
+            return False
+        if self._local_destructible_contact_seq == previous_seq:
+            return True
+        sender = getattr(self._sender, 'send_current', None)
+        if callable(sender) and sender():
+            self._local_input_sent_during_drive = True
+            return True
+        # The local native mutation is irreversible.  Retain the exact token
+        # for the next periodic/reliable input retry, but do not reinterpret
+        # transport backpressure as a physical wall in this copied step.
+        return True
+
+    def _destructible_pose_sweep(
+            self, start_position, start_yaw, end_position, end_yaw,
+            speed, descriptor, now, dt, commit_enabled=False,
+            rotation_speed_cap=None):
+        """Resolve the complete translating and rotating catalog hull sweep.
+
+        Each slice is a fixed-orientation zonotope understood by the pinned
+        sensor.  Its midpoint-frame bbox analytically encloses every rotated
+        hull pose in the slice, so the union covers the continuous old-to-new
+        pose instead of sampling a few rays or isolated endpoint rectangles.
+        """
+        clear = {
+            'status': 'clear', 'token': None, 'accepted_now': False,
+            'used_kinetic_speed': False, 'kinds': '-',
+            'requires_commit': False, 'impact_speed': abs(float(speed)),
+        }
+        if self._destructibles is None:
+            return clear
+        bbox_reader = getattr(
+            self._destructibles, '_vehicle_hull_bbox', None)
+        if not callable(bbox_reader):
+            # Production always has the pinned typed sensor.  Preserve the old
+            # no-rotation behavior for narrow injected adapters which predate
+            # this seam rather than inventing a hull shape for them.
+            return clear
+        bbox = bbox_reader(descriptor)
+        if bbox is None:
+            return clear
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 2:
+            # Narrow test/extension adapters may expose a dynamic attribute in
+            # place of the pinned sensor function.  It is not hull evidence.
+            return clear
+        resolver_name = ('_catalog_motion_blocked' if commit_enabled else
+                         '_catalog_motion_proposal')
+        resolver = getattr(self._destructibles, resolver_name, None)
+        if not callable(resolver):
+            raise RuntimeError(
+                'destructible pose-sweep resolver is unavailable')
+
+        start = tuple(float(value) for value in start_position[:3])
+        end = tuple(float(value) for value in end_position[:3])
+        yaw_delta = _angle_delta(float(start_yaw), float(end_yaw))
+        if abs(yaw_delta) <= 1.0e-8:
+            return clear
+        steps = int(math.ceil(
+            abs(yaw_delta) / DESTRUCTIBLE_POSE_MAX_ANGLE_STEP))
+        if not 1 <= steps <= DESTRUCTIBLE_POSE_MAX_SWEEP_STEPS:
+            raise RuntimeError('destructible pose sweep exceeds its bound')
+        duration = max(1.0e-6, float(dt))
+        center_dx = end[0] - start[0]
+        center_dy = end[1] - start[1]
+        center_dz = end[2] - start[2]
+        center_distance = math.sqrt(
+            center_dx * center_dx + center_dz * center_dz)
+        corner_radius = max(math.sqrt(
+            float(local_x) * float(local_x) +
+            float(local_z) * float(local_z))
+            for local_x in (bbox[0][0], bbox[1][0])
+            for local_z in (bbox[0][2], bbox[1][2]))
+        if rotation_speed_cap is None:
+            rotation_kinetic_speed = None
+        else:
+            try:
+                rotation_speed_cap = abs(float(rotation_speed_cap))
+            except (TypeError, ValueError, OverflowError):
+                raise RuntimeError(
+                    'destructible rotation speed cap is invalid')
+            if (math.isnan(rotation_speed_cap) or
+                    math.isinf(rotation_speed_cap)):
+                raise RuntimeError(
+                    'destructible rotation speed cap is invalid')
+            rotation_kinetic_speed = rotation_speed_cap * corner_radius
+        angular_edge_speed = abs(yaw_delta) * corner_radius / duration
+        impact_magnitude = min(200.0, math.sqrt(
+            max(abs(float(speed)), center_distance / duration) ** 2 +
+            angular_edge_speed ** 2))
+        impact_speed = (-impact_magnitude
+                        if float(speed) < 0.0 else impact_magnitude)
+        if impact_magnitude <= 1.0e-8:
+            return clear
+
+        token = set()
+        kinds = set()
+        accepted_now = False
+        used_kinetic_speed = False
+        requires_commit = False
+        saw_crushed = False
+        saw_soft = False
+        saw_approach = False
+        saw_kinetic = False
+        saw_pending = False
+        saw_hard = False
+        for index in range(steps):
+            lower = float(index) / float(steps)
+            upper = float(index + 1) / float(steps)
+            middle = (lower + upper) * 0.5
+            slice_start = tuple(
+                start[axis] + (end[axis] - start[axis]) * lower
+                for axis in range(3))
+            slice_end = tuple(
+                start[axis] + (end[axis] - start[axis]) * upper
+                for axis in range(3))
+            slice_yaw = float(start_yaw) + yaw_delta * middle
+            interval_bbox = _destructible_rotation_interval_bbox(
+                bbox, abs(yaw_delta) * 0.5 / float(steps))
+            sweep_descriptor = _destructible_sweep_descriptor(
+                descriptor, interval_bbox)
+            move_x = slice_end[0] - slice_start[0]
+            move_z = slice_end[2] - slice_start[2]
+            move_distance = math.sqrt(move_x * move_x + move_z * move_z)
+            motion_yaw = (math.atan2(move_x, move_z)
+                          if move_distance > 1.0e-8 else None)
+            # Geometry needs the realised centre travel, while kinetic
+            # classification needs the faster rotating hull edge.  Choosing a
+            # duration whose product with impact speed equals centre travel
+            # preserves that path; the sensor's normal contact skin remains.
+            slice_dt = (move_distance / impact_magnitude
+                        if move_distance > 1.0e-8 else 0.0)
+            if commit_enabled:
+                detail = resolver(
+                    self._avatar.spaceID, self._vector(slice_start),
+                    slice_yaw, impact_speed, sweep_descriptor, now,
+                    dt=slice_dt, kinetic_speed=rotation_kinetic_speed,
+                    return_detail=True,
+                    kinetic_commit=True, commit_enabled=True,
+                    motion_yaw=motion_yaw)
+            else:
+                detail = resolver(
+                    self._avatar.spaceID, self._vector(slice_start),
+                    slice_yaw, impact_speed, sweep_descriptor, now,
+                    dt=slice_dt, kinetic_speed=rotation_kinetic_speed,
+                    motion_yaw=motion_yaw)
+            if isinstance(detail, bool):
+                detail = {'status': 'hard' if detail else 'clear'}
+            elif isinstance(detail, str):
+                detail = {'status': detail}
+            if not isinstance(detail, dict):
+                raise RuntimeError(
+                    'destructible pose-sweep detail is unavailable')
+            status = detail.get('status')
+            if status not in (
+                    'clear', 'crushed', 'soft', 'hard', 'approach',
+                    'kinetic', 'pending'):
+                raise RuntimeError(
+                    'destructible pose sweep returned an invalid status')
+            parsed_token = self._destructible_contact_token(
+                detail.get('token'))
+            if parsed_token is not None:
+                token.update(parsed_token)
+            raw_kinds = str(detail.get('kinds', '-'))
+            kinds.update(value for value in raw_kinds.split(',')
+                         if value and value != '-')
+            accepted_now = accepted_now or bool(
+                detail.get('accepted_now', False))
+            used_kinetic_speed = used_kinetic_speed or bool(
+                detail.get('used_kinetic_speed', False))
+            requires_commit = requires_commit or bool(
+                detail.get('requires_commit', False))
+            saw_crushed = saw_crushed or status == 'crushed'
+            saw_soft = saw_soft or status == 'soft'
+            saw_approach = saw_approach or status == 'approach'
+            saw_kinetic = saw_kinetic or status == 'kinetic'
+            saw_pending = saw_pending or status == 'pending'
+            saw_hard = saw_hard or status == 'hard'
+            if saw_hard:
+                # A hard backing body still blocks the pose, but an exact
+                # fragile token from this or an earlier slice must be
+                # committed and propagated before the tank stops.
+                break
+
+        status = ('hard' if saw_hard else
+                  'pending' if saw_pending else
+                  'kinetic' if saw_kinetic else
+                  'crushed' if saw_crushed else
+                  'soft' if saw_soft else
+                  'approach' if saw_approach else 'clear')
+        return {
+            'status': status,
+            'token': tuple(sorted(token, key=lambda row: (
+                row[0], row[1], -1 if row[2] is None else row[2]))) or None,
+            'accepted_now': accepted_now,
+            'used_kinetic_speed': used_kinetic_speed,
+            'kinds': ','.join(sorted(kinds)) or '-',
+            'requires_commit': requires_commit,
+            'impact_speed': impact_speed,
+            '_pending': saw_pending,
+        }
+
+    def _pose_sweep_is_clear(
+            self, entity, start_position, start_yaw, end_position, end_yaw,
+            speed, dt):
+        """Submit one visible rotating-hull proposal before applying its pose."""
+        now = self._clock()
+        rotation_speed_cap = self._destructible_rotation_speed_cap(
+            self._local_physics,
+            critical_damage.stat_factor(entity, 'traverse'))
+        catalog_detail = self._destructible_pose_sweep(
+            start_position, start_yaw, end_position, end_yaw, speed,
+            entity.typeDescriptor, now, dt,
+            rotation_speed_cap=rotation_speed_cap)
+        tree_detail = self._tree_motion_proposal(
+            start_position, start_yaw, end_position, end_yaw,
+            speed, entity.typeDescriptor, now, dt)
+        detail = self._merge_destructible_motion_proposals(
+            catalog_detail, tree_detail)
+        status = detail.get('status')
+        self._local_motion_kinds = str(detail.get('kinds', '-'))
+        self._local_motion_status = status
+        if status == 'pending':
+            return False
+        if not bool(detail.get('requires_commit', False)):
+            return status in ('clear', 'crushed', 'approach')
+        token = self._destructible_contact_token(detail.get('token'))
+        if token is None:
+            raise RuntimeError('destructible pose sweep lost its exact token')
+        impact_speed = float(detail.get('impact_speed', speed))
+        if not self._commit_local_destructible_motion(
+                detail, start_position, start_yaw, end_position, end_yaw,
+                entity.typeDescriptor, speed, now, dt,
+                catalog_speed=impact_speed):
+            return False
+        # Translation is integrated before traverse in this copied physics
+        # step.  Bind the immediate input sample to the translated rotation
+        # start, then restore the in-progress fields until the step commits.
+        saved_position = self._local_position
+        saved_yaw = self._local_yaw
+        self._local_position = tuple(start_position)
+        self._local_yaw = float(start_yaw)
+        try:
+            sent = self._queue_and_send_local_destructible_contact(
+                detail, start_position, start_yaw, speed, dt,
+                end_position, end_yaw)
+        finally:
+            self._local_position = saved_position
+            self._local_yaw = saved_yaw
+        if not sent:
+            return False
+        return status in ('clear', 'crushed', 'approach')
+
     def _motion_is_clear(self, entity, position, yaw, speed, dt,
                          allow_crush_drive=False, hull_yaw=None):
         """Thin tuple-to-Vector adapter around the copied 0.8.2 probe."""
-        if getattr(self, '_local_destructible_send_failed', False):
-            return False
         self._local_motion_soft_block = False
         self._local_motion_cap_crushed = False
         self._local_motion_kinds = '-'
@@ -14087,37 +14789,56 @@ class BattleRuntime(object):
             limit_name = 'speedBwd' if speed < 0.0 else 'speedFwd'
             kinetic_speed = (-float(params[limit_name]) if speed < 0.0 else
                              float(params[limit_name]))
-        if self._destructibles is not None and kinetic_speed is not None:
+        if world_motion_yaw is None:
+            contact_end = (
+                float(position[0]) + math.sin(float(yaw)) *
+                float(speed) * float(dt),
+                float(position[1]),
+                float(position[2]) + math.cos(float(yaw)) *
+                float(speed) * float(dt))
+        else:
+            contact_end = (
+                float(position[0]) +
+                math.sin(float(world_motion_yaw)) *
+                abs(float(speed)) * float(dt),
+                float(position[1]),
+                float(position[2]) +
+                math.cos(float(world_motion_yaw)) *
+                abs(float(speed)) * float(dt))
+        if self._destructibles is not None:
+            proposal_now = self._clock()
             proposer = getattr(
                 self._destructibles, '_catalog_motion_proposal', None)
-            proposal = (proposer(
+            catalog_proposal = (proposer(
                 self._avatar.spaceID, self._vector(position), world_hull_yaw,
-                speed, entity.typeDescriptor, self._clock(),
+                speed, entity.typeDescriptor, proposal_now,
                 dt=dt, kinetic_speed=kinetic_speed,
                 **destructible_motion)
                 if callable(proposer) else None)
-            # Lightweight injected adapters predating the proposal seam keep
-            # using the read-only catalog path below. Production's pinned
-            # sensor always returns the typed proposal dictionary.
-            if (isinstance(proposal, dict) and
-                    bool(proposal.get('requires_commit', False))):
+            tree_proposal = self._tree_motion_proposal(
+                position, world_hull_yaw, contact_end, world_hull_yaw,
+                speed, entity.typeDescriptor, proposal_now, dt)
+            proposal = self._merge_destructible_motion_proposals(
+                catalog_proposal, tree_proposal)
+            if proposal.get('status') == 'pending':
                 self._local_motion_kinds = str(
                     proposal.get('kinds', '-'))
-                self._local_motion_status = 'kinetic'
-                token = self._destructible_contact_token(
-                    proposal.get('token'))
-                committer = getattr(
-                    self._destructibles, 'commit_local_prediction', None)
-                predictor = getattr(
-                    self._destructibles, 'begin_local_prediction', None)
-                if token is not None and callable(committer):
-                    predicted = bool(committer(
-                        self._avatar.spaceID, token,
-                        self._vector(position), yaw, speed))
-                else:
-                    predicted = bool(
-                        token is not None and callable(predictor) and
-                        predictor(token))
+                self._local_motion_status = 'pending'
+                return False
+            if bool(proposal.get('requires_commit', False)):
+                self._local_motion_kinds = str(
+                    proposal.get('kinds', '-'))
+                self._local_motion_status = proposal.get('status')
+                if not self._commit_local_destructible_motion(
+                        proposal, position, world_hull_yaw, contact_end,
+                        world_hull_yaw, entity.typeDescriptor, speed,
+                        proposal_now, dt):
+                    self._local_motion_status = 'hard'
+                    return False
+                if not self._queue_and_send_local_destructible_contact(
+                        proposal, position, world_hull_yaw, speed, dt,
+                        contact_end, world_hull_yaw):
+                    return False
                 world_status = world_collision.check_horizontal_collision(
                     self._runtime.bigworld, self._runtime.math,
                     self._avatar.spaceID, self._vector(position),
@@ -14128,39 +14849,10 @@ class BattleRuntime(object):
                 if isinstance(world_status, bool):
                     world_status = 'hard' if world_status else 'clear'
                 if world_status not in ('clear', 'kinetic'):
-                    if predicted:
-                        self._clear_local_destructible_prediction(token)
                     self._local_motion_status = 'hard'
                     return False
-                previous_seq = self._local_destructible_contact_seq
-                if not self._queue_local_destructible_contact(
-                        proposal, position, yaw, speed, dt):
-                    if predicted:
-                        self._clear_local_destructible_prediction(token)
-                    return False
-                if self._local_destructible_contact_seq != previous_seq:
-                    sender = getattr(self._sender, 'send_current', None)
-                    if not callable(sender) or not sender():
-                        failed_seq = self._local_destructible_contact_seq
-                        self._local_destructible_contacts.pop(
-                            failed_seq, None)
-                        self._local_destructible_safe_poses.pop(
-                            failed_seq, None)
-                        self._local_destructible_contact_seq = previous_seq
-                        if predicted:
-                            self._clear_local_destructible_prediction(token)
-                        self._local_destructible_send_failed = True
-                        return False
-                    # The pre-advance pose and proposal now precede every
-                    # resulting pose in the transport FIFO.  Treat this as
-                    # this frame's periodic input too; otherwise a long frame
-                    # immediately emits a redundant post-advance sample.
-                    self._local_input_sent_during_drive = True
-                # This exact local proof owns movement prediction only. Keep
-                # advancing the copied vehicle pose while the server relays it
-                # to the worker; the worker remains the sole owner of the
-                # irreversible map mutation and its canonical LAN event.
-                return True
+                return proposal.get('status') in (
+                    'clear', 'crushed', 'approach')
         world_status = world_collision.check_horizontal_collision(
             self._runtime.bigworld, self._runtime.math,
             self._avatar.spaceID, self._vector(position),
@@ -15222,8 +15914,9 @@ class BattleRuntime(object):
 
     @staticmethod
     def _destructible_contact_token(value):
-        """Canonicalise one exact catalog identity set for the LAN ledger."""
-        if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 16:
+        """Canonicalise one exact destructible identity set for the LAN ledger."""
+        if (not isinstance(value, (list, tuple)) or
+                not 1 <= len(value) <= DESTRUCTIBLE_CONTACT_TOKEN_LIMIT):
             return None
         result = set()
         for raw in value:
@@ -15243,7 +15936,8 @@ class BattleRuntime(object):
                 row[0], row[1], -1 if row[2] is None else row[2])))
 
     def _queue_local_destructible_contact(
-            self, detail, position, yaw, speed, dt):
+            self, detail, position, yaw, speed, dt,
+            end_position=None, end_yaw=None):
         """Retain one read-only hull contact until worker resolution."""
         if (not isinstance(detail, dict) or
                 not bool(detail.get('requires_commit', False))):
@@ -15255,8 +15949,6 @@ class BattleRuntime(object):
             if self._destructible_contact_token(
                     pending.get('token')) == token:
                 return True
-        if len(self._local_destructible_contacts) >= 16:
-            return False
         try:
             contact_speed = float(speed)
             contact_dt = float(dt)
@@ -15265,6 +15957,24 @@ class BattleRuntime(object):
         if (math.isnan(contact_speed) or math.isinf(contact_speed) or
                 math.isnan(contact_dt) or math.isinf(contact_dt) or
                 contact_dt <= 0.0 or contact_dt > 0.1):
+            return False
+        if end_position is None:
+            end_position = (
+                float(position[0]) + math.sin(float(yaw)) *
+                contact_speed * contact_dt,
+                float(position[1]),
+                float(position[2]) + math.cos(float(yaw)) *
+                contact_speed * contact_dt)
+        if end_yaw is None:
+            end_yaw = yaw
+        try:
+            parsed_end = tuple(float(end_position[index]) for index in range(3))
+            parsed_end_yaw = float(end_yaw)
+        except (IndexError, TypeError, ValueError, OverflowError):
+            return False
+        if (any(math.isnan(value) or math.isinf(value)
+                for value in parsed_end) or
+                math.isnan(parsed_end_yaw) or math.isinf(parsed_end_yaw)):
             return False
         self._local_destructible_contact_seq += 1
         seq = self._local_destructible_contact_seq
@@ -15276,6 +15986,10 @@ class BattleRuntime(object):
             'yaw': round(float(yaw), 5),
             'speed': round(max(-200.0, min(200.0, contact_speed)), 4),
             'dt': round(contact_dt, 6),
+            'end_x': round(parsed_end[0], 4),
+            'end_y': round(parsed_end[1], 4),
+            'end_z': round(parsed_end[2], 4),
+            'end_yaw': round(parsed_end_yaw, 5),
             'token': [list(row) for row in token],
         }
         self._local_destructible_safe_poses[seq] = (
@@ -15284,9 +15998,15 @@ class BattleRuntime(object):
         return True
 
     def local_destructible_contacts(self):
-        """Return every hull-sweep proposal awaiting a worker verdict."""
-        return [dict(value)
-                for value in self._local_destructible_contacts.values()]
+        """Return the oldest bounded window awaiting worker verdicts."""
+        result = []
+        for seq, value in self._local_destructible_contacts.items():
+            if seq <= self._local_destructible_admitted_seq:
+                continue
+            result.append(dict(value))
+            if len(result) >= DESTRUCTIBLE_CONTACT_WINDOW:
+                break
+        return result
 
     def _destructible_contacts_enqueued(self):
         capabilities = getattr(self.client, 'server_capabilities', ()) or ()
@@ -15299,7 +16019,9 @@ class BattleRuntime(object):
         if self.client is None or not isinstance(snapshot, dict):
             return False
         local_id = int(self.client.player_id)
+        admitted = None
         resolved = None
+        resolved_exact = ()
         rejected = ()
         for raw in snapshot.get('players') or ():
             if not isinstance(raw, dict):
@@ -15307,8 +16029,21 @@ class BattleRuntime(object):
             try:
                 if int(raw.get('id')) != local_id:
                     continue
+                admitted = int(raw.get(
+                    'destructible_contact_admitted_seq', 0))
                 resolved = int(raw.get(
                     'destructible_contact_resolved_seq', 0))
+                raw_resolved_exact = raw.get(
+                    'destructible_contact_resolved_seqs', ())
+                if (not isinstance(raw_resolved_exact, (list, tuple)) or
+                        len(raw_resolved_exact) >
+                        DESTRUCTIBLE_CONTACT_INFLIGHT_LIMIT):
+                    return False
+                resolved_exact = tuple(
+                    int(value) for value in raw_resolved_exact)
+                if (any(value <= 0 for value in resolved_exact) or
+                        len(set(resolved_exact)) != len(resolved_exact)):
+                    return False
                 raw_rejected = raw.get(
                     'destructible_contact_rejected_seqs', ())
                 if (not isinstance(raw_rejected, (list, tuple)) or
@@ -15316,20 +16051,29 @@ class BattleRuntime(object):
                     return False
                 rejected = tuple(int(value) for value in raw_rejected)
             except (TypeError, ValueError, OverflowError):
+                admitted = None
                 resolved = None
             break
-        if resolved is None:
+        if (admitted is None or resolved is None or
+                not 0 <= resolved <= admitted <=
+                self._local_destructible_contact_seq or
+                any(value <= resolved or value > admitted
+                    for value in resolved_exact)):
             return False
-        changed = False
+        exact = set(resolved_exact)
+        changed = admitted > self._local_destructible_admitted_seq
+        self._local_destructible_admitted_seq = max(
+            self._local_destructible_admitted_seq, admitted)
         rollback = [
             seq for seq in self._local_destructible_contacts
-            if (seq <= resolved and seq in rejected and
+            if ((seq <= resolved or seq in exact) and
+                seq in rejected and
                 seq in self._local_destructible_safe_poses)]
-        if rollback:
+        for seq in rollback:
             changed = self._apply_local_destructible_rejection(
-                min(rollback)) or changed
+                seq) or changed
         for seq in list(self._local_destructible_contacts):
-            if seq <= resolved:
+            if seq <= resolved or seq in exact:
                 self._local_destructible_contacts.pop(seq, None)
                 self._local_destructible_safe_poses.pop(seq, None)
                 changed = True
@@ -15348,17 +16092,14 @@ class BattleRuntime(object):
         if (sequence not in self._local_destructible_contacts or
                 sequence not in self._local_destructible_safe_poses):
             return False
-        for seq, pending in self._local_destructible_contacts.items():
-            if seq >= sequence:
-                self._clear_local_destructible_prediction(
-                    self._destructible_contact_token(pending.get('token')))
+        pending = self._local_destructible_contacts.get(sequence)
+        self._clear_local_destructible_prediction(
+            self._destructible_contact_token(pending.get('token')))
         self._report_destructible_verdict(
             'visible_kept', sequence, False,
             self._destructible_contact_token(
                 self._local_destructible_contacts[sequence].get('token')))
-        for seq in list(self._local_destructible_safe_poses):
-            if seq >= sequence:
-                self._local_destructible_safe_poses.pop(seq, None)
+        self._local_destructible_safe_poses.pop(sequence, None)
         return True
 
     def _clear_local_destructible_prediction(self, token):
@@ -15761,7 +16502,6 @@ class BattleRuntime(object):
             return
         elapsed = max(0.0, float(elapsed))
         self._local_input_sent_during_drive = False
-        self._local_destructible_send_failed = False
         remaining = elapsed
         stopped = False
         if remaining <= 0.0:
@@ -15952,7 +16692,22 @@ class BattleRuntime(object):
             candidate_yaw += 2.0 * math.pi
         if self._arena_rotation_is_clear(
                 entity, position, yaw, candidate_yaw):
-            yaw = candidate_yaw
+            yaw_changed = abs(_angle_delta(yaw, candidate_yaw)) > 1.0e-8
+            sweep_clear = (not yaw_changed or self._local_airborne or
+                           self._pose_sweep_is_clear(
+                               entity, position, yaw, position,
+                               candidate_yaw, self._local_speed, dt))
+            if sweep_clear:
+                yaw = candidate_yaw
+                if (yaw_changed and
+                        self._local_motion_status == 'crushed'):
+                    contact_path = contact_path or 'turn_crush'
+            else:
+                # A catalog hard body or an unresolved kinetic contact owns
+                # the same angular stop as the arena edge.  Translation already
+                # passed the unchanged native world probe above.
+                self._local_turn_speed = 0.0
+                contact_path = contact_path or 'turn_contact'
         else:
             # The rectangular red border behaves as a hard chassis contact:
             # keep this tick's last legal pose and remove angular momentum.

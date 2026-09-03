@@ -12,6 +12,10 @@ _DESTRUCTIBLE_ORIGIN_RADIUS = 8.0
 _DESTRUCTIBLE_CHUNK_METRES_1513 = 100.0
 _SOLID_CONTACT_RADIUS_1513 = 0.5
 _SOLID_CONTACT_NORMAL_DOT_1513 = 0.5
+_TREE_SWEEP_ANGLE_STEP_1513 = 3.141592653589793 / 36.0
+_TREE_SWEEP_TRANSLATION_STEP_1513 = 8.0
+_TREE_SWEEP_MAX_SEGMENTS_1513 = 128
+_TREE_CONTACT_TOKEN_LIMIT_1513 = 64
 _CATALOG_POINT_EPSILON = 0.075
 _SHOT_RAY_EPSILON = 1.0e-4
 _SOFT_STATIC_MAX_SKIPS = 4
@@ -298,14 +302,19 @@ def _native_chunk_destructible_count_1513(manager, chunk_id):
 	return int(count)
 
 
-def _native_name_groups_1513(area_destructibles, names, ignored_items=()):
-	"""Type non-empty entries from a possibly compacted native name list."""
+def _native_name_groups_1513(
+		area_destructibles, names, ignored_items=(), positional=False):
+	"""Type names and report only position-proven per-item failures."""
 	try:
 		cache = area_destructibles.g_cache
+		query = cache.getDescByFilename
 	except Exception:
-		return None, 'descriptor_cache'
+		return None, 'descriptor_cache', ()
+	if not callable(query):
+		return None, 'descriptor_cache', ()
 	ignored_items = set(int(value) for value in ignored_items)
 	names_by_type = {}
+	item_failures = []
 	for item_index, name in enumerate(names):
 		if item_index in ignored_items:
 			continue
@@ -314,17 +323,31 @@ def _native_name_groups_1513(area_destructibles, names, ignored_items=()):
 		if not name:
 			continue
 		try:
-			descriptor = cache.getDescByFilename(name)
-		except Exception:
-			return None, 'descriptor_cache'
+			descriptor = query(name)
+		except Exception as error:
+			if positional:
+				item_failures.append(
+					(item_index, 'descriptor_cache', error))
+				continue
+			return None, 'descriptor_cache', ()
 		if not isinstance(descriptor, dict):
-			return None, 'name_descriptor'
+			if positional:
+				item_failures.append((
+					item_index, 'name_descriptor',
+					'filename=%r expected descriptor dict' % name))
+				continue
+			return None, 'name_descriptor', ()
 		descriptor_type = descriptor.get('type')
 		if (isinstance(descriptor_type, bool) or
 				not isinstance(descriptor_type, _INTEGER_TYPES)):
-			return None, 'name_descriptor'
+			if positional:
+				item_failures.append((
+					item_index, 'name_descriptor',
+					'filename=%r type=%r' % (name, descriptor_type)))
+				continue
+			return None, 'name_descriptor', ()
 		names_by_type.setdefault(int(descriptor_type), []).append(name)
-	return names_by_type, 'ready'
+	return names_by_type, 'ready', tuple(item_failures)
 
 
 def _align_native_item_names_1513(
@@ -348,7 +371,7 @@ def _align_native_item_names_1513(
 			for name in name_list:
 				name_types[name] = descriptor_type
 		mapping = {}
-		anomalous = []
+		item_failures = []
 		for item_index, name in enumerate(positional_names):
 			if item_index in ignored_items:
 				continue
@@ -358,12 +381,15 @@ def _align_native_item_names_1513(
 			native_type = item_types.get(item_index)
 			if descriptor_type != native_type:
 				if descriptor_type is not None:
-					anomalous.append(descriptor_type)
+					item_failures.append((
+						item_index, 'name_type_mismatch',
+						'name=%r descriptor_type=%s native_type=%s' % (
+							name, descriptor_type, native_type)))
 				continue
 			mapping[item_index] = name
-		if anomalous:
-			return mapping, 'partial', tuple(sorted(set(anomalous)))
-		return mapping, 'exact', ()
+		if item_failures:
+			return mapping, 'partial', (), tuple(item_failures)
+		return mapping, 'exact', (), ()
 	mapping = {}
 	anomalous = []
 	for native_type in sorted(names_by_type):
@@ -381,8 +407,24 @@ def _align_native_item_names_1513(
 			# compaction cannot be reconstructed.
 			anomalous.append(native_type)
 	if anomalous:
-		return mapping, 'partial', tuple(sorted(set(anomalous)))
-	return mapping, 'exact', ()
+		return mapping, 'partial', tuple(sorted(set(anomalous))), ()
+	return mapping, 'exact', (), ()
+
+
+def _finish_native_item_name_alignment_1513(
+		entry, positional_names, chunk_id):
+	"""Consume exact positional failures without weakening compacted checks."""
+	mapping, status, anomalous, item_failures = (
+		_align_native_item_names_1513(
+			entry['names_by_type'], entry['items_by_type'], positional_names,
+			entry['ignored_items']))
+	for item_index, failure_type, detail in item_failures:
+		entry['ignored_items'].add(item_index)
+		_isolate_destructible_1513(
+			failure_type, chunk_id, item_index, detail=detail)
+	if item_failures:
+		return mapping, 'exact', ()
+	return mapping, status, anomalous
 
 
 def _item_name_query_allowance_1513(bigworld, work_key, requested):
@@ -520,11 +562,13 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	valid only after every resolvable native item has been typed.  Advance that
 	enumeration from one shared render-tick budget and cache its progress; until
 	it completes, callers receive
-	``pending_alignment`` and must keep the chunk solid.  Unknown descriptors,
-	malformed categories, or a completed count mismatch are terminal evidence
-	failures and are never converted into an unnamed item.  A resolver exception
-	is the exact native loop's unnamed case, but that live slot is quarantined so
-	no later native matrix/effect/destroy query can touch it.
+	``pending_alignment`` and must keep the chunk solid.  Unknown descriptors
+	or malformed categories are terminal evidence failures: full-width position
+	proof contains them to one item, while a compacted list stays unsafe as a
+	whole.  Neither is converted into an unnamed item.  A completed compacted
+	count mismatch is likewise terminal.  A resolver exception is the exact
+	native loop's unnamed case, but that live slot is quarantined so no later
+	native matrix/effect/destroy query can touch it.
 	"""
 	cache = globals().setdefault('g_offh_destr_item_names', {})
 	key = (int(space_id), int(chunk_id))
@@ -554,13 +598,18 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 			if victim is None:
 				return None, 'pending_alignment', ()
 			cache.pop(victim, None)
+		full_width = len(names) == int(native_count)
 		ignored_items = set()
-		if len(names) == int(native_count):
+		if full_width:
 			ignored_items = set(item_index for chunk, item_index in
 				globals().get('g_offh_destr_isolated_slots', ())
 				if int(chunk) == int(chunk_id))
-		names_by_type, status = _native_name_groups_1513(
-			area_destructibles, names, ignored_items)
+		names_by_type, status, item_failures = _native_name_groups_1513(
+			area_destructibles, names, ignored_items, full_width)
+		for item_index, failure_type, detail in item_failures:
+			ignored_items.add(item_index)
+			_isolate_destructible_1513(
+				failure_type, chunk_id, item_index, detail=detail)
 		if names_by_type is None:
 			entry = {
 				'fingerprint': fingerprint,
@@ -585,10 +634,9 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 		_release_item_name_query_focus_1513(space_id, chunk_id)
 		return entry['result']
 	if entry['next_item'] >= int(native_count):
-		entry['result'] = _align_native_item_names_1513(
-			entry['names_by_type'], entry['items_by_type'],
-			names if len(names) == int(native_count) else None,
-			entry['ignored_items'])
+		entry['result'] = _finish_native_item_name_alignment_1513(
+			entry, names if len(names) == int(native_count) else None,
+			chunk_id)
 		_release_item_name_query_focus_1513(space_id, chunk_id)
 		return entry['result']
 	query = getattr(bigworld, 'wg_getDestructibleEffectCategory', None)
@@ -627,9 +675,17 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 				'g_offh_destr_name_unresolved_slots', set()).add(identity)
 			_isolate_destructible_1513(
 				'name_item_unresolved', chunk_id, item_index, detail=error)
+			if len(names) == int(native_count):
+				entry['ignored_items'].add(item_index)
 			continue
 		if (isinstance(native_type, bool) or
 				not isinstance(native_type, _INTEGER_TYPES)):
+			if len(names) == int(native_count):
+				entry['ignored_items'].add(item_index)
+				_isolate_destructible_1513(
+					'category_abi', chunk_id, item_index,
+					detail='native category is not an integer')
+				continue
 			entry['result'] = (None, 'category_abi', ())
 			_release_item_name_query_focus_1513(space_id, chunk_id)
 			return entry['result']
@@ -640,10 +696,9 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	entry['next_item'] = end_item
 	if end_item < int(native_count):
 		return None, 'pending_alignment', ()
-	entry['result'] = _align_native_item_names_1513(
-		entry['names_by_type'], entry['items_by_type'],
-		names if len(names) == int(native_count) else None,
-		entry['ignored_items'])
+	entry['result'] = _finish_native_item_name_alignment_1513(
+		entry, names if len(names) == int(native_count) else None,
+		chunk_id)
 	_release_item_name_query_focus_1513(space_id, chunk_id)
 	return entry['result']
 
@@ -709,10 +764,11 @@ def _chunk_native_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	"""Align one chunk's validated name list to its native item indices.
 
 	All calls and chunks share at most ``_ITEM_NAME_QUERY_BUDGET`` native category
-	queries per render tick.  ``pending_alignment`` is retryable; every completed
-	failure is a chunk-wide fail-closed boundary because a shorter compacted list
+	queries per render tick.  ``pending_alignment`` is retryable.  A shorter
+	compacted list keeps every completed evidence failure chunk-wide because it
 	cannot identify which slot owns contradictory name evidence.  A full-width
-	list preserves slots, including legal empty strings.
+	list preserves slots, including legal empty strings, so descriptor, category,
+	or type failures are contained to their exact item.
 	"""
 	mapping, status, anomalous = _chunk_item_names_1513(
 		bigworld, area_destructibles, space_id, chunk_id, native_count, names)
@@ -989,6 +1045,8 @@ def _clear_runtime_registry():
 			'g_offh_destr_chunks', 'g_offh_destr_instances',
 			'g_offh_destr_contact_bins', 'g_offh_destr_pending',
 			'g_offh_destr_speculative',
+			'g_offh_destr_catalog_published',
+			'g_offh_destr_catalog_publish_pending',
 			'g_offh_destr_falling_active', 'g_offh_destr_ground_skips',
 			'g_offh_destr_broken_cache',
 			'g_offh_destr_item_names',
@@ -2090,30 +2148,279 @@ def _vehicle_swept_box(pos, yaw, vel, bbox, travel_reach=None,
 	return center, half_axes
 
 
-def _vehicle_contact_box(pos, yaw, bbox, epsilon=0.075, travel=0.0):
-	"""Return only the leading hull face plus this frame's travel."""
+def _tree_trig_interval_1513(cosine_factor, sine_factor, start, end):
+	"""Return exact extrema of ``a*cos(yaw) + b*sin(yaw)``."""
+	import math
+	start = float(start)
+	end = float(end)
+	if end < start:
+		start, end = end, start
+	values = (
+		cosine_factor * math.cos(start) + sine_factor * math.sin(start),
+		cosine_factor * math.cos(end) + sine_factor * math.sin(end))
+	result = [values[0], values[1]]
+	stationary = math.atan2(sine_factor, cosine_factor)
+	first = int(math.ceil((start - stationary) / math.pi))
+	last = int(math.floor((end - stationary) / math.pi))
+	for offset in range(first, last + 1):
+		angle = stationary + offset * math.pi
+		result.append(
+			cosine_factor * math.cos(angle) +
+			sine_factor * math.sin(angle))
+	return min(result), max(result)
+
+
+def _tree_rotation_interval_bbox_1513(bbox, half_angle):
+	"""Enclose the native hull over one bounded yaw interval."""
+	minimum, maximum = bbox[:2]
+	half_angle = abs(float(half_angle))
+	x_values = []
+	z_values = []
+	for local_x in (float(minimum[0]), float(maximum[0])):
+		for local_z in (float(minimum[2]), float(maximum[2])):
+			low, high = _tree_trig_interval_1513(
+				local_x, local_z, -half_angle, half_angle)
+			x_values.extend((low, high))
+			low, high = _tree_trig_interval_1513(
+				local_z, -local_x, -half_angle, half_angle)
+			z_values.extend((low, high))
+	return (
+		(min(x_values), float(minimum[1]), min(z_values)),
+		(max(x_values), float(maximum[1]), max(z_values)), None)
+
+
+def _finite_tree_motion_value_1513(value):
+	import math
+	try:
+		value = float(value)
+	except (TypeError, ValueError, OverflowError):
+		return None
+	if math.isnan(value) or math.isinf(value):
+		return None
+	return value
+
+
+def _tree_pose_sweep_boxes_1513(
+		start_pos, start_yaw, end_pos, end_yaw, bbox):
+	"""Build bounded zonotope slices for one previous-to-current hull sweep.
+
+	Each slice analytically encloses every intermediate hull orientation, then
+	adds the exact linear translation as a fourth generator.  The union is a
+	continuous swept-hull cover; no finite set of contact rays is used.
+	"""
+	import math
+	values = tuple(_finite_tree_motion_value_1513(value) for value in (
+		start_pos.x, start_pos.y, start_pos.z, start_yaw,
+		end_pos.x, end_pos.y, end_pos.z, end_yaw))
+	if any(value is None for value in values):
+		return None
+	(sx, sy, sz, start_yaw, ex, ey, ez, end_yaw) = values
+	try:
+		minimum, maximum = bbox[:2]
+		minimum = tuple(_finite_tree_motion_value_1513(value)
+			for value in minimum[:3])
+		maximum = tuple(_finite_tree_motion_value_1513(value)
+			for value in maximum[:3])
+	except (AttributeError, KeyError, TypeError, IndexError):
+		return None
+	if (any(value is None for value in minimum + maximum) or
+			any(minimum[index] > maximum[index] for index in range(3))):
+		return None
+	dx = ex - sx
+	dy = ey - sy
+	dz = ez - sz
+	distance = (dx * dx + dz * dz) ** 0.5
+	yaw_delta = ((end_yaw - start_yaw + math.pi) %
+		(2.0 * math.pi)) - math.pi
+	steps = max(1,
+		int(math.ceil(distance / _TREE_SWEEP_TRANSLATION_STEP_1513)),
+		int(math.ceil(abs(yaw_delta) / _TREE_SWEEP_ANGLE_STEP_1513)))
+	if steps > _TREE_SWEEP_MAX_SEGMENTS_1513:
+		return None
+	boxes = []
+	for index in range(steps):
+		t0 = float(index) / float(steps)
+		t1 = float(index + 1) / float(steps)
+		p0 = (sx + dx * t0, sy + dy * t0, sz + dz * t0)
+		p1 = (sx + dx * t1, sy + dy * t1, sz + dz * t1)
+		yaw0 = start_yaw + yaw_delta * t0
+		yaw1 = start_yaw + yaw_delta * t1
+		mid_yaw = (yaw0 + yaw1) * 0.5
+		interval_bbox = _tree_rotation_interval_bbox_1513(
+			(minimum, maximum, None), (yaw1 - yaw0) * 0.5)
+		interval_minimum, interval_maximum = interval_bbox[:2]
+		local_center_x = (
+			interval_minimum[0] + interval_maximum[0]) * 0.5
+		local_center_y = (
+			interval_minimum[1] + interval_maximum[1]) * 0.5
+		local_center_z = (
+			interval_minimum[2] + interval_maximum[2]) * 0.5
+		half_x = (interval_maximum[0] - interval_minimum[0]) * 0.5
+		half_y = (interval_maximum[1] - interval_minimum[1]) * 0.5
+		half_z = (interval_maximum[2] - interval_minimum[2]) * 0.5
+		cos_y = math.cos(mid_yaw)
+		sin_y = math.sin(mid_yaw)
+		travel = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+		center = (
+			p0[0] + cos_y * local_center_x +
+				sin_y * local_center_z + travel[0] * 0.5,
+			p0[1] + local_center_y + travel[1] * 0.5,
+			p0[2] - sin_y * local_center_x +
+				cos_y * local_center_z + travel[2] * 0.5)
+		half_axes = (
+			(cos_y * half_x, 0.0, -sin_y * half_x),
+			(0.0, half_y, 0.0),
+			(sin_y * half_z, 0.0, cos_y * half_z),
+			(travel[0] * 0.5, travel[1] * 0.5,
+				travel[2] * 0.5))
+		boxes.append((center, half_axes))
+	return tuple(boxes)
+
+
+def _tree_xz_zonotope_hull_1513(sweep_box):
+	"""Return the convex XZ polygon of one generated sweep slice."""
+	center, half_axes = sweep_box[:2]
+	generators = tuple((float(axis[0]), float(axis[2]))
+		for axis in half_axes
+		if axis[0] * axis[0] + axis[2] * axis[2] > 1.0e-16)
+	points = [(float(center[0]), float(center[2]))]
+	for generator in generators:
+		points = [(point[0] + sign * generator[0],
+			point[1] + sign * generator[1])
+			for point in points for sign in (-1.0, 1.0)]
+	points = sorted(set(points))
+	if len(points) <= 2:
+		return tuple(points)
+
+	def cross(origin, left, right):
+		return ((left[0] - origin[0]) * (right[1] - origin[1]) -
+			(left[1] - origin[1]) * (right[0] - origin[0]))
+
+	lower = []
+	for point in points:
+		while (len(lower) >= 2 and
+				cross(lower[-2], lower[-1], point) <= 1.0e-12):
+			lower.pop()
+		lower.append(point)
+	upper = []
+	for point in reversed(points):
+		while (len(upper) >= 2 and
+				cross(upper[-2], upper[-1], point) <= 1.0e-12):
+			upper.pop()
+		upper.append(point)
+	return tuple(lower[:-1] + upper[:-1])
+
+
+def _point_near_tree_sweep_1513(x, z, sweep_box,
+		contact_radius=_SOLID_CONTACT_RADIUS_1513):
+	"""Test a tree origin against a swept zonotope plus its circular skin."""
+	hull = _tree_xz_zonotope_hull_1513(sweep_box)
+	if not hull:
+		return False
+	point = (float(x), float(z))
+	if len(hull) == 1:
+		dx = point[0] - hull[0][0]
+		dz = point[1] - hull[0][1]
+		return dx * dx + dz * dz <= contact_radius * contact_radius
+	inside = True
+	minimum_distance_squared = None
+	for index, start in enumerate(hull):
+		end = hull[(index + 1) % len(hull)]
+		edge_x = end[0] - start[0]
+		edge_z = end[1] - start[1]
+		if edge_x * (point[1] - start[1]) - edge_z * (
+				point[0] - start[0]) < -1.0e-8:
+			inside = False
+		length_squared = edge_x * edge_x + edge_z * edge_z
+		if length_squared <= 1.0e-16:
+			fraction = 0.0
+		else:
+			fraction = ((point[0] - start[0]) * edge_x +
+				(point[1] - start[1]) * edge_z) / length_squared
+			fraction = max(0.0, min(1.0, fraction))
+		nearest_x = start[0] + edge_x * fraction
+		nearest_z = start[1] + edge_z * fraction
+		distance_squared = ((point[0] - nearest_x) ** 2 +
+			(point[1] - nearest_z) ** 2)
+		if (minimum_distance_squared is None or
+				distance_squared < minimum_distance_squared):
+			minimum_distance_squared = distance_squared
+	if inside:
+		return True
+	return (minimum_distance_squared is not None and
+		minimum_distance_squared <=
+		contact_radius * contact_radius + 1.0e-8)
+
+
+def _tree_candidates_for_sweeps_1513(
+		chunk_id, registry, sweep_boxes, tree_type,
+		contact_radius=_SOLID_CONTACT_RADIUS_1513):
+	"""Return exact named tree records and known isolated contacts."""
+	candidates = {}
+	isolated_hits = set()
+	seen = set()
+	for sweep_box in sweep_boxes:
+		minimum_x, maximum_x, minimum_z, maximum_z = (
+			_box_xz_bounds(sweep_box))
+		minimum_x -= contact_radius
+		maximum_x += contact_radius
+		minimum_z -= contact_radius
+		maximum_z += contact_radius
+		for bin_key in _bin_keys_for_bounds(
+				minimum_x, maximum_x, minimum_z, maximum_z):
+			for item in registry.get('bins', {}).get(bin_key, ()):
+				item_index = int(item[0])
+				identity = (int(chunk_id), item_index, None)
+				if identity in seen:
+					continue
+				if (item[4] != tree_type or
+						not _normalized_filename(item[5])):
+					continue
+				if not _point_near_tree_sweep_1513(
+						item[1], item[3], sweep_box, contact_radius):
+					continue
+				seen.add(identity)
+				if _destructible_isolated_1513(chunk_id, item_index):
+					isolated_hits.add(identity)
+					continue
+				candidates[identity] = item
+	return candidates, isolated_hits
+
+
+def _vehicle_contact_box(pos, yaw, bbox, epsilon=0.075, travel=0.0,
+		motion_yaw=None):
+	"""Return the complete current hull plus only this frame's real travel."""
 	import math
 	minimum, maximum = bbox[:2]
 	margin = max(0.0, float(epsilon))
 	travel = float(travel)
-	if travel < 0.0:
-		minimum_forward = float(minimum[2]) - margin + travel
-		maximum_forward = float(minimum[2]) + margin
-	else:
-		minimum_forward = float(maximum[2]) - margin
-		maximum_forward = float(maximum[2]) + margin + travel
-	half_width = max(abs(float(minimum[0])), abs(float(maximum[0]))) + margin
-	cos_y = math.cos(yaw)
-	sin_y = math.sin(yaw)
+	minimum_x = float(minimum[0]) - margin
+	maximum_x = float(maximum[0]) + margin
+	minimum_forward = float(minimum[2]) - margin
+	maximum_forward = float(maximum[2]) + margin
+	center_x = (minimum_x + maximum_x) * 0.5
+	half_width = (maximum_x - minimum_x) * 0.5
 	center_forward = (minimum_forward + maximum_forward) * 0.5
 	half_forward = (maximum_forward - minimum_forward) * 0.5
+	if motion_yaw is None:
+		travel_yaw = float(yaw) if travel >= 0.0 else float(yaw) + math.pi
+	else:
+		travel_yaw = float(motion_yaw)
+	travel_distance = abs(travel)
+	travel_x = math.sin(travel_yaw) * travel_distance
+	travel_z = math.cos(travel_yaw) * travel_distance
+	cos_y = math.cos(yaw)
+	sin_y = math.sin(yaw)
 	center_y = pos.y + (float(minimum[1]) + float(maximum[1])) * 0.5
 	half_y = (float(maximum[1]) - float(minimum[1])) * 0.5 + margin
-	center = (pos.x + sin_y * center_forward, center_y,
-		pos.z + cos_y * center_forward)
+	center = (
+		pos.x + cos_y * center_x + sin_y * center_forward + travel_x * 0.5,
+		center_y,
+		pos.z - sin_y * center_x + cos_y * center_forward + travel_z * 0.5)
 	half_axes = ((cos_y * half_width, 0.0, -sin_y * half_width),
 		(0.0, half_y, 0.0),
-		(sin_y * half_forward, 0.0, cos_y * half_forward))
+		(sin_y * half_forward, 0.0, cos_y * half_forward),
+		(travel_x * 0.5, 0.0, travel_z * 0.5))
 	return center, half_axes
 
 
@@ -2198,7 +2505,8 @@ def commit_local_prediction(spaceID, token, position, yaw, speed):
 	The visible client owns the native contact that its copied vehicle physics
 	just observed.  Commit that presentation before movement is advanced; the
 	hidden worker still publishes the canonical LAN event for other clients.
-	Only checksum-pinned fragile items and exact structure modules reach here.
+	Only checksum-pinned fragile items, falling atoms and exact structure modules
+	reach here.
 	"""
 	import Math
 	authority = _get_destr_authority()
@@ -2216,6 +2524,7 @@ def commit_local_prediction(spaceID, token, position, yaw, speed):
 			continue
 		kind = instance.get('kind')
 		if not ((kind == 'fragile' and mat_kind is None) or
+				(kind == 'falling' and mat_kind is None) or
 				(kind == 'structure' and mat_kind is not None)):
 			continue
 		boxes = tuple(box for box in instance.get('boxes', ())
@@ -2229,6 +2538,9 @@ def commit_local_prediction(spaceID, token, position, yaw, speed):
 		elif kind == 'fragile':
 			accepted = authority.destroy_fragile(
 				spaceID, chunk_id, item_index, point, False)
+		elif kind == 'falling':
+			accepted = authority.destroy_column(
+				spaceID, chunk_id, item_index, yaw, speed, point)
 		else:
 			accepted = authority.destroy_module(
 				spaceID, chunk_id, item_index, mat_kind, point, False)
@@ -2236,9 +2548,9 @@ def commit_local_prediction(spaceID, token, position, yaw, speed):
 			raise RuntimeError(
 				'local native destructible prediction was not accepted: '
 				'chunk=%s item=%s' % (chunk_id, item_index))
-		note_destroyed(
-			'fragile' if kind == 'fragile' else 'module',
-			chunk_id, item_index, mat_kind)
+		event_kind = ('fragile' if kind == 'fragile' else
+			'column' if kind == 'falling' else 'module')
+		note_destroyed(event_kind, chunk_id, item_index, mat_kind)
 		committed.append((chunk_id, item_index, mat_kind))
 	return begin_local_prediction(committed) or bool(committed)
 
@@ -2666,15 +2978,28 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 		raise ValueError(
 			'catalog motion proposals require detail and kinetic classification')
 	_diagnostic_flush_1513(now)
+	publish_failures, publish_kinds = _retry_catalog_publications_1513()
+	if publish_failures:
+		# Backpressure is an operation-local pending result.  Do not admit more
+		# irreversible native mutations until the already committed event is
+		# observable, and retain its exact identity for the worker retry.
+		return _catalog_motion_result(
+			'pending', publish_failures, return_status=return_status,
+			return_detail=return_detail, kinds=publish_kinds,
+			requires_commit=False if proposal_only else None)
 	if _destructible_catalog is None:
 		return _catalog_motion_result(
-			'clear', return_status=return_status,
-			return_detail=return_detail)
+			'pending' if publish_failures else 'clear', publish_failures,
+			return_status=return_status, return_detail=return_detail,
+			kinds=publish_kinds,
+			requires_commit=False if proposal_only else None)
 	bbox = _vehicle_hull_bbox(td)
 	if bbox is None:
 		return _catalog_motion_result(
-			'clear', return_status=return_status,
-			return_detail=return_detail)
+			'pending' if publish_failures else 'clear', publish_failures,
+			return_status=return_status, return_detail=return_detail,
+			kinds=publish_kinds,
+			requires_commit=False if proposal_only else None)
 	import Math
 	auth = _get_destr_authority()
 	_refresh_destroyed_falling_instances_1513(spaceID, auth, now)
@@ -2688,22 +3013,26 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 	candidates = _catalog_contact_candidates(vehicle_box)
 	if not candidates:
 		return _catalog_motion_result(
-			'clear', return_status=return_status,
-			return_detail=return_detail)
+			'pending' if publish_failures else 'clear', publish_failures,
+			return_status=return_status, return_detail=return_detail,
+			kinds=publish_kinds,
+			requires_commit=False if proposal_only else None)
 
 	grouped = {}
 	for candidate in candidates:
 		grouped.setdefault((candidate[0], candidate[1]), []).append(candidate)
 	instances = globals().get('g_offh_destr_instances', {})
 	contact_box = (_vehicle_contact_box(
-		pos, yaw, bbox, travel=float(vel) * max(0.0, float(dt)))
-		if kinetic_speed is not None and motion_yaw is None else None)
+		pos, yaw, bbox, travel=float(vel) * max(0.0, float(dt)),
+		motion_yaw=motion_yaw)
+		if kinetic_speed is not None else None)
 	blocked = False
 	crushed = False
 	kinetic = False
 	approach = False
-	exact_token = set()
-	contact_kinds = set()
+	publication_pending = bool(publish_failures)
+	exact_token = set(publish_failures)
+	contact_kinds = set(publish_kinds)
 	commit_candidates = []
 
 	for identity in sorted(grouped):
@@ -2718,7 +3047,7 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 				candidate[:5])
 			key = (chunk_id, item_index, mat_kind)
 			contact_candidate = (contact_box is not None and
-				kind in ('fragile', 'structure') and
+				kind in ('fragile', 'structure', 'falling') and
 				any(_boxes_intersect(contact_box, world_box)
 					for world_box in instances.get(
 						(chunk_id, item_index), {}).get('boxes', ())
@@ -2764,13 +3093,15 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 				else:
 					blocked = True
 				continue
-			if contact_candidate:
-				exact_token.add(key)
 			if physical_crushable and commit_enabled:
 				commit_candidates.append((candidate, vel, False))
 			elif physical_crushable:
+				exact_token.add(key)
 				blocked = True
 			elif cap_crushable:
+				# Cap-only admission reaches here only for exact current-hull
+				# contact; planning look-ahead returned ``approach`` above.
+				exact_token.add(key)
 				if kinetic_commit:
 					commit_candidates.append((candidate, kinetic_speed, True))
 				else:
@@ -2787,65 +3118,67 @@ def _catalog_motion_blocked(spaceID, pos, yaw, vel, td, now,
 	accepted_now = False
 	used_kinetic_speed = False
 	requires_commit = False
-	if not blocked and not kinetic:
-		for candidate, gate_speed, used_cap in commit_candidates:
-			chunk_id, item_index, mat_kind, unused_filename, kind = (
-				candidate[:5])
-			if _destructible_isolated_1513(chunk_id, item_index):
-				continue
-			if proposal_only:
-				exact_token.add((chunk_id, item_index, mat_kind))
-				requires_commit = True
-				used_kinetic_speed = used_kinetic_speed or used_cap
-				crushed = True
-				continue
-			mat_info = _synthetic_mat_info(candidate, Math)
-			point = mat_info[1]
-			if kind == 'fragile':
-				accepted = auth.destroy_fragile(
-					spaceID, chunk_id, item_index, point, False)
-				event_kind = 'fragile'
-			elif kind == 'structure':
-				accepted = auth.destroy_module(
-					spaceID, chunk_id, item_index, mat_kind, point, False)
-				event_kind = 'module'
-			elif kind == 'falling' and not used_cap:
-				accepted = auth.destroy_column(
-					spaceID, chunk_id, item_index, yaw, vel, point)
-				event_kind = 'column'
-			else:
-				blocked = True
-				break
-			if not accepted:
-				raise RuntimeError(
-					'native catalog contact destroy was not accepted: '
-					'chunk=%s item=%s' % (chunk_id, item_index))
-			# A proposal includes every candidate that it asks authority to
-			# commit, including the narrow swept-ahead strip beyond the exact
-			# leading-face box.  Return the same identity after a successful
-			# native commit: the mutation itself is the authoritative receipt.
-			# Without this, the worker destroys the prop but reports an empty or
-			# partial token and the visible client rolls back through the gap.
+	# A hard or still-kinetic sibling may stop the chassis, but it must not hide
+	# an independently proved crushable identity in the same sweep.  Preserve
+	# and, when requested, commit that exact subset before returning the overall
+	# blocking status.
+	for candidate, gate_speed, used_cap in commit_candidates:
+		chunk_id, item_index, mat_kind, unused_filename, kind = (
+			candidate[:5])
+		if _destructible_isolated_1513(chunk_id, item_index):
+			continue
+		if proposal_only:
 			exact_token.add((chunk_id, item_index, mat_kind))
-			note_destroyed(
-				event_kind, chunk_id, item_index, mat_kind, now)
-			_publish_destroyed(
-				event_kind, chunk_id, item_index, point, yaw, vel,
-				mat_kind if event_kind == 'module' else None)
-			accepted_now = True
+			requires_commit = True
 			used_kinetic_speed = used_kinetic_speed or used_cap
-			_diagnostic_contact_1513(
-				'swept_native_accept', chunk_id, item_index,
-				fields=(('kind', kind), ('mat', mat_kind),
-					('speed', '%.3f' % float(gate_speed))), now=now)
 			crushed = True
+			continue
+		mat_info = _synthetic_mat_info(candidate, Math)
+		point = mat_info[1]
+		if kind == 'fragile':
+			accepted = auth.destroy_fragile(
+				spaceID, chunk_id, item_index, point, False)
+			event_kind = 'fragile'
+		elif kind == 'structure':
+			accepted = auth.destroy_module(
+				spaceID, chunk_id, item_index, mat_kind, point, False)
+			event_kind = 'module'
+		elif kind == 'falling' and not used_cap:
+			accepted = auth.destroy_column(
+				spaceID, chunk_id, item_index, yaw, vel, point)
+			event_kind = 'column'
+		else:
+			blocked = True
+			continue
+		if not accepted:
+			raise RuntimeError(
+				'native catalog contact destroy was not accepted: '
+				'chunk=%s item=%s' % (chunk_id, item_index))
+		# Return every identity that authority was asked to mutate.  This
+		# includes physical-speed look-ahead and exact cap-qualified contact;
+		# the native mutation itself is the authoritative commit receipt.
+		exact_token.add((chunk_id, item_index, mat_kind))
+		note_destroyed(
+			event_kind, chunk_id, item_index, mat_kind, now)
+		if not _publish_catalog_once_1513(
+				event_kind, chunk_id, item_index, point, yaw, vel,
+				mat_kind if event_kind == 'module' else None):
+			publication_pending = True
+		accepted_now = True
+		used_kinetic_speed = used_kinetic_speed or used_cap
+		_diagnostic_contact_1513(
+			'swept_native_accept', chunk_id, item_index,
+			fields=(('kind', kind), ('mat', mat_kind),
+				('speed', '%.3f' % float(gate_speed))), now=now)
+		crushed = True
 
-	status = ('hard' if blocked else
+	status = ('pending' if publication_pending else
+		'hard' if blocked else
 		'kinetic' if kinetic else
 		'crushed' if crushed else
 		'approach' if approach else 'clear')
 	return _catalog_motion_result(
-		status, None if blocked else exact_token, accepted_now,
+		status, exact_token, accepted_now,
 		used_kinetic_speed, return_status, return_detail, contact_kinds,
 		requires_commit if proposal_only else None)
 
@@ -3302,6 +3635,52 @@ def _publish_destroyed(kind, chunkID, itemIndex, pos, fallYaw=0.0,
 	return True
 
 
+def _publish_catalog_once_1513(
+		kind, chunk_id, item_index, point, yaw, speed, mat_kind=None):
+	"""Retry one native-committed catalog event until LAN admission."""
+	key = (int(chunk_id), int(item_index),
+		int(mat_kind) if mat_kind is not None else None)
+	published = globals().setdefault(
+		'g_offh_destr_catalog_published', set())
+	if key in published:
+		return True
+	pending = globals().setdefault(
+		'g_offh_destr_catalog_publish_pending', {})
+	payload = pending.get(key)
+	if payload is None:
+		payload = (
+			str(kind), key[0], key[1], _position_payload(point),
+			float(yaw), float(speed), key[2])
+		pending[key] = payload
+	try:
+		_publish_destroyed(
+			payload[0], payload[1], payload[2], payload[3],
+			payload[4], payload[5], payload[6])
+	except Exception:
+		return False
+	pending.pop(key, None)
+	published.add(key)
+	return True
+
+
+def _retry_catalog_publications_1513():
+	"""Retry native-committed catalog events before geometry can move away."""
+	pending = globals().get('g_offh_destr_catalog_publish_pending', {})
+	failed = set()
+	kinds = set()
+	for key in sorted(pending):
+		payload = pending.get(key)
+		if payload is None:
+			continue
+		if not _publish_catalog_once_1513(
+				payload[0], payload[1], payload[2], payload[3],
+				payload[4], payload[5], payload[6]):
+			failed.add(key)
+			kinds.add('structure' if payload[0] == 'module' else
+				'falling' if payload[0] == 'column' else 'fragile')
+	return failed, kinds
+
+
 def reset(spaceID=None):
 	_clear_runtime_registry()
 	if spaceID is not None:
@@ -3544,7 +3923,370 @@ def _drop_streamed_chunk_registry_1513(state, chunk_id):
 	return changed
 
 
-def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
+def _tree_runtime_state_1513(space_id=None):
+	state = globals().setdefault('g_offh_tree_state', {
+		'chunks': {}, 'felled': set(), 'spaceID': None})
+	if space_id is not None and state.get('spaceID') != int(space_id):
+		return None
+	native_committed = state.setdefault(
+		'native_committed', state.setdefault('felled', set()))
+	state['felled'] = native_committed
+	state.setdefault('canonical_published', set())
+	state.setdefault('publish_pending', {})
+	return state
+
+
+def _tree_motion_detail_1513(status, token=None, accepted_now=False,
+		requires_commit=False):
+	return {
+		'status': str(status),
+		'token': tuple(sorted(token or ())) or None,
+		'accepted_now': bool(accepted_now),
+		'kinds': 'tree',
+		'requires_commit': bool(requires_commit),
+	}
+
+
+def _tree_motion_axis_samples_1513(minimum, maximum):
+	import math
+	minimum = float(minimum)
+	maximum = float(maximum)
+	span = maximum - minimum
+	segments = max(1, int(math.ceil(
+		span / (_DESTRUCTIBLE_CHUNK_METRES_1513 * 0.5))))
+	if segments > 32:
+		return None
+	return tuple(minimum + span * float(index) / float(segments)
+		for index in range(segments + 1))
+
+
+def _tree_motion_required_chunks_1513(sweep_boxes):
+	"""Map only chunk cells intersected by the segmented sweep broadphase."""
+	import AreaDestructibles
+	import Math
+	mapper = getattr(AreaDestructibles, 'chunkIDFromPosition', None)
+	if not callable(mapper):
+		return 'hard', ()
+	chunk_ids = set()
+	for sweep_box in sweep_boxes:
+		minimum_x, maximum_x, minimum_z, maximum_z = _box_xz_bounds(
+			sweep_box)
+		minimum_x -= _SOLID_CONTACT_RADIUS_1513
+		maximum_x += _SOLID_CONTACT_RADIUS_1513
+		minimum_z -= _SOLID_CONTACT_RADIUS_1513
+		maximum_z += _SOLID_CONTACT_RADIUS_1513
+		x_values = _tree_motion_axis_samples_1513(minimum_x, maximum_x)
+		z_values = _tree_motion_axis_samples_1513(minimum_z, maximum_z)
+		if x_values is None or z_values is None:
+			return 'hard', ()
+		y = float(sweep_box[0][1])
+		for x in x_values:
+			for z in z_values:
+				try:
+					chunk_id = mapper(Math.Vector3(x, y, z))
+				except Exception:
+					return 'pending', ()
+				if chunk_id is None:
+					continue
+				if (isinstance(chunk_id, bool) or
+						not isinstance(chunk_id, _INTEGER_TYPES) or
+						int(chunk_id) < 0):
+					return 'hard', ()
+				chunk_ids.add(int(chunk_id))
+	if not chunk_ids:
+		return 'pending', ()
+	return 'ready', tuple(sorted(chunk_ids))
+
+
+def prewarm_tree_registry(spaceID, pos, yaw, td=None, now=None):
+	"""Build nearby exact native registries without destroying any object."""
+	try:
+		result = _fell_trees_near(
+			spaceID, pos, yaw, 0.0, td, registration_only=True)
+	except Exception:
+		result = None
+	if isinstance(result, dict):
+		return result
+	return {
+		'status': 'pending', 'ready_chunks': (),
+		'pending_chunks': (), 'isolated_chunks': (),
+	}
+
+
+def _tree_motion_resolution_1513(
+		spaceID, start_pos, start_yaw, end_pos, end_yaw, speed, td, now,
+		dt, requested_chunks=None):
+	"""Return registry-complete tree candidates for one trusted pose sweep."""
+	speed = _finite_tree_motion_value_1513(speed)
+	dt = _finite_tree_motion_value_1513(dt)
+	if speed is None or dt is None or dt <= 0.0 or dt > 0.25:
+		return 'hard', {}, set(), {}, set()
+	bbox = _vehicle_hull_bbox(td)
+	if bbox is None:
+		return 'hard', {}, set(), {}, set()
+	sweep_boxes = _tree_pose_sweep_boxes_1513(
+		start_pos, start_yaw, end_pos, end_yaw, bbox)
+	if not sweep_boxes:
+		return 'hard', {}, set(), {}, set()
+	# One registration pass covers the current chunk and its eight neighbours.
+	# Do not repeat the complete native alignment for every sweep slice: the
+	# shared 16-query frame budget must advance one focused chunk predictably.
+	prewarm_tree_registry(spaceID, end_pos, end_yaw, td, now)
+	required_status, required_chunks = (
+		_tree_motion_required_chunks_1513(sweep_boxes))
+	if required_status == 'hard':
+		return required_status, {}, set(), {}, set()
+	if required_status != 'ready':
+		required_chunks = ()
+	scan_chunks = set(required_chunks)
+	for chunk_id in requested_chunks or ():
+		if (isinstance(chunk_id, bool) or
+				not isinstance(chunk_id, _INTEGER_TYPES) or
+				int(chunk_id) < 0):
+			return 'hard', {}, set(), {}, set()
+		scan_chunks.add(int(chunk_id))
+	state = _tree_runtime_state_1513(spaceID)
+	chunk_status = {}
+	for chunk_id in sorted(scan_chunks):
+		if _destructible_isolated_1513(chunk_id):
+			chunk_status[chunk_id] = 'hard'
+		elif state is None or chunk_id not in state.get('chunks', {}):
+			chunk_status[chunk_id] = 'pending'
+		else:
+			chunk_status[chunk_id] = 'ready'
+	try:
+		import AreaDestructibles
+		tree_type = AreaDestructibles.DESTR_TYPE_TREE
+	except (AttributeError, ImportError):
+		return 'hard', {}, set(), chunk_status, set()
+	candidates = {}
+	isolated_hits = set()
+	for chunk_id in sorted(scan_chunks):
+		if chunk_status.get(chunk_id) != 'ready':
+			continue
+		chunk_candidates, chunk_isolated_hits = (
+			_tree_candidates_for_sweeps_1513(
+				chunk_id, state['chunks'][chunk_id], sweep_boxes, tree_type))
+		candidates.update(chunk_candidates)
+		isolated_hits.update(chunk_isolated_hits)
+	if len(candidates) > _TREE_CONTACT_TOKEN_LIMIT_1513:
+		return 'hard', {}, set(), chunk_status, isolated_hits
+	try:
+		authority = _get_destr_authority()
+		active = set(identity for identity in candidates
+			if not authority.is_destroyed(*identity))
+	except Exception:
+		active = set(candidates)
+	# A terminal chunk quarantine has no exact positional proof and must not
+	# create an endless pending retry.  Exact candidates in ready chunks remain
+	# actionable even when another intersected chunk is pending or isolated.
+	status = ('ready' if candidates or (
+		required_status == 'ready' and not any(
+			value == 'pending' for value in chunk_status.values())) else 'pending')
+	return status, candidates, active, chunk_status, isolated_hits
+
+
+def _tree_motion_proposal(
+		spaceID, start_pos, start_yaw, end_pos, end_yaw, speed, td, now,
+		dt=0.04):
+	"""Return a mutation-free exact tree token for a continuous hull sweep."""
+	_diagnostic_flush_1513(now)
+	status, candidates, active, unused_chunk_status, isolated_hits = (
+		_tree_motion_resolution_1513(
+		spaceID, start_pos, start_yaw, end_pos, end_yaw, speed, td, now, dt)
+	)
+	# A position-proven isolated identity is a terminal conflict for this exact
+	# contact even when an unrelated intersected chunk is still streaming.
+	if not candidates and isolated_hits:
+		return _tree_motion_detail_1513('hard')
+	if status != 'ready':
+		return _tree_motion_detail_1513(status)
+	if not candidates:
+		return _tree_motion_detail_1513('clear')
+	return _tree_motion_detail_1513(
+		'crushed', set(candidates), accepted_now=False,
+		requires_commit=bool(active))
+
+
+def _parse_tree_contact_token_1513(token):
+	if not isinstance(token, (list, tuple, set, frozenset)):
+		return None
+	result = set()
+	for row in token:
+		if not isinstance(row, (list, tuple)) or len(row) != 3:
+			return None
+		chunk_id, item_index, mat_kind = row
+		if (isinstance(chunk_id, bool) or
+				not isinstance(chunk_id, _INTEGER_TYPES) or
+				int(chunk_id) < 0 or
+				isinstance(item_index, bool) or
+				not isinstance(item_index, _INTEGER_TYPES) or
+				int(item_index) < 0 or mat_kind is not None):
+			return None
+		result.add((int(chunk_id), int(item_index), None))
+	if not result or len(result) > _TREE_CONTACT_TOKEN_LIMIT_1513:
+		return None
+	return result
+
+
+def _tree_commit_identity_status_1513(
+		spaceID, identity, item, authority):
+	chunk_id, item_index, mat_kind = identity
+	try:
+		if authority.is_destroyed(chunk_id, item_index, mat_kind):
+			return 'destroyed'
+	except Exception:
+		return 'pending'
+	status, filename = resolve_native_item_name_1513(
+		spaceID, chunk_id, item_index)
+	if status == 'pending':
+		return 'pending'
+	if (status != 'exact' or
+			_normalized_filename(filename) !=
+			_normalized_filename(item[5])):
+		if status == 'exact':
+			_isolate_destructible_1513(
+				'tree_prediction_name', chunk_id, item_index,
+				detail='registry=%r native=%r' % (item[5], filename))
+		return 'hard'
+	try:
+		valid = validate_tree_identity_1513(
+			spaceID, chunk_id, item_index)
+	except Exception:
+		return 'pending'
+	if valid:
+		return 'ready'
+	return ('hard' if _destructible_isolated_1513(
+		chunk_id, item_index) else 'pending')
+
+
+def _publish_tree_once_1513(
+		state, spaceID, identity, object_pos, fall_yaw, speed):
+	key = identity[:2]
+	if key in state['canonical_published']:
+		return True
+	payload = state['publish_pending'].get(key)
+	if payload is None:
+		payload = (
+			int(spaceID), int(identity[0]), int(identity[1]),
+			(float(object_pos.x), float(object_pos.y), float(object_pos.z)),
+			float(fall_yaw), float(speed))
+		state['publish_pending'][key] = payload
+	try:
+		_publish_destroyed(
+			'tree', payload[1], payload[2], payload[3], payload[4],
+			payload[5])
+	except Exception:
+		return False
+	state['publish_pending'].pop(key, None)
+	state['canonical_published'].add(key)
+	return True
+
+
+def _commit_tree_contacts_1513(
+		spaceID, token, start_pos, start_yaw, end_pos, end_yaw, speed, td,
+		now, dt, publish):
+	requested = _parse_tree_contact_token_1513(token)
+	if requested is None:
+		return _tree_motion_detail_1513('hard')
+	status, candidates, unused_active, chunk_status, isolated_hits = (
+		_tree_motion_resolution_1513(
+		spaceID, start_pos, start_yaw, end_pos, end_yaw, speed, td, now, dt,
+		set(identity[0] for identity in requested))
+	)
+	if status == 'hard':
+		return _tree_motion_detail_1513(status)
+	requested_chunk_status = set(chunk_status.get(identity[0], 'pending')
+		for identity in requested)
+	if 'hard' in requested_chunk_status:
+		return _tree_motion_detail_1513('hard')
+	if 'pending' in requested_chunk_status:
+		return _tree_motion_detail_1513('pending')
+	if requested.intersection(isolated_hits):
+		return _tree_motion_detail_1513('hard')
+	if not requested.issubset(set(candidates)):
+		return _tree_motion_detail_1513('hard')
+	authority = _get_destr_authority()
+	identity_status = {}
+	for identity in sorted(requested):
+		identity_status[identity] = _tree_commit_identity_status_1513(
+			spaceID, identity, candidates[identity], authority)
+	if any(value == 'hard' for value in identity_status.values()):
+		return _tree_motion_detail_1513('hard')
+	if any(value == 'pending' for value in identity_status.values()):
+		return _tree_motion_detail_1513('pending')
+	import Math
+	dx = float(end_pos.x) - float(start_pos.x)
+	dz = float(end_pos.z) - float(start_pos.z)
+	distance = (dx * dx + dz * dz) ** 0.5
+	if distance > 1.0e-8:
+		import math
+		fall_yaw = math.atan2(dx, dz)
+	else:
+		fall_yaw = float(end_yaw)
+		if float(speed) < 0.0:
+			import math
+			fall_yaw += math.pi
+	fall_speed = float(speed)
+	state = _tree_runtime_state_1513(spaceID)
+	if state is None:
+		return _tree_motion_detail_1513('pending')
+	accepted_now = False
+	object_positions = {}
+	for identity in sorted(requested):
+		item = candidates[identity]
+		object_pos = Math.Vector3(item[1], item[2], item[3])
+		object_positions[identity] = object_pos
+		if identity_status[identity] == 'destroyed':
+			state['native_committed'].add(identity[:2])
+			continue
+		try:
+			accepted = authority.destroy_tree(
+				spaceID, identity[0], identity[1], fall_yaw,
+				fall_speed, object_pos)
+		except Exception:
+			accepted = False
+		if not accepted:
+			try:
+				accepted = authority.is_destroyed(*identity)
+			except Exception:
+				accepted = False
+		if not accepted:
+			return _tree_motion_detail_1513('pending')
+		accepted_now = True
+		state['native_committed'].add(identity[:2])
+		_invalidate_chunk_native_names_1513(identity[0])
+	if publish:
+		for identity in sorted(requested):
+			if not _publish_tree_once_1513(
+					state, spaceID, identity, object_positions[identity],
+					fall_yaw, fall_speed):
+				return _tree_motion_detail_1513('pending')
+	return _tree_motion_detail_1513(
+		'crushed', requested, accepted_now=accepted_now,
+		requires_commit=False)
+
+
+def commit_local_tree_prediction(
+		spaceID, token, start_pos, start_yaw, end_pos, end_yaw, speed, td,
+		now, dt=0.04, publish=False):
+	"""Apply the trusted visible client's exact tree token locally."""
+	return _commit_tree_contacts_1513(
+		spaceID, token, start_pos, start_yaw, end_pos, end_yaw, speed, td,
+		now, dt, bool(publish))
+
+
+def commit_tree_contacts(
+		spaceID, token, start_pos, start_yaw, end_pos, end_yaw, speed, td,
+		now, dt=0.04, publish=True):
+	"""Commit and publish a worker-validated exact tree contact token."""
+	return _commit_tree_contacts_1513(
+		spaceID, token, start_pos, start_yaw, end_pos, end_yaw, speed, td,
+		now, dt, bool(publish))
+
+
+def _fell_trees_near(
+		spaceID, pos, yaw, vel, td=None, registration_only=False):
 	# Offline tree/pole felling. Online the SERVER detected tank-vs-tree
 	# contact; the client-side collision probes never return tree/column
 	# materials, so trees could never fall offline. Instead: enumerate
@@ -3561,6 +4303,9 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 		structure_type = getattr(
 			AreaDestructibles, 'DESTR_TYPE_STRUCTURE', None)
 		if mgr.getSpaceID() != spaceID:
+			# Countdown prewarm is the earliest safe battle-owned caller.  Bind a
+			# stale cross-battle manager now so later registration ticks can consume
+			# fresh onChunkLoad counts instead of deferring this reset to contact.
 			mgr.startSpace(spaceID)
 		if globals().get('g_offh_destr_runtime_space') != spaceID:
 			_clear_runtime_registry()
@@ -3571,6 +4316,9 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 			# dedup sets would suppress destruction of fresh objects.
 			_st['chunks'] = {}
 			_st['felled'] = set()
+			_st['native_committed'] = _st['felled']
+			_st['canonical_published'] = set()
+			_st['publish_pending'] = {}
 			_st['spaceID'] = spaceID
 			globals().setdefault('g_offh_destr_ordered', set())
 			globals().setdefault('g_offh_destr_chunks', set())
@@ -3579,6 +4327,7 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 			globals().setdefault('g_offh_destr_contact_bins', {})
 			globals().setdefault('g_offh_destr_pending', {})
 			globals().setdefault('g_offh_destr_falling_active', {})
+		_st = _tree_runtime_state_1513(spaceID)
 		cos_y = math.cos(yaw); sin_y = math.sin(yaw)
 		bbox = ((-1.6, -1.0, -3.6), (1.6, 1.0, 3.6), None)
 		bbox = _vehicle_hull_bbox(td)
@@ -3597,32 +4346,57 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 		if _current_cid is not None and _destructible_catalog is not None:
 			_receipt_key = _proximity_receipt_key_1513(
 				spaceID, _current_cid, pos, vehicle_box)
-			if _empty_proximity_receipt_valid_1513(
-					_receipt_key, mgr, _st['chunks']):
+			if (not registration_only and
+					_empty_proximity_receipt_valid_1513(
+					_receipt_key, mgr, _st['chunks'])):
 				return
 		cids = set((_current_cid,))
 		_mapped_cid = AreaDestructibles.chunkIDFromPosition(
 			Math.Vector3(pos.x + sin_y * (6.0 if vel >= 0 else -6.0),
 				pos.y, pos.z + cos_y * (6.0 if vel >= 0 else -6.0)))
 		cids.add(_mapped_cid)
+		_prewarm_priority = {}
 		# #1513 chunks are 100 m squares.  Catalog instances can be non-uniformly
 		# scaled, so raw resource bounds cannot determine the origin reach.  Sample
-		# the current chunk plus all eight neighbours through the native mapper;
-		# the pinned catalog's transformed maximum XZ reach is below 50 m.
-		if _destructible_catalog is not None:
+		# the current chunk plus all eight neighbours through the native mapper.
+		# Registration-only tree prewarm deliberately uses the same neighbourhood:
+		# at 16 name probes per frame it starts the next chunk before contact rather
+		# than waiting 0.5-1 seconds after the vehicle crosses the boundary.
+		if _destructible_catalog is not None or registration_only:
 			for _offset_x in (-_DESTRUCTIBLE_CHUNK_METRES_1513, 0.0,
 					_DESTRUCTIBLE_CHUNK_METRES_1513):
 				for _offset_z in (-_DESTRUCTIBLE_CHUNK_METRES_1513, 0.0,
 						_DESTRUCTIBLE_CHUNK_METRES_1513):
-					cids.add(AreaDestructibles.chunkIDFromPosition(
+					_neighbour_cid = AreaDestructibles.chunkIDFromPosition(
 						Math.Vector3(pos.x + _offset_x, pos.y,
-							pos.z + _offset_z)))
+							pos.z + _offset_z))
+					cids.add(_neighbour_cid)
+					if _neighbour_cid is not None:
+						_forward_offset = (
+							_offset_x * sin_y + _offset_z * cos_y)
+						_lateral_offset = abs(
+							_offset_x * cos_y - _offset_z * sin_y)
+						_prewarm_priority[_neighbour_cid] = max(
+							_prewarm_priority.get(
+								_neighbour_cid,
+								(-float('inf'), -float('inf'))),
+							(_forward_offset, -_lateral_offset))
 		cids.discard(None)
 		instances = globals().setdefault('g_offh_destr_instances', {})
 		contact_bins = globals().setdefault(
 			'g_offh_destr_contact_bins', {})
 		_found_nearby = False
-		for cid in cids:
+		_cid_order = sorted(cids)
+		if registration_only:
+			# Finish the occupied chunk first, then the most forward mapped
+			# neighbours.  This makes the single shared 16-query budget useful
+			# for the chunk the vehicle will enter instead of depending on opaque
+			# numeric chunk-ID ordering.
+			_cid_order = sorted(cids, key=lambda cid: (
+				0 if cid == _current_cid else 1,
+				-_prewarm_priority.get(cid, (0.0, 0.0))[0],
+				-_prewarm_priority.get(cid, (0.0, 0.0))[1], cid))
+		for cid in _cid_order:
 			if _destructible_isolated_1513(cid):
 				continue
 			registry = _st['chunks'].get(cid)
@@ -4024,8 +4798,21 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						_names_status, registry)
 				LOG_DEBUG('DestrTree: chunk registry', cid,
 					registry['count'], 'trees/poles')
+			if registration_only:
+				continue
 			if not registry['count']:
 				continue
+			_tree_vehicle_box = vehicle_box
+			if vel < 0.0:
+				# Preserve the legacy scanner's fixed 0.8 m reverse reach.  Its
+				# velocity-scaled look-ahead historically applied only forwards.
+				_tree_vehicle_box = _vehicle_swept_box(
+					pos, yaw, vel, bbox, travel_reach=0.8)
+			_tree_candidates, unused_tree_isolated_hits = (
+				_tree_candidates_for_sweeps_1513(
+					cid, registry, (_tree_vehicle_box,),
+					AreaDestructibles.DESTR_TYPE_TREE, 0.0))
+			_tree_candidate_keys = set(_tree_candidates)
 			for (_ti, _tx, _ty, _tz, _ttyp, _tfn, _thp, _tmass,
 					_world_boxes, _contact_radius) in _nearby_destructibles(
 						registry, pos, vehicle_box):
@@ -4048,6 +4835,11 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					# proximity alone.  Stock WGVehiclePhysics (when available) or
 					# the native solid ray below remains the contact authority.
 					continue
+				elif _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
+					if abs(vel) < 1.0:
+						continue
+					if (cid, _ti, None) not in _tree_candidate_keys:
+						continue
 				else:
 					if abs(vel) < 1.0:
 						continue
@@ -4063,6 +4855,14 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 				_key = ((cid, _ti, _mat_kind) if _mat_kind is not None
 					else (cid, _ti))
 				if _key in _st['felled']:
+					if (_ttyp == AreaDestructibles.DESTR_TYPE_TREE and
+							_key in _st['publish_pending']):
+						_object_pos = Math.Vector3(_tx, _ty, _tz)
+						if not _publish_tree_once_1513(
+								_st, spaceID, (cid, _ti, None), _object_pos,
+								yaw if vel >= 0 else yaw + math.pi, vel):
+							raise RuntimeError(
+								'tree proximity event was not admitted')
 					continue
 				fall_yaw = yaw if vel >= 0 else (yaw + math.pi)
 				_auth = _get_destr_authority()
@@ -4096,16 +4896,39 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						'native proximity destroy was not accepted: '
 						'chunk=%s item=%s' % (cid, _ti))
 				_invalidate_chunk_native_names_1513(cid)
-				_publish_destroyed(
-					('fragile' if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE
-					 else 'module' if _ttyp == structure_type
-					 else 'tree' if _ttyp == AreaDestructibles.DESTR_TYPE_TREE
-					 else 'column'),
-					cid, _ti, _object_pos, fall_yaw, vel,
-					_mat_kind)
 				_st['felled'].add(_key)
+				if _ttyp == AreaDestructibles.DESTR_TYPE_TREE:
+					if not _publish_tree_once_1513(
+							_st, spaceID, (cid, _ti, None), _object_pos,
+							fall_yaw, vel):
+						raise RuntimeError(
+							'tree proximity event was not admitted')
+				else:
+					_publish_destroyed(
+						('fragile'
+						 if _ttyp == AreaDestructibles.DESTR_TYPE_FRAGILE
+						 else 'module' if _ttyp == structure_type
+						 else 'column'),
+						cid, _ti, _object_pos, fall_yaw, vel,
+						_mat_kind)
 				LOG_DEBUG('DestrTree: FELLED', cid, _ti, 'type', _ttyp,
 					'hp', _thp, 'mass', _tmass, _tfn)
+		if registration_only:
+			_ready_chunks = tuple(sorted(cid for cid in cids
+				if cid in _st['chunks'] and
+				not _destructible_isolated_1513(cid)))
+			_pending_chunks = tuple(sorted(cid for cid in cids
+				if cid not in _st['chunks'] and
+				not _destructible_isolated_1513(cid)))
+			_isolated_chunks = tuple(sorted(cid for cid in cids
+				if _destructible_isolated_1513(cid)))
+			return {
+				'status': ('invalid' if _isolated_chunks else
+					'pending' if _pending_chunks or not cids else 'ready'),
+				'ready_chunks': _ready_chunks,
+				'pending_chunks': _pending_chunks,
+				'isolated_chunks': _isolated_chunks,
+			}
 		if (_receipt_key is not None and not _found_nearby and
 				not globals().get('g_offh_destr_falling_active') and
 				all(cid in _st['chunks'] and
