@@ -10656,6 +10656,120 @@ class BotRuntimeTests(unittest.TestCase):
             'recovery_mode': 'arrived', 'movement_intent': False,
         }
 
+    def test_tank_separation_is_probed_at_the_distance_it_moves(self):
+        """Static geometry beyond the hull must not veto a small unjam.
+
+        The contact response moves centimetres, but it used the default
+        direction probe, which ranks a driving direction fifteen to twenty
+        metres ahead. A rock or wall inside that corridor cancelled the
+        separation entirely, so two hulls wedged near an obstacle could never
+        push apart - the case Peng sees most often in a spawn with a rock.
+        """
+        requested = []
+
+        def probe(position, yaw, speed, descriptor, maximum_distance=None):
+            requested.append(maximum_distance)
+            # An obstacle eight metres away: inside the driving corridor,
+            # well outside the space this nudge actually enters.
+            blocked = bool(maximum_distance is None or
+                           float(maximum_distance) > 8.0)
+            return {'clear': not blocked, 'collision': blocked,
+                    'water': False, 'slope': 0.0}
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=probe,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0,
+                     half_length=3.5, grounded_once=True,
+                     push_x=0.0, push_z=0.0)
+
+        runtime._apply_tank_contact_response(
+            state, {'delta_velocity': (2.0, 0.0),
+                    'correction': (0.25, 0.0)}, 0.1)
+
+        self.assertTrue(requested)
+        self.assertNotIn(None, requested)
+        self.assertLessEqual(max(requested), 8.0)
+        self.assertGreater(state['x'], 0.0)
+
+    def test_tank_separation_still_refuses_to_push_into_geometry(self):
+        """Shortening the query must not license crossing static world."""
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {
+                'clear': False, 'collision': True,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0,
+                     half_length=3.5, grounded_once=True,
+                     push_x=0.0, push_z=0.0)
+
+        runtime._apply_tank_contact_response(
+            state, {'delta_velocity': (2.0, 0.0),
+                    'correction': (0.25, 0.0)}, 0.1)
+
+        self.assertEqual(0.0, state['x'])
+        self.assertEqual(0.0, state['push_x'])
+
+    def test_tank_separation_probe_reaches_diagonal_leading_corner(self):
+        """An oblique nudge must probe past the OBB's leading corner."""
+        requested = []
+        wall_distance = 4.0
+
+        def probe(position, yaw, speed, descriptor, maximum_distance=None):
+            requested.append(maximum_distance)
+            # Model an infinite wall transverse to the nudge. All three
+            # lateral rays miss it when their common axial endpoint is short.
+            blocked = bool(maximum_distance is not None and
+                           float(maximum_distance) >= wall_distance)
+            return {'clear': not blocked, 'collision': blocked,
+                    'water': False, 'slope': 0.0}
+
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=probe,
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(self.start)
+        state = runtime.states[11]
+        half_length = 3.5
+        half_width = 1.7
+        support = math.sqrt(
+            half_length * half_length + half_width * half_width)
+        nudge = 0.25
+        state.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.0,
+                     half_length=half_length, half_width=half_width,
+                     grounded_once=True, push_x=0.0, push_z=0.0)
+
+        runtime._apply_tank_contact_response(
+            state, {'delta_velocity': (0.0, 0.0),
+                    'correction': (nudge * half_width / support,
+                                   nudge * half_length / support)}, 0.1)
+
+        old_axial_reach = half_length + nudge
+        expected_reach = support + nudge
+        self.assertLess(old_axial_reach, wall_distance)
+        self.assertLess(wall_distance, expected_reach)
+        self.assertEqual(1, len(requested))
+        self.assertAlmostEqual(expected_reach, requested[0])
+        self.assertEqual((0.0, 0.0), (state['x'], state['z']))
+
     def test_reverse_probe_pitch_is_stored_in_hull_coordinates(self):
         command = self._stationary_command()
         command.update({
