@@ -407,6 +407,46 @@ class LocalDriver(object):
 					return False
 		return True
 
+	def _reverse_blocked_by_vehicle(self, position, yaw, neighbours,
+			half_length, half_width):
+		"""Reject a blind reverse when a hull already occupies the space behind.
+
+		``direction_clear`` answers for terrain and static world geometry only.
+		In a spawn line-up every tank reaches the stuck threshold within about a
+		second of every other one, so an unchecked reverse recovery drives each
+		hull straight into the one behind it and the whole formation grinds.
+		"""
+		behind = (
+			float(position[0]) - math.sin(float(yaw)) * half_length * 1.6,
+			float(position[1]),
+			float(position[2]) - math.cos(float(yaw)) * half_length * 1.6)
+		for neighbour in neighbours or ():
+			other = self._neighbour_position(neighbour)
+			if other is None:
+				continue
+			try:
+				if abs(float(other[1]) - float(position[1])) > 5.0:
+					continue
+			except Exception:
+				pass
+			other_yaw = 0.0
+			other_length = half_length
+			other_width = half_width
+			if isinstance(neighbour, dict):
+				other_yaw = float(neighbour.get('yaw', 0.0) or 0.0)
+				other_length = float(
+					neighbour.get('half_length', half_length) or half_length)
+				other_width = float(
+					neighbour.get('half_width', half_width) or half_width)
+			try:
+				if self._obb_overlap(
+						behind, float(yaw), half_length, half_width,
+						other, other_yaw, other_length, other_width):
+					return True
+			except Exception:
+				continue
+		return False
+
 	def _choose_yaw(self, state, desired_yaw, current_yaw, position, speed,
 			velocity, neighbours, direction_clear, half_length, half_width):
 		separation = self._separation_yaw(
@@ -480,6 +520,8 @@ class LocalDriver(object):
 				'target_yaw': float(yaw),
 				'recovery_mode': 'arrived',
 			}
+		own_half_length = max(0.5, float(half_length))
+		own_half_width = max(0.3, float(half_width))
 		displacement = _distance((position[0], 0.0, position[2]),
 		                         (state['last_position'][0], 0.0,
 		                          state['last_position'][1]))
@@ -533,7 +575,10 @@ class LocalDriver(object):
 			# the unsafe side that caused the stall in the first place.
 			direction = 1.0 if ((state['recovery_count'] + int(state['phase'] * 10)) % 2) else -1.0
 			recovery_yaw = float(yaw) + direction * 0.85
-			if not self._clear(direction_clear, float(yaw) + math.pi):
+			if (not self._clear(direction_clear, float(yaw) + math.pi) or
+					self._reverse_blocked_by_vehicle(
+						position, yaw, neighbours,
+						own_half_length, own_half_width)):
 				return {
 					'throttle': 0.0,
 					'turn': direction,
@@ -550,8 +595,6 @@ class LocalDriver(object):
 				'recovery_mode': 'reverse_turn',
 			}
 
-		own_half_length = max(0.5, float(half_length))
-		own_half_width = max(0.3, float(half_width))
 		chosen_yaw = None
 		old_yaw = state.get('steering_yaw')
 		# Keep a clear avoidance branch long enough for the hull to pass the wall,

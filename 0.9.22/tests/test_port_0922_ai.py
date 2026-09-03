@@ -1432,6 +1432,40 @@ class BotAiPortTests(unittest.TestCase):
 
         self.assertTrue(modes & set(('reverse_turn', 'pivot_recovery')))
 
+    def test_wedged_hull_never_reverses_into_the_tank_behind_it(self):
+        """direction_clear answers for terrain, not for the queue behind.
+
+        In a spawn line-up every tank reaches the stuck threshold at about the
+        same time, so an unchecked reverse recovery drives each hull into the
+        one behind it.
+        """
+        driver = LocalDriver()
+        behind = ({'position': (0.0, 0.0, -7.0), 'yaw': 0.0,
+                   'half_length': 3.5, 'half_width': 1.7},)
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                9, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, 50.0), behind, lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+
+        self.assertIn('pivot_recovery', modes)
+        self.assertNotIn('reverse_turn', modes)
+
+    def test_wedged_hull_still_reverses_when_the_space_behind_is_free(self):
+        """The vehicle check must not disable reverse recovery generally."""
+        driver = LocalDriver()
+        far = ({'position': (0.0, 0.0, -40.0), 'yaw': 0.0,
+                'half_length': 3.5, 'half_width': 1.7},)
+        modes = set()
+        for unused in range(150):
+            order = driver.drive(
+                10, (0.0, 0.0, 0.0), 0.0, 0.0, 1.0 / 30.0,
+                (0.0, 0.0, 50.0), far, lambda unused_yaw: True)
+            modes.add(order['recovery_mode'])
+
+        self.assertIn('reverse_turn', modes)
+
     def test_brief_traffic_wait_does_not_trigger_reverse_recovery(self):
         driver = LocalDriver()
         order = None

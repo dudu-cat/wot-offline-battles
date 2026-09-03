@@ -1815,6 +1815,7 @@ class BotRuntime(object):
              unused_shell, unused_receipt: True))
         self.artillery_launch_cancel = artillery_launch_cancel
         self.spawn_resolver = spawn_resolver
+        self._contact_lease_ids = set()
         self._injected_baked_graph = baked_graph
         self.baked_graph = None
         self._navigation_map_name = None
@@ -6582,6 +6583,33 @@ class BotRuntime(object):
                 break
         return reports
 
+    def _apply_traffic_wait_lease(self):
+        """Suppress the stuck timer while another hull owns the blockage.
+
+        LocalDriver's stuck detector measures translation. A tank held in place
+        by the simultaneous contact solver is not translating, but it is also
+        not wedged against terrain, and its recovery is a blind reverse into
+        whatever is behind it. ``wait_for_traffic`` grants a bounded
+        right-of-way lease for exactly this case; it lost its only producer
+        when the predictive headway controller was removed from the call path,
+        while the stuck timer it protected stayed. A genuine deadlock is still
+        detected, because the lease expires after
+        ``TRAFFIC_WAIT_LEASE_SECONDS``.
+        """
+        contacted = self._contact_lease_ids
+        if not contacted:
+            return
+        self._contact_lease_ids = set()
+        driver = getattr(self.adapter, 'driver', None)
+        wait = getattr(driver, 'wait_for_traffic', None)
+        if not callable(wait):
+            return
+        for bot_id in contacted:
+            try:
+                wait(bot_id)
+            except Exception:
+                continue
+
     def _resolve_tank_contacts(self, players, now, step):
         """Apply current 0.8.2 chassis OBB response and report rams."""
         if self.native_motion:
@@ -6709,6 +6737,12 @@ class BotRuntime(object):
                 own, others, **resolve_kwargs)
             self._ram_cooldowns = result['cooldowns']
             current_ram_contacts.update(result['contacts'])
+            if (any(abs(_number(value)) > 0.0001
+                    for value in result['delta_velocity']) or
+                    any(abs(_number(value)) > 0.0001
+                        for value in result['correction'])):
+                # Another hull owns this tank's lack of progress this tick.
+                self._contact_lease_ids.add(int(state['id']))
             self._apply_tank_contact_response(state, result, step)
             reports.extend(self._ram_reports(
                 state, result['ram_events']))
@@ -8331,6 +8365,12 @@ class BotRuntime(object):
                             frame_step, step_now, players, neighbours,
                             refresh_control, publish_step))
                         refresh_control = False
+                # One right-of-way lease per render callback, matching the one
+                # planner decision per callback. Granting it per catch-up slice
+                # would spend the bounded wait several times faster than real
+                # time, which is worst at exactly the low frame rates where the
+                # jam lasts longest.
+                self._apply_traffic_wait_lease()
             finally:
                 if visibility_frame_open:
                     self._finish_visibility_frame()

@@ -10477,6 +10477,66 @@ class BotRuntimeTests(unittest.TestCase):
             'recovery_mode': 'arrived', 'movement_intent': False,
         }
 
+    def _two_bot_runtime(self):
+        start = dict(self.start)
+        start['bots'] = [
+            {'id': 11, 'team': 2, 'slot': 0, 'name': 'Bot'},
+            {'id': 12, 'team': 2, 'slot': 1, 'name': 'Bot'},
+        ]
+        runtime = self.module.BotRuntime(
+            1, descriptor_resolver=lambda unused: _combat_descriptor(),
+            adapter_factory=lambda *unused, **kwargs: _FixedAdapter(
+                self._stationary_command()),
+            direction_probe=lambda *unused: {
+                'clear': True, 'collision': False,
+                'water': False, 'slope': 0.0},
+            ground_probe=lambda *unused: 0.0,
+            physics_ground_probe=lambda *unused: 0.0,
+            spawn_resolver=_spawn_resolver, baked_graph=_graph())
+        runtime.battle_start(start)
+        return runtime
+
+    def test_contact_lease_reaches_the_local_driver(self):
+        """A tank held by another hull must not read as terrain-stuck.
+
+        LocalDriver.wait_for_traffic exists to suppress the stuck timer for a
+        bounded right-of-way wait. It lost its only producer when the
+        predictive headway controller was taken out of the call path, while the
+        stuck timer it protected stayed, so ordinary spawn congestion armed the
+        pivot/reverse recovery.
+        """
+        waited = []
+        runtime = self._two_bot_runtime()
+        runtime.adapter.driver = type('_Driver', (object,), {
+            'wait_for_traffic': staticmethod(waited.append)})()
+        runtime._contact_lease_ids = set([11, 12])
+
+        runtime._apply_traffic_wait_lease()
+
+        self.assertEqual([11, 12], sorted(waited))
+        self.assertEqual(set(), runtime._contact_lease_ids)
+
+    def test_overlapping_hulls_record_a_contact_lease(self):
+        """The lease is granted by the contact solver, not guessed."""
+        runtime = self._two_bot_runtime()
+        first = runtime.states[11]
+        second = runtime.states[12]
+        first.update(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=4.0,
+                     grounded_once=True)
+        second.update(x=0.0, y=0.0, z=2.0, yaw=0.0, speed=0.0,
+                      grounded_once=True)
+        runtime._contact_lease_ids = set()
+
+        runtime._resolve_tank_contacts([], 1.0, 0.1)
+
+        self.assertTrue(runtime._contact_lease_ids)
+
+    def test_production_adapter_exposes_a_lease_capable_driver(self):
+        """The wiring above must reach the shipped adapter, not a double."""
+        adapter = self.module.BotAdapter('01_karelia', 5)
+        self.assertTrue(callable(
+            getattr(adapter.driver, 'wait_for_traffic', None)))
+
     def test_reverse_probe_pitch_is_stored_in_hull_coordinates(self):
         command = self._stationary_command()
         command.update({
