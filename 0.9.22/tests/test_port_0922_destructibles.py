@@ -805,9 +805,8 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             0, destructibles_sensor.g_offh_tree_state['chunks'][22]['count'])
 
     def test_malformed_native_name_entry_isolates_the_chunk(self):
-        # The engine's own name loop appends one non-NULL string per named
-        # item, so a non-string or empty entry is a chunk-level ABI violation
-        # and no part of that surface may be trusted.
+        # The engine's own name loop always appends a Python string.  An empty
+        # string is legal, but a non-string is a chunk-level ABI violation.
         manager = _Manager()
         manager.space_id = 1
         manager.set_chunk_count(22, 2)
@@ -822,7 +821,7 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
             getDescByFilename=lambda unused: {'type': 1, 'health': 10})
         bigworld = types.ModuleType('BigWorld')
         bigworld.wg_getChunkDestrFilenames = (
-            lambda *unused: ('missing-tree', ''))
+            lambda *unused: ('missing-tree', None))
         bigworld.wg_getDestructibleEffectCategory = lambda *unused: 1
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=_Vector())
@@ -4122,7 +4121,9 @@ class DestructiblesCompatibilityTests(unittest.TestCase):
         area.g_cache = types.SimpleNamespace(
             getDescByFilename=lambda value: descriptors.get(value))
         bigworld = types.ModuleType('BigWorld')
-        bigworld.wg_getChunkDestrFilenames = lambda *unused: ()
+        # The exact client emits a full-width list here, with anonymous BSMI
+        # slots represented by legal empty strings.
+        bigworld.wg_getChunkDestrFilenames = lambda *unused: ('', '')
         bigworld.wg_getChunkMatrix = lambda *unused: types.SimpleNamespace(
             translation=chunk_translation)
         bigworld.wg_getDestructibleMatrix = (
@@ -7805,12 +7806,13 @@ def _native_item_surface(items):
     * ``category`` ``-1`` models a resolved item whose native type owns no
       name handler;
     * ``filename`` ``None`` models an item that contributes no name.
+    * ``filename`` ``''`` models a handled item that emits an empty C string.
 
     ``wg_getChunkDestrFilenames`` is then built exactly as
     ``WorldOfTanks.exe`` ``0x006b1a10`` builds it: it walks item indices in
-    order and appends one name per named item, appending nothing at all for a
-    skipped item.  The result is compacted, so its positions are deliberately
-    not native item indices.
+    order and appends one string per handled item, including an empty string,
+    while appending nothing at all for a skipped item.  A shorter result is
+    compacted, so its positions are deliberately not native item indices.
     """
     names = tuple(filename for category, filename in items
                   if category is not None and category != -1
@@ -7870,7 +7872,7 @@ class NativeItemNameContractTests(unittest.TestCase):
 
     def _align(self, items):
         for unused_category, filename in items:
-            if filename is not None and filename not in self.descriptors:
+            if filename and filename not in self.descriptors:
                 self.fail('test must type every native name')
         names, chunk_filenames, effect_category = _native_item_surface(items)
         bigworld = types.ModuleType('BigWorld')
@@ -7901,6 +7903,39 @@ class NativeItemNameContractTests(unittest.TestCase):
         # Item 1 owns no name at all; it is emphatically not names[1].
         self.assertEqual({0: poplar, 2: poplar}, mapping)
         self.assertIsNone(mapping.get(1))
+
+    def test_full_width_empty_name_preserves_native_slot_positions(self):
+        first = 'content/GatesAndFences/test/normal/lod0/fence-a.model'
+        second = 'content/GatesAndFences/test/normal/lod0/fence-b.model'
+        self.descriptors[first] = {'type': self.FRAGILE, 'health': 15}
+        self.descriptors[second] = {'type': self.FRAGILE, 'health': 15}
+        items = ((self.FRAGILE, first), (self.FRAGILE, ''),
+                 (self.FRAGILE, second))
+
+        names, (mapping, status, anomalous) = self._align(items)
+
+        self.assertEqual((first, '', second), names)
+        self.assertEqual('exact', status)
+        self.assertEqual((), anomalous)
+        self.assertEqual({0: first, 2: second}, mapping)
+        self.assertIsNone(mapping.get(1))
+
+    def test_short_list_with_empty_name_never_uses_list_positions(self):
+        first = 'speedtree/test/first.spt'
+        second = 'speedtree/test/second.spt'
+        self.descriptors[first] = {'type': self.TREE, 'health': 10}
+        self.descriptors[second] = {'type': self.TREE, 'health': 10}
+        items = ((self.FRAGILE, ''), (self.TREE, first),
+                 (self.FRAGILE, None), (self.TREE, second))
+
+        names, (mapping, status, anomalous) = self._align(items)
+
+        self.assertEqual(('', first, second), names)
+        self.assertEqual('exact', status)
+        self.assertEqual((), anomalous)
+        self.assertEqual({1: first, 3: second}, mapping)
+        self.assertIsNone(mapping.get(0))
+        self.assertIsNone(mapping.get(2))
 
     def test_unnamed_type_declines_quietly_and_named_type_still_aligns(self):
         tree = 'speedtree/11_murovanka/oak.spt'

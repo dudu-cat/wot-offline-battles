@@ -10,11 +10,11 @@ replaces one unsafe #1513 tree-descriptor lookup.
 safe probe: for a resolved item whose native type owns no name handler it
 reaches ``PyString_FromString(NULL)`` and faults natively.  The chunk list
 ``wg_getChunkDestrFilenames`` (``0x006b1a10``) guards both nulls and is the
-safe boundary, but it is *compacted*: it appends one entry per named item and
-nothing for a skipped item, so its positions are not native item indices.
-Indexing it by the item index therefore returned another item's resource.  The
-sensor rebuilds the exact ``item_index -> filename`` mapping from that list and
-the null-safe effect-category call; this adapter consumes that mapping.
+safe boundary, but it may be compacted: it appends nothing for a skipped item,
+while a handled item may append either a non-empty name or ``''``.  Positions
+are native item indices only when the list length equals the exact item count.
+The sensor rebuilds the exact ``item_index -> filename`` mapping from that list
+and the null-safe effect-category call; this adapter consumes that mapping.
 """
 
 
@@ -38,7 +38,7 @@ def inspect_destructible_desc(cache, space_id, chunk_id, item_index):
     """Inspect one streamed descriptor without the nullable scalar wrapper.
 
     The name is this exact native item's own resource, recovered from the
-    compacted chunk list through the sensor's alignment.  That is exactly what
+    possibly compacted chunk list through the sensor's alignment.  That is what
     the only two stock callers of ``getDestructibleDesc`` need: tree
     fracture/touchdown effects and the tree animator.  Non-tree identities keep
     their existing native paths and are deliberately not inferred here.

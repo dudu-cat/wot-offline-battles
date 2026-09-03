@@ -372,10 +372,14 @@ that manager count and enumerates every native index.
 PE checksum `0x019a5229`), its implementation at `0x006b1a10` walks item
 indices `0 .. numDestructibles(chunk) - 1` and appends one name per item only
 when the item resolves, its native type owns a name handler, and that handler
-returns a non-NULL string. Every other item appends nothing: there is no
-branch that appends a blank placeholder. The returned list is therefore
-compacted in item order, and its positions are not native item indices.
-Indexing it by the item index can therefore return another item's resource.
+returns a non-NULL pointer. The code does not test the first byte: a non-NULL
+pointer to `\0` becomes the legal Python string `''`. An unresolved item, a
+missing handler or a NULL pointer appends nothing, so the returned list is only
+*possibly* compacted in item order. When its length equals the exact native
+item count, the one-append-per-item bound and loop order prove that every
+position is that native item, with `''` carrying no filename evidence. When
+the list is shorter, its positions are not native item indices; indexing it by
+the item index can therefore return another item's resource.
 The two old `05_prohorovka` reports captured only that direct lookup at list
 position `70`, not the complete name list and per-item categories needed for
 reconstruction. They prove the old lookup was unsound; they do not prove that
@@ -396,17 +400,21 @@ loop uses, so matrix, per-item name and effect category share exactly one item
 index space of length `numDestructibles(chunk)`. That call fails for an
 unresolved item and returns `-1` through `or eax, 0xffffffff` at `0x006b20b8`
 for a resolved item whose native type owns no handler - precisely the two
-cases the name loop skips. Enumerating it therefore reconstructs the
-compaction per native type: an item is typed by its live effect category and a
-name by the client descriptor it resolves to, then both filtered sequences are
-paired in item order. This is sound only under the pinned-client bridge that a
-descriptor's `type` is the same native category returned for that item, and
-only after every resolvable native item has been enumerated. A whole category
-with zero emitted names is known to be unnamed. A nonzero unequal name/item
-count is only a partial alignment, however, so the complete chunk is isolated;
-no otherwise aligned category is admitted from it. An unknown or malformed
-name descriptor and a malformed category result also isolate the complete
-chunk. A category-query exception is the native resolver's skipped-item case:
+cases the name loop skips. Enumerating it reconstructs the name list after
+every live item is typed. A full-width list is aligned by position, while each
+non-empty name's descriptor type must still equal that slot's live effect
+category. For a shorter list, empty strings carry no descriptor evidence and
+the remaining names are reconstructed per native type: an item is typed by
+its live effect category and a name by the client descriptor it resolves to,
+then both filtered sequences are paired in item order. This is sound only
+under the pinned-client bridge that a descriptor's `type` is the same native
+category returned for that item, and only after every resolvable native item
+has been enumerated. A whole category with zero non-empty names is known to be
+unnamed. A nonzero unequal name/item count is only a partial alignment,
+however, so the complete chunk is isolated; no otherwise aligned category is
+admitted from it. An unknown or malformed non-empty name descriptor and a
+malformed category result also isolate the complete chunk. A category-query
+exception is the native resolver's skipped-item case:
 that exact slot is isolated before any matrix, effect or destruction call,
 while other resolvable slots may finish alignment. Native category `-1` is a
 resolved handlerless item, not that exception case: alignment leaves it
@@ -491,13 +499,14 @@ unchanged. Straight-line Windows driving remains the frame-pacing acceptance
 test; this source review cannot claim that the visible hitch is eliminated.
 
 The previous 0.3.65 schema-v2 catalog supplied transformed OBBs but joined
-runtime slots by native filename taken from the compacted chunk list. No slot
-is ever "blank" in that list: an unnamed item is absent from it, which is why
-indexing it by the item index silently returned a neighbour's resource. The
+runtime slots by native filename taken from the chunk list. A slot may be
+present as `''`, while an unresolved, handlerless or NULL-name slot is absent;
+therefore only a full-width list preserves native indices. Indexing a shorter
+list by the item index silently returned a neighbour's resource. The
 exact-instance runtime shape introduced at schema v4 closes that identity gap
 with the whole-map matrix signature, and the per-item name is now recovered
-from the reconstructed compaction instead. The coherent shipped batches are
-destructible format v7 and foliage format v4.
+from the full-width or reconstructed compacted alignment. The coherent shipped
+batches are destructible format v7 and foliage format v4.
 
 The stock `BigWorld.entity`/`entities` facade is an AOI surface, not the LAN
 authority registry. Unspotted or dead synthetic vehicles remain private there;

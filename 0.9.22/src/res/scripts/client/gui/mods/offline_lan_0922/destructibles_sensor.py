@@ -270,9 +270,11 @@ def _native_chunk_destructible_count_1513(manager, chunk_id):
 	"""Read the count written by ``game.wg_onChunkLoad`` on pinned #1513.
 
 	``wg_getChunkDestrFilenames`` is not a slot-count API.  Its ``0x006b1a10``
-	loop appends one entry per *named* item and nothing at all for an item that
-	is unresolved, owns no name handler or yields a NULL name, so its length is
-	a lower bound on the item count and says nothing about which indices exist.
+	loop appends one entry per handled item and nothing at all for an item that
+	is unresolved, owns no name handler or yields a NULL name pointer.  A
+	non-NULL pointer may still yield an empty Python string, so the list length
+	is a lower bound on the item count and alone says nothing about which indices
+	exist.
 	The manager's private map is populated from the engine callback's
 	``numDestructibles`` argument and is the only exact streamed-slot boundary
 	available to Python.
@@ -297,13 +299,17 @@ def _native_chunk_destructible_count_1513(manager, chunk_id):
 
 
 def _native_name_groups_1513(area_destructibles, names):
-	"""Type a compacted native name list through the exact client cache."""
+	"""Type non-empty entries from a possibly compacted native name list."""
 	try:
 		cache = area_destructibles.g_cache
 	except Exception:
 		return None, 'descriptor_cache'
 	names_by_type = {}
 	for name in names:
+		# The pinned helper can append a non-NULL pointer to an empty C string.
+		# That entry identifies no descriptor, but still occupies its emitted slot.
+		if not name:
+			continue
 		try:
 			descriptor = cache.getDescByFilename(name)
 		except Exception:
@@ -318,8 +324,39 @@ def _native_name_groups_1513(area_destructibles, names):
 	return names_by_type, 'ready'
 
 
-def _align_native_item_names_1513(names_by_type, items_by_type):
-	"""Finish a fully enumerated per-type name alignment without guessing."""
+def _align_native_item_names_1513(
+		names_by_type, items_by_type, positional_names=None):
+	"""Finish a fully enumerated native-name alignment without guessing.
+
+	When the helper emitted exactly one string per native item, cardinality and
+	the native loop order prove that list positions are item indices.  Empty
+	strings then represent anonymous slots.  A shorter list remains compacted
+	and can only be reconstructed by the stricter per-type count alignment.
+	"""
+	if positional_names is not None:
+		item_types = {}
+		for native_type, item_list in items_by_type.items():
+			for item_index in item_list:
+				item_types[item_index] = native_type
+		name_types = {}
+		for descriptor_type, name_list in names_by_type.items():
+			for name in name_list:
+				name_types[name] = descriptor_type
+		mapping = {}
+		anomalous = []
+		for item_index, name in enumerate(positional_names):
+			if not name:
+				continue
+			descriptor_type = name_types.get(name)
+			native_type = item_types.get(item_index)
+			if descriptor_type != native_type:
+				if descriptor_type is not None:
+					anomalous.append(descriptor_type)
+				continue
+			mapping[item_index] = name
+		if anomalous:
+			return mapping, 'partial', tuple(sorted(set(anomalous)))
+		return mapping, 'exact', ()
 	mapping = {}
 	anomalous = []
 	for native_type in sorted(names_by_type):
@@ -455,10 +492,11 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	* ``wg_getChunkDestrFilenames`` (``0x006b1a10``) walks item indices
 	  ``0 .. numDestructibles(chunk) - 1`` in order and appends one name per
 	  item only when the item resolves, its native type owns a name handler,
-	  and that handler returns a non-NULL string.  Every other item appends
-	  nothing, so the returned list is compacted in item order and its
-	  positions are not native item indices.  The loop has no branch which
-	  appends a blank placeholder for a skipped item.
+	  and that handler returns a non-NULL pointer.  The pointer may address an
+	  empty C string, which is appended as ``''``.  An unresolved item, missing
+	  handler or NULL pointer appends nothing, so the returned list may be
+	  compacted in item order.  Its positions are item indices only when its
+	  length equals the exact native item count.
 	* ``wg_getDestructibleEffectCategory(space, chunk, item, -1)``
 	  (``0x006b1f10``) resolves the same item through the same provider entry
 	  (vtable ``+0x10``) that the name loop and ``wg_getDestructibleMatrix``
@@ -471,9 +509,10 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	  reaches ``PyString_FromString(NULL)`` and faults natively, and a native
 	  access violation is not a catchable Python failure.
 
-	The type-count alignment is valid only after every resolvable native item has
-	been typed.  Advance that enumeration from one shared render-tick budget and
-	cache its progress; until it completes, callers receive
+	The full-width positional proof and shorter-list type-count alignment are
+	valid only after every resolvable native item has been typed.  Advance that
+	enumeration from one shared render-tick budget and cache its progress; until
+	it completes, callers receive
 	``pending_alignment`` and must keep the chunk solid.  Unknown descriptors,
 	malformed categories, or a completed count mismatch are terminal evidence
 	failures and are never converted into an unnamed item.  A resolver exception
@@ -534,7 +573,8 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 		return entry['result']
 	if entry['next_item'] >= int(native_count):
 		entry['result'] = _align_native_item_names_1513(
-			entry['names_by_type'], entry['items_by_type'])
+			entry['names_by_type'], entry['items_by_type'],
+			names if len(names) == int(native_count) else None)
 		_release_item_name_query_focus_1513(space_id, chunk_id)
 		return entry['result']
 	query = getattr(bigworld, 'wg_getDestructibleEffectCategory', None)
@@ -579,13 +619,14 @@ def _chunk_item_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 	if end_item < int(native_count):
 		return None, 'pending_alignment', ()
 	entry['result'] = _align_native_item_names_1513(
-		entry['names_by_type'], entry['items_by_type'])
+		entry['names_by_type'], entry['items_by_type'],
+		names if len(names) == int(native_count) else None)
 	_release_item_name_query_focus_1513(space_id, chunk_id)
 	return entry['result']
 
 
 def _chunk_native_name_list_1513(bigworld, space_id, chunk_id, native_count):
-	"""Read and validate one chunk's compacted native name list.
+	"""Read and validate one chunk's possibly compacted native name list.
 
 	The native helper itself walks the whole chunk, so retain its validated
 	snapshot for all scanners and streamed-shot callers until the chunk unloads
@@ -593,8 +634,8 @@ def _chunk_native_name_list_1513(bigworld, space_id, chunk_id, native_count):
 	``(names, status)`` with ``'ready'``, ``'pending'`` at a legal streaming
 	boundary, or an isolating reason with ``None``.  A malformed list is a
 	chunk-level ABI violation, because the engine's own name loop cannot append
-	a non-string or empty entry and cannot append more entries than the chunk
-	has native items.
+	a non-string or more entries than the chunk has native items.  An empty
+	string is legal when a name handler returns a non-NULL pointer to ``'\0'``.
 	"""
 	key = (int(space_id), int(chunk_id))
 	cache = globals().setdefault('g_offh_destr_native_name_lists', {})
@@ -623,7 +664,7 @@ def _chunk_native_name_list_1513(bigworld, space_id, chunk_id, native_count):
 			detail='names=%s count=%s' % (len(names), native_count))
 		return None, 'filename_prefix'
 	for name in names:
-		if not isinstance(name, _STRING_TYPES) or not name:
+		if not isinstance(name, _STRING_TYPES):
 			_isolate_destructible_1513(
 				'filename_payload', chunk_id,
 				detail='names=%s count=%s entry=%r' % (
@@ -646,8 +687,9 @@ def _chunk_native_names_1513(bigworld, area_destructibles, space_id, chunk_id,
 
 	All calls and chunks share at most ``_ITEM_NAME_QUERY_BUDGET`` native category
 	queries per render tick.  ``pending_alignment`` is retryable; every completed
-	failure is a chunk-wide fail-closed boundary because the compacted list cannot
-	identify which slot owns the contradictory name evidence.
+	failure is a chunk-wide fail-closed boundary because a shorter compacted list
+	cannot identify which slot owns contradictory name evidence.  A full-width
+	list preserves slots, including legal empty strings.
 	"""
 	mapping, status, anomalous = _chunk_item_names_1513(
 		bigworld, area_destructibles, space_id, chunk_id, native_count, names)
@@ -712,8 +754,8 @@ def _live_filename_identity_1513(area_destructibles, raw_filename,
 	"""Classify one live/catalog filename disagreement for a native slot.
 
 	The live name is now recovered for this exact native item rather than read
-	out of the compacted chunk list, so a disagreement is real evidence instead
-	of an alignment artefact.  Classes:
+	directly out of the possibly compacted chunk list, so a disagreement is real
+	evidence instead of an alignment artefact.  Classes:
 
 	* ``none`` - this item owns no native name, so there is no evidence;
 	* ``match`` - the normalized names are equal;
@@ -3575,12 +3617,12 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 						_diagnostic_chunk_pending_1513(
 							'count_pending', cid)
 					# ``game.wg_onChunkLoad`` has not admitted this chunk yet. Do not
-					# infer a count from the compacted name list, whose length is only
+					# infer a count from the possibly compacted name list, whose length is only
 					# a lower bound; retry after the native streaming callback
 					# populates the manager map.
 					continue
-				# The pinned chunk name list is compacted, so recover the exact
-				# ``item_index -> filename`` mapping instead of indexing it.
+				# The pinned chunk name list may be compacted, so recover the exact
+				# ``item_index -> filename`` mapping under the cardinality contract.
 				_names, _names_status = _chunk_native_name_list_1513(
 					BigWorld, spaceID, cid, _native_count)
 				if _names_status == 'pending':
@@ -3590,9 +3632,9 @@ def _fell_trees_near(spaceID, pos, yaw, vel, td=None):
 					continue # chunk not streamed in yet; retry next tick
 				if _names is None:
 					continue
-				# A compacted name cannot be treated as an item index.  Complete the
-				# bounded per-type alignment before admitting any slot from this
-				# chunk.  An incomplete alignment retries on a later scan and a
+				# Complete the bounded native alignment before admitting any slot.
+				# A shorter list uses per-type reconstruction; a full-width list keeps
+				# its positions.  An incomplete alignment retries on a later scan and a
 				# terminal evidence failure isolates the whole chunk.
 				_item_names, _names_status = _chunk_native_names_1513(
 					BigWorld, AreaDestructibles, spaceID, cid,
